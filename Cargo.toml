@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license-file = "LICENSE"
+authors = ["JeffG <j@jeffg.me>"]
+description = "All of Nostr, at your fingertips."
+readme = "README.md"
+homepage = "https://github.com/andotherstuff/pensieve"
+repository = "https://github.com/andotherstuff/pensieve"
+documentation = "https://docs.rs/pensieve"
+keywords = ["nostr", "memory", "knowledge", "analytics", "data"]
+categories = ["database", "analytics", "data"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ClickHouse
+clickhouse = { version = "0.13", features = ["lz4", "chrono", "native-tls"] }
+
+# Nostr
+nostr = "0.44"
+
+# HTTP server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"

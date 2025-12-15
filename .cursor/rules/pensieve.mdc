@@ -1,0 +1,24 @@
+---
+description: Overall project context and goals
+alwaysApply: true
+---
+
+This project is focused on making Nostr data easy to **archive**, **explore**, and **analyze** at network scale.
+1. Right now Nostr data is spread around many relays, which makes it hard to answer basic aggregate questions (active users, activity by kind, trends) without heavy bespoke crawling.
+1. Primary user: any person or application that needs to explore or consume **aggregate** Nostr data (analytics, counts, trends, datasets), not “read/write” relay behavior.
+1. Non-goal: Pensieve is **not** a normal Nostr relay. It prioritizes correctness, deduplication, and analytics-friendly storage over serving realtime client subscriptions.
+1. This project consists of several different crates:
+    1. `pensieve-core`: core types, validation utilities, and shared helpers used across the system.
+    1. `pensieve-ingest`: an ingester that connects to many relays, validates events, and writes to long-term storage + ClickHouse. See `docs/ingestion_pipeline.md` for detailed design rationale.
+        1. **Architecture**: archive-first. The archive is an append-only log (source of truth); ClickHouse is a derived index built by consuming the archive.
+        1. **Relay coverage**: start from a configured seed list, then discover additional relays via **NIP-65** relay lists. Relays requiring authentication (e.g., **NIP-42**) can be skipped initially. Coverage is best-effort.
+        1. **Correctness**: on ingestion, recompute and validate **event IDs and signatures** (per **NIP-01**). Invalid events must not be stored.
+        1. **Deduplication**: use an embedded **RocksDB** index keyed by event ID. Dedupe by event id (same event seen on multiple relays). Replaceable events are stored as distinct events because they have distinct ids.
+        1. **ClickHouse correctness**: prefer **at-most-once** insertion per event id. Checkpoint at the segment level; on restart, reconcile the uncommitted tail against ClickHouse.
+        1. **Deletions**: store deletion events (e.g., **NIP-09**) as normal events; do not remove referenced events from the archive. In ClickHouse, maintain a way to mark/filter "deleted" events for analytics queries.
+        1. **Archive format**: length-prefixed segments (`[u32 length][event]...`), partitioned by **ingestion time**. Sealed segments are uploaded to S3. The archive stores canonical Nostr events only (no ingestion-specific metadata). Event encoding is TBD: evaluating **CBOR** (standard, mature) vs **[notepack](https://docs.rs/notepack/)** (Nostr-specific, ~128 bytes smaller per event).
+        1. **Reliability**: the local archive log buffers events through downstream outages (ClickHouse, object storage).
+    1. `pensieve-serve`: an HTTP API for analytics-oriented queries against ClickHouse (details TBD; optimized for aggregate/counted queries).
+1. ClickHouse schema: `docs/clickhouse_self_hosted.sql` (starting point; will evolve to cover more common Nostr analytics use cases).
+1. Observability: all parts of the system should be well instrumented with **Prometheus metrics** and **distributed tracing** (OpenTelemetry), focused on service health and performance (avoid high-cardinality labels).
+1. Operations: designed to run self-hosted and deployable via Docker + configuration management (Ansible or similar).
