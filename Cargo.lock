@@ -11,9 +11,5 @@ name = "pensieve-ingest"
 version = "0.1.0"
 
 [[package]]
-name = "pensieve-observe"
-version = "0.1.0"
-
-[[package]]
 name = "pensieve-serve"
 version = "0.1.0"
