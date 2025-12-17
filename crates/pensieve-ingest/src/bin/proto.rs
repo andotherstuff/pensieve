@@ -921,3 +921,368 @@ fn record_metrics(stats: &Stats, elapsed_secs: f64) {
         gauge!("backfill_events_per_second").set(events_per_sec);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pensieve_core::Tag;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // Progress tests
+    // =========================================================================
+
+    #[test]
+    fn test_progress_default() {
+        let progress = Progress::default();
+        assert!(progress.completed_keys.is_empty());
+    }
+
+    #[test]
+    fn test_progress_mark_completed() {
+        let mut progress = Progress::default();
+        assert!(!progress.is_completed("key1"));
+
+        progress.mark_completed("key1");
+        assert!(progress.is_completed("key1"));
+        assert!(!progress.is_completed("key2"));
+    }
+
+    #[test]
+    fn test_progress_mark_completed_idempotent() {
+        let mut progress = Progress::default();
+        progress.mark_completed("key1");
+        progress.mark_completed("key1");
+        progress.mark_completed("key1");
+
+        // Should still only have one entry
+        assert_eq!(progress.completed_keys.len(), 1);
+        assert!(progress.is_completed("key1"));
+    }
+
+    #[test]
+    fn test_progress_save_and_load() {
+        let tmp = TempDir::new().unwrap();
+        let progress_path = tmp.path().join("progress.json");
+
+        // Create and save progress
+        let mut progress = Progress::default();
+        progress.mark_completed("s3://bucket/key1.proto.gz");
+        progress.mark_completed("s3://bucket/key2.proto.gz");
+        progress.save(&progress_path).unwrap();
+
+        // Load it back
+        let loaded = Progress::load(&progress_path).unwrap();
+        assert!(loaded.is_completed("s3://bucket/key1.proto.gz"));
+        assert!(loaded.is_completed("s3://bucket/key2.proto.gz"));
+        assert!(!loaded.is_completed("s3://bucket/key3.proto.gz"));
+    }
+
+    #[test]
+    fn test_progress_load_nonexistent() {
+        let tmp = TempDir::new().unwrap();
+        let progress_path = tmp.path().join("nonexistent.json");
+
+        let progress = Progress::load(&progress_path).unwrap();
+        assert!(progress.completed_keys.is_empty());
+    }
+
+    #[test]
+    fn test_progress_multiple_keys() {
+        let mut progress = Progress::default();
+        for i in 0..100 {
+            progress.mark_completed(&format!("key{}", i));
+        }
+
+        assert_eq!(progress.completed_keys.len(), 100);
+        assert!(progress.is_completed("key0"));
+        assert!(progress.is_completed("key99"));
+        assert!(!progress.is_completed("key100"));
+    }
+
+    // =========================================================================
+    // hex_to_bytes32 tests
+    // =========================================================================
+
+    #[test]
+    fn test_hex_to_bytes32_valid() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000001";
+        let result = hex_to_bytes32(hex).unwrap();
+        assert_eq!(result[31], 1);
+        assert_eq!(result[0], 0);
+    }
+
+    #[test]
+    fn test_hex_to_bytes32_all_zeros() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = hex_to_bytes32(hex).unwrap();
+        assert!(result.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_hex_to_bytes32_all_ff() {
+        let hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let result = hex_to_bytes32(hex).unwrap();
+        assert!(result.iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn test_hex_to_bytes32_too_short() {
+        let hex = "0001020304";
+        let result = hex_to_bytes32(hex);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes32_too_long() {
+        let hex = "00000000000000000000000000000000000000000000000000000000000000000000";
+        let result = hex_to_bytes32(hex);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes32_invalid_chars() {
+        let hex = "000000000000000000000000000000000000000000000000000000000000gggg";
+        let result = hex_to_bytes32(hex);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // proto_to_notepack_unvalidated tests
+    // =========================================================================
+
+    fn make_test_proto(id: &str, content: &str) -> pensieve_core::ProtoEvent {
+        pensieve_core::ProtoEvent {
+            id: id.to_string(),
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            created_at: 1700000000,
+            kind: 1,
+            tags: vec![],
+            content: content.to_string(),
+            sig: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_proto_to_notepack_unvalidated_basic() {
+        let proto = make_test_proto(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "Hello, world!",
+        );
+
+        let mut buf = Vec::new();
+        let size = proto_to_notepack_unvalidated(&proto, &mut buf).unwrap();
+
+        assert!(size > 0);
+        assert_eq!(buf.len(), size);
+    }
+
+    #[test]
+    fn test_proto_to_notepack_unvalidated_with_tags() {
+        let proto = pensieve_core::ProtoEvent {
+            id: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000002"
+                .to_string(),
+            created_at: 1700000000,
+            kind: 1,
+            tags: vec![
+                Tag {
+                    values: vec!["p".to_string(), "target_pubkey".to_string()],
+                },
+                Tag {
+                    values: vec![
+                        "e".to_string(),
+                        "event_id".to_string(),
+                        "relay_url".to_string(),
+                    ],
+                },
+            ],
+            content: "Tagged content".to_string(),
+            sig: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        };
+
+        let mut buf = Vec::new();
+        let size = proto_to_notepack_unvalidated(&proto, &mut buf).unwrap();
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_proto_to_notepack_unvalidated_unicode() {
+        let proto = make_test_proto(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "Hello 🌍 世界 emoji: 🎉",
+        );
+
+        let mut buf = Vec::new();
+        let size = proto_to_notepack_unvalidated(&proto, &mut buf).unwrap();
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_proto_to_notepack_unvalidated_empty_content() {
+        let proto = make_test_proto(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "",
+        );
+
+        let mut buf = Vec::new();
+        let size = proto_to_notepack_unvalidated(&proto, &mut buf).unwrap();
+        assert!(size > 0);
+    }
+
+    #[test]
+    fn test_proto_to_notepack_unvalidated_appends_to_buffer() {
+        let proto = make_test_proto(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "test",
+        );
+
+        let mut buf = vec![0xAA, 0xBB]; // Pre-existing data
+        let size = proto_to_notepack_unvalidated(&proto, &mut buf).unwrap();
+
+        // Buffer should contain original bytes plus new data
+        assert_eq!(buf[0], 0xAA);
+        assert_eq!(buf[1], 0xBB);
+        assert_eq!(buf.len(), 2 + size);
+    }
+
+    // =========================================================================
+    // Stats tests
+    // =========================================================================
+
+    #[test]
+    fn test_stats_default() {
+        let stats = Stats::default();
+        assert_eq!(stats.files_processed, 0);
+        assert_eq!(stats.files_skipped, 0);
+        assert_eq!(stats.total_events, 0);
+        assert_eq!(stats.valid_events, 0);
+        assert_eq!(stats.invalid_events, 0);
+        assert_eq!(stats.duplicate_events, 0);
+        assert_eq!(stats.proto_errors, 0);
+        assert_eq!(stats.validation_errors, 0);
+    }
+
+    #[test]
+    fn test_stats_mutation() {
+        let stats = Stats {
+            total_events: 100,
+            valid_events: 80,
+            duplicate_events: 15,
+            invalid_events: 5,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            stats.valid_events + stats.duplicate_events + stats.invalid_events,
+            100
+        );
+    }
+
+    // =========================================================================
+    // print_summary tests (smoke test - just ensure it doesn't panic)
+    // =========================================================================
+
+    #[test]
+    fn test_print_summary_local_input() {
+        let args = Args {
+            input: Some(PathBuf::from("/test/input")),
+            s3_bucket: None,
+            s3_prefix: None,
+            output: PathBuf::from("/test/output"),
+            rocksdb_path: Some(PathBuf::from("/test/rocksdb")),
+            clickhouse_url: Some("http://localhost:8123".to_string()),
+            clickhouse_db: "nostr".to_string(),
+            segment_size: 256 * 1024 * 1024,
+            gzip: false,
+            skip_validation: false,
+            continue_on_error: true,
+            limit: None,
+            progress_interval: 100000,
+            progress_file: None,
+            temp_dir: None,
+            no_compress: false,
+            metrics_port: 9091,
+        };
+
+        let stats = Stats {
+            files_processed: 10,
+            files_skipped: 2,
+            total_events: 1000,
+            valid_events: 900,
+            invalid_events: 50,
+            duplicate_events: 50,
+            proto_errors: 20,
+            validation_errors: 30,
+            segments_sealed: 3,
+            compressed_proto_bytes: 500_000,
+            decompressed_proto_bytes: 1_000_000,
+            notepack_bytes: 600_000,
+            compressed_notepack_bytes: 250_000,
+        };
+
+        let elapsed = std::time::Duration::from_secs(10);
+
+        // This should not panic
+        print_summary(&args, &stats, elapsed);
+    }
+
+    #[test]
+    fn test_print_summary_s3_input() {
+        let args = Args {
+            input: None,
+            s3_bucket: Some("my-bucket".to_string()),
+            s3_prefix: Some("nostr/segments/".to_string()),
+            output: PathBuf::from("/test/output"),
+            rocksdb_path: None,
+            clickhouse_url: None,
+            clickhouse_db: "nostr".to_string(),
+            segment_size: 256 * 1024 * 1024,
+            gzip: false,
+            skip_validation: false,
+            continue_on_error: true,
+            limit: None,
+            progress_interval: 100000,
+            progress_file: None,
+            temp_dir: None,
+            no_compress: false,
+            metrics_port: 0,
+        };
+
+        let stats = Stats::default();
+        let elapsed = std::time::Duration::from_secs(0);
+
+        // This should not panic
+        print_summary(&args, &stats, elapsed);
+    }
+
+    #[test]
+    fn test_print_summary_zero_bytes() {
+        let args = Args {
+            input: Some(PathBuf::from("/test")),
+            s3_bucket: None,
+            s3_prefix: None,
+            output: PathBuf::from("/out"),
+            rocksdb_path: None,
+            clickhouse_url: None,
+            clickhouse_db: "nostr".to_string(),
+            segment_size: 256 * 1024 * 1024,
+            gzip: false,
+            skip_validation: false,
+            continue_on_error: true,
+            limit: None,
+            progress_interval: 100000,
+            progress_file: None,
+            temp_dir: None,
+            no_compress: false,
+            metrics_port: 0,
+        };
+
+        // All zeros - should handle division by zero gracefully
+        let stats = Stats::default();
+        let elapsed = std::time::Duration::from_secs(0);
+
+        print_summary(&args, &stats, elapsed);
+    }
+}

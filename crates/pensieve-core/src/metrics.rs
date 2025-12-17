@@ -305,17 +305,82 @@ pub fn set_gauge(name: &'static str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    // Ensure metrics are initialized exactly once for all tests
+    static INIT: Once = Once::new();
+
+    fn ensure_metrics_init() {
+        INIT.call_once(|| {
+            let _ = try_init_metrics();
+        });
+    }
+
+    // =========================================================================
+    // Initialization tests
+    // =========================================================================
 
     #[test]
-    fn test_try_init_metrics() {
-        // First call should succeed
-        let handle = try_init_metrics();
+    fn test_try_init_metrics_idempotent() {
+        // First call may or may not succeed (depends on test order)
+        let handle1 = try_init_metrics();
 
-        // If the recorder was already installed by another test, this is fine
-        if handle.is_some() {
-            // Second call should return None (already installed)
-            assert!(try_init_metrics().is_none());
-        }
+        // Second call should definitely return None (already installed)
+        let handle2 = try_init_metrics();
+
+        // At most one should succeed
+        assert!(handle1.is_none() || handle2.is_none());
+    }
+
+    // =========================================================================
+    // Helper function tests
+    // =========================================================================
+
+    #[test]
+    fn test_record_bytes_does_not_panic() {
+        ensure_metrics_init();
+        // Should not panic even with zero bytes
+        record_bytes("test_bytes_total", "test_type", 0);
+        record_bytes("test_bytes_total", "test_type", 1000);
+        record_bytes("test_bytes_total", "test_type", u64::MAX);
+    }
+
+    #[test]
+    fn test_increment_does_not_panic() {
+        ensure_metrics_init();
+        increment("test_counter", 0);
+        increment("test_counter", 1);
+        increment("test_counter", 100);
+    }
+
+    #[test]
+    fn test_set_gauge_does_not_panic() {
+        ensure_metrics_init();
+        set_gauge("test_gauge", 0.0);
+        set_gauge("test_gauge", 42.5);
+        set_gauge("test_gauge", -100.0);
+        set_gauge("test_gauge", f64::MAX);
+    }
+
+    #[test]
+    fn test_set_gauge_with_various_values() {
+        ensure_metrics_init();
+        // Test various floating point edge cases
+        set_gauge("test_edge_gauge", f64::MIN);
+        set_gauge("test_edge_gauge", f64::EPSILON);
+        set_gauge("test_edge_gauge", std::f64::consts::PI);
+    }
+
+    // =========================================================================
+    // Metric description registration
+    // =========================================================================
+
+    #[test]
+    fn test_register_common_metrics_does_not_panic() {
+        ensure_metrics_init();
+        // This should be idempotent and not panic
+        register_common_metrics();
+        register_common_metrics();
     }
 }
 

@@ -129,9 +129,26 @@ fn read_varint_with_size<R: std::io::Read>(reader: &mut R) -> std::io::Result<(u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn make_proto_event(id: &str, content: &str, kind: i32) -> ProtoEvent {
+        ProtoEvent {
+            id: id.to_string(),
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            created_at: 1700000000,
+            kind,
+            tags: vec![],
+            content: content.to_string(),
+            sig: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        }
+    }
+
+    // =========================================================================
+    // proto_to_json tests
+    // =========================================================================
 
     #[test]
-    fn test_proto_to_json() {
+    fn test_proto_to_json_basic() {
         let proto = ProtoEvent {
             id: "abc123".to_string(),
             pubkey: "def456".to_string(),
@@ -146,25 +163,243 @@ mod tests {
 
         let json = proto_to_json(&proto).unwrap();
         assert!(json.contains("\"id\":\"abc123\""));
+        assert!(json.contains("\"pubkey\":\"def456\""));
+        assert!(json.contains("\"created_at\":1234567890"));
         assert!(json.contains("\"kind\":1"));
-        assert!(json.contains("Hello, Nostr!"));
+        assert!(json.contains("\"content\":\"Hello, Nostr!\""));
+        assert!(json.contains("\"sig\":\"sig789\""));
     }
 
     #[test]
-    fn test_decode_proto_event() {
+    fn test_proto_to_json_with_tags() {
+        let proto = ProtoEvent {
+            id: "test".to_string(),
+            pubkey: "test".to_string(),
+            created_at: 0,
+            kind: 1,
+            tags: vec![
+                Tag {
+                    values: vec!["p".to_string(), "pubkey1".to_string()],
+                },
+                Tag {
+                    values: vec!["e".to_string(), "eventid".to_string(), "relay".to_string()],
+                },
+            ],
+            content: "".to_string(),
+            sig: "test".to_string(),
+        };
+
+        let json = proto_to_json(&proto).unwrap();
+        // Parse and verify tags structure
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let tags = parsed["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0][0], "p");
+        assert_eq!(tags[0][1], "pubkey1");
+        assert_eq!(tags[1][0], "e");
+        assert_eq!(tags[1][1], "eventid");
+        assert_eq!(tags[1][2], "relay");
+    }
+
+    #[test]
+    fn test_proto_to_json_empty_tags() {
+        let proto = make_proto_event("test", "content", 1);
+        let json = proto_to_json(&proto).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["tags"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_proto_to_json_unicode_content() {
         let proto = ProtoEvent {
             id: "test".to_string(),
             pubkey: "test".to_string(),
             created_at: 0,
             kind: 1,
             tags: vec![],
-            content: "".to_string(),
+            content: "Hello 🌍 世界 emoji: 🎉".to_string(),
             sig: "test".to_string(),
+        };
+
+        let json = proto_to_json(&proto).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["content"], "Hello 🌍 世界 emoji: 🎉");
+    }
+
+    #[test]
+    fn test_proto_to_json_special_characters_in_content() {
+        let proto = ProtoEvent {
+            id: "test".to_string(),
+            pubkey: "test".to_string(),
+            created_at: 0,
+            kind: 1,
+            tags: vec![],
+            content: "quotes: \" backslash: \\ newline: \n tab: \t".to_string(),
+            sig: "test".to_string(),
+        };
+
+        let json = proto_to_json(&proto).unwrap();
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["content"].as_str().unwrap().contains("quotes"));
+    }
+
+    // =========================================================================
+    // decode_proto_event tests
+    // =========================================================================
+
+    #[test]
+    fn test_decode_proto_event_roundtrip() {
+        let proto = ProtoEvent {
+            id: "abcd1234".to_string(),
+            pubkey: "pubkey123".to_string(),
+            created_at: 1700000000,
+            kind: 1,
+            tags: vec![Tag {
+                values: vec!["p".to_string(), "target".to_string()],
+            }],
+            content: "Hello!".to_string(),
+            sig: "signature".to_string(),
         };
 
         let bytes = proto.encode_to_vec();
         let decoded = decode_proto_event(&bytes).unwrap();
-        assert_eq!(decoded.id, "test");
+
+        assert_eq!(decoded.id, proto.id);
+        assert_eq!(decoded.pubkey, proto.pubkey);
+        assert_eq!(decoded.created_at, proto.created_at);
+        assert_eq!(decoded.kind, proto.kind);
+        assert_eq!(decoded.content, proto.content);
+        assert_eq!(decoded.sig, proto.sig);
+        assert_eq!(decoded.tags.len(), 1);
+    }
+
+    #[test]
+    fn test_decode_proto_event_empty_bytes() {
+        let result = decode_proto_event(&[]);
+        // Empty protobuf is valid (all fields default)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decode_proto_event_invalid_bytes() {
+        // Invalid protobuf bytes (truncated varint)
+        let result = decode_proto_event(&[0x80, 0x80, 0x80]);
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // decode_length_delimited tests
+    // =========================================================================
+
+    #[test]
+    fn test_decode_length_delimited_single_event() {
+        let proto = make_proto_event("test1", "content", 1);
+        let mut buf = Vec::new();
+        proto.encode_length_delimited(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let result = decode_length_delimited(&mut cursor).unwrap();
+
+        assert!(result.is_some());
+        let decoded = result.unwrap();
+        assert_eq!(decoded.id, "test1");
+    }
+
+    #[test]
+    fn test_decode_length_delimited_multiple_events() {
+        let proto1 = make_proto_event("event1", "content1", 1);
+        let proto2 = make_proto_event("event2", "content2", 7);
+
+        let mut buf = Vec::new();
+        proto1.encode_length_delimited(&mut buf).unwrap();
+        proto2.encode_length_delimited(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+
+        // Decode first event
+        let result1 = decode_length_delimited(&mut cursor).unwrap();
+        assert!(result1.is_some());
+        assert_eq!(result1.unwrap().id, "event1");
+
+        // Decode second event
+        let result2 = decode_length_delimited(&mut cursor).unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().id, "event2");
+
+        // EOF
+        let result3 = decode_length_delimited(&mut cursor).unwrap();
+        assert!(result3.is_none());
+    }
+
+    #[test]
+    fn test_decode_length_delimited_eof() {
+        let buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(buf);
+
+        let result = decode_length_delimited(&mut cursor).unwrap();
+        assert!(result.is_none());
+    }
+
+    // =========================================================================
+    // decode_length_delimited_with_size tests
+    // =========================================================================
+
+    #[test]
+    fn test_decode_length_delimited_with_size_returns_bytes() {
+        let proto = make_proto_event("sized", "content", 1);
+        let mut buf = Vec::new();
+        proto.encode_length_delimited(&mut buf).unwrap();
+        let total_len = buf.len();
+
+        let mut cursor = Cursor::new(buf);
+        let result = decode_length_delimited_with_size(&mut cursor).unwrap();
+
+        assert!(result.is_some());
+        let (decoded, bytes_read) = result.unwrap();
+        assert_eq!(decoded.id, "sized");
+        assert_eq!(bytes_read, total_len);
+    }
+
+    #[test]
+    fn test_decode_length_delimited_with_size_multiple() {
+        let proto1 = make_proto_event("first", "a", 1);
+        let proto2 = make_proto_event("second", "longer content here", 1);
+
+        let mut buf = Vec::new();
+        proto1.encode_length_delimited(&mut buf).unwrap();
+        let first_len = buf.len();
+        proto2.encode_length_delimited(&mut buf).unwrap();
+        let second_len = buf.len() - first_len;
+
+        let mut cursor = Cursor::new(buf);
+
+        let (_, size1) = decode_length_delimited_with_size(&mut cursor).unwrap().unwrap();
+        assert_eq!(size1, first_len);
+
+        let (_, size2) = decode_length_delimited_with_size(&mut cursor).unwrap().unwrap();
+        assert_eq!(size2, second_len);
+    }
+
+    // =========================================================================
+    // validate_proto_event tests (requires valid nostr event)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_proto_event_rejects_invalid_hex() {
+        // Invalid hex in ID field
+        let proto = ProtoEvent {
+            id: "not_valid_hex".to_string(),
+            pubkey: "also_not_valid".to_string(),
+            created_at: 0,
+            kind: 1,
+            tags: vec![],
+            content: "".to_string(),
+            sig: "invalid_sig".to_string(),
+        };
+
+        let result = validate_proto_event(&proto);
+        assert!(result.is_err());
     }
 }
 
