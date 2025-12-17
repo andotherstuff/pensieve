@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning
+# Loads dashboards from /etc/grafana/provisioning/dashboards/json/
+
+apiVersion: 1
+
+providers:
+  - name: 'Pensieve'
+    orgId: 1
+    folder: 'Pensieve'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+

@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Core types, validation, and shared utilities for the Pensieve ingestion pipeline.
+//!
+//! This crate provides:
+//! - Event validation (ID and signature verification per NIP-01) via the nostr crate
+//! - Serialization between JSON and notepack formats
+//! - Protobuf types and conversion utilities
+//! - Prometheus metrics helpers
+//! - Shared error types
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod error;
+mod event;
+pub mod metrics;
+pub mod proto;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::{Error, Result};
+pub use event::{
+    event_to_notebuf, pack_event_binary, pack_event_binary_into, validate_event,
+    validate_event_id, validate_event_signature, validate_notebuf,
+};
+pub use proto::{
+    decode_length_delimited, decode_length_delimited_with_size, decode_proto_event, proto_to_json,
+    validate_proto_event, EventBatch, ProtoEvent, Tag,
+};

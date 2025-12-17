@@ -1,0 +1,106 @@
+<?xml version="1.0"?>
+<!--
+    ClickHouse custom configuration for Pensieve
+
+    This file is mounted to /etc/clickhouse-server/config.d/custom.xml
+    Settings here override defaults from /etc/clickhouse-server/config.xml
+-->
+<clickhouse>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Memory Settings -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Use up to 70% of RAM (leave room for RocksDB, OS, etc) -->
+    <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Mark cache for faster index lookups -->
+    <mark_cache_size>5368709120</mark_cache_size> <!-- 5 GB -->
+
+    <!-- Uncompressed cache for hot data -->
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size> <!-- 8 GB -->
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Query Settings -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Max memory per query (prevent single query from using all RAM) -->
+    <max_memory_usage>32000000000</max_memory_usage> <!-- 32 GB -->
+
+    <!-- Query timeout -->
+    <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- MergeTree Settings -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <merge_tree>
+        <!-- Background merge threads (more = faster merges, more CPU) -->
+        <number_of_free_entries_in_pool_to_execute_mutation>0</number_of_free_entries_in_pool_to_execute_mutation>
+
+        <!-- Parts management -->
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+        <max_parts_in_total>100000</max_parts_in_total>
+    </merge_tree>
+
+    <!-- Background pool size (for merges, mutations) -->
+    <background_pool_size>16</background_pool_size>
+    <background_move_pool_size>8</background_move_pool_size>
+    <background_schedule_pool_size>16</background_schedule_pool_size>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Compression -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <compression>
+        <!-- Use ZSTD for better compression on text-heavy Nostr data -->
+        <case>
+            <min_part_size>10000000000</min_part_size> <!-- 10 GB -->
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>zstd</method>
+            <level>3</level>
+        </case>
+    </compression>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Logging -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <logger>
+        <level>information</level>
+        <size>100M</size>
+        <count>5</count>
+    </logger>
+
+    <!-- Query log (useful for debugging slow queries) -->
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <partition_by>toYYYYMM(event_date)</partition_by>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_log>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Network -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Listen on all interfaces inside container (Docker handles exposure) -->
+    <listen_host>::</listen_host>
+
+    <!-- Max concurrent connections -->
+    <max_connections>100</max_connections>
+
+    <!-- Keep-alive timeout -->
+    <keep_alive_timeout>3</keep_alive_timeout>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Async Insert (for high-throughput ingestion) -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <!-- Enable async inserts for better batching -->
+    <async_insert>1</async_insert>
+    <wait_for_async_insert>0</wait_for_async_insert>
+    <async_insert_max_data_size>10000000</async_insert_max_data_size> <!-- 10 MB -->
+    <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+</clickhouse>
+

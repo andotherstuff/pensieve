@@ -1,0 +1,74 @@
+# Pensieve Caddy Configuration
+#
+# This Caddyfile configures reverse proxy routes for Pensieve services.
+#
+# For local development (no HTTPS):
+#   Set DOMAIN=localhost in .env
+#
+# For production with auto-HTTPS:
+#   Set DOMAIN=your-domain.com in .env
+#   Ensure ports 80/443 are open and DNS points to this server
+
+# Use environment variable for domain, default to localhost
+{$DOMAIN:localhost} {
+    # =========================================================================
+    # Grafana - Dashboards
+    # =========================================================================
+    # Access at: https://your-domain.com/grafana/
+    # Or: http://localhost/grafana/ (local dev)
+
+    handle_path /grafana/* {
+        reverse_proxy grafana:3000
+    }
+
+    # Grafana also needs to handle its root for redirects
+    handle /grafana {
+        redir /grafana/ permanent
+    }
+
+    # =========================================================================
+    # Prometheus - Metrics (internal, optional exposure)
+    # =========================================================================
+    # Uncomment to expose Prometheus UI (useful for debugging)
+    # Access at: https://your-domain.com/prometheus/
+    #
+    # handle_path /prometheus/* {
+    #     reverse_proxy prometheus:9090
+    # }
+
+    # =========================================================================
+    # Pensieve API - Query Interface (when implemented)
+    # =========================================================================
+    # Access at: https://your-domain.com/api/
+    #
+    # handle_path /api/* {
+    #     reverse_proxy pensieve-serve:8080
+    # }
+
+    # =========================================================================
+    # Root - Landing page or redirect
+    # =========================================================================
+    handle / {
+        respond "Pensieve is running. Visit /grafana/ for dashboards." 200
+    }
+
+    # Catch-all: 404
+    handle {
+        respond "Not Found" 404
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Alternative: Subdomains (if you prefer grafana.your-domain.com)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Uncomment and modify if you want subdomain routing instead of path-based:
+#
+# grafana.{$DOMAIN} {
+#     reverse_proxy grafana:3000
+# }
+#
+# api.{$DOMAIN} {
+#     reverse_proxy pensieve-serve:8080
+# }
+

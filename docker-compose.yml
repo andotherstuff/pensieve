@@ -1,0 +1,38 @@
+# Docker Compose for local Pensieve development
+#
+# Start: docker compose up -d
+# Stop:  docker compose down
+# Logs:  docker compose logs -f clickhouse
+#
+# ClickHouse UI: http://localhost:8123/play
+# Connect: clickhouse-client --host localhost
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: pensieve-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native TCP interface
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      # Mount schema file for easy initialization
+      - ./docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      - CLICKHOUSE_DB=nostr
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  clickhouse_data:
+  clickhouse_logs:
+

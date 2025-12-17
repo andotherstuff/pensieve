@@ -1,0 +1,25 @@
+[Unit]
+Description=Sync Pensieve archive segments to Storage Box
+Documentation=https://github.com/yourname/pensieve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pensieve
+Group=pensieve
+
+# Run the sync script
+ExecStart=/home/pensieve/deploy/scripts/sync-archive.sh
+
+# Environment
+EnvironmentFile=-/home/pensieve/deploy/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pensieve-sync
+
+# Don't start multiple syncs
+# (timer won't trigger new run if previous is still running)
+

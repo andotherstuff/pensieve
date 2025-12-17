@@ -1,0 +1,48 @@
+# Prometheus configuration for Pensieve
+#
+# Scrapes metrics from:
+# - ClickHouse (built-in metrics)
+# - Pensieve ingester/backfill (custom metrics)
+# - Prometheus itself
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Prometheus self-monitoring
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ClickHouse metrics
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:8123']
+    metrics_path: '/metrics'
+    # ClickHouse exposes Prometheus metrics at /metrics by default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Pensieve Ingester (when running in Docker)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'pensieve-ingester'
+    static_configs:
+      - targets: ['ingester:9091']
+    # Will show as "down" until ingester is running
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Pensieve Backfill (when running locally on host)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'pensieve-backfill'
+    static_configs:
+      # host.docker.internal works on Docker Desktop (Mac/Windows)
+      # For Linux, use the host's actual IP or --add-host flag
+      - targets: ['host.docker.internal:9091']
+        labels:
+          instance: 'backfill-local'
+    # Will show as "down" when no backfill is running
+

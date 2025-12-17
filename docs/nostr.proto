@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package nostr;
+
+// Main Nostr event message
+//
+// Represents a Nostr event as defined in NIP-01.
+// All hex-encoded fields (id, pubkey, sig) are stored as strings
+// to maintain compatibility with Nostr's standard encoding.
+message ProtoEvent {
+  // 32-byte lowercase hex-encoded SHA-256 hash of the serialized event data
+  string id = 1;
+
+  // 32-byte lowercase hex-encoded public key of the event creator
+  string pubkey = 2;
+
+  // Unix timestamp in seconds when the event was created
+  int64 created_at = 3;
+
+  // Event kind (integer between 0 and 65535)
+  // See NIP-01 for kind ranges:
+  // - Regular: 1000-9999 (stored by relays)
+  // - Replaceable: 10000-19999 (only latest stored)
+  // - Ephemeral: 20000-29999 (not stored)
+  // - Addressable: 30000-39999 (identified by kind+pubkey+d-tag)
+  int32 kind = 4;
+
+  // Array of tags (each tag is an array of strings)
+  // Tags provide metadata and relationships between events
+  repeated Tag tags = 5;
+
+  // Arbitrary string content (format depends on event kind)
+  // - Kind 0: Stringified JSON with user metadata
+  // - Kind 1: Text note content
+  // - Kind 3: Contact list (usually empty)
+  // - Kind 30023: Markdown long-form content
+  // - etc.
+  string content = 6;
+
+  // 64-byte lowercase hex-encoded Schnorr signature of the event ID
+  // Signature is over the event.id using the private key corresponding to pubkey
+  string sig = 7;
+}
+
+// Tag message representing a single tag
+//
+// Tags are arrays of strings where:
+// - values[0]: Tag name (e.g., "e", "p", "a", "t", "r")
+// - values[1]: Primary value (event ID, pubkey, etc.)
+// - values[2+]: Optional parameters (relay hints, markers, etc.)
+message Tag {
+  // Array of string values representing the tag
+  // Minimum length is typically 2 (name + value)
+  // Maximum length is unlimited but typically < 10
+  repeated string values = 1;
+}
+
+// EventBatch message for convenience operations
+//
+// Used for testing and bulk operations where multiple events
+// need to be bundled together. Not used for primary storage
+// (we use length-delimited format instead).
+message EventBatch {
+  // Array of events
+  repeated ProtoEvent events = 1;
+}
+

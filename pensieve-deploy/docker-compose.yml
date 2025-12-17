@@ -1,0 +1,158 @@
+# Pensieve Production Docker Compose
+#
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f
+# Status: docker compose ps
+
+services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Caddy - Reverse Proxy with Auto-HTTPS
+  # ═══════════════════════════════════════════════════════════════════════════
+  caddy:
+    image: caddy:2-alpine
+    container_name: pensieve-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    depends_on:
+      - grafana
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ClickHouse - Analytics Database
+  # ═══════════════════════════════════════════════════════════════════════════
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: pensieve-clickhouse
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8123:8123"  # HTTP interface (localhost only)
+      - "127.0.0.1:9000:9000"  # Native TCP interface (localhost only)
+    volumes:
+      # Data directory (on fast SSD/NVMe)
+      - /data/clickhouse:/var/lib/clickhouse
+      # Logs
+      - clickhouse_logs:/var/log/clickhouse-server
+      # Custom config
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+      # Schema initialization
+      - ../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      - CLICKHOUSE_DB=nostr
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Prometheus - Metrics Collection
+  # ═══════════════════════════════════════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: pensieve-prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    # Linux: Allow container to reach host via host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Grafana - Dashboards
+  # ═══════════════════════════════════════════════════════════════════════════
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: pensieve-grafana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # Configure for reverse proxy at /grafana/
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    depends_on:
+      - prometheus
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Pensieve Ingester (placeholder - uncomment when ready)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ingester:
+  #   image: ghcr.io/yourname/pensieve-ingest:latest
+  #   container_name: pensieve-ingester
+  #   restart: unless-stopped
+  #   depends_on:
+  #     clickhouse:
+  #       condition: service_healthy
+  #   ports:
+  #     - "127.0.0.1:9091:9091"  # Metrics endpoint
+  #   volumes:
+  #     # RocksDB dedupe index (on fast SSD/NVMe)
+  #     - /data/rocksdb:/data/rocksdb
+  #     # Archive segments (on HDD)
+  #     - /archive/segments:/archive/segments
+  #   environment:
+  #     - CLICKHOUSE_URL=http://clickhouse:8123
+  #     - CLICKHOUSE_DB=nostr
+  #     - ROCKSDB_PATH=/data/rocksdb
+  #     - ARCHIVE_PATH=/archive/segments
+  #     - METRICS_PORT=9091
+  #     - RUST_LOG=info,pensieve_ingest=debug
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "100m"
+  #       max-file: "5"
+
+volumes:
+  clickhouse_logs:
+  prometheus_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:

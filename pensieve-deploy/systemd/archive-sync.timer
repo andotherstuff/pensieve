@@ -1,0 +1,17 @@
+[Unit]
+Description=Periodic archive sync to Storage Box
+Documentation=https://github.com/yourname/pensieve
+
+[Timer]
+# Run every hour
+OnCalendar=hourly
+
+# Add some randomness to avoid thundering herd
+RandomizedDelaySec=300
+
+# Run immediately if we missed scheduled time (e.g., server was off)
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

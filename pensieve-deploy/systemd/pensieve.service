@@ -1,0 +1,34 @@
+[Unit]
+Description=Pensieve Nostr Indexer
+Documentation=https://github.com/yourname/pensieve
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=pensieve
+Group=pensieve
+WorkingDirectory=/home/pensieve/deploy
+
+# Start docker compose
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Give containers time to stop gracefully
+TimeoutStopSec=60
+
+# Environment file
+EnvironmentFile=-/home/pensieve/deploy/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pensieve
+
+[Install]
+WantedBy=multi-user.target
+

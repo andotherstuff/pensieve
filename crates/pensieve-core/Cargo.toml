@@ -14,3 +14,28 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# Nostr protocol types and crypto
+nostr.workspace = true
+notepack.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Protobuf
+prost.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Observability
+tracing.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# HTTP server (for metrics endpoint)
+axum.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"

@@ -40,25 +40,20 @@ Archive segments use **length-prefixed framing**: `[u32 length][event blob][u32 
 - No ambiguity about record boundaries if corruption occurs
 - Can add CRC32 per record later if we want corruption detection
 
-### Event serialization format: TBD (CBOR vs notepack)
+### Event serialization format: notepack
 
-We're evaluating two options for the binary encoding of individual events:
+We're using **[notepack](https://docs.rs/notepack/latest/notepack/)** as the binary encoding for individual events.
 
-**Option 1: CBOR**
-- IETF standard (RFC 8949), mature ecosystem, many language bindings
-- General-purpose; treats events as opaque structs
-
-**Option 2: [notepack](https://docs.rs/notepack/latest/notepack/)**
+**Why notepack?**
 - Nostr-specific binary format by jb55 (Damus creator)
 - Stores 32-byte hex fields (id, pubkey, sig) as raw bytes → ~128 bytes smaller per event
 - Streaming parser that yields fields without full deserialization
 - Rust-native, version field for forward compatibility
+- At scale (billions of events), the ~128 bytes/event savings is significant (~120 GB at 1B events)
 
-**Pending validation:**
-- Round-trip correctness for edge cases (empty tags, unusual content, etc.)
-- Benchmarking serialization/deserialization performance vs CBOR
-
-At scale (billions of events), the ~128 bytes/event savings from notepack is significant (~120 GB at 1B events). If validation passes, notepack is the likely choice.
+**Why not CBOR?**
+- CBOR is general-purpose and doesn't optimize for Nostr's specific structure
+- The space savings from notepack's Nostr-native encoding are substantial at archive scale
 
 ### Checkpoint granularity: Per-sealed-segment
 
@@ -105,14 +100,14 @@ The rest of this doc describes the two architectures we evaluated and their trad
 Treat the archive as an **append-only log** (like Kafka). ClickHouse is a **derived index** built by consuming that log.
 
 - Producer: relay ingester
-- Log: local append-only segment files (CBOR-seq / length-delimited records)
+- Log: local append-only segment files (notepack / length-delimited records)
 - Remote storage: upload sealed segments to S3 (or similar) for durability + rebuilds
 - Consumer: ClickHouse indexer
 - Checkpoint: (segment_key, offset) stored durably
 
 ### How batching to S3 works with checkpoints
 S3 objects are immutable; you generally **don’t append to S3**. Instead:
-1. Write events to a **local segment file** (e.g., `archive/2025-12-13/segment-000123.cborseq`).
+1. Write events to a **local segment file** (e.g., `archive/2025-12-13/segment-000123.notepack`).
 2. Rotate/“seal” the segment on size/time (e.g., 256MB or 1 minute).
 3. Upload the sealed segment as **one object** to S3 (that’s your batch).
 
@@ -121,8 +116,7 @@ Your checkpoint can be:
 - **Record-level**: `(segment_key, record_index)` or `(segment_key, byte_offset)` for crash-safe resumption mid-segment.
 
 Record-level offsets are easy if the segment uses:
-- CBOR sequence (one CBOR value after another), or
-- A length-prefix framing (u32 length + bytes), so you can resume from a byte offset cleanly.
+- A length-prefix framing (u32 length + notepack bytes), so you can resume from a byte offset cleanly.
 
 ### Out-of-order events (created_at vs ingestion order)
 In practice, events will arrive “out of order” relative to `created_at` (backfills, relay catch-up, clock skew).

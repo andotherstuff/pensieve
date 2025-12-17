@@ -13,4 +13,68 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "backfill-jsonl"
+path = "src/bin/jsonl.rs"
+
+[[bin]]
+name = "backfill-proto"
+path = "src/bin/proto.rs"
+
 [dependencies]
+# Internal crates
+pensieve-core = { path = "../pensieve-core" }
+
+# Nostr
+notepack.workspace = true
+nostr.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Protobuf
+prost.workspace = true
+
+# Storage
+rocksdb.workspace = true
+clickhouse.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Encoding
+hex.workspace = true
+
+# AWS S3
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+
+# Concurrency
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+num_cpus.workspace = true
+
+# Compression
+flate2 = "1.0"
+
+# Observability
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.23"
