@@ -1,6 +1,6 @@
 [Unit]
 Description=Pensieve Nostr Indexer
-Documentation=https://github.com/yourname/pensieve
+Documentation=https://github.com/andotherstuff/pensieve
 After=docker.service
 Requires=docker.service
 
@@ -8,7 +8,7 @@ Requires=docker.service
 Type=simple
 User=pensieve
 Group=pensieve
-WorkingDirectory=/home/pensieve/deploy
+WorkingDirectory=/home/pensieve/pensieve/pensieve-deploy
 
 # Start docker compose
 ExecStart=/usr/bin/docker compose up
@@ -22,7 +22,7 @@ RestartSec=10
 TimeoutStopSec=60
 
 # Environment file
-EnvironmentFile=-/home/pensieve/deploy/.env
+EnvironmentFile=-/home/pensieve/pensieve/pensieve-deploy/.env
 
 # Logging
 StandardOutput=journal

@@ -1,6 +1,6 @@
 [Unit]
 Description=Sync Pensieve archive segments to Storage Box
-Documentation=https://github.com/yourname/pensieve
+Documentation=https://github.com/andotherstuff/pensieve
 After=network-online.target
 Wants=network-online.target
 
@@ -10,10 +10,10 @@ User=pensieve
 Group=pensieve
 
 # Run the sync script
-ExecStart=/home/pensieve/deploy/scripts/sync-archive.sh
+ExecStart=/home/pensieve/pensieve/pensieve-deploy/scripts/sync-archive.sh
 
 # Environment
-EnvironmentFile=-/home/pensieve/deploy/.env
+EnvironmentFile=-/home/pensieve/pensieve/pensieve-deploy/.env
 
 # Logging
 StandardOutput=journal

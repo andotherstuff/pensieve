@@ -98,12 +98,13 @@ mkdir -p /archive/segments
 chown -R pensieve:pensieve /data /archive
 ```
 
-### 5. Clone Deployment Config
+### 5. Clone Repository
 
 ```bash
+echo "pensieve ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pensieve
 su - pensieve
-git clone <your-repo-url> ~/deploy
-cd ~/deploy
+git clone https://github.com/andotherstuff/pensieve.git
+cd ~/pensieve/pensieve-deploy
 cp env.example .env
 # Edit .env with your settings
 nano .env
@@ -134,8 +135,8 @@ rclone mkdir storagebox:pensieve/archive
 
 ```bash
 # Copy service files
-sudo cp ~/deploy/systemd/*.service /etc/systemd/system/
-sudo cp ~/deploy/systemd/*.timer /etc/systemd/system/
+sudo cp ~/pensieve/pensieve-deploy/systemd/*.service /etc/systemd/system/
+sudo cp ~/pensieve/pensieve-deploy/systemd/*.timer /etc/systemd/system/
 
 # Reload systemd
 sudo systemctl daemon-reload
@@ -176,24 +177,27 @@ docker compose exec clickhouse clickhouse-client \
     ├── segment-000002.notepack
     └── ...
 
-/home/pensieve/deploy/      # This deployment config
-├── docker-compose.yml
-├── .env
-├── caddy/
-│   └── Caddyfile           # Reverse proxy config
-├── clickhouse/
-│   └── config.xml          # ClickHouse tuning
-├── grafana/
-│   └── provisioning/       # Auto-configured dashboards
-├── prometheus/
-│   └── prometheus.yml      # Scrape targets
-├── systemd/
-│   ├── pensieve.service
-│   ├── archive-sync.service
-│   └── archive-sync.timer
-└── scripts/
-    ├── deploy.sh
-    └── sync-archive.sh
+/home/pensieve/pensieve/              # Repository clone
+├── crates/                           # Rust crates
+├── docs/                             # Documentation
+└── pensieve-deploy/                  # Deployment config
+    ├── docker-compose.yml
+    ├── .env
+    ├── caddy/
+    │   └── Caddyfile                 # Reverse proxy config
+    ├── clickhouse/
+    │   └── config.xml                # ClickHouse tuning
+    ├── grafana/
+    │   └── provisioning/             # Auto-configured dashboards
+    ├── prometheus/
+    │   └── prometheus.yml            # Scrape targets
+    ├── systemd/
+    │   ├── pensieve.service
+    │   ├── archive-sync.service
+    │   └── archive-sync.timer
+    └── scripts/
+        ├── deploy.sh
+        └── sync-archive.sh
 ```
 
 ---
@@ -209,7 +213,7 @@ sudo systemctl stop pensieve
 sudo systemctl status pensieve
 
 # Or directly with docker compose
-cd ~/deploy
+cd ~/pensieve/pensieve-deploy
 docker compose up -d
 docker compose down
 docker compose logs -f
@@ -244,7 +248,7 @@ docker compose exec clickhouse clickhouse-client \
 
 ```bash
 # Sync old segments to Storage Box
-~/deploy/scripts/sync-archive.sh
+~/pensieve/pensieve-deploy/scripts/sync-archive.sh
 
 # Check sync status
 rclone size storagebox:pensieve/archive
