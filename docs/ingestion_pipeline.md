@@ -57,7 +57,7 @@ We're using **[notepack](https://docs.rs/notepack/latest/notepack/)** as the bin
 
 ### Checkpoint granularity: Per-sealed-segment
 
-We checkpoint at the **segment level**: when a segment is sealed and uploaded to S3, we record "segment N fully consumed" for ClickHouse indexing.
+We checkpoint at the **segment level**: when a segment is sealed and synced to remote storage, we record "segment N fully consumed" for ClickHouse indexing.
 
 **Why?**
 - Simpler than per-record checkpoints
@@ -101,15 +101,15 @@ Treat the archive as an **append-only log** (like Kafka). ClickHouse is a **deri
 
 - Producer: relay ingester
 - Log: local append-only segment files (notepack / length-delimited records)
-- Remote storage: upload sealed segments to S3 (or similar) for durability + rebuilds
+- Remote storage: sync sealed segments to Hetzner Storage Box (via rclone) for durability + rebuilds
 - Consumer: ClickHouse indexer
 - Checkpoint: (segment_key, offset) stored durably
 
-### How batching to S3 works with checkpoints
-S3 objects are immutable; you generally **don’t append to S3**. Instead:
+### How batching to remote storage works with checkpoints
+Remote storage objects are immutable; you generally **don't append** to them. Instead:
 1. Write events to a **local segment file** (e.g., `archive/2025-12-13/segment-000123.notepack`).
-2. Rotate/“seal” the segment on size/time (e.g., 256MB or 1 minute).
-3. Upload the sealed segment as **one object** to S3 (that’s your batch).
+2. Rotate/"seal" the segment on size/time (e.g., 256MB or 1 minute).
+3. Sync the sealed segment to remote storage via rclone (that's your batch).
 
 Your checkpoint can be:
 - **Object-level**: “segment is fully processed” (simple but coarse), or
