@@ -51,7 +51,7 @@ num_cpus = "1.16"
 
 # Nostr
 nostr = "0.44"
-notepack = { path = "../notepack" }
+notepack = { git = "https://github.com/erskingardner/notepack" }
 
 # HTTP server
 axum = "0.8"

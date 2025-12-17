@@ -2180,6 +2180,7 @@ dependencies = [
 [[package]]
 name = "notepack"
 version = "0.3.0"
+source = "git+https://github.com/erskingardner/notepack#95a78265d4df197df5bf818a65b201c72c136166"
 dependencies = [
  "base64",
  "hex-simd",

@@ -53,6 +53,9 @@ apt install -y rclone htop iotop tmux git
 useradd -m -s /bin/bash pensieve
 usermod -aG docker pensieve
 
+# Grant sudo access (for systemd operations)
+echo "pensieve ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pensieve
+
 # Set up SSH key (optional, for deployments)
 mkdir -p /home/pensieve/.ssh
 cp ~/.ssh/authorized_keys /home/pensieve/.ssh/
@@ -61,7 +64,24 @@ chmod 700 /home/pensieve/.ssh
 chmod 600 /home/pensieve/.ssh/authorized_keys
 ```
 
-### 3. Set Up HDD (if not done during OS install)
+### 3. Install Rust (as pensieve user)
+
+```bash
+su - pensieve
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Accept defaults (option 1)
+
+# Reload shell environment
+source ~/.cargo/env
+
+# Verify installation
+rustc --version
+cargo --version
+```
+
+### 4. Set Up HDD (if not done during OS install)
 
 If the HDD wasn't configured during `installimage`:
 
@@ -84,7 +104,7 @@ echo 'LABEL=archive /archive xfs defaults,noatime 0 2' >> /etc/fstab
 mount /archive
 ```
 
-### 4. Create Directory Structure
+### 5. Create Directory Structure
 
 ```bash
 # Data directories (on SSD/NVMe)
@@ -98,7 +118,7 @@ mkdir -p /archive/segments
 chown -R pensieve:pensieve /data /archive
 ```
 
-### 5. Clone Repository
+### 6. Clone Repository
 
 ```bash
 echo "pensieve ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pensieve
@@ -110,7 +130,7 @@ cp env.example .env
 nano .env
 ```
 
-### 6. Configure Storage Box (for remote archive)
+### 7. Configure Storage Box (for remote archive)
 
 ```bash
 # Configure rclone for Hetzner Storage Box
@@ -131,7 +151,7 @@ rclone ls storagebox:
 rclone mkdir storagebox:pensieve/archive
 ```
 
-### 7. Install Systemd Services
+### 8. Install Systemd Services
 
 ```bash
 # Copy service files
@@ -150,7 +170,7 @@ sudo systemctl enable archive-sync.timer
 sudo systemctl start archive-sync.timer
 ```
 
-### 8. Initialize ClickHouse Schema
+### 9. Initialize ClickHouse Schema
 
 ```bash
 # Wait for ClickHouse to be ready
