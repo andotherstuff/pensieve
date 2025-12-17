@@ -5,6 +5,7 @@
 # Logs:  docker compose logs -f clickhouse
 #
 # ClickHouse UI: http://localhost:8123/play
+# Prometheus UI: http://localhost:9090
 # Connect: clickhouse-client --host localhost
 
 services:
@@ -31,6 +32,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Optional: Prometheus for metrics during local dev
+  # Comment out if you don't need metrics
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: pensieve-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus-local.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   clickhouse_data:

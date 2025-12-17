@@ -1,0 +1,13 @@
+# Prometheus config for local development
+# Scrapes backfill metrics from host machine
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Backfill tool running on host (default port 9091)
+  - job_name: 'backfill'
+    static_configs:
+      - targets: ['host.docker.internal:9091']
+
