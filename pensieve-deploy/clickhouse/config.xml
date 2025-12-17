@@ -20,16 +20,6 @@
     <uncompressed_cache_size>8589934592</uncompressed_cache_size> <!-- 8 GB -->
 
     <!-- ═══════════════════════════════════════════════════════════════════ -->
-    <!-- Query Settings -->
-    <!-- ═══════════════════════════════════════════════════════════════════ -->
-
-    <!-- Max memory per query (prevent single query from using all RAM) -->
-    <max_memory_usage>32000000000</max_memory_usage> <!-- 32 GB -->
-
-    <!-- Query timeout -->
-    <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
-
-    <!-- ═══════════════════════════════════════════════════════════════════ -->
     <!-- MergeTree Settings -->
     <!-- ═══════════════════════════════════════════════════════════════════ -->
 
@@ -94,13 +84,23 @@
     <keep_alive_timeout>3</keep_alive_timeout>
 
     <!-- ═══════════════════════════════════════════════════════════════════ -->
-    <!-- Async Insert (for high-throughput ingestion) -->
+    <!-- User Profile Settings (query-level settings) -->
     <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-    <!-- Enable async inserts for better batching -->
-    <async_insert>1</async_insert>
-    <wait_for_async_insert>0</wait_for_async_insert>
-    <async_insert_max_data_size>10000000</async_insert_max_data_size> <!-- 10 MB -->
-    <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+    <profiles>
+        <default>
+            <!-- Max memory per query (prevent single query from using all RAM) -->
+            <max_memory_usage>32000000000</max_memory_usage> <!-- 32 GB -->
+
+            <!-- Query timeout -->
+            <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
+
+            <!-- Enable async inserts for better batching -->
+            <async_insert>1</async_insert>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <async_insert_max_data_size>10000000</async_insert_max_data_size> <!-- 10 MB -->
+            <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+        </default>
+    </profiles>
 </clickhouse>
 
