@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS events_local (
 
 ) ENGINE = ReplacingMergeTree(indexed_at)
 ORDER BY (id)
-SETTINGS index_granularity = 8192;
+SETTINGS index_granularity = 8192,
+         deduplicate_merge_projection_mode = 'rebuild';
 
 -- =============================================================================
 -- TAG MATERIALIZED VIEW
