@@ -17,7 +17,7 @@
     # Access at: https://your-domain.com/grafana/
     # Or: http://localhost/grafana/ (local dev)
 
-    handle_path /grafana/* {
+    handle /grafana/* {
         reverse_proxy grafana:3000
     }
 
