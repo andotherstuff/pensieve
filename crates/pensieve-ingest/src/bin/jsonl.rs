@@ -322,13 +322,14 @@ fn collect_files(input: &PathBuf, limit: Option<usize>) -> Result<Vec<PathBuf>> 
 // Pipeline
 // ============================================================================
 
-fn init_pipeline(
-    args: &Args,
-) -> Result<(
+/// Result of pipeline initialization: (segment writer, dedupe index, clickhouse indexer handle).
+type PipelineComponents = (
     Arc<SegmentWriter>,
     Option<Arc<DedupeIndex>>,
     Option<std::thread::JoinHandle<()>>,
-)> {
+);
+
+fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index (optional)
     let dedupe = if let Some(ref rocksdb_path) = args.rocksdb_path {
         info!("Opening dedupe index at {}", rocksdb_path.display());
@@ -514,7 +515,7 @@ fn process_file(
         stats.valid_events += 1;
 
         // Progress reporting
-        if stats.total_events % args.progress_interval == 0 {
+        if stats.total_events.is_multiple_of(args.progress_interval) {
             info!(
                 "Progress: {} events, {} valid, {} duplicates, {} invalid, {} segments",
                 stats.total_events,
