@@ -39,7 +39,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Backfill Nostr events from JSONL files to notepack archive format.
@@ -277,12 +276,12 @@ fn process(args: &Args) -> Result<Stats> {
 
     // Wait for ClickHouse indexer to finish processing the queue
     if let Some(handle) = indexer_handle {
-        info!("Waiting for ClickHouse indexer to finish...");
+        tracing::info!("Waiting for ClickHouse indexer to finish...");
         drop(segment_writer);
         if let Err(e) = handle.join() {
-            warn!("ClickHouse indexer thread panicked: {:?}", e);
+            tracing::warn!("ClickHouse indexer thread panicked: {:?}", e);
         }
-        info!("ClickHouse indexer finished");
+        tracing::info!("ClickHouse indexer finished");
     }
 
     Ok(stats)
@@ -302,10 +301,10 @@ type PipelineComponents = (
 fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index (optional)
     let dedupe = if let Some(ref rocksdb_path) = args.rocksdb_path {
-        info!("Opening dedupe index at {}", rocksdb_path.display());
+        tracing::info!("Opening dedupe index at {}", rocksdb_path.display());
         Some(Arc::new(DedupeIndex::open(rocksdb_path)?))
     } else {
-        warn!("Running without deduplication (no --rocksdb-path specified)");
+        tracing::warn!("Running without deduplication (no --rocksdb-path specified)");
         None
     };
 
@@ -330,7 +329,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     let indexer_handle = if let (Some(ch_url), Some(receiver)) =
         (&args.clickhouse_url, sealed_receiver)
     {
-        info!("Starting ClickHouse indexer for {}", ch_url);
+        tracing::info!("Starting ClickHouse indexer for {}", ch_url);
         let ch_config = ClickHouseConfig {
             url: ch_url.clone(),
             database: args.clickhouse_db.clone(),
@@ -353,7 +352,7 @@ fn finalize_pipeline(
 ) -> Result<()> {
     // Seal any remaining segment
     if let Some(sealed) = segment_writer.seal()? {
-        info!(
+        tracing::info!(
             "Sealed final segment {}: {} events",
             sealed.segment_number, sealed.event_count
         );
@@ -369,7 +368,7 @@ fn finalize_pipeline(
     if let Some(dedupe) = dedupe {
         dedupe.flush()?;
         let dedupe_stats = dedupe.stats();
-        info!("Dedupe index: ~{} keys", dedupe_stats.approximate_keys);
+        tracing::info!("Dedupe index: ~{} keys", dedupe_stats.approximate_keys);
     }
 
     Ok(())

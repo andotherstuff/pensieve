@@ -15,7 +15,6 @@ use crate::Result;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
 
 /// Status flags stored as values in the dedupe index.
 #[repr(u8)]
@@ -63,9 +62,12 @@ impl DedupeIndex {
     /// let index = DedupeIndex::open("./data/dedupe")?;
     /// # Ok::<(), pensieve_ingest::Error>(())
     /// ```
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P>(path: P) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
         let path = path.as_ref();
-        info!("Opening dedupe index at {}", path.display());
+        tracing::info!("Opening dedupe index at {}", path.display());
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -162,7 +164,7 @@ impl DedupeIndex {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true); // Ensure durability
             self.db.write_opt(batch, &write_opts)?;
-            debug!("Marked {} events as archived", count);
+            tracing::debug!("Marked {} events as archived", count);
         }
 
         Ok(())

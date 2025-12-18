@@ -29,7 +29,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use tracing::{error, info, warn};
 
 /// Configuration for the ClickHouse indexer.
 #[derive(Debug, Clone)]
@@ -87,7 +86,7 @@ impl ClickHouseIndexer {
             .with_url(&config.url)
             .with_database(&config.database);
 
-        info!(
+        tracing::info!(
             "ClickHouse indexer initialized: url={}, database={}, table={}",
             config.url, config.database, config.table
         );
@@ -120,7 +119,7 @@ impl ClickHouseIndexer {
             let events_indexed =
                 unsafe { &*(events_indexed as *const AtomicUsize) };
 
-            info!("ClickHouse indexer thread started");
+            tracing::info!("ClickHouse indexer thread started");
 
             // Create a runtime for async operations
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -131,7 +130,7 @@ impl ClickHouseIndexer {
             while running.load(Ordering::SeqCst) {
                 match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
                     Ok(sealed) => {
-                        info!(
+                        tracing::info!(
                             "Indexing segment {}: {} events from {}",
                             sealed.segment_number,
                             sealed.event_count,
@@ -142,13 +141,13 @@ impl ClickHouseIndexer {
                             Ok(count) => {
                                 segments_indexed.fetch_add(1, Ordering::Relaxed);
                                 events_indexed.fetch_add(count, Ordering::Relaxed);
-                                info!(
+                                tracing::info!(
                                     "Indexed segment {}: {} events",
                                     sealed.segment_number, count
                                 );
                             }
                             Err(e) => {
-                                error!(
+                                tracing::error!(
                                     "Failed to index segment {}: {}",
                                     sealed.segment_number, e
                                 );
@@ -160,13 +159,13 @@ impl ClickHouseIndexer {
                         // Continue waiting
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        info!("Segment channel disconnected, stopping indexer");
+                        tracing::info!("Segment channel disconnected, stopping indexer");
                         break;
                     }
                 }
             }
 
-            info!("ClickHouse indexer thread stopped");
+            tracing::info!("ClickHouse indexer thread stopped");
         })
     }
 
@@ -238,7 +237,7 @@ impl ClickHouseIndexer {
             match Self::parse_notepack(&data) {
                 Ok(row) => events.push(row),
                 Err(e) => {
-                    warn!("Failed to parse event: {}", e);
+                    tracing::warn!("Failed to parse event: {}", e);
                     // Continue with next event
                 }
             }

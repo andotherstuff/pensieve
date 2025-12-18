@@ -31,7 +31,6 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tracing::{debug, info, warn};
 
 /// Configuration for the segment writer.
 #[derive(Debug, Clone)]
@@ -142,7 +141,7 @@ impl SegmentWriter {
         // Find the next segment number by scanning existing files
         let next_segment = Self::find_next_segment_number(&config)?;
 
-        info!(
+        tracing::info!(
             "SegmentWriter initialized: output_dir={}, max_size={}, starting at segment {}",
             config.output_dir.display(),
             config.max_segment_size,
@@ -208,7 +207,7 @@ impl SegmentWriter {
             let segment_num = self.segment_number.load(Ordering::SeqCst);
             let path = self.segment_path(segment_num);
 
-            debug!("Creating new segment: {}", path.display());
+            tracing::debug!("Creating new segment: {}", path.display());
 
             let file = File::create(&path)?;
             let writer = BufWriter::with_capacity(8 * 1024 * 1024, file); // 8MB buffer
@@ -309,10 +308,10 @@ impl SegmentWriter {
 
             // Remove the uncompressed file
             if let Err(e) = fs::remove_file(&path) {
-                warn!("Failed to remove uncompressed segment: {}", e);
+                tracing::warn!("Failed to remove uncompressed segment: {}", e);
             }
 
-            info!(
+            tracing::info!(
                 "Sealed segment {}: {} events, {} bytes -> {} bytes ({:.1}%) at {}",
                 segment_number,
                 event_count,
@@ -324,7 +323,7 @@ impl SegmentWriter {
 
             (gz_path, compressed_bytes)
         } else {
-            info!(
+            tracing::info!(
                 "Sealed segment {}: {} events, {} bytes at {}",
                 segment_number,
                 event_count,
@@ -352,7 +351,7 @@ impl SegmentWriter {
         if let Some(sender) = &self.sealed_sender
             && let Err(e) = sender.send(sealed.clone())
         {
-            warn!("Failed to send sealed segment notification: {}", e);
+            tracing::warn!("Failed to send sealed segment notification: {}", e);
         }
 
         Ok(Some(sealed))
@@ -414,7 +413,7 @@ impl Drop for SegmentWriter {
     fn drop(&mut self) {
         // Seal any remaining segment on drop
         if let Err(e) = self.seal() {
-            warn!("Error sealing segment on drop: {}", e);
+            tracing::warn!("Error sealing segment on drop: {}", e);
         }
     }
 }

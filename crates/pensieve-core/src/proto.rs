@@ -67,7 +67,10 @@ pub fn decode_proto_event(bytes: &[u8]) -> Result<ProtoEvent> {
 /// Decode a length-delimited ProtoEvent from a reader.
 ///
 /// Returns `Ok(None)` on EOF, `Ok(Some(event))` on success, or an error.
-pub fn decode_length_delimited<R: std::io::Read>(reader: &mut R) -> Result<Option<ProtoEvent>> {
+pub fn decode_length_delimited<R>(reader: &mut R) -> Result<Option<ProtoEvent>>
+where
+    R: std::io::Read,
+{
     decode_length_delimited_with_size(reader).map(|opt| opt.map(|(event, _size)| event))
 }
 
@@ -75,9 +78,10 @@ pub fn decode_length_delimited<R: std::io::Read>(reader: &mut R) -> Result<Optio
 ///
 /// Returns `Ok(None)` on EOF, `Ok(Some((event, bytes_read)))` on success, or an error.
 /// The `bytes_read` includes the varint length prefix and the message body.
-pub fn decode_length_delimited_with_size<R: std::io::Read>(
-    reader: &mut R,
-) -> Result<Option<(ProtoEvent, usize)>> {
+pub fn decode_length_delimited_with_size<R>(reader: &mut R) -> Result<Option<(ProtoEvent, usize)>>
+where
+    R: std::io::Read,
+{
     // Read the varint length prefix
     let (len, varint_size) = match read_varint_with_size(reader) {
         Ok((len, size)) => (len, size),
@@ -97,7 +101,10 @@ pub fn decode_length_delimited_with_size<R: std::io::Read>(
 }
 
 /// Read a varint from a reader, returning the value and number of bytes read.
-fn read_varint_with_size<R: std::io::Read>(reader: &mut R) -> std::io::Result<(u64, usize)> {
+fn read_varint_with_size<R>(reader: &mut R) -> std::io::Result<(u64, usize)>
+where
+    R: std::io::Read,
+{
     let mut result: u64 = 0;
     let mut shift = 0;
     let mut bytes_read = 0;

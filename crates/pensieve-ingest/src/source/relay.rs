@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
 
 /// Configuration for the relay source.
 #[derive(Debug, Clone)]
@@ -140,7 +139,7 @@ impl RelaySource {
     {
         self.running.store(true, Ordering::SeqCst);
 
-        info!(
+        tracing::info!(
             "Starting relay source with {} seed relays, discovery={}",
             self.config.seed_relays.len(),
             self.config.discovery_enabled
@@ -150,7 +149,7 @@ impl RelaySource {
         // This allows us to authenticate with relays that require it
         // We don't use this key for signing events, just for relay auth
         let keys = Keys::generate();
-        info!(
+        tracing::info!(
             "Generated ephemeral keypair for relay auth: {}",
             keys.public_key().to_bech32().unwrap_or_else(|_| "unknown".to_string())
         );
@@ -164,9 +163,9 @@ impl RelaySource {
         // Add seed relays
         for relay_url in &self.config.seed_relays {
             if let Err(e) = client.add_relay(relay_url).await {
-                warn!("Failed to add relay {}: {}", relay_url, e);
+                tracing::warn!("Failed to add relay {}: {}", relay_url, e);
             } else {
-                debug!("Added relay: {}", relay_url);
+                tracing::debug!("Added relay: {}", relay_url);
             }
         }
 
@@ -181,7 +180,7 @@ impl RelaySource {
         self.stats
             .relays_connected
             .store(connected, Ordering::Relaxed);
-        info!("Connected to {} relays", connected);
+        tracing::info!("Connected to {} relays", connected);
 
         // Subscribe to all events (empty filter = all events)
         // We use an Arc so we can share the filter with the discovery process
@@ -189,7 +188,7 @@ impl RelaySource {
 
         // Subscribe
         let output = client.subscribe((*filter).clone(), None).await?;
-        info!("Subscribed with ID: {:?}", output.val);
+        tracing::info!("Subscribed with ID: {:?}", output.val);
 
         // Get notification receiver
         let mut notifications = client.notifications();
@@ -210,7 +209,7 @@ impl RelaySource {
                 Ok(Ok(n)) => n,
                 Ok(Err(_)) => {
                     // Channel closed
-                    info!("Notification channel closed");
+                    tracing::info!("Notification channel closed");
                     break;
                 }
                 Err(_) => {
@@ -236,31 +235,31 @@ impl RelaySource {
                                 && let Err(e) =
                                     self.process_relay_list(&event, &client, &filter).await
                             {
-                                debug!("Failed to process relay list: {}", e);
+                                tracing::debug!("Failed to process relay list: {}", e);
                             }
 
                             // Call the handler
                             match handler(packed) {
                                 Ok(true) => {} // Continue
                                 Ok(false) => {
-                                    info!("Handler signaled stop");
+                                    tracing::info!("Handler signaled stop");
                                     break;
                                 }
                                 Err(e) => {
-                                    error!("Handler error: {}", e);
+                                    tracing::error!("Handler error: {}", e);
                                     break;
                                 }
                             }
                         }
                         Err(e) => {
                             self.stats.invalid_events.fetch_add(1, Ordering::Relaxed);
-                            debug!("Failed to pack event: {}", e);
+                            tracing::debug!("Failed to pack event: {}", e);
                         }
                     }
 
                     // Progress logging
                     if event_count.is_multiple_of(progress_interval) {
-                        info!(
+                        tracing::info!(
                             "Received {} events, {} relays connected",
                             event_count,
                             self.stats.relays_connected.load(Ordering::Relaxed)
@@ -280,17 +279,17 @@ impl RelaySource {
                                 || msg_lower.contains("denied")
                                 || msg_lower.contains("not allowed")
                             {
-                                warn!(
+                                tracing::warn!(
                                     "Relay {} rejected access: {}. Disconnecting.",
                                     relay_url, notice_msg
                                 );
                                 // Disconnect from this relay
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
-                                    debug!("Failed to disconnect from {}: {}", relay_url, e);
+                                    tracing::debug!("Failed to disconnect from {}: {}", relay_url, e);
                                 }
                                 self.stats.relays_connected.fetch_sub(1, Ordering::Relaxed);
                             } else {
-                                debug!("Relay {} notice: {}", relay_url, notice_msg);
+                                tracing::debug!("Relay {} notice: {}", relay_url, notice_msg);
                             }
                         }
                         RelayMessage::Closed {
@@ -303,12 +302,12 @@ impl RelaySource {
                                 || msg_lower.contains("restricted")
                                 || msg_lower.contains("not allowed")
                             {
-                                warn!(
+                                tracing::warn!(
                                     "Relay {} closed subscription {}: {}. Disconnecting.",
                                     relay_url, subscription_id, closed_msg
                                 );
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
-                                    debug!("Failed to disconnect from {}: {}", relay_url, e);
+                                    tracing::debug!("Failed to disconnect from {}: {}", relay_url, e);
                                 }
                                 self.stats.relays_connected.fetch_sub(1, Ordering::Relaxed);
                             }
@@ -318,7 +317,7 @@ impl RelaySource {
                 }
 
                 RelayPoolNotification::Shutdown => {
-                    info!("Relay pool shutdown notification received");
+                    tracing::info!("Relay pool shutdown notification received");
                     break;
                 }
             }
@@ -420,13 +419,13 @@ impl RelaySource {
                         match client.add_relay(&url_str).await {
                             Ok(_) => {
                                 self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);
-                                debug!("Discovered and added relay: {}", url_str);
+                                tracing::debug!("Discovered and added relay: {}", url_str);
 
                                 // Try to connect the new relay
                                 match client.connect_relay(&url_str).await {
                                     Ok(_) => {
                                         self.stats.relays_connected.fetch_add(1, Ordering::Relaxed);
-                                        info!("Connected to discovered relay: {}", url_str);
+                                        tracing::info!("Connected to discovered relay: {}", url_str);
 
                                         // Subscribe the new relay to the same filter
                                         // so it starts sending us events immediately
@@ -436,13 +435,13 @@ impl RelaySource {
                                                 .await
                                             {
                                                 Ok(_) => {
-                                                    debug!(
+                                                    tracing::debug!(
                                                         "Subscribed discovered relay to event stream: {}",
                                                         url_str
                                                     );
                                                 }
                                                 Err(e) => {
-                                                    warn!(
+                                                    tracing::warn!(
                                                         "Failed to subscribe discovered relay {}: {}",
                                                         url_str, e
                                                     );
@@ -451,7 +450,7 @@ impl RelaySource {
                                         }
                                     }
                                     Err(e) => {
-                                        debug!(
+                                        tracing::debug!(
                                             "Failed to connect to discovered relay {}: {}",
                                             url_str, e
                                         );
@@ -459,7 +458,7 @@ impl RelaySource {
                                 }
                             }
                             Err(e) => {
-                                debug!("Failed to add discovered relay {}: {}", url_str, e);
+                                tracing::debug!("Failed to add discovered relay {}: {}", url_str, e);
                             }
                         }
                     }

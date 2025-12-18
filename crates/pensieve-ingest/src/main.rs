@@ -40,7 +40,6 @@ use pensieve_ingest::{
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Pensieve live ingestion daemon.
@@ -108,14 +107,14 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    info!("Pensieve live ingestion daemon starting...");
+    tracing::info!("Pensieve live ingestion daemon starting...");
 
     // Initialize metrics
     if args.metrics_port > 0 {
         let metrics_handle = init_metrics();
         start_metrics_server(args.metrics_port, metrics_handle).await?;
         gauge!("ingestion_running").set(1.0);
-        info!("Metrics server listening on port {}", args.metrics_port);
+        tracing::info!("Metrics server listening on port {}", args.metrics_port);
     }
 
     // Set up graceful shutdown
@@ -123,7 +122,7 @@ async fn main() -> Result<()> {
     let running_clone = Arc::clone(&running);
 
     ctrlc::set_handler(move || {
-        info!("Shutdown signal received, stopping gracefully...");
+        tracing::info!("Shutdown signal received, stopping gracefully...");
         running_clone.store(false, Ordering::SeqCst);
     })
     .context("Failed to set Ctrl+C handler")?;
@@ -150,16 +149,16 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    info!("Configuration:");
-    info!("  RocksDB: {}", args.rocksdb_path.display());
-    info!("  Output: {}", args.output_dir.display());
-    info!(
+    tracing::info!("Configuration:");
+    tracing::info!("  RocksDB: {}", args.rocksdb_path.display());
+    tracing::info!("  Output: {}", args.output_dir.display());
+    tracing::info!(
         "  ClickHouse: {}",
         args.clickhouse_url.as_deref().unwrap_or("disabled")
     );
-    info!("  Seed relays: {}", relay_config.seed_relays.len());
-    info!("  Discovery: {}", relay_config.discovery_enabled);
-    info!("  Max relays: {}", relay_config.max_relays);
+    tracing::info!("  Seed relays: {}", relay_config.seed_relays.len());
+    tracing::info!("  Discovery: {}", relay_config.discovery_enabled);
+    tracing::info!("  Max relays: {}", relay_config.max_relays);
 
     // Create relay source
     let relay_source = RelaySource::new(relay_config);
@@ -172,7 +171,7 @@ async fn main() -> Result<()> {
     let mut events_deduplicated = 0usize;
 
     // Run the ingestion loop
-    info!("Starting live ingestion...");
+    tracing::info!("Starting live ingestion...");
 
     let stats = relay_source
         .run_async(|event: PackedEvent| {
@@ -186,7 +185,7 @@ async fn main() -> Result<()> {
                 Ok(true) => {
                     // New event - write to segment
                     if let Err(e) = segment_writer.write(event) {
-                        error!("Failed to write event: {}", e);
+                        tracing::error!("Failed to write event: {}", e);
                         // Continue processing despite write errors
                     } else {
                         events_processed += 1;
@@ -197,7 +196,7 @@ async fn main() -> Result<()> {
                     events_deduplicated += 1;
                 }
                 Err(e) => {
-                    warn!("Dedupe check error: {}", e);
+                    tracing::warn!("Dedupe check error: {}", e);
                     // Continue processing
                 }
             }
@@ -213,11 +212,11 @@ async fn main() -> Result<()> {
         .await?;
 
     // Shutdown sequence
-    info!("Shutting down...");
+    tracing::info!("Shutting down...");
 
     // Seal final segment
     if let Some(sealed) = segment_writer.seal()? {
-        info!(
+        tracing::info!(
             "Sealed final segment {}: {} events",
             sealed.segment_number, sealed.event_count
         );
@@ -231,10 +230,10 @@ async fn main() -> Result<()> {
 
     // Wait for ClickHouse indexer if running
     if let Some(handle) = indexer_handle {
-        info!("Waiting for ClickHouse indexer to finish...");
+        tracing::info!("Waiting for ClickHouse indexer to finish...");
         drop(segment_writer);
         if let Err(e) = handle.join() {
-            warn!("ClickHouse indexer thread panicked: {:?}", e);
+            tracing::warn!("ClickHouse indexer thread panicked: {:?}", e);
         }
     }
 
@@ -242,17 +241,17 @@ async fn main() -> Result<()> {
     gauge!("ingestion_running").set(0.0);
 
     // Print summary
-    info!("═══════════════════════════════════════════════════════");
-    info!("SHUTDOWN COMPLETE");
-    info!("═══════════════════════════════════════════════════════");
-    info!("Events received:      {}", stats.total_events);
-    info!("Events processed:     {}", events_processed);
-    info!("Events deduplicated:  {}", events_deduplicated);
-    info!(
+    tracing::info!("═══════════════════════════════════════════════════════");
+    tracing::info!("SHUTDOWN COMPLETE");
+    tracing::info!("═══════════════════════════════════════════════════════");
+    tracing::info!("Events received:      {}", stats.total_events);
+    tracing::info!("Events processed:     {}", events_processed);
+    tracing::info!("Events deduplicated:  {}", events_deduplicated);
+    tracing::info!(
         "Relays connected:     {}",
         stats.source_metadata.relays_connected.unwrap_or(0)
     );
-    info!(
+    tracing::info!(
         "Relays discovered:    {}",
         stats.source_metadata.relays_discovered.unwrap_or(0)
     );
@@ -270,14 +269,14 @@ type PipelineComponents = (
 /// Initialize pipeline components.
 fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index
-    info!("Opening dedupe index at {}", args.rocksdb_path.display());
+    tracing::info!("Opening dedupe index at {}", args.rocksdb_path.display());
     let dedupe = Arc::new(
         DedupeIndex::open(&args.rocksdb_path)
             .with_context(|| format!("Failed to open dedupe index at {:?}", args.rocksdb_path))?,
     );
 
     let dedupe_stats = dedupe.stats();
-    info!(
+    tracing::info!(
         "Dedupe index opened: ~{} keys",
         dedupe_stats.approximate_keys
     );
@@ -298,7 +297,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         compress: !args.no_compress,
     };
 
-    info!(
+    tracing::info!(
         "Segment writer: output={}, max_size={}, compress={}",
         args.output_dir.display(),
         args.segment_size,
@@ -313,7 +312,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize ClickHouse indexer (optional)
     let indexer_handle =
         if let (Some(ch_url), Some(receiver)) = (&args.clickhouse_url, sealed_receiver) {
-            info!("Starting ClickHouse indexer for {}", ch_url);
+            tracing::info!("Starting ClickHouse indexer for {}", ch_url);
             let ch_config = ClickHouseConfig {
                 url: ch_url.clone(),
                 database: args.clickhouse_db.clone(),

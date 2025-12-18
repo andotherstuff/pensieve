@@ -12,7 +12,6 @@ use pensieve_core::{decode_length_delimited_with_size, pack_event_binary_into, v
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use tracing::{info, warn};
 
 /// Configuration for the Protobuf source.
 #[derive(Debug, Clone)]
@@ -140,7 +139,7 @@ impl ProtoSource {
                     break;
                 }
                 Err(e) => {
-                    warn!("Protobuf decode error: {}", e);
+                    tracing::warn!("Protobuf decode error: {}", e);
                     stats.invalid_events += 1;
                     stats.proto_errors += 1;
                     if self.config.continue_on_error {
@@ -160,7 +159,7 @@ impl ProtoSource {
                 match proto_to_notepack_unvalidated(&proto_event, &mut pack_buf) {
                     Ok(_) => hex_to_bytes32(&proto_event.id)?,
                     Err(e) => {
-                        warn!("Notepack encoding error: {}", e);
+                        tracing::warn!("Notepack encoding error: {}", e);
                         stats.invalid_events += 1;
                         stats.proto_errors += 1;
                         if self.config.continue_on_error {
@@ -178,7 +177,7 @@ impl ProtoSource {
                         id_bytes
                     }
                     Err(e) => {
-                        warn!("Validation error: {}", e);
+                        tracing::warn!("Validation error: {}", e);
                         stats.invalid_events += 1;
                         stats.validation_errors += 1;
                         if self.config.continue_on_error {
@@ -201,12 +200,12 @@ impl ProtoSource {
             match handler(packed_event) {
                 Ok(true) => {} // Continue
                 Ok(false) => {
-                    info!("Handler signaled stop");
+                    tracing::info!("Handler signaled stop");
                     return Ok(false);
                 }
                 Err(e) => {
                     if self.config.continue_on_error {
-                        warn!("Handler error: {}", e);
+                        tracing::warn!("Handler error: {}", e);
                     } else {
                         return Err(e);
                     }
@@ -215,7 +214,7 @@ impl ProtoSource {
 
             // Progress reporting
             if stats.total_events.is_multiple_of(self.config.progress_interval) {
-                info!(
+                tracing::info!(
                     "Progress: {} events, {} valid, {} invalid",
                     stats.total_events, stats.valid_events, stats.invalid_events
                 );
@@ -239,10 +238,10 @@ impl EventSource for ProtoSource {
 
         // Collect input files
         let files = self.collect_files()?;
-        info!("Found {} protobuf files to process", files.len());
+        tracing::info!("Found {} protobuf files to process", files.len());
 
         for (file_idx, file_path) in files.iter().enumerate() {
-            info!(
+            tracing::info!(
                 "[{}/{}] Processing: {}",
                 file_idx + 1,
                 files.len(),
@@ -259,7 +258,7 @@ impl EventSource for ProtoSource {
                     break;
                 }
                 Err(e) => {
-                    warn!("Error processing {}: {}", file_path.display(), e);
+                    tracing::warn!("Error processing {}: {}", file_path.display(), e);
                     if !self.config.continue_on_error {
                         return Err(e);
                     }

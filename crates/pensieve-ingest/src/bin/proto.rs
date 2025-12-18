@@ -54,7 +54,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Backfill Nostr events from Protobuf files to notepack archive format.
@@ -335,7 +334,7 @@ async fn process_s3(args: &Args) -> Result<Stats> {
     let prefix = args.s3_prefix.as_deref().unwrap_or("");
     let process_start = Instant::now();
 
-    info!(
+    tracing::info!(
         "Initializing S3 client for bucket: {} (prefix: {:?})",
         bucket,
         if prefix.is_empty() { "<root>" } else { prefix }
@@ -353,7 +352,7 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
     // Load progress (for resume)
     let mut progress = Progress::load(&progress_file)?;
-    info!(
+    tracing::info!(
         "Loaded progress from {}: {} keys already completed",
         progress_file.display(),
         progress.completed_keys.len()
@@ -361,7 +360,7 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
     // List all objects in the bucket with the prefix
     let keys = list_s3_objects(&s3_client, bucket, prefix, args.limit).await?;
-    info!("Found {} S3 objects to process", keys.len());
+    tracing::info!("Found {} S3 objects to process", keys.len());
 
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle) = init_pipeline(args)?;
@@ -378,12 +377,12 @@ async fn process_s3(args: &Args) -> Result<Stats> {
     for (idx, key) in keys.iter().enumerate() {
         // Skip if already completed
         if progress.is_completed(key) {
-            info!("[{}/{}] Skipping (already done): {}", idx + 1, keys.len(), key);
+            tracing::info!("[{}/{}] Skipping (already done): {}", idx + 1, keys.len(), key);
             stats.files_skipped += 1;
             continue;
         }
 
-        info!("[{}/{}] Processing: {}", idx + 1, keys.len(), key);
+        tracing::info!("[{}/{}] Processing: {}", idx + 1, keys.len(), key);
 
         // Download to temp file
         let temp_path = temp_dir.join(format!("backfill-{}.tmp", idx));
@@ -392,7 +391,7 @@ async fn process_s3(args: &Args) -> Result<Stats> {
                 stats.compressed_proto_bytes += size;
             }
             Err(e) => {
-                error!("Failed to download {}: {}", key, e);
+                tracing::error!("Failed to download {}: {}", key, e);
                 if args.continue_on_error {
                     continue;
                 } else {
@@ -411,14 +410,14 @@ async fn process_s3(args: &Args) -> Result<Stats> {
                 // Mark as completed and save progress
                 progress.mark_completed(key);
                 if let Err(e) = progress.save(&progress_file) {
-                    warn!("Failed to save progress: {}", e);
+                    tracing::warn!("Failed to save progress: {}", e);
                 }
 
                 // Update metrics after each file
                 record_metrics(&stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                error!("Error processing {}: {}", key, e);
+                tracing::error!("Error processing {}: {}", key, e);
                 if !args.continue_on_error {
                     // Clean up temp file before returning
                     let _ = fs::remove_file(&temp_path);
@@ -429,7 +428,7 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
         // Delete temp file
         if let Err(e) = fs::remove_file(&temp_path) {
-            warn!("Failed to delete temp file {}: {}", temp_path.display(), e);
+            tracing::warn!("Failed to delete temp file {}: {}", temp_path.display(), e);
         }
     }
 
@@ -441,14 +440,14 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
     // Wait for ClickHouse indexer to finish processing the queue
     if let Some(handle) = indexer_handle {
-        info!("Waiting for ClickHouse indexer to finish...");
+        tracing::info!("Waiting for ClickHouse indexer to finish...");
         // Drop the segment writer to close the sealed_sender channel,
         // signaling the indexer thread to exit after draining the queue
         drop(segment_writer);
         if let Err(e) = handle.join() {
-            warn!("ClickHouse indexer thread panicked: {:?}", e);
+            tracing::warn!("ClickHouse indexer thread panicked: {:?}", e);
         }
-        info!("ClickHouse indexer finished");
+        tracing::info!("ClickHouse indexer finished");
     }
 
     Ok(stats)
@@ -538,7 +537,7 @@ async fn download_s3_object(
 
     file.flush().await?;
 
-    info!(
+    tracing::info!(
         "Downloaded {} bytes from s3://{}/{}",
         total_written, bucket, key
     );
@@ -560,10 +559,10 @@ fn process_local(args: &Args) -> Result<Stats> {
 
     // Collect input files
     let files = collect_local_files(input, args.limit)?;
-    info!("Found {} files to process", files.len());
+    tracing::info!("Found {} files to process", files.len());
 
     for (file_idx, file_path) in files.iter().enumerate() {
-        info!(
+        tracing::info!(
             "[{}/{}] Processing: {}",
             file_idx + 1,
             files.len(),
@@ -582,7 +581,7 @@ fn process_local(args: &Args) -> Result<Stats> {
                 record_metrics(&stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                warn!("Error processing {}: {}", file_path.display(), e);
+                tracing::warn!("Error processing {}: {}", file_path.display(), e);
                 if !args.continue_on_error {
                     return Err(e);
                 }
@@ -598,14 +597,14 @@ fn process_local(args: &Args) -> Result<Stats> {
 
     // Wait for ClickHouse indexer to finish processing the queue
     if let Some(handle) = indexer_handle {
-        info!("Waiting for ClickHouse indexer to finish...");
+        tracing::info!("Waiting for ClickHouse indexer to finish...");
         // Drop the segment writer to close the sealed_sender channel,
         // signaling the indexer thread to exit after draining the queue
         drop(segment_writer);
         if let Err(e) = handle.join() {
-            warn!("ClickHouse indexer thread panicked: {:?}", e);
+            tracing::warn!("ClickHouse indexer thread panicked: {:?}", e);
         }
-        info!("ClickHouse indexer finished");
+        tracing::info!("ClickHouse indexer finished");
     }
 
     Ok(stats)
@@ -655,10 +654,10 @@ type PipelineComponents = (
 fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index (optional)
     let dedupe = if let Some(ref rocksdb_path) = args.rocksdb_path {
-        info!("Opening dedupe index at {}", rocksdb_path.display());
+        tracing::info!("Opening dedupe index at {}", rocksdb_path.display());
         Some(Arc::new(DedupeIndex::open(rocksdb_path)?))
     } else {
-        warn!("Running without deduplication (no --rocksdb-path specified)");
+        tracing::warn!("Running without deduplication (no --rocksdb-path specified)");
         None
     };
 
@@ -677,7 +676,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
     };
-    info!(
+    tracing::info!(
         "Segment compression: {}",
         if segment_config.compress {
             "enabled"
@@ -691,7 +690,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     let indexer_handle = if let (Some(ch_url), Some(receiver)) =
         (&args.clickhouse_url, sealed_receiver)
     {
-        info!("Starting ClickHouse indexer for {}", ch_url);
+        tracing::info!("Starting ClickHouse indexer for {}", ch_url);
         let ch_config = ClickHouseConfig {
             url: ch_url.clone(),
             database: args.clickhouse_db.clone(),
@@ -732,7 +731,7 @@ fn finalize_pipeline(
     if let Some(dedupe) = dedupe {
         dedupe.flush()?;
         let dedupe_stats = dedupe.stats();
-        info!("Dedupe index: ~{} keys", dedupe_stats.approximate_keys);
+        tracing::info!("Dedupe index: ~{} keys", dedupe_stats.approximate_keys);
     }
 
     Ok(())
@@ -770,7 +769,7 @@ fn process_file_impl(
                 break;
             }
             Err(e) => {
-                warn!("Protobuf decode error: {}", e);
+                tracing::warn!("Protobuf decode error: {}", e);
                 stats.invalid_events += 1;
                 stats.proto_errors += 1;
                 if args.continue_on_error {
@@ -793,7 +792,7 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    warn!("Notepack encoding error: {}", e);
+                    tracing::warn!("Notepack encoding error: {}", e);
                     stats.invalid_events += 1;
                     stats.proto_errors += 1;
                     if args.continue_on_error {
@@ -811,7 +810,7 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    warn!("Validation error: {}", e);
+                    tracing::warn!("Validation error: {}", e);
                     stats.invalid_events += 1;
                     stats.validation_errors += 1;
                     if args.continue_on_error {
@@ -845,7 +844,7 @@ fn process_file_impl(
 
         // Progress reporting and metrics
         if stats.total_events.is_multiple_of(args.progress_interval) {
-            info!(
+            tracing::info!(
                 "Progress: {} events, {} valid, {} duplicates, {} invalid, {} segments",
                 stats.total_events,
                 stats.valid_events,

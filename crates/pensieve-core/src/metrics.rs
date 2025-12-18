@@ -34,7 +34,6 @@ use axum::{routing::get, Router};
 use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
-use tracing::info;
 
 /// Initialize the Prometheus metrics recorder.
 ///
@@ -82,7 +81,7 @@ pub async fn start_metrics_server(port: u16, handle: PrometheusHandle) -> Result
     );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Metrics server listening on http://{}/metrics", addr);
+    tracing::info!("Metrics server listening on http://{}/metrics", addr);
 
     // Spawn the server in the background
     tokio::spawn(async move {

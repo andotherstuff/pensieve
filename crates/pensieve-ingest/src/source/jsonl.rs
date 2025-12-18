@@ -12,7 +12,6 @@ use pensieve_core::{pack_event_binary_into, validate_event};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use tracing::{info, warn};
 
 /// Configuration for the JSONL source.
 #[derive(Debug, Clone)]
@@ -121,7 +120,7 @@ impl JsonlSource {
             let line = match line_result {
                 Ok(l) => l,
                 Err(e) => {
-                    warn!("Line {}: I/O error: {}", line_num + 1, e);
+                    tracing::warn!("Line {}: I/O error: {}", line_num + 1, e);
                     stats.invalid_events += 1;
                     stats.json_errors += 1;
                     if self.config.continue_on_error {
@@ -144,7 +143,7 @@ impl JsonlSource {
                 match serde_json::from_str::<NoteBuf>(&line) {
                     Ok(note) => {
                         if let Err(e) = pack_note_into(&note, &mut pack_buf) {
-                            warn!("Line {}: Notepack encoding error: {}", line_num + 1, e);
+                            tracing::warn!("Line {}: Notepack encoding error: {}", line_num + 1, e);
                             stats.invalid_events += 1;
                             stats.notepack_errors += 1;
                             if self.config.continue_on_error {
@@ -157,7 +156,7 @@ impl JsonlSource {
                         hex_to_bytes32(&note.id)?
                     }
                     Err(e) => {
-                        warn!("Line {}: JSON parse error: {}", line_num + 1, e);
+                        tracing::warn!("Line {}: JSON parse error: {}", line_num + 1, e);
                         stats.invalid_events += 1;
                         stats.json_errors += 1;
                         if self.config.continue_on_error {
@@ -175,7 +174,7 @@ impl JsonlSource {
                         id_bytes
                     }
                     Err(e) => {
-                        warn!("Line {}: Validation error: {}", line_num + 1, e);
+                        tracing::warn!("Line {}: Validation error: {}", line_num + 1, e);
                         stats.invalid_events += 1;
                         stats.validation_errors += 1;
                         if self.config.continue_on_error {
@@ -198,12 +197,12 @@ impl JsonlSource {
             match handler(packed_event) {
                 Ok(true) => {} // Continue
                 Ok(false) => {
-                    info!("Handler signaled stop");
+                    tracing::info!("Handler signaled stop");
                     return Ok(false);
                 }
                 Err(e) => {
                     if self.config.continue_on_error {
-                        warn!("Handler error: {}", e);
+                        tracing::warn!("Handler error: {}", e);
                     } else {
                         return Err(e);
                     }
@@ -212,7 +211,7 @@ impl JsonlSource {
 
             // Progress reporting
             if stats.total_events.is_multiple_of(self.config.progress_interval) {
-                info!(
+                tracing::info!(
                     "Progress: {} events, {} valid, {} invalid",
                     stats.total_events, stats.valid_events, stats.invalid_events
                 );
@@ -236,10 +235,10 @@ impl EventSource for JsonlSource {
 
         // Collect input files
         let files = self.collect_files()?;
-        info!("Found {} JSONL files to process", files.len());
+        tracing::info!("Found {} JSONL files to process", files.len());
 
         for (file_idx, file_path) in files.iter().enumerate() {
-            info!(
+            tracing::info!(
                 "[{}/{}] Processing: {}",
                 file_idx + 1,
                 files.len(),
@@ -259,7 +258,7 @@ impl EventSource for JsonlSource {
                     break;
                 }
                 Err(e) => {
-                    warn!("Error processing {}: {}", file_path.display(), e);
+                    tracing::warn!("Error processing {}: {}", file_path.display(), e);
                     if !self.config.continue_on_error {
                         return Err(e);
                     }
