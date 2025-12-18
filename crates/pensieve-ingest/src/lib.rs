@@ -36,6 +36,7 @@
 
 pub mod error;
 pub mod pipeline;
+pub mod relay;
 pub mod source;
 
 // Re-export commonly used types at crate root
@@ -51,4 +52,10 @@ pub use pipeline::{
 pub use source::{
     EventSource, JsonlConfig, JsonlSource, ProtoConfig, ProtoSource, RelayConfig, RelaySource,
     SourceMetadata, SourceStats,
+};
+
+// Re-export relay manager types
+pub use relay::{
+    AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig, RelayStatus,
+    RelayTier,
 };

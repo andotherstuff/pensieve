@@ -71,3 +71,6 @@ anyhow = "1.0"
 
 # Signals
 ctrlc = { version = "3.4", features = ["termination"] }
+
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -11,15 +11,21 @@
 //!
 //! When `discovery_enabled` is true, the source parses NIP-65 kind:10002 events
 //! to discover new relay URLs and automatically connects to them (up to `max_relays`).
+//!
+//! # Quality-Based Optimization
+//!
+//! When a `RelayManager` is provided, the source tracks connection events and
+//! periodically optimizes which relays are connected based on quality scores.
 
 use super::{EventSource, SourceMetadata, SourceStats};
 use crate::pipeline::PackedEvent;
+use crate::relay::RelayManager;
 use crate::{Error, Result};
 use nostr_sdk::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Configuration for the relay source.
@@ -43,6 +49,10 @@ pub struct RelayConfig {
     /// Whether to subscribe to all events or use filters.
     /// For archival purposes, we want all events.
     pub subscribe_all: bool,
+
+    /// How often to run the optimization loop (swap low/high-scoring relays).
+    /// Set to Duration::ZERO to disable optimization.
+    pub optimization_interval: Duration,
 }
 
 impl Default for RelayConfig {
@@ -63,6 +73,7 @@ impl Default for RelayConfig {
             blocklist: HashSet::new(),
             connection_timeout: Duration::from_secs(30),
             subscribe_all: true,
+            optimization_interval: Duration::from_secs(300), // 5 minutes
         }
     }
 }
@@ -79,6 +90,10 @@ pub struct RelaySource {
     running: Arc<AtomicBool>,
     /// Statistics counters.
     stats: Arc<RelayStats>,
+    /// Optional relay manager for quality tracking and optimization.
+    relay_manager: Option<Arc<RelayManager>>,
+    /// Connection start times for tracking uptime (relay_url -> connected_at).
+    connection_times: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 /// Internal statistics for the relay source.
@@ -112,6 +127,26 @@ impl RelaySource {
             known_relays: Arc::new(RwLock::new(known_relays)),
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RelayStats::default()),
+            relay_manager: None,
+            connection_times: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create a new relay source with quality tracking via a `RelayManager`.
+    ///
+    /// When a manager is provided:
+    /// - Connection attempts and disconnections are recorded
+    /// - The optimization loop periodically swaps low-scoring relays for higher-scoring ones
+    pub fn with_manager(config: RelayConfig, relay_manager: Arc<RelayManager>) -> Self {
+        let known_relays: HashSet<String> = config.seed_relays.iter().cloned().collect();
+
+        Self {
+            config,
+            known_relays: Arc::new(RwLock::new(known_relays)),
+            running: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(RelayStats::default()),
+            relay_manager: Some(relay_manager),
+            connection_times: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -130,12 +165,52 @@ impl RelaySource {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Record a successful connection to a relay.
+    async fn record_connection(&self, relay_url: &str) {
+        // Track connection time for uptime calculation
+        self.connection_times
+            .write()
+            .await
+            .insert(relay_url.to_string(), Instant::now());
+
+        // Record in relay manager
+        if let Some(ref manager) = self.relay_manager {
+            manager.record_connection_attempt(relay_url, true);
+        }
+    }
+
+    /// Record a failed connection attempt.
+    fn record_connection_failure(&self, relay_url: &str) {
+        if let Some(ref manager) = self.relay_manager {
+            manager.record_connection_attempt(relay_url, false);
+        }
+    }
+
+    /// Record a disconnection from a relay.
+    async fn record_disconnection(&self, relay_url: &str) {
+        // Calculate connected duration
+        let connected_seconds = {
+            let mut times = self.connection_times.write().await;
+            times
+                .remove(relay_url)
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0)
+        };
+
+        // Record in relay manager
+        if let Some(ref manager) = self.relay_manager {
+            manager.record_disconnect(relay_url, connected_seconds);
+        }
+    }
+
     /// Run the relay source asynchronously.
     ///
     /// This is the main async implementation that the sync `process` method calls.
+    /// The handler receives `(relay_url, packed_event)` so events can be attributed
+    /// to their source relay for quality tracking.
     pub async fn run_async<F>(&self, mut handler: F) -> Result<SourceStats>
     where
-        F: FnMut(PackedEvent) -> Result<bool>,
+        F: FnMut(String, PackedEvent) -> Result<bool>,
     {
         self.running.store(true, Ordering::SeqCst);
 
@@ -164,8 +239,18 @@ impl RelaySource {
 
         // Add seed relays
         for relay_url in &self.config.seed_relays {
+            // Register with manager if available
+            if let Some(ref manager) = self.relay_manager {
+                if let Err(e) =
+                    manager.register_relay(relay_url, crate::relay::RelayTier::Seed)
+                {
+                    tracing::warn!("Failed to register seed relay {}: {}", relay_url, e);
+                }
+            }
+
             if let Err(e) = client.add_relay(relay_url).await {
                 tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                self.record_connection_failure(relay_url);
             } else {
                 tracing::debug!("Added relay: {}", relay_url);
             }
@@ -177,12 +262,23 @@ impl RelaySource {
         // Wait a bit for connections to establish
         tokio::time::sleep(Duration::from_secs(2)).await;
 
+        // Record successful connections
+        let relays = client.relays().await;
+        let mut connected_count = 0usize;
+        for (url, relay) in &relays {
+            // Check if relay is actually connected
+            if relay.status() == nostr_sdk::RelayStatus::Connected {
+                self.record_connection(&url.to_string()).await;
+                metrics::counter!("relay_connects_total", "reason" => "seed").increment(1);
+                connected_count += 1;
+            }
+        }
+
         // Update connected count
-        let connected = client.relays().await.len();
         self.stats
             .relays_connected
-            .store(connected, Ordering::Relaxed);
-        tracing::info!("Connected to {} relays", connected);
+            .store(connected_count, Ordering::Relaxed);
+        tracing::info!("Connected to {} relays", connected_count);
 
         // Subscribe to all events (empty filter = all events)
         // We use an Arc so we can share the filter with the discovery process
@@ -199,8 +295,21 @@ impl RelaySource {
         let mut event_count = 0usize;
         let progress_interval = 10_000;
 
+        // Optimization timer
+        let optimization_interval = self.config.optimization_interval;
+        let mut last_optimization = Instant::now();
+
         while self.running.load(Ordering::SeqCst) {
-            // Use timeout to periodically check running flag
+            // Check if it's time to run optimization
+            if self.relay_manager.is_some()
+                && !optimization_interval.is_zero()
+                && last_optimization.elapsed() >= optimization_interval
+            {
+                self.run_optimization(&client, &filter).await;
+                last_optimization = Instant::now();
+            }
+
+            // Use timeout to periodically check running flag and optimization timer
             let notification =
                 tokio::time::timeout(Duration::from_secs(1), notifications.recv()).await;
 
@@ -218,9 +327,12 @@ impl RelaySource {
             };
 
             match notification {
-                RelayPoolNotification::Event { event, .. } => {
+                RelayPoolNotification::Event { relay_url, event, .. } => {
                     self.stats.total_events.fetch_add(1, Ordering::Relaxed);
                     event_count += 1;
+
+                    // Extract relay URL as string for attribution
+                    let relay_url_str = relay_url.to_string();
 
                     // Events from nostr-sdk are already validated
                     // Pack to notepack format
@@ -237,8 +349,8 @@ impl RelaySource {
                                 tracing::debug!("Failed to process relay list: {}", e);
                             }
 
-                            // Call the handler
-                            match handler(packed) {
+                            // Call the handler with relay URL for attribution
+                            match handler(relay_url_str, packed) {
                                 Ok(true) => {} // Continue
                                 Ok(false) => {
                                     tracing::info!("Handler signaled stop");
@@ -283,6 +395,10 @@ impl RelaySource {
                                     relay_url,
                                     notice_msg
                                 );
+                                let relay_url_str = relay_url.to_string();
+                                // Record disconnection before disconnecting
+                                self.record_disconnection(&relay_url_str).await;
+                                metrics::counter!("relay_disconnects_total", "reason" => "rejection").increment(1);
                                 // Disconnect from this relay
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
                                     tracing::debug!(
@@ -312,6 +428,10 @@ impl RelaySource {
                                     subscription_id,
                                     closed_msg
                                 );
+                                let relay_url_str = relay_url.to_string();
+                                // Record disconnection before disconnecting
+                                self.record_disconnection(&relay_url_str).await;
+                                metrics::counter!("relay_disconnects_total", "reason" => "rejection").increment(1);
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
                                     tracing::debug!(
                                         "Failed to disconnect from {}: {}",
@@ -339,6 +459,146 @@ impl RelaySource {
         self.running.store(false, Ordering::SeqCst);
 
         Ok(self.build_stats())
+    }
+
+    /// Run the optimization loop: swap low-scoring relays for higher-scoring ones.
+    async fn run_optimization(&self, client: &Client, filter: &Arc<Filter>) {
+        use metrics::{counter, gauge};
+
+        let manager = match &self.relay_manager {
+            Some(m) => m,
+            None => return,
+        };
+
+        // First, recompute scores
+        if let Err(e) = manager.recompute_scores() {
+            tracing::warn!("Failed to recompute relay scores: {}", e);
+            return;
+        }
+
+        // Get list of currently connected relay URLs
+        let connected_relays: Vec<String> = {
+            let relays = client.relays().await;
+            let mut urls = Vec::with_capacity(relays.len());
+            for (url, relay) in relays {
+                if relay.status() == nostr_sdk::RelayStatus::Connected {
+                    urls.push(url.to_string());
+                }
+            }
+            urls
+        };
+
+        // Get optimization suggestions
+        let suggestions = match manager.get_optimization_suggestions(&connected_relays) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to get optimization suggestions: {}", e);
+                return;
+            }
+        };
+
+        // Update metrics
+        counter!("relay_optimization_cycles_total").increment(1);
+        gauge!("relay_optimization_swaps").set(suggestions.to_disconnect.len() as f64);
+        gauge!("relay_optimization_explorations").set(suggestions.exploration_relays.len() as f64);
+
+        if suggestions.is_empty() {
+            tracing::debug!("Optimization: no changes needed");
+            return;
+        }
+
+        tracing::info!(
+            "Optimization: disconnecting {} relays, connecting {} (swaps) + {} (exploration)",
+            suggestions.to_disconnect.len(),
+            suggestions.to_connect.len(),
+            suggestions.exploration_relays.len()
+        );
+
+        // Disconnect low-scoring relays
+        for url in &suggestions.to_disconnect {
+            tracing::info!("Disconnecting low-scoring relay: {}", url);
+            self.record_disconnection(url).await;
+            counter!("relay_disconnects_total", "reason" => "optimization").increment(1);
+
+            if let Ok(relay_url) = RelayUrl::parse(url) {
+                if let Err(e) = client.disconnect_relay(relay_url).await {
+                    tracing::warn!("Failed to disconnect {}: {}", url, e);
+                } else {
+                    self.stats.relays_connected.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Connect higher-scoring relays (swaps)
+        for url in &suggestions.to_connect {
+            tracing::info!("Connecting higher-scoring relay: {}", url);
+            self.try_connect_relay(client, filter, url, "swap").await;
+        }
+
+        // Connect exploration relays (untested/stale relays)
+        for url in &suggestions.exploration_relays {
+            tracing::info!("Exploring untested relay: {}", url);
+            counter!("relay_exploration_attempts_total").increment(1);
+            self.try_connect_relay(client, filter, url, "exploration").await;
+        }
+
+        // Log aggregate stats
+        if let Ok(stats) = manager.get_aggregate_stats() {
+            tracing::info!(
+                "Relay stats: {} total, {} active, {} blocked, avg score {:.3}",
+                stats.total_relays,
+                stats.active_relays,
+                stats.blocked_relays,
+                stats.avg_score
+            );
+        }
+    }
+
+    /// Try to connect to a relay and subscribe it to the filter.
+    async fn try_connect_relay(
+        &self,
+        client: &Client,
+        filter: &Arc<Filter>,
+        url: &str,
+        reason: &'static str,
+    ) {
+        use metrics::counter;
+
+        // Add to known set
+        {
+            let mut known = self.known_relays.write().await;
+            known.insert(url.to_string());
+        }
+
+        // Add and connect
+        match client.add_relay(url).await {
+            Ok(_) => match client.connect_relay(url).await {
+                Ok(_) => {
+                    self.record_connection(url).await;
+                    self.stats.relays_connected.fetch_add(1, Ordering::Relaxed);
+                    counter!("relay_connects_total", "reason" => reason).increment(1);
+
+                    // Subscribe the new relay
+                    if let Ok(relay_url) = RelayUrl::parse(url) {
+                        if let Err(e) =
+                            client.subscribe_to(vec![relay_url], (**filter).clone(), None).await
+                        {
+                            tracing::warn!("Failed to subscribe new relay {}: {}", url, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to {}: {}", url, e);
+                    self.record_connection_failure(url);
+                    counter!("relay_connect_failures_total", "reason" => reason).increment(1);
+                }
+            },
+            Err(e) => {
+                tracing::debug!("Failed to add relay {}: {}", url, e);
+                self.record_connection_failure(url);
+                counter!("relay_connect_failures_total", "reason" => reason).increment(1);
+            }
+        }
     }
 
     /// Pack a nostr Event into notepack format.
@@ -425,6 +685,19 @@ impl RelaySource {
                             }
                         }
 
+                        // Register with relay manager if available
+                        if let Some(ref manager) = self.relay_manager {
+                            if let Err(e) = manager
+                                .register_relay(&url_str, crate::relay::RelayTier::Discovered)
+                            {
+                                tracing::debug!(
+                                    "Failed to register discovered relay {}: {}",
+                                    url_str,
+                                    e
+                                );
+                            }
+                        }
+
                         // Try to add and connect
                         match client.add_relay(&url_str).await {
                             Ok(_) => {
@@ -434,7 +707,10 @@ impl RelaySource {
                                 // Try to connect the new relay
                                 match client.connect_relay(&url_str).await {
                                     Ok(_) => {
+                                        // Record successful connection
+                                        self.record_connection(&url_str).await;
                                         self.stats.relays_connected.fetch_add(1, Ordering::Relaxed);
+                                        metrics::counter!("relay_connects_total", "reason" => "discovery").increment(1);
                                         tracing::info!(
                                             "Connected to discovered relay: {}",
                                             url_str
@@ -468,6 +744,9 @@ impl RelaySource {
                                         }
                                     }
                                     Err(e) => {
+                                        // Record failed connection
+                                        self.record_connection_failure(&url_str);
+                                        metrics::counter!("relay_connect_failures_total", "reason" => "discovery").increment(1);
                                         tracing::debug!(
                                             "Failed to connect to discovered relay {}: {}",
                                             url_str,
@@ -477,6 +756,8 @@ impl RelaySource {
                                 }
                             }
                             Err(e) => {
+                                self.record_connection_failure(&url_str);
+                                metrics::counter!("relay_connect_failures_total", "reason" => "discovery").increment(1);
                                 tracing::debug!(
                                     "Failed to add discovered relay {}: {}",
                                     url_str,
@@ -514,7 +795,7 @@ impl EventSource for RelaySource {
         "relay"
     }
 
-    fn process<F>(&mut self, handler: F) -> Result<SourceStats>
+    fn process<F>(&mut self, mut handler: F) -> Result<SourceStats>
     where
         F: FnMut(PackedEvent) -> Result<bool>,
     {
@@ -524,6 +805,8 @@ impl EventSource for RelaySource {
             .build()
             .map_err(Error::Io)?;
 
-        rt.block_on(self.run_async(handler))
+        // Wrap the handler to adapt from (String, PackedEvent) to PackedEvent
+        // This provides backward compatibility with the EventSource trait
+        rt.block_on(self.run_async(|_relay_url, event| handler(event)))
     }
 }

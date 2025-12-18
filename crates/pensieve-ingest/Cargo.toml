@@ -45,6 +45,7 @@ prost.workspace = true
 # Storage
 rocksdb.workspace = true
 clickhouse.workspace = true
+rusqlite.workspace = true
 
 # Time
 chrono.workspace = true

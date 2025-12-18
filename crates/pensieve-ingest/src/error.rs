@@ -63,4 +63,8 @@ pub enum Error {
     /// Hex decoding error.
     #[error("Hex decoding error: {0}")]
     Hex(String),
+
+    /// SQLite/Database error.
+    #[error("Database error: {0}")]
+    Database(String),
 }

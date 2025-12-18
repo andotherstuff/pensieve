@@ -141,7 +141,7 @@ fn register_common_metrics() {
     );
 
     // =========================================================================
-    // Live Ingestion Metrics (for future relay ingester)
+    // Live Ingestion Metrics
     // =========================================================================
 
     describe_counter!("ingest_events_total", "Total events received from relays");
@@ -155,9 +155,96 @@ fn register_common_metrics() {
         "ingest_relay_connections",
         "Number of active relay connections"
     );
+
+    // Throughput monitoring counters (use rate() in Prometheus for per-second)
+    describe_counter!(
+        "ingest_events_received_total",
+        "Total events received from relays (before dedupe)"
+    );
+    describe_counter!(
+        "ingest_events_processed_total",
+        "Total novel events processed (after dedupe)"
+    );
+    describe_counter!(
+        "ingest_events_deduplicated_total",
+        "Total duplicate events skipped"
+    );
+
+    // Pre-calculated rate gauges (5-second rolling average)
     describe_gauge!(
-        "ingest_events_per_second",
-        "Current ingestion rate (events/sec)"
+        "ingest_events_received_rate",
+        "Events received per second (5-second rolling average)"
+    );
+    describe_gauge!(
+        "ingest_events_processed_rate",
+        "Novel events processed per second (5-second rolling average)"
+    );
+    describe_gauge!(
+        "ingest_events_deduplicated_rate",
+        "Duplicate events per second (5-second rolling average)"
+    );
+    describe_gauge!(
+        "ingest_dedupe_ratio",
+        "Ratio of duplicate events (0.0-1.0, higher = more duplicates)"
+    );
+
+    // =========================================================================
+    // Relay Manager Metrics
+    // =========================================================================
+
+    describe_gauge!(
+        "relay_manager_total_relays",
+        "Total number of relays tracked"
+    );
+    describe_gauge!(
+        "relay_manager_active_relays",
+        "Number of currently active relay connections"
+    );
+    describe_gauge!(
+        "relay_manager_blocked_relays",
+        "Number of blocked relays (too many failures)"
+    );
+    describe_gauge!("relay_manager_avg_score", "Average relay quality score");
+    describe_gauge!(
+        "relay_manager_events_novel_1h",
+        "Novel events received in the last hour"
+    );
+    describe_gauge!(
+        "relay_manager_events_duplicate_1h",
+        "Duplicate events received in the last hour"
+    );
+
+    // =========================================================================
+    // Relay Optimization Metrics
+    // =========================================================================
+
+    describe_counter!(
+        "relay_optimization_cycles_total",
+        "Total number of optimization cycles run"
+    );
+    describe_gauge!(
+        "relay_optimization_swaps",
+        "Number of relay swaps in last optimization cycle"
+    );
+    describe_gauge!(
+        "relay_optimization_explorations",
+        "Number of exploration relays tried in last cycle"
+    );
+    describe_counter!(
+        "relay_connects_total",
+        "Total relay connections (label: reason=seed|discovery|swap|exploration)"
+    );
+    describe_counter!(
+        "relay_disconnects_total",
+        "Total relay disconnections (label: reason=optimization|failure|rejection)"
+    );
+    describe_counter!(
+        "relay_connect_failures_total",
+        "Failed relay connection attempts (label: reason)"
+    );
+    describe_counter!(
+        "relay_exploration_attempts_total",
+        "Total exploration attempts (trying untested relays)"
     );
 
     // =========================================================================

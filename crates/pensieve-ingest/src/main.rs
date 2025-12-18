@@ -30,17 +30,52 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use metrics::gauge;
+use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, SealedSegment, SegmentConfig,
-    SegmentWriter,
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, RelayManager,
+    RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter,
     source::{RelayConfig, RelaySource},
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+
+/// Default seed relays to use when no CLI args or seed file is available.
+fn default_seed_relays() -> Vec<String> {
+    vec![
+        "wss://relay.damus.io".to_string(),
+        "wss://relay.nostr.band".to_string(),
+        "wss://nos.lol".to_string(),
+        "wss://relay.snort.social".to_string(),
+        "wss://purplepag.es".to_string(),
+        "wss://relay.primal.net".to_string(),
+        "wss://nostr.wine".to_string(),
+        "wss://relay.nostr.bg".to_string(),
+    ]
+}
+
+/// Load seed relays from a text file (one URL per line, # for comments).
+fn load_seeds_from_file(path: &std::path::Path) -> Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read seed file: {}", path.display()))?;
+
+    let mut seeds = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Only include valid websocket URLs
+        if line.starts_with("wss://") || line.starts_with("ws://") {
+            seeds.push(line.to_string());
+        }
+    }
+    Ok(seeds)
+}
 
 /// Pensieve live ingestion daemon.
 #[derive(Parser, Debug)]
@@ -72,9 +107,17 @@ struct Args {
     #[arg(long)]
     no_compress: bool,
 
-    /// Initial relay URLs (comma-separated, overrides defaults)
+    /// Initial seed relay URLs (comma-separated, overrides seed file)
     #[arg(long, value_delimiter = ',')]
     seed_relays: Option<Vec<String>>,
+
+    /// Path to seed relays file (one URL per line, # for comments)
+    #[arg(long, default_value = "./data/relays/seed.txt")]
+    seed_file: PathBuf,
+
+    /// Import discovered relays from a JSON file (tier=discovered, can be swapped)
+    #[arg(long)]
+    import_discovered_json: Option<PathBuf>,
 
     /// Disable relay discovery via NIP-65
     #[arg(long)]
@@ -87,6 +130,14 @@ struct Args {
     /// Metrics HTTP server port (0 to disable)
     #[arg(long, default_value = "9090")]
     metrics_port: u16,
+
+    /// SQLite database path for relay quality tracking
+    #[arg(long, default_value = "./data/relay-stats.db")]
+    relay_db_path: PathBuf,
+
+    /// Score recomputation interval in seconds
+    #[arg(long, default_value = "300")]
+    score_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -130,27 +181,91 @@ async fn main() -> Result<()> {
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle) = init_pipeline(&args)?;
 
-    // Build relay config
+    // Initialize relay manager for quality tracking
+    let relay_manager_config = RelayManagerConfig {
+        db_path: args.relay_db_path.clone(),
+        max_relays: args.max_relays,
+        optimization_interval_secs: args.score_interval_secs,
+        ..Default::default()
+    };
+
+    let relay_manager = Arc::new(
+        RelayManager::open(relay_manager_config)
+            .with_context(|| format!("Failed to open relay manager at {:?}", args.relay_db_path))?,
+    );
+
+    // Load seed relays (tier=seed, protected from eviction)
+    // Priority: CLI args > seed file > hardcoded defaults
+    let seed_relays = if let Some(relays) = args.seed_relays.clone() {
+        tracing::info!("Using {} seed relays from CLI arguments", relays.len());
+        relays
+    } else if args.seed_file.exists() {
+        match load_seeds_from_file(&args.seed_file) {
+            Ok(relays) if !relays.is_empty() => {
+                tracing::info!(
+                    "Loaded {} seed relays from file: {}",
+                    relays.len(),
+                    args.seed_file.display()
+                );
+                relays
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "Seed file {} is empty, using defaults",
+                    args.seed_file.display()
+                );
+                default_seed_relays()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load seed file {}: {}. Using defaults.",
+                    args.seed_file.display(),
+                    e
+                );
+                default_seed_relays()
+            }
+        }
+    } else {
+        tracing::info!("Using default seed relays (no seed file found)");
+        default_seed_relays()
+    };
+
+    // Register seeds with tier=seed (protected, score floor 0.5)
+    relay_manager.register_seed_relays(&seed_relays)?;
+    tracing::info!("Registered {} seed relays (tier=seed)", seed_relays.len());
+
+    // Import discovered relays from JSON if provided (tier=discovered, can be swapped)
+    if let Some(json_path) = &args.import_discovered_json {
+        match relay_manager.import_from_json(json_path) {
+            Ok(count) => {
+                tracing::info!(
+                    "Imported {} discovered relays from JSON: {} (tier=discovered)",
+                    count,
+                    json_path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to import discovered relays from {}: {}",
+                    json_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Build relay config for RelaySource
     let relay_config = RelayConfig {
-        seed_relays: args.seed_relays.unwrap_or_else(|| {
-            vec![
-                "wss://relay.damus.io".to_string(),
-                "wss://relay.nostr.band".to_string(),
-                "wss://nos.lol".to_string(),
-                "wss://relay.snort.social".to_string(),
-                "wss://purplepag.es".to_string(),
-                "wss://relay.primal.net".to_string(),
-                "wss://nostr.wine".to_string(),
-                "wss://relay.nostr.bg".to_string(),
-            ]
-        }),
+        seed_relays: seed_relays.clone(),
         discovery_enabled: !args.no_discovery,
         max_relays: args.max_relays,
+        optimization_interval: Duration::from_secs(args.score_interval_secs),
         ..Default::default()
     };
 
     tracing::info!("Configuration:");
     tracing::info!("  RocksDB: {}", args.rocksdb_path.display());
+    tracing::info!("  Relay DB: {}", args.relay_db_path.display());
     tracing::info!("  Output: {}", args.output_dir.display());
     tracing::info!(
         "  ClickHouse: {}",
@@ -159,52 +274,171 @@ async fn main() -> Result<()> {
     tracing::info!("  Seed relays: {}", relay_config.seed_relays.len());
     tracing::info!("  Discovery: {}", relay_config.discovery_enabled);
     tracing::info!("  Max relays: {}", relay_config.max_relays);
+    tracing::info!(
+        "  Optimization interval: {}s",
+        relay_config.optimization_interval.as_secs()
+    );
 
-    // Create relay source
-    let relay_source = RelaySource::new(relay_config);
+    // Create relay source with manager for quality tracking and optimization
+    // The RelaySource now handles:
+    // - Recording connection attempts/disconnections
+    // - Periodic score recomputation
+    // - Swapping low-scoring relays for higher-scoring ones
+    let relay_source = RelaySource::with_manager(relay_config, Arc::clone(&relay_manager));
 
     // Clone running flag for the handler
     let handler_running = Arc::clone(&running);
 
-    // Run stats
-    let mut events_processed = 0usize;
-    let mut events_deduplicated = 0usize;
+    // Clone relay manager for the handler (to record event novelty)
+    let handler_relay_manager = Arc::clone(&relay_manager);
+
+    // Spawn background task for updating metrics
+    // (Score recomputation is now handled by RelaySource's optimization loop)
+    let metrics_running = Arc::clone(&running);
+    let metrics_relay_manager = Arc::clone(&relay_manager);
+    let metrics_interval = args.score_interval_secs;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(metrics_interval));
+        interval.tick().await; // Skip first immediate tick
+
+        while metrics_running.load(Ordering::SeqCst) {
+            interval.tick().await;
+
+            if !metrics_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Update aggregate metrics
+            if let Ok(agg_stats) = metrics_relay_manager.get_aggregate_stats() {
+                gauge!("relay_manager_total_relays").set(agg_stats.total_relays as f64);
+                gauge!("relay_manager_active_relays").set(agg_stats.active_relays as f64);
+                gauge!("relay_manager_blocked_relays").set(agg_stats.blocked_relays as f64);
+                gauge!("relay_manager_avg_score").set(agg_stats.avg_score);
+                gauge!("relay_manager_events_novel_1h").set(agg_stats.events_novel_1h as f64);
+                gauge!("relay_manager_events_duplicate_1h")
+                    .set(agg_stats.events_duplicate_1h as f64);
+            }
+        }
+
+        tracing::debug!("Metrics update task stopped");
+    });
+
+    // Run stats - use atomics so we can read from the metrics task
+    let events_received = Arc::new(AtomicUsize::new(0));
+    let events_processed = Arc::new(AtomicUsize::new(0));
+    let events_deduplicated = Arc::new(AtomicUsize::new(0));
+
+    // Clone for the handler
+    let handler_events_received = Arc::clone(&events_received);
+    let handler_events_processed = Arc::clone(&events_processed);
+    let handler_events_deduplicated = Arc::clone(&events_deduplicated);
+
+    // Spawn background task for rate metrics calculation
+    let rate_running = Arc::clone(&running);
+    let rate_events_received = Arc::clone(&events_received);
+    let rate_events_processed = Arc::clone(&events_processed);
+    let rate_events_deduplicated = Arc::clone(&events_deduplicated);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.tick().await; // Skip first immediate tick
+
+        let mut last_received = 0usize;
+        let mut last_processed = 0usize;
+        let mut last_deduplicated = 0usize;
+
+        while rate_running.load(Ordering::SeqCst) {
+            interval.tick().await;
+
+            if !rate_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Read current counts
+            let curr_received = rate_events_received.load(Ordering::Relaxed);
+            let curr_processed = rate_events_processed.load(Ordering::Relaxed);
+            let curr_deduplicated = rate_events_deduplicated.load(Ordering::Relaxed);
+
+            // Calculate rates (events per second, over 5-second window)
+            let received_rate = (curr_received - last_received) as f64 / 5.0;
+            let processed_rate = (curr_processed - last_processed) as f64 / 5.0;
+            let deduplicated_rate = (curr_deduplicated - last_deduplicated) as f64 / 5.0;
+
+            // Update counters (absolute values - Prometheus calculates rate())
+            // Using absolute() to set the counter to the current value
+            counter!("ingest_events_received_total").absolute(curr_received as u64);
+            counter!("ingest_events_processed_total").absolute(curr_processed as u64);
+            counter!("ingest_events_deduplicated_total").absolute(curr_deduplicated as u64);
+
+            // Rate gauges (our own 5-second rolling average for quick dashboards)
+            gauge!("ingest_events_received_rate").set(received_rate);
+            gauge!("ingest_events_processed_rate").set(processed_rate);
+            gauge!("ingest_events_deduplicated_rate").set(deduplicated_rate);
+
+            // Dedupe ratio (what percentage of incoming events are duplicates)
+            let total_handled = curr_processed + curr_deduplicated;
+            let dedupe_ratio = if total_handled > 0 {
+                curr_deduplicated as f64 / total_handled as f64
+            } else {
+                0.0
+            };
+            gauge!("ingest_dedupe_ratio").set(dedupe_ratio);
+
+            // Save for next iteration
+            last_received = curr_received;
+            last_processed = curr_processed;
+            last_deduplicated = curr_deduplicated;
+
+            // Log throughput periodically (every 5 seconds)
+            if curr_received > 0 {
+                tracing::debug!(
+                    "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
+                    received_rate,
+                    processed_rate,
+                    deduplicated_rate,
+                    dedupe_ratio * 100.0
+                );
+            }
+        }
+
+        tracing::debug!("Rate metrics task stopped");
+    });
 
     // Run the ingestion loop
     tracing::info!("Starting live ingestion...");
 
     let stats = relay_source
-        .run_async(|event: PackedEvent| {
+        .run_async(|relay_url: String, event: PackedEvent| {
             // Check if we should stop
             if !handler_running.load(Ordering::SeqCst) {
                 return Ok(false);
             }
 
+            // Count all received events (before dedupe)
+            handler_events_received.fetch_add(1, Ordering::Relaxed);
+
             // Dedupe check
-            match dedupe.check_and_mark_pending(&event.event_id) {
-                Ok(true) => {
-                    // New event - write to segment
-                    if let Err(e) = segment_writer.write(event) {
-                        tracing::error!("Failed to write event: {}", e);
-                        // Continue processing despite write errors
-                    } else {
-                        events_processed += 1;
-                    }
-                }
-                Ok(false) => {
-                    // Duplicate - skip
-                    events_deduplicated += 1;
-                }
+            let is_novel = match dedupe.check_and_mark_pending(&event.event_id) {
+                Ok(novel) => novel,
                 Err(e) => {
                     tracing::warn!("Dedupe check error: {}", e);
-                    // Continue processing
+                    false // Treat as duplicate on error
                 }
-            }
+            };
 
-            // Update metrics periodically
-            if events_processed.is_multiple_of(1000) {
-                gauge!("events_processed_total").set(events_processed as f64);
-                gauge!("events_deduplicated_total").set(events_deduplicated as f64);
+            // Record event for relay quality tracking
+            handler_relay_manager.record_event(&relay_url, is_novel);
+
+            if is_novel {
+                // New event - write to segment
+                if let Err(e) = segment_writer.write(event) {
+                    tracing::error!("Failed to write event: {}", e);
+                    // Continue processing despite write errors
+                } else {
+                    handler_events_processed.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                // Duplicate - skip
+                handler_events_deduplicated.fetch_add(1, Ordering::Relaxed);
             }
 
             Ok(true) // Continue
@@ -229,6 +463,11 @@ async fn main() -> Result<()> {
     // Flush dedupe
     dedupe.flush()?;
 
+    // Flush relay manager stats
+    if let Err(e) = relay_manager.flush() {
+        tracing::warn!("Failed to flush relay stats: {}", e);
+    }
+
     // Wait for ClickHouse indexer if running
     if let Some(handle) = indexer_handle {
         tracing::info!("Waiting for ClickHouse indexer to finish...");
@@ -241,13 +480,21 @@ async fn main() -> Result<()> {
     // Mark as stopped
     gauge!("ingestion_running").set(0.0);
 
+    // Get final relay manager stats
+    let relay_stats = relay_manager.get_aggregate_stats().ok();
+
+    // Get final counts from atomics
+    let final_received = events_received.load(Ordering::Relaxed);
+    let final_processed = events_processed.load(Ordering::Relaxed);
+    let final_deduplicated = events_deduplicated.load(Ordering::Relaxed);
+
     // Print summary
     tracing::info!("═══════════════════════════════════════════════════════");
     tracing::info!("SHUTDOWN COMPLETE");
     tracing::info!("═══════════════════════════════════════════════════════");
-    tracing::info!("Events received:      {}", stats.total_events);
-    tracing::info!("Events processed:     {}", events_processed);
-    tracing::info!("Events deduplicated:  {}", events_deduplicated);
+    tracing::info!("Events received:      {}", final_received);
+    tracing::info!("Events processed:     {}", final_processed);
+    tracing::info!("Events deduplicated:  {}", final_deduplicated);
     tracing::info!(
         "Relays connected:     {}",
         stats.source_metadata.relays_connected.unwrap_or(0)
@@ -256,6 +503,16 @@ async fn main() -> Result<()> {
         "Relays discovered:    {}",
         stats.source_metadata.relays_discovered.unwrap_or(0)
     );
+    if let Some(rs) = relay_stats {
+        tracing::info!("───────────────────────────────────────────────────────");
+        tracing::info!("Relay Manager Stats:");
+        tracing::info!("  Total relays tracked:  {}", rs.total_relays);
+        tracing::info!("  Active relays:         {}", rs.active_relays);
+        tracing::info!("  Blocked relays:        {}", rs.blocked_relays);
+        tracing::info!("  Seed relays:           {}", rs.seed_relays);
+        tracing::info!("  Discovered relays:     {}", rs.discovered_relays);
+        tracing::info!("  Avg quality score:     {:.3}", rs.avg_score);
+    }
 
     Ok(())
 }
