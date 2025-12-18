@@ -206,11 +206,17 @@ impl RelaySource {
     /// Run the relay source asynchronously.
     ///
     /// This is the main async implementation that the sync `process` method calls.
-    /// The handler receives `(relay_url, packed_event)` so events can be attributed
-    /// to their source relay for quality tracking.
+    /// The handler receives `(relay_url, &Event)` so the caller can do dedupe checks
+    /// **before** expensive packing, and attribute events to their source relay.
+    ///
+    /// # Performance Note
+    ///
+    /// The handler receives a reference to the raw `Event` rather than a `PackedEvent`.
+    /// This allows deduplication checks to happen before the expensive serialization
+    /// step, avoiding wasted work on duplicate events (~90% of incoming traffic).
     pub async fn run_async<F>(&self, mut handler: F) -> Result<SourceStats>
     where
-        F: FnMut(String, PackedEvent) -> Result<bool>,
+        F: FnMut(String, &Event) -> Result<bool>,
     {
         self.running.store(true, Ordering::SeqCst);
 
@@ -240,12 +246,10 @@ impl RelaySource {
         // Add seed relays
         for relay_url in &self.config.seed_relays {
             // Register with manager if available
-            if let Some(ref manager) = self.relay_manager {
-                if let Err(e) =
-                    manager.register_relay(relay_url, crate::relay::RelayTier::Seed)
-                {
-                    tracing::warn!("Failed to register seed relay {}: {}", relay_url, e);
-                }
+            if let Some(ref manager) = self.relay_manager
+                && let Err(e) = manager.register_relay(relay_url, crate::relay::RelayTier::Seed)
+            {
+                tracing::warn!("Failed to register seed relay {}: {}", relay_url, e);
             }
 
             if let Err(e) = client.add_relay(relay_url).await {
@@ -329,42 +333,31 @@ impl RelaySource {
             match notification {
                 RelayPoolNotification::Event { relay_url, event, .. } => {
                     self.stats.total_events.fetch_add(1, Ordering::Relaxed);
+                    self.stats.valid_events.fetch_add(1, Ordering::Relaxed);
                     event_count += 1;
 
                     // Extract relay URL as string for attribution
                     let relay_url_str = relay_url.to_string();
 
-                    // Events from nostr-sdk are already validated
-                    // Pack to notepack format
-                    match self.pack_event(&event) {
-                        Ok(packed) => {
-                            self.stats.valid_events.fetch_add(1, Ordering::Relaxed);
+                    // Check for NIP-65 relay list events for discovery
+                    if self.config.discovery_enabled
+                        && event.kind == Kind::RelayList
+                        && let Err(e) = self.process_relay_list(&event, &client, &filter).await
+                    {
+                        tracing::debug!("Failed to process relay list: {}", e);
+                    }
 
-                            // Check for NIP-65 relay list events for discovery
-                            if self.config.discovery_enabled
-                                && event.kind == Kind::RelayList
-                                && let Err(e) =
-                                    self.process_relay_list(&event, &client, &filter).await
-                            {
-                                tracing::debug!("Failed to process relay list: {}", e);
-                            }
-
-                            // Call the handler with relay URL for attribution
-                            match handler(relay_url_str, packed) {
-                                Ok(true) => {} // Continue
-                                Ok(false) => {
-                                    tracing::info!("Handler signaled stop");
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!("Handler error: {}", e);
-                                    break;
-                                }
-                            }
+                    // Pass raw event to handler - let it decide whether to pack
+                    // This allows dedupe checks BEFORE expensive serialization
+                    match handler(relay_url_str, &event) {
+                        Ok(true) => {} // Continue
+                        Ok(false) => {
+                            tracing::info!("Handler signaled stop");
+                            break;
                         }
                         Err(e) => {
-                            self.stats.invalid_events.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!("Failed to pack event: {}", e);
+                            tracing::error!("Handler error: {}", e);
+                            break;
                         }
                     }
 
@@ -579,12 +572,11 @@ impl RelaySource {
                     counter!("relay_connects_total", "reason" => reason).increment(1);
 
                     // Subscribe the new relay
-                    if let Ok(relay_url) = RelayUrl::parse(url) {
-                        if let Err(e) =
+                    if let Ok(relay_url) = RelayUrl::parse(url)
+                        && let Err(e) =
                             client.subscribe_to(vec![relay_url], (**filter).clone(), None).await
-                        {
-                            tracing::warn!("Failed to subscribe new relay {}: {}", url, e);
-                        }
+                    {
+                        tracing::warn!("Failed to subscribe new relay {}: {}", url, e);
                     }
                 }
                 Err(e) => {
@@ -599,41 +591,6 @@ impl RelaySource {
                 counter!("relay_connect_failures_total", "reason" => reason).increment(1);
             }
         }
-    }
-
-    /// Pack a nostr Event into notepack format.
-    fn pack_event(&self, event: &Event) -> Result<PackedEvent> {
-        use notepack::{NoteBuf, pack_note_into};
-
-        let mut buf = Vec::with_capacity(512);
-
-        // Convert tags to the format notepack expects
-        let tags: Vec<Vec<String>> = event
-            .tags
-            .iter()
-            .map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect())
-            .collect();
-
-        // Format signature as hex
-        let sig_bytes = event.sig.serialize();
-        let sig_hex = hex::encode(sig_bytes);
-
-        let note = NoteBuf {
-            id: event.id.to_hex(),
-            pubkey: event.pubkey.to_hex(),
-            created_at: event.created_at.as_secs(),
-            kind: event.kind.as_u16() as u64,
-            tags,
-            content: event.content.clone(),
-            sig: sig_hex,
-        };
-
-        pack_note_into(&note, &mut buf).map_err(|e| Error::Serialization(e.to_string()))?;
-
-        Ok(PackedEvent {
-            event_id: *event.id.as_bytes(),
-            data: buf,
-        })
     }
 
     /// Process a NIP-65 relay list event to discover new relays.
@@ -686,16 +643,15 @@ impl RelaySource {
                         }
 
                         // Register with relay manager if available
-                        if let Some(ref manager) = self.relay_manager {
-                            if let Err(e) = manager
-                                .register_relay(&url_str, crate::relay::RelayTier::Discovered)
-                            {
-                                tracing::debug!(
-                                    "Failed to register discovered relay {}: {}",
-                                    url_str,
-                                    e
-                                );
-                            }
+                        if let Some(ref manager) = self.relay_manager
+                            && let Err(e) =
+                                manager.register_relay(&url_str, crate::relay::RelayTier::Discovered)
+                        {
+                            tracing::debug!(
+                                "Failed to register discovered relay {}: {}",
+                                url_str,
+                                e
+                            );
                         }
 
                         // Try to add and connect
@@ -799,14 +755,26 @@ impl EventSource for RelaySource {
     where
         F: FnMut(PackedEvent) -> Result<bool>,
     {
+        use crate::pipeline::pack_nostr_event;
+
         // Create a tokio runtime for the async code
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(Error::Io)?;
 
-        // Wrap the handler to adapt from (String, PackedEvent) to PackedEvent
+        // Wrap the handler to adapt from (String, &Event) to PackedEvent
         // This provides backward compatibility with the EventSource trait
-        rt.block_on(self.run_async(|_relay_url, event| handler(event)))
+        // Note: This path does NOT benefit from the dedupe-before-pack optimization
+        // For optimized handling, use run_async directly with a custom handler
+        rt.block_on(self.run_async(|_relay_url, event| {
+            match pack_nostr_event(event) {
+                Ok(packed) => handler(packed),
+                Err(e) => {
+                    tracing::debug!("Failed to pack event: {}", e);
+                    Ok(true) // Continue on pack errors
+                }
+            }
+        }))
     }
 }

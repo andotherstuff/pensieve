@@ -96,6 +96,45 @@ pub struct PackedEvent {
     pub data: Vec<u8>,
 }
 
+/// Pack a nostr_sdk Event into notepack format.
+///
+/// This serializes the event using the notepack format for archival storage.
+/// Call this **after** deduplication checks to avoid wasted work on duplicates.
+pub fn pack_nostr_event(event: &nostr_sdk::Event) -> crate::Result<PackedEvent> {
+    use notepack::{NoteBuf, pack_note_into};
+
+    let mut buf = Vec::with_capacity(512);
+
+    // Convert tags to the format notepack expects
+    let tags: Vec<Vec<String>> = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice().iter().map(|s| s.to_string()).collect())
+        .collect();
+
+    // Format signature as hex
+    let sig_bytes = event.sig.serialize();
+    let sig_hex = hex::encode(sig_bytes);
+
+    let note = NoteBuf {
+        id: event.id.to_hex(),
+        pubkey: event.pubkey.to_hex(),
+        created_at: event.created_at.as_secs(),
+        kind: event.kind.as_u16() as u64,
+        tags,
+        content: event.content.clone(),
+        sig: sig_hex,
+    };
+
+    pack_note_into(&note, &mut buf)
+        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+
+    Ok(PackedEvent {
+        event_id: *event.id.as_bytes(),
+        data: buf,
+    })
+}
+
 /// Internal state for the current segment being written.
 struct CurrentSegment {
     /// The file writer.

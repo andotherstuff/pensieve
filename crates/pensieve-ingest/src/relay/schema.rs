@@ -122,24 +122,24 @@ fn create_tables(conn: &Connection) -> Result<()> {
 /// Run migrations from one version to another.
 fn migrate(conn: &Connection, from: i32, to: i32) -> Result<()> {
     for version in from..to {
-        match version {
-            // Add migration cases here as schema evolves
-            // 1 => migrate_v1_to_v2(conn)?,
-            _ => {
-                // No migration needed for this version
-            }
-        }
+        // Add migration cases here as schema evolves
+        // match version {
+        //     1 => migrate_v1_to_v2(conn)?,
+        //     _ => {}
+        // }
+        let _ = version; // Suppress unused variable warning until migrations are added
     }
     set_schema_version(conn, to)?;
     Ok(())
 }
 
 /// Relay tier classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RelayTier {
     /// Manually curated, always-connect relays.
     Seed,
     /// Discovered via NIP-65 or georelays import.
+    #[default]
     Discovered,
 }
 
@@ -150,12 +150,16 @@ impl RelayTier {
             Self::Discovered => "discovered",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for RelayTier {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "seed" => Some(Self::Seed),
-            "discovered" => Some(Self::Discovered),
-            _ => None,
+            "seed" => Ok(Self::Seed),
+            "discovered" => Ok(Self::Discovered),
+            _ => Err(()),
         }
     }
 }
@@ -185,15 +189,19 @@ impl RelayStatus {
             Self::Blocked => "blocked",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for RelayStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "pending" => Some(Self::Pending),
-            "active" => Some(Self::Active),
-            "idle" => Some(Self::Idle),
-            "failing" => Some(Self::Failing),
-            "blocked" => Some(Self::Blocked),
-            _ => None,
+            "pending" => Ok(Self::Pending),
+            "active" => Ok(Self::Active),
+            "idle" => Ok(Self::Idle),
+            "failing" => Ok(Self::Failing),
+            "blocked" => Ok(Self::Blocked),
+            _ => Err(()),
         }
     }
 }
@@ -232,15 +240,17 @@ mod tests {
 
     #[test]
     fn test_relay_tier_roundtrip() {
-        assert_eq!(RelayTier::from_str(RelayTier::Seed.as_str()), Some(RelayTier::Seed));
+        use std::str::FromStr;
+        assert_eq!(RelayTier::from_str(RelayTier::Seed.as_str()), Ok(RelayTier::Seed));
         assert_eq!(
             RelayTier::from_str(RelayTier::Discovered.as_str()),
-            Some(RelayTier::Discovered)
+            Ok(RelayTier::Discovered)
         );
     }
 
     #[test]
     fn test_relay_status_roundtrip() {
+        use std::str::FromStr;
         for status in [
             RelayStatus::Pending,
             RelayStatus::Active,
@@ -248,7 +258,7 @@ mod tests {
             RelayStatus::Failing,
             RelayStatus::Blocked,
         ] {
-            assert_eq!(RelayStatus::from_str(status.as_str()), Some(status));
+            assert_eq!(RelayStatus::from_str(status.as_str()), Ok(status));
         }
     }
 }

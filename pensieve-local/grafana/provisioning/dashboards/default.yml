@@ -1,0 +1,14 @@
+# Grafana dashboard provisioning - auto-loads dashboards from folder
+apiVersion: 1
+
+providers:
+  - name: 'Pensieve'
+    orgId: 1
+    folder: 'Pensieve'
+    folderUid: 'pensieve'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+

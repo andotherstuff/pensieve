@@ -33,8 +33,8 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, RelayManager,
-    RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter,
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, RelayManager, RelayManagerConfig,
+    SealedSegment, SegmentConfig, SegmentWriter, pack_nostr_event,
     source::{RelayConfig, RelaySource},
 };
 use std::path::PathBuf;
@@ -407,7 +407,7 @@ async fn main() -> Result<()> {
     tracing::info!("Starting live ingestion...");
 
     let stats = relay_source
-        .run_async(|relay_url: String, event: PackedEvent| {
+        .run_async(|relay_url: String, event: &nostr_sdk::Event| {
             // Check if we should stop
             if !handler_running.load(Ordering::SeqCst) {
                 return Ok(false);
@@ -416,8 +416,11 @@ async fn main() -> Result<()> {
             // Count all received events (before dedupe)
             handler_events_received.fetch_add(1, Ordering::Relaxed);
 
-            // Dedupe check
-            let is_novel = match dedupe.check_and_mark_pending(&event.event_id) {
+            // Get the event ID bytes for dedupe check (CHEAP - just a reference)
+            let event_id = event.id.as_bytes();
+
+            // Dedupe check FIRST - before expensive packing
+            let is_novel = match dedupe.check_and_mark_pending(event_id) {
                 Ok(novel) => novel,
                 Err(e) => {
                     tracing::warn!("Dedupe check error: {}", e);
@@ -429,15 +432,23 @@ async fn main() -> Result<()> {
             handler_relay_manager.record_event(&relay_url, is_novel);
 
             if is_novel {
-                // New event - write to segment
-                if let Err(e) = segment_writer.write(event) {
-                    tracing::error!("Failed to write event: {}", e);
-                    // Continue processing despite write errors
-                } else {
-                    handler_events_processed.fetch_add(1, Ordering::Relaxed);
+                // New event - NOW pack it (only for novel events)
+                match pack_nostr_event(event) {
+                    Ok(packed) => {
+                        // Write to segment
+                        if let Err(e) = segment_writer.write(packed) {
+                            tracing::error!("Failed to write event: {}", e);
+                            // Continue processing despite write errors
+                        } else {
+                            handler_events_processed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to pack event: {}", e);
+                    }
                 }
             } else {
-                // Duplicate - skip
+                // Duplicate - skip (no packing needed!)
                 handler_events_deduplicated.fetch_add(1, Ordering::Relaxed);
             }
 

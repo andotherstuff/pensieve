@@ -1,0 +1,19 @@
+# Prometheus config for local development
+# Scrapes metrics from tools running on host machine
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Live ingester running on host
+  # NOTE: Use --metrics-port 9091 when running the ingester (9090 is taken by Prometheus)
+  - job_name: 'ingest'
+    static_configs:
+      - targets: ['host.docker.internal:9091']
+
+  # Backfill tool running on host (default port 9092)
+  - job_name: 'backfill'
+    static_configs:
+      - targets: ['host.docker.internal:9092']
+

@@ -6,14 +6,16 @@
 //! - Computing quality scores
 //! - Managing relay slot allocation (connect/disconnect decisions)
 
-use super::schema::{self, RelayStatus, RelayTier};
-use super::scoring::{self, RelayStatsForScoring};
-use crate::{Error, Result};
-use parking_lot::Mutex;
-use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
+use rusqlite::Connection;
+
+use super::schema::{self, RelayStatus, RelayTier};
+use super::scoring::{self, RelayStatsForScoring};
+use crate::{Error, Result};
 
 /// Configuration for the relay manager.
 #[derive(Debug, Clone)]
@@ -478,7 +480,7 @@ impl RelayManager {
                 let attempts_7d: f64 = row.get(9)?;
                 let successes_7d: f64 = row.get(10)?;
 
-                let tier = RelayTier::from_str(&tier_str).unwrap_or(RelayTier::Discovered);
+                let tier = tier_str.parse().unwrap_or(RelayTier::Discovered);
 
                 Ok((
                     url,
@@ -883,8 +885,10 @@ mod tests {
 
     #[test]
     fn test_connection_blocking() {
-        let mut config = RelayManagerConfig::default();
-        config.block_after_failures = 3;
+        let config = RelayManagerConfig {
+            block_after_failures: 3,
+            ..Default::default()
+        };
 
         let manager = RelayManager::open_in_memory().unwrap();
         // Override config for test
