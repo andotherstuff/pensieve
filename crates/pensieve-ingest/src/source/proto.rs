@@ -8,7 +8,9 @@ use super::{EventSource, SourceMetadata, SourceStats};
 use crate::pipeline::PackedEvent;
 use crate::{Error, Result};
 use flate2::read::GzDecoder;
-use pensieve_core::{decode_length_delimited_with_size, pack_event_binary_into, validate_proto_event};
+use pensieve_core::{
+    decode_length_delimited_with_size, pack_event_binary_into, validate_proto_event,
+};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
@@ -213,10 +215,15 @@ impl ProtoSource {
             }
 
             // Progress reporting
-            if stats.total_events.is_multiple_of(self.config.progress_interval) {
+            if stats
+                .total_events
+                .is_multiple_of(self.config.progress_interval)
+            {
                 tracing::info!(
                     "Progress: {} events, {} valid, {} invalid",
-                    stats.total_events, stats.valid_events, stats.invalid_events
+                    stats.total_events,
+                    stats.valid_events,
+                    stats.invalid_events
                 );
             }
         }
@@ -297,7 +304,10 @@ struct ProtoStats {
 fn hex_to_bytes32(hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex).map_err(|e| Error::Hex(e.to_string()))?;
     if bytes.len() != 32 {
-        return Err(Error::Hex(format!("Expected 32 bytes, got {}", bytes.len())));
+        return Err(Error::Hex(format!(
+            "Expected 32 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
@@ -310,7 +320,7 @@ fn proto_to_notepack_unvalidated(
     proto: &pensieve_core::ProtoEvent,
     buf: &mut Vec<u8>,
 ) -> std::result::Result<usize, String> {
-    use notepack::{pack_note_into, NoteBuf};
+    use notepack::{NoteBuf, pack_note_into};
 
     // Convert proto tags to notepack tags (Vec<Vec<String>>)
     let tags: Vec<Vec<String>> = proto.tags.iter().map(|t| t.values.clone()).collect();

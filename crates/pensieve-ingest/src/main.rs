@@ -33,13 +33,13 @@ use clap::Parser;
 use metrics::gauge;
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    source::{RelayConfig, RelaySource},
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, SealedSegment, SegmentConfig,
     SegmentWriter,
+    source::{RelayConfig, RelaySource},
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::EnvFilter;
 
 /// Pensieve live ingestion daemon.
@@ -218,7 +218,8 @@ async fn main() -> Result<()> {
     if let Some(sealed) = segment_writer.seal()? {
         tracing::info!(
             "Sealed final segment {}: {} events",
-            sealed.segment_number, sealed.event_count
+            sealed.segment_number,
+            sealed.event_count
         );
 
         // Mark as archived

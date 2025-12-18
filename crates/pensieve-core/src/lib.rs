@@ -14,10 +14,10 @@ pub mod proto;
 
 pub use error::{Error, Result};
 pub use event::{
-    event_to_notebuf, pack_event_binary, pack_event_binary_into, validate_event,
-    validate_event_id, validate_event_signature, validate_notebuf,
+    event_to_notebuf, pack_event_binary, pack_event_binary_into, validate_event, validate_event_id,
+    validate_event_signature, validate_notebuf,
 };
 pub use proto::{
-    decode_length_delimited, decode_length_delimited_with_size, decode_proto_event, proto_to_json,
-    validate_proto_event, EventBatch, ProtoEvent, Tag,
+    EventBatch, ProtoEvent, Tag, decode_length_delimited, decode_length_delimited_with_size,
+    decode_proto_event, proto_to_json, validate_proto_event,
 };

@@ -24,4 +24,3 @@ mod segment;
 pub use clickhouse::{ClickHouseConfig, ClickHouseIndexer, EventRow, IndexerStats};
 pub use dedupe::{DedupeIndex, DedupeStats, EventStatus};
 pub use segment::{PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter};
-

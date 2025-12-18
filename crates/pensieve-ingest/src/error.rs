@@ -64,4 +64,3 @@ pub enum Error {
     #[error("Hex decoding error: {0}")]
     Hex(String),
 }
-

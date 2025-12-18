@@ -32,12 +32,12 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    source::{EventSource, JsonlConfig, JsonlSource},
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, SealedSegment, SegmentConfig, SegmentWriter,
+    source::{EventSource, JsonlConfig, JsonlSource},
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing_subscriber::EnvFilter;
 
@@ -326,21 +326,20 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender)?);
 
     // Initialize ClickHouse indexer (optional)
-    let indexer_handle = if let (Some(ch_url), Some(receiver)) =
-        (&args.clickhouse_url, sealed_receiver)
-    {
-        tracing::info!("Starting ClickHouse indexer for {}", ch_url);
-        let ch_config = ClickHouseConfig {
-            url: ch_url.clone(),
-            database: args.clickhouse_db.clone(),
-            table: "events_local".to_string(),
-            batch_size: 10000,
+    let indexer_handle =
+        if let (Some(ch_url), Some(receiver)) = (&args.clickhouse_url, sealed_receiver) {
+            tracing::info!("Starting ClickHouse indexer for {}", ch_url);
+            let ch_config = ClickHouseConfig {
+                url: ch_url.clone(),
+                database: args.clickhouse_db.clone(),
+                table: "events_local".to_string(),
+                batch_size: 10000,
+            };
+            let indexer = ClickHouseIndexer::new(ch_config)?;
+            Some(indexer.start(receiver))
+        } else {
+            None
         };
-        let indexer = ClickHouseIndexer::new(ch_config)?;
-        Some(indexer.start(receiver))
-    } else {
-        None
-    };
 
     Ok((segment_writer, dedupe, indexer_handle))
 }
@@ -354,7 +353,8 @@ fn finalize_pipeline(
     if let Some(sealed) = segment_writer.seal()? {
         tracing::info!(
             "Sealed final segment {}: {} events",
-            sealed.segment_number, sealed.event_count
+            sealed.segment_number,
+            sealed.event_count
         );
     }
 

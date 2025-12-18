@@ -32,7 +32,7 @@
 //!     -o ./segments/ --limit 5
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use aws_sdk_s3::Client as S3Client;
 use clap::Parser;
 use flate2::read::GzDecoder;
@@ -247,7 +247,10 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
     println!();
     println!("Files processed:   {:>12}", stats.files_processed);
     if stats.files_skipped > 0 {
-        println!("Files skipped:     {:>12} (already done)", stats.files_skipped);
+        println!(
+            "Files skipped:     {:>12} (already done)",
+            stats.files_skipped
+        );
     }
     println!("Total events:      {:>12}", stats.total_events);
     println!("Valid events:      {:>12}", stats.valid_events);
@@ -283,8 +286,7 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
 
     // Raw vs Raw comparison (apples to apples)
     if stats.decompressed_proto_bytes > 0 {
-        let notepack_vs_proto =
-            stats.notepack_bytes as f64 / stats.decompressed_proto_bytes as f64;
+        let notepack_vs_proto = stats.notepack_bytes as f64 / stats.decompressed_proto_bytes as f64;
         let reduction = (1.0 - notepack_vs_proto) * 100.0;
         println!(
             "│ Raw: Notepack vs Proto:    {:>6.1}% ({:<8})               │",
@@ -295,8 +297,7 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
 
     // Compressed vs Compressed comparison (final storage)
     if stats.compressed_proto_bytes > 0 && stats.compressed_notepack_bytes > 0 {
-        let gz_vs_gz =
-            stats.compressed_notepack_bytes as f64 / stats.compressed_proto_bytes as f64;
+        let gz_vs_gz = stats.compressed_notepack_bytes as f64 / stats.compressed_proto_bytes as f64;
         let reduction = (1.0 - gz_vs_gz) * 100.0;
         println!(
             "│ Gzip: Notepack vs Proto:   {:>6.1}% ({:<8})               │",
@@ -309,12 +310,17 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
     if stats.decompressed_proto_bytes > 0 && stats.compressed_proto_bytes > 0 {
         let proto_ratio =
             stats.decompressed_proto_bytes as f64 / stats.compressed_proto_bytes as f64;
-        println!("│ Proto gzip ratio:          {:>6.1}x                            │", proto_ratio);
+        println!(
+            "│ Proto gzip ratio:          {:>6.1}x                            │",
+            proto_ratio
+        );
     }
     if stats.notepack_bytes > 0 && stats.compressed_notepack_bytes > 0 {
-        let notepack_ratio =
-            stats.notepack_bytes as f64 / stats.compressed_notepack_bytes as f64;
-        println!("│ Notepack gzip ratio:       {:>6.1}x                            │", notepack_ratio);
+        let notepack_ratio = stats.notepack_bytes as f64 / stats.compressed_notepack_bytes as f64;
+        println!(
+            "│ Notepack gzip ratio:       {:>6.1}x                            │",
+            notepack_ratio
+        );
     }
     println!("╰─────────────────────────────────────────────────────────────────╯");
     println!();
@@ -368,16 +374,18 @@ async fn process_s3(args: &Args) -> Result<Stats> {
     let mut stats = Stats::default();
 
     // Get temp directory
-    let temp_dir = args
-        .temp_dir
-        .clone()
-        .unwrap_or_else(std::env::temp_dir);
+    let temp_dir = args.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
     fs::create_dir_all(&temp_dir)?;
 
     for (idx, key) in keys.iter().enumerate() {
         // Skip if already completed
         if progress.is_completed(key) {
-            tracing::info!("[{}/{}] Skipping (already done): {}", idx + 1, keys.len(), key);
+            tracing::info!(
+                "[{}/{}] Skipping (already done): {}",
+                idx + 1,
+                keys.len(),
+                key
+            );
             stats.files_skipped += 1;
             continue;
         }
@@ -402,8 +410,14 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
         // Process the file
         let is_gzip = args.gzip || key.ends_with(".gz");
-        match process_file_impl(&temp_path, is_gzip, &segment_writer, dedupe.as_ref(), args, &mut stats)
-        {
+        match process_file_impl(
+            &temp_path,
+            is_gzip,
+            &segment_writer,
+            dedupe.as_ref(),
+            args,
+            &mut stats,
+        ) {
             Ok(()) => {
                 stats.files_processed += 1;
 
@@ -463,10 +477,7 @@ async fn list_s3_objects(
     let mut continuation_token: Option<String> = None;
 
     loop {
-        let mut request = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(prefix);
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
 
         if let Some(token) = continuation_token {
             request = request.continuation_token(token);
@@ -539,7 +550,9 @@ async fn download_s3_object(
 
     tracing::info!(
         "Downloaded {} bytes from s3://{}/{}",
-        total_written, bucket, key
+        total_written,
+        bucket,
+        key
     );
 
     Ok(content_length)
@@ -574,7 +587,14 @@ fn process_local(args: &Args) -> Result<Stats> {
 
         let is_gzip = args.gzip || file_path.extension().is_some_and(|ext| ext == "gz");
 
-        match process_file_impl(file_path, is_gzip, &segment_writer, dedupe.as_ref(), args, &mut stats) {
+        match process_file_impl(
+            file_path,
+            is_gzip,
+            &segment_writer,
+            dedupe.as_ref(),
+            args,
+            &mut stats,
+        ) {
             Ok(()) => {
                 stats.files_processed += 1;
                 // Update metrics after each file
@@ -622,7 +642,9 @@ fn collect_local_files(input: &PathBuf, limit: Option<usize>) -> Result<Vec<Path
             .filter(|e| {
                 let path = e.path();
                 path.is_file()
-                    && (path.extension().is_some_and(|ext| ext == "pb" || ext == "gz"))
+                    && (path
+                        .extension()
+                        .is_some_and(|ext| ext == "pb" || ext == "gz"))
             })
             .map(|e| e.path())
             .collect();
@@ -687,21 +709,20 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender)?);
 
     // Initialize ClickHouse indexer (optional)
-    let indexer_handle = if let (Some(ch_url), Some(receiver)) =
-        (&args.clickhouse_url, sealed_receiver)
-    {
-        tracing::info!("Starting ClickHouse indexer for {}", ch_url);
-        let ch_config = ClickHouseConfig {
-            url: ch_url.clone(),
-            database: args.clickhouse_db.clone(),
-            table: "events_local".to_string(),
-            batch_size: 10000,
+    let indexer_handle =
+        if let (Some(ch_url), Some(receiver)) = (&args.clickhouse_url, sealed_receiver) {
+            tracing::info!("Starting ClickHouse indexer for {}", ch_url);
+            let ch_config = ClickHouseConfig {
+                url: ch_url.clone(),
+                database: args.clickhouse_db.clone(),
+                table: "events_local".to_string(),
+                batch_size: 10000,
+            };
+            let indexer = ClickHouseIndexer::new(ch_config)?;
+            Some(indexer.start(receiver))
+        } else {
+            None
         };
-        let indexer = ClickHouseIndexer::new(ch_config)?;
-        Some(indexer.start(receiver))
-    } else {
-        None
-    };
 
     Ok((segment_writer, dedupe, indexer_handle))
 }
@@ -872,7 +893,7 @@ fn proto_to_notepack_unvalidated(
     proto: &pensieve_core::ProtoEvent,
     buf: &mut Vec<u8>,
 ) -> Result<usize> {
-    use notepack::{pack_note_into, NoteBuf};
+    use notepack::{NoteBuf, pack_note_into};
 
     let tags: Vec<Vec<String>> = proto.tags.iter().map(|t| t.values.clone()).collect();
 

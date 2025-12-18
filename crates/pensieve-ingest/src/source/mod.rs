@@ -23,8 +23,8 @@ pub use jsonl::{JsonlConfig, JsonlSource};
 pub use proto::{ProtoConfig, ProtoSource};
 pub use relay::{RelayConfig, RelaySource};
 
-use crate::pipeline::PackedEvent;
 use crate::Result;
+use crate::pipeline::PackedEvent;
 
 /// A source of Nostr events.
 ///
@@ -91,4 +91,3 @@ pub struct SourceMetadata {
     /// For relay sources: number of relays discovered.
     pub relays_discovered: Option<usize>,
 }
-

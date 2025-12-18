@@ -24,8 +24,8 @@
 use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use parking_lot::Mutex;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -134,7 +134,10 @@ impl SegmentWriter {
     ///
     /// * `config` - Configuration for the writer
     /// * `sealed_sender` - Optional channel to send sealed segment notifications
-    pub fn new(config: SegmentConfig, sealed_sender: Option<Sender<SealedSegment>>) -> Result<Self> {
+    pub fn new(
+        config: SegmentConfig,
+        sealed_sender: Option<Sender<SealedSegment>>,
+    ) -> Result<Self> {
         // Create output directory if it doesn't exist
         fs::create_dir_all(&config.output_dir)?;
 
@@ -231,9 +234,9 @@ impl SegmentWriter {
         self.ensure_current_segment()?;
 
         let mut current = self.current.lock();
-        let segment = current.as_mut().ok_or_else(|| {
-            Error::Segment("No current segment".to_string())
-        })?;
+        let segment = current
+            .as_mut()
+            .ok_or_else(|| Error::Segment("No current segment".to_string()))?;
 
         // Write length-prefixed format: [u32 length][notepack bytes]
         let len_bytes = (event.data.len() as u32).to_le_bytes();
@@ -552,4 +555,3 @@ mod tests {
         assert_eq!(sealed.segment_number, 0);
     }
 }
-

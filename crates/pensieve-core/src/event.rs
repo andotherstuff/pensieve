@@ -5,8 +5,8 @@
 //! - Signature verification (Schnorr over secp256k1)
 
 use crate::error::Result;
-use notepack::{NoteBinary, NoteBuf};
-use nostr::JsonUtil; // Required for Event::from_json()
+use nostr::JsonUtil;
+use notepack::{NoteBinary, NoteBuf}; // Required for Event::from_json()
 
 /// Validates both the event ID and signature of a Nostr event.
 ///
@@ -190,8 +190,18 @@ mod tests {
     #[test]
     fn test_validate_event_preserves_tags() {
         let tags = vec![
-            Tag::public_key(nostr::PublicKey::from_hex("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap()),
-            Tag::event(nostr::EventId::from_hex("1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd").unwrap()),
+            Tag::public_key(
+                nostr::PublicKey::from_hex(
+                    "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+                )
+                .unwrap(),
+            ),
+            Tag::event(
+                nostr::EventId::from_hex(
+                    "1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd",
+                )
+                .unwrap(),
+            ),
         ];
         let event = make_test_event("tagged event", Kind::TextNote, tags);
         let json = event_to_json(&event);
@@ -367,9 +377,12 @@ mod tests {
 
     #[test]
     fn test_event_to_notebuf_preserves_all_fields() {
-        let tags = vec![
-            Tag::public_key(nostr::PublicKey::from_hex("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap()),
-        ];
+        let tags = vec![Tag::public_key(
+            nostr::PublicKey::from_hex(
+                "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+            )
+            .unwrap(),
+        )];
         let event = make_test_event("conversion test", Kind::TextNote, tags);
 
         let notebuf = event_to_notebuf(&event);
@@ -471,12 +484,12 @@ mod tests {
     #[test]
     fn test_validate_various_kinds() {
         let kinds = [
-            Kind::Metadata,        // 0
-            Kind::TextNote,        // 1
-            Kind::ContactList,     // 3
-            Kind::Repost,          // 6
-            Kind::Reaction,        // 7
-            Kind::Custom(30023),   // Long-form content
+            Kind::Metadata,      // 0
+            Kind::TextNote,      // 1
+            Kind::ContactList,   // 3
+            Kind::Repost,        // 6
+            Kind::Reaction,      // 7
+            Kind::Custom(30023), // Long-form content
         ];
 
         for kind in kinds {
@@ -488,4 +501,3 @@ mod tests {
         }
     }
 }
-

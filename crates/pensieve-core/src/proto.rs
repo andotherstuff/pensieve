@@ -381,10 +381,14 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
 
-        let (_, size1) = decode_length_delimited_with_size(&mut cursor).unwrap().unwrap();
+        let (_, size1) = decode_length_delimited_with_size(&mut cursor)
+            .unwrap()
+            .unwrap();
         assert_eq!(size1, first_len);
 
-        let (_, size2) = decode_length_delimited_with_size(&mut cursor).unwrap().unwrap();
+        let (_, size2) = decode_length_delimited_with_size(&mut cursor)
+            .unwrap()
+            .unwrap();
         assert_eq!(size2, second_len);
     }
 
@@ -409,4 +413,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

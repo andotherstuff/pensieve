@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 /// Configuration for the ClickHouse indexer.
@@ -88,7 +88,9 @@ impl ClickHouseIndexer {
 
         tracing::info!(
             "ClickHouse indexer initialized: url={}, database={}, table={}",
-            config.url, config.database, config.table
+            config.url,
+            config.database,
+            config.table
         );
 
         Ok(Self {
@@ -114,10 +116,8 @@ impl ClickHouseIndexer {
 
         thread::spawn(move || {
             // SAFETY: We're passing raw pointers but they're valid for the lifetime of the indexer
-            let segments_indexed =
-                unsafe { &*(segments_indexed as *const AtomicUsize) };
-            let events_indexed =
-                unsafe { &*(events_indexed as *const AtomicUsize) };
+            let segments_indexed = unsafe { &*(segments_indexed as *const AtomicUsize) };
+            let events_indexed = unsafe { &*(events_indexed as *const AtomicUsize) };
 
             tracing::info!("ClickHouse indexer thread started");
 
@@ -143,13 +143,15 @@ impl ClickHouseIndexer {
                                 events_indexed.fetch_add(count, Ordering::Relaxed);
                                 tracing::info!(
                                     "Indexed segment {}: {} events",
-                                    sealed.segment_number, count
+                                    sealed.segment_number,
+                                    count
                                 );
                             }
                             Err(e) => {
                                 tracing::error!(
                                     "Failed to index segment {}: {}",
-                                    sealed.segment_number, e
+                                    sealed.segment_number,
+                                    e
                                 );
                                 // TODO: Implement retry logic
                             }
@@ -187,8 +189,7 @@ impl ClickHouseIndexer {
         }
 
         // Batch insert
-        let mut inserter = client
-            .insert(&config.table)?;
+        let mut inserter = client.insert(&config.table)?;
 
         for event in &events {
             inserter.write(event).await?;
@@ -206,9 +207,7 @@ impl ClickHouseIndexer {
         let file = File::open(path)?;
 
         // Detect gzip by extension
-        let is_gzip = path
-            .extension()
-            .is_some_and(|ext| ext == "gz");
+        let is_gzip = path.extension().is_some_and(|ext| ext == "gz");
 
         let mut reader: Box<dyn Read> = if is_gzip {
             Box::new(BufReader::new(GzDecoder::new(BufReader::new(file))))
@@ -302,7 +301,8 @@ impl ClickHouseIndexer {
 
         inserter.end().await?;
 
-        self.events_indexed.fetch_add(events.len(), Ordering::Relaxed);
+        self.events_indexed
+            .fetch_add(events.len(), Ordering::Relaxed);
         self.segments_indexed.fetch_add(1, Ordering::Relaxed);
 
         Ok(events.len())
@@ -357,4 +357,3 @@ mod tests {
 
     // Integration tests would require a running ClickHouse instance
 }
-

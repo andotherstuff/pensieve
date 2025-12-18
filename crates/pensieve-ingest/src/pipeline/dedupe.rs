@@ -235,10 +235,7 @@ mod tests {
         assert!(index.check_and_mark_pending(&id2).unwrap());
 
         // Check status
-        assert_eq!(
-            index.get_status(&id1).unwrap(),
-            Some(EventStatus::Pending)
-        );
+        assert_eq!(index.get_status(&id1).unwrap(), Some(EventStatus::Pending));
     }
 
     #[test]
@@ -257,14 +254,8 @@ mod tests {
         index.mark_archived([&id1, &id2].into_iter()).unwrap();
 
         // Check status
-        assert_eq!(
-            index.get_status(&id1).unwrap(),
-            Some(EventStatus::Archived)
-        );
-        assert_eq!(
-            index.get_status(&id2).unwrap(),
-            Some(EventStatus::Archived)
-        );
+        assert_eq!(index.get_status(&id1).unwrap(), Some(EventStatus::Archived));
+        assert_eq!(index.get_status(&id2).unwrap(), Some(EventStatus::Archived));
     }
 
     #[test]
@@ -279,4 +270,3 @@ mod tests {
         assert!(!index.is_new(&id1).unwrap());
     }
 }
-

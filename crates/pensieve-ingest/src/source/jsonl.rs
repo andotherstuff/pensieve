@@ -7,7 +7,7 @@
 use super::{EventSource, SourceMetadata, SourceStats};
 use crate::pipeline::PackedEvent;
 use crate::{Error, Result};
-use notepack::{pack_note_into, NoteBuf};
+use notepack::{NoteBuf, pack_note_into};
 use pensieve_core::{pack_event_binary_into, validate_event};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -210,10 +210,15 @@ impl JsonlSource {
             }
 
             // Progress reporting
-            if stats.total_events.is_multiple_of(self.config.progress_interval) {
+            if stats
+                .total_events
+                .is_multiple_of(self.config.progress_interval)
+            {
                 tracing::info!(
                     "Progress: {} events, {} valid, {} invalid",
-                    stats.total_events, stats.valid_events, stats.invalid_events
+                    stats.total_events,
+                    stats.valid_events,
+                    stats.invalid_events
                 );
             }
         }
@@ -298,7 +303,10 @@ struct JsonlStats {
 fn hex_to_bytes32(hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex).map_err(|e| Error::Hex(e.to_string()))?;
     if bytes.len() != 32 {
-        return Err(Error::Hex(format!("Expected 32 bytes, got {}", bytes.len())));
+        return Err(Error::Hex(format!(
+            "Expected 32 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);

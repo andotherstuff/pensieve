@@ -30,7 +30,7 @@
 //! - Suffix: Unit or type (e.g., `_total`, `_bytes`, `_seconds`)
 //! - Labels: Use sparingly to avoid cardinality explosion
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
@@ -71,7 +71,10 @@ pub fn try_init_metrics() -> Option<PrometheusHandle> {
 ///
 /// * `port` - TCP port to listen on (e.g., 9091)
 /// * `handle` - Prometheus handle from [`init_metrics`]
-pub async fn start_metrics_server(port: u16, handle: PrometheusHandle) -> Result<(), std::io::Error> {
+pub async fn start_metrics_server(
+    port: u16,
+    handle: PrometheusHandle,
+) -> Result<(), std::io::Error> {
     let app = Router::new().route(
         "/metrics",
         get(move || {
@@ -141,22 +144,13 @@ fn register_common_metrics() {
     // Live Ingestion Metrics (for future relay ingester)
     // =========================================================================
 
-    describe_counter!(
-        "ingest_events_total",
-        "Total events received from relays"
-    );
+    describe_counter!("ingest_events_total", "Total events received from relays");
     describe_counter!(
         "ingest_events_valid_total",
         "Valid events written to archive"
     );
-    describe_counter!(
-        "ingest_events_duplicate_total",
-        "Duplicate events skipped"
-    );
-    describe_counter!(
-        "ingest_events_invalid_total",
-        "Invalid events rejected"
-    );
+    describe_counter!("ingest_events_duplicate_total", "Duplicate events skipped");
+    describe_counter!("ingest_events_invalid_total", "Invalid events rejected");
     describe_gauge!(
         "ingest_relay_connections",
         "Number of active relay connections"
@@ -182,10 +176,7 @@ fn register_common_metrics() {
         "segment_bytes_compressed_total",
         "Total compressed bytes written to segments"
     );
-    describe_counter!(
-        "segment_sealed_total",
-        "Number of segments sealed"
-    );
+    describe_counter!("segment_sealed_total", "Number of segments sealed");
     describe_gauge!(
         "segment_current_events",
         "Events in the current unsealed segment"
@@ -203,10 +194,7 @@ fn register_common_metrics() {
         "dedupe_keys_approximate",
         "Approximate number of event IDs in the dedupe index"
     );
-    describe_counter!(
-        "dedupe_lookups_total",
-        "Total dedupe index lookups"
-    );
+    describe_counter!("dedupe_lookups_total", "Total dedupe index lookups");
     describe_counter!(
         "dedupe_hits_total",
         "Dedupe index hits (event already seen)"
@@ -228,18 +216,12 @@ fn register_common_metrics() {
         "clickhouse_segments_indexed_total",
         "Segments fully indexed into ClickHouse"
     );
-    describe_counter!(
-        "clickhouse_insert_errors_total",
-        "ClickHouse insert errors"
-    );
+    describe_counter!("clickhouse_insert_errors_total", "ClickHouse insert errors");
     describe_histogram!(
         "clickhouse_insert_duration_seconds",
         "Time spent on ClickHouse batch inserts"
     );
-    describe_gauge!(
-        "clickhouse_queue_depth",
-        "Segments waiting to be indexed"
-    );
+    describe_gauge!("clickhouse_queue_depth", "Segments waiting to be indexed");
 
     // =========================================================================
     // Archive Sync Metrics
@@ -261,10 +243,7 @@ fn register_common_metrics() {
         "archive_local_segments",
         "Number of segments in local archive"
     );
-    describe_gauge!(
-        "archive_local_bytes",
-        "Bytes in local archive"
-    );
+    describe_gauge!("archive_local_bytes", "Bytes in local archive");
 }
 
 // =============================================================================
@@ -382,4 +361,3 @@ mod tests {
         register_common_metrics();
     }
 }
-
