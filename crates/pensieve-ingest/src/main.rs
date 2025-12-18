@@ -138,6 +138,21 @@ struct Args {
     /// Score recomputation interval in seconds
     #[arg(long, default_value = "300")]
     score_interval_secs: u64,
+
+    /// Disable catch-up processing (ignore saved checkpoint, subscribe to live events only)
+    #[arg(long)]
+    no_catchup: bool,
+
+    /// Buffer time in seconds to subtract from checkpoint when catching up.
+    /// This handles clock skew and relay propagation delay.
+    /// The dedupe index will filter out any duplicates from the overlap.
+    #[arg(long, default_value = "300")]
+    catchup_buffer_secs: u64,
+
+    /// How often to update the checkpoint (seconds).
+    /// Lower values mean less catch-up work after a crash but more I/O.
+    #[arg(long, default_value = "60")]
+    checkpoint_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -254,12 +269,41 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load checkpoint for catch-up processing
+    let since_timestamp = if args.no_catchup {
+        tracing::info!("Catch-up disabled via --no-catchup flag");
+        None
+    } else {
+        match relay_manager.get_last_archived_timestamp() {
+            Ok(Some(checkpoint)) => {
+                // Apply buffer to handle clock skew and relay propagation delay
+                let buffered = checkpoint.saturating_sub(args.catchup_buffer_secs);
+                tracing::info!(
+                    "Loaded checkpoint: {} (buffered to {} with {}s buffer)",
+                    checkpoint,
+                    buffered,
+                    args.catchup_buffer_secs
+                );
+                Some(buffered)
+            }
+            Ok(None) => {
+                tracing::info!("No checkpoint found - fresh start, subscribing to live events only");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load checkpoint: {} - starting without catch-up", e);
+                None
+            }
+        }
+    };
+
     // Build relay config for RelaySource
     let relay_config = RelayConfig {
         seed_relays: seed_relays.clone(),
         discovery_enabled: !args.no_discovery,
         max_relays: args.max_relays,
         optimization_interval: Duration::from_secs(args.score_interval_secs),
+        since_timestamp,
         ..Default::default()
     };
 
@@ -277,6 +321,17 @@ async fn main() -> Result<()> {
     tracing::info!(
         "  Optimization interval: {}s",
         relay_config.optimization_interval.as_secs()
+    );
+    tracing::info!(
+        "  Catch-up: {}",
+        match relay_config.since_timestamp {
+            Some(ts) => format!("enabled (since {})", ts),
+            None => "disabled (live only)".to_string(),
+        }
+    );
+    tracing::info!(
+        "  Checkpoint interval: {}s",
+        args.checkpoint_interval_secs
     );
 
     // Create relay source with manager for quality tracking and optimization
@@ -328,10 +383,17 @@ async fn main() -> Result<()> {
     let events_processed = Arc::new(AtomicUsize::new(0));
     let events_deduplicated = Arc::new(AtomicUsize::new(0));
 
+    // Track max created_at timestamp for checkpoint updates
+    // Start with the current checkpoint (if any) so we don't regress
+    let max_created_at = Arc::new(std::sync::atomic::AtomicU64::new(
+        since_timestamp.unwrap_or(0),
+    ));
+
     // Clone for the handler
     let handler_events_received = Arc::clone(&events_received);
     let handler_events_processed = Arc::clone(&events_processed);
     let handler_events_deduplicated = Arc::clone(&events_deduplicated);
+    let handler_max_created_at = Arc::clone(&max_created_at);
 
     // Spawn background task for rate metrics calculation
     let rate_running = Arc::clone(&running);
@@ -403,6 +465,37 @@ async fn main() -> Result<()> {
         tracing::debug!("Rate metrics task stopped");
     });
 
+    // Spawn background task for checkpoint updates
+    let checkpoint_running = Arc::clone(&running);
+    let checkpoint_relay_manager = Arc::clone(&relay_manager);
+    let checkpoint_max_created_at = Arc::clone(&max_created_at);
+    let checkpoint_interval = args.checkpoint_interval_secs;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(checkpoint_interval));
+        interval.tick().await; // Skip first immediate tick
+
+        while checkpoint_running.load(Ordering::SeqCst) {
+            interval.tick().await;
+
+            if !checkpoint_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Read the current max timestamp and persist it
+            let max_ts = checkpoint_max_created_at.load(Ordering::Relaxed);
+            if max_ts > 0 {
+                if let Err(e) = checkpoint_relay_manager.update_last_archived_timestamp(max_ts) {
+                    tracing::warn!("Failed to update checkpoint: {}", e);
+                } else {
+                    tracing::debug!("Updated checkpoint to {}", max_ts);
+                    gauge!("ingest_checkpoint_timestamp").set(max_ts as f64);
+                }
+            }
+        }
+
+        tracing::debug!("Checkpoint update task stopped");
+    });
+
     // Run the ingestion loop
     tracing::info!("Starting live ingestion...");
 
@@ -441,6 +534,11 @@ async fn main() -> Result<()> {
                             // Continue processing despite write errors
                         } else {
                             handler_events_processed.fetch_add(1, Ordering::Relaxed);
+
+                            // Track max created_at for checkpoint
+                            // Use fetch_max to atomically update to the highest value
+                            let event_ts = event.created_at.as_secs();
+                            handler_max_created_at.fetch_max(event_ts, Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
@@ -477,6 +575,15 @@ async fn main() -> Result<()> {
     // Flush relay manager stats
     if let Err(e) = relay_manager.flush() {
         tracing::warn!("Failed to flush relay stats: {}", e);
+    }
+
+    // Save final checkpoint
+    let final_checkpoint = max_created_at.load(Ordering::Relaxed);
+    if final_checkpoint > 0 {
+        match relay_manager.update_last_archived_timestamp(final_checkpoint) {
+            Ok(()) => tracing::info!("Saved final checkpoint: {}", final_checkpoint),
+            Err(e) => tracing::warn!("Failed to save final checkpoint: {}", e),
+        }
     }
 
     // Wait for ClickHouse indexer if running

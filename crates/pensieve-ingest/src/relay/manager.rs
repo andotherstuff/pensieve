@@ -800,6 +800,71 @@ impl RelayManager {
         let now = Self::unix_now();
         now - (now % 3600)
     }
+
+    // =========================================================================
+    // Checkpoint methods for catch-up processing
+    // =========================================================================
+
+    /// Get the last archived event timestamp for catch-up processing.
+    ///
+    /// Returns `None` if no checkpoint has been recorded yet (fresh start).
+    pub fn get_last_archived_timestamp(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock();
+
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM ingestion_checkpoint WHERE key = 'last_archived_timestamp'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+
+        Ok(result.map(|v| v as u64))
+    }
+
+    /// Update the last archived event timestamp.
+    ///
+    /// Call this periodically during ingestion (e.g., after each segment seal)
+    /// to track the high-water mark of successfully archived events.
+    pub fn update_last_archived_timestamp(&self, timestamp: u64) -> Result<()> {
+        let now = Self::unix_now();
+        let conn = self.conn.lock();
+
+        conn.execute(
+            "INSERT INTO ingestion_checkpoint (key, value, updated_at)
+             VALUES ('last_archived_timestamp', ?, ?)
+             ON CONFLICT(key) DO UPDATE SET
+                value = MAX(value, excluded.value),
+                updated_at = excluded.updated_at",
+            rusqlite::params![timestamp as i64, now],
+        )
+        .map_err(|e| Error::Database(format!("Failed to update checkpoint: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Get all checkpoints (for debugging/introspection).
+    pub fn get_checkpoints(&self) -> Result<Vec<(String, u64, i64)>> {
+        let conn = self.conn.lock();
+
+        let mut stmt = conn
+            .prepare("SELECT key, value, updated_at FROM ingestion_checkpoint ORDER BY key")
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let rows: Vec<(String, u64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| Error::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
 }
 
 /// Aggregate statistics for Prometheus metrics.
@@ -924,6 +989,65 @@ mod tests {
         let stats = manager.get_aggregate_stats().unwrap();
         assert_eq!(stats.total_relays, 2);
         assert_eq!(stats.seed_relays, 1);
+    }
+
+    #[test]
+    fn test_checkpoint_fresh_db() {
+        let manager = RelayManager::open_in_memory().unwrap();
+
+        // Fresh database should have no checkpoint
+        let checkpoint = manager.get_last_archived_timestamp().unwrap();
+        assert_eq!(checkpoint, None);
+    }
+
+    #[test]
+    fn test_checkpoint_update_and_read() {
+        let manager = RelayManager::open_in_memory().unwrap();
+
+        // Update checkpoint
+        manager.update_last_archived_timestamp(1700000000).unwrap();
+
+        // Read it back
+        let checkpoint = manager.get_last_archived_timestamp().unwrap();
+        assert_eq!(checkpoint, Some(1700000000));
+
+        // Update to a higher value
+        manager.update_last_archived_timestamp(1700001000).unwrap();
+        let checkpoint = manager.get_last_archived_timestamp().unwrap();
+        assert_eq!(checkpoint, Some(1700001000));
+    }
+
+    #[test]
+    fn test_checkpoint_only_increases() {
+        let manager = RelayManager::open_in_memory().unwrap();
+
+        // Set initial checkpoint
+        manager.update_last_archived_timestamp(1700001000).unwrap();
+
+        // Try to update with a lower value - should be ignored (MAX semantics)
+        manager.update_last_archived_timestamp(1700000000).unwrap();
+
+        // Should still be the higher value
+        let checkpoint = manager.get_last_archived_timestamp().unwrap();
+        assert_eq!(checkpoint, Some(1700001000));
+    }
+
+    #[test]
+    fn test_get_checkpoints() {
+        let manager = RelayManager::open_in_memory().unwrap();
+
+        // Initially empty
+        let checkpoints = manager.get_checkpoints().unwrap();
+        assert!(checkpoints.is_empty());
+
+        // Add a checkpoint
+        manager.update_last_archived_timestamp(1700000000).unwrap();
+
+        // Should have one entry
+        let checkpoints = manager.get_checkpoints().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].0, "last_archived_timestamp");
+        assert_eq!(checkpoints[0].1, 1700000000);
     }
 }
 

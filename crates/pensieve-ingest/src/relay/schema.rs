@@ -6,7 +6,7 @@
 use rusqlite::{Connection, Result};
 
 /// Current schema version. Increment when making breaking changes.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Initialize the database schema.
 ///
@@ -113,6 +113,13 @@ fn create_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_relay_stats_hourly_time ON relay_stats_hourly(hour_start);
         CREATE INDEX IF NOT EXISTS idx_relay_stats_daily_time ON relay_stats_daily(day_start);
         CREATE INDEX IF NOT EXISTS idx_relay_scores_score ON relay_scores(score DESC);
+
+        -- Ingestion checkpoint for catch-up processing
+        CREATE TABLE IF NOT EXISTS ingestion_checkpoint (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )?;
 
@@ -122,14 +129,25 @@ fn create_tables(conn: &Connection) -> Result<()> {
 /// Run migrations from one version to another.
 fn migrate(conn: &Connection, from: i32, to: i32) -> Result<()> {
     for version in from..to {
-        // Add migration cases here as schema evolves
-        // match version {
-        //     1 => migrate_v1_to_v2(conn)?,
-        //     _ => {}
-        // }
-        let _ = version; // Suppress unused variable warning until migrations are added
+        if version == 1 {
+            migrate_v1_to_v2(conn)?;
+        }
     }
     set_schema_version(conn, to)?;
+    Ok(())
+}
+
+/// Migrate from v1 to v2: add ingestion_checkpoint table.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ingestion_checkpoint (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
     Ok(())
 }
 

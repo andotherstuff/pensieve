@@ -21,6 +21,8 @@ use super::{EventSource, SourceMetadata, SourceStats};
 use crate::pipeline::PackedEvent;
 use crate::relay::RelayManager;
 use crate::{Error, Result};
+
+use chrono::DateTime;
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,6 +55,15 @@ pub struct RelayConfig {
     /// How often to run the optimization loop (swap low/high-scoring relays).
     /// Set to Duration::ZERO to disable optimization.
     pub optimization_interval: Duration,
+
+    /// Optional timestamp to request events from (for catch-up after restart).
+    ///
+    /// When set, subscriptions will use a `since` filter to request events
+    /// with `created_at` >= this timestamp. This allows the ingester to
+    /// catch up on events missed during downtime.
+    ///
+    /// The dedupe index will handle any duplicates from the overlap window.
+    pub since_timestamp: Option<u64>,
 }
 
 impl Default for RelayConfig {
@@ -74,6 +85,7 @@ impl Default for RelayConfig {
             connection_timeout: Duration::from_secs(30),
             subscribe_all: true,
             optimization_interval: Duration::from_secs(300), // 5 minutes
+            since_timestamp: None,
         }
     }
 }
@@ -284,9 +296,23 @@ impl RelaySource {
             .store(connected_count, Ordering::Relaxed);
         tracing::info!("Connected to {} relays", connected_count);
 
-        // Subscribe to all events (empty filter = all events)
-        // We use an Arc so we can share the filter with the discovery process
-        let filter = Arc::new(Filter::new());
+        // Build subscription filter
+        // If since_timestamp is set, we're catching up from a previous run
+        let filter = if let Some(since_ts) = self.config.since_timestamp {
+            let since = Timestamp::from(since_ts);
+            let formatted = DateTime::from_timestamp(since_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "invalid".to_string());
+            tracing::info!(
+                "Catch-up mode: requesting events since {} ({})",
+                since_ts,
+                formatted
+            );
+            Arc::new(Filter::new().since(since))
+        } else {
+            tracing::info!("Live mode: subscribing to new events only (no catch-up)");
+            Arc::new(Filter::new())
+        };
 
         // Subscribe
         let output = client.subscribe((*filter).clone(), None).await?;
