@@ -139,9 +139,11 @@ struct Args {
     #[arg(long, default_value = "300")]
     score_interval_secs: u64,
 
-    /// Disable catch-up processing (ignore saved checkpoint, subscribe to live events only)
+    /// Enable catch-up processing (use saved checkpoint to request missed events).
+    /// WARNING: Most relays don't serve historical data efficiently, so this may
+    /// result in much lower throughput. Generally not recommended.
     #[arg(long)]
-    no_catchup: bool,
+    catchup: bool,
 
     /// Buffer time in seconds to subtract from checkpoint when catching up.
     /// This handles clock skew and relay propagation delay.
@@ -270,17 +272,32 @@ async fn main() -> Result<()> {
     }
 
     // Load checkpoint for catch-up processing
-    let since_timestamp = if args.no_catchup {
-        tracing::info!("Catch-up disabled via --no-catchup flag");
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let since_timestamp = if !args.catchup {
+        tracing::info!("Catch-up disabled (default) - subscribing to all events");
         None
     } else {
         match relay_manager.get_last_archived_timestamp() {
             Ok(Some(checkpoint)) => {
+                // Clamp checkpoint to current time (events can have future created_at due to clock skew)
+                let clamped = checkpoint.min(now_secs);
+                if clamped < checkpoint {
+                    tracing::warn!(
+                        "Checkpoint {} was in the future, clamped to current time {}",
+                        checkpoint,
+                        clamped
+                    );
+                }
+
                 // Apply buffer to handle clock skew and relay propagation delay
-                let buffered = checkpoint.saturating_sub(args.catchup_buffer_secs);
+                let buffered = clamped.saturating_sub(args.catchup_buffer_secs);
                 tracing::info!(
                     "Loaded checkpoint: {} (buffered to {} with {}s buffer)",
-                    checkpoint,
+                    clamped,
                     buffered,
                     args.catchup_buffer_secs
                 );
@@ -325,8 +342,8 @@ async fn main() -> Result<()> {
     tracing::info!(
         "  Catch-up: {}",
         match relay_config.since_timestamp {
-            Some(ts) => format!("enabled (since {})", ts),
-            None => "disabled (live only)".to_string(),
+            Some(ts) => format!("enabled (since {}) - WARNING: may reduce throughput", ts),
+            None => "disabled (default)".to_string(),
         }
     );
     tracing::info!(
@@ -537,8 +554,14 @@ async fn main() -> Result<()> {
 
                             // Track max created_at for checkpoint
                             // Use fetch_max to atomically update to the highest value
+                            // Clamp to current time to avoid saving future timestamps
                             let event_ts = event.created_at.as_secs();
-                            handler_max_created_at.fetch_max(event_ts, Ordering::Relaxed);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let clamped_ts = event_ts.min(now);
+                            handler_max_created_at.fetch_max(clamped_ts, Ordering::Relaxed);
                         }
                     }
                     Err(e) => {

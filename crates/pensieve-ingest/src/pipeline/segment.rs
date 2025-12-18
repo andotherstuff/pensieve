@@ -22,6 +22,7 @@
 //! 4. Start a new segment
 
 use crate::{Error, Result};
+
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
 use flate2::Compression;
@@ -30,6 +31,7 @@ use parking_lot::Mutex;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Configuration for the segment writer.
@@ -162,7 +164,8 @@ pub struct SegmentWriter {
     segment_number: AtomicU64,
     total_events: AtomicUsize,
     total_bytes: AtomicUsize,
-    total_compressed_bytes: AtomicUsize,
+    /// Wrapped in Arc for sharing with background compression threads.
+    total_compressed_bytes: Arc<AtomicUsize>,
     sealed_sender: Option<Sender<SealedSegment>>,
 }
 
@@ -196,7 +199,7 @@ impl SegmentWriter {
             segment_number: AtomicU64::new(next_segment),
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
-            total_compressed_bytes: AtomicUsize::new(0),
+            total_compressed_bytes: Arc::new(AtomicUsize::new(0)),
             sealed_sender,
         })
     }
@@ -320,7 +323,12 @@ impl SegmentWriter {
     /// Seal the current segment.
     ///
     /// This finalizes the current segment and prepares for a new one.
-    /// If compression is enabled, the segment is gzipped and renamed to `.notepack.gz`.
+    /// If compression is enabled, it's done in a background thread to avoid
+    /// blocking the async runtime.
+    ///
+    /// Returns the sealed segment info (event_ids are immediately available
+    /// for marking as archived). The ClickHouse notification is sent after
+    /// compression completes (from the background thread).
     pub fn seal(&self) -> Result<Option<SealedSegment>> {
         let mut current = self.current.lock();
 
@@ -342,28 +350,78 @@ impl SegmentWriter {
         drop(writer);
 
         let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
+        let sealed_at = Utc::now();
 
-        // Compress if enabled
-        let (final_path, compressed_size) = if self.config.compress {
+        // Build the sealed segment info (returned immediately)
+        // If compressing, the path/size will be updated in the background
+        let sealed = SealedSegment {
+            path: path.clone(),
+            segment_number,
+            event_count,
+            size_bytes,
+            compressed_size_bytes: size_bytes, // Will be updated if compressed
+            event_ids,
+            sealed_at,
+        };
+
+        if self.config.compress {
+            // Spawn background thread for compression to avoid blocking async runtime
             let gz_path = path.with_extension("notepack.gz");
-            let compressed_bytes = self.compress_file(&path, &gz_path)?;
+            let sender = self.sealed_sender.clone();
+            let total_compressed_bytes = self.total_compressed_bytes.clone();
+            let sealed_for_notify = sealed.clone();
 
-            // Remove the uncompressed file
-            if let Err(e) = fs::remove_file(&path) {
-                tracing::warn!("Failed to remove uncompressed segment: {}", e);
-            }
+            std::thread::spawn(move || {
+                match Self::compress_file_static(&path, &gz_path) {
+                    Ok(compressed_bytes) => {
+                        // Remove the uncompressed file
+                        if let Err(e) = fs::remove_file(&path) {
+                            tracing::warn!("Failed to remove uncompressed segment: {}", e);
+                        }
 
-            tracing::info!(
-                "Sealed segment {}: {} events, {} bytes -> {} bytes ({:.1}%) at {}",
-                segment_number,
-                event_count,
-                size_bytes,
-                compressed_bytes,
-                (compressed_bytes as f64 / size_bytes as f64) * 100.0,
-                gz_path.display()
-            );
+                        tracing::info!(
+                            "Sealed segment {}: {} events, {} bytes -> {} bytes ({:.1}%) at {}",
+                            segment_number,
+                            event_count,
+                            size_bytes,
+                            compressed_bytes,
+                            (compressed_bytes as f64 / size_bytes as f64) * 100.0,
+                            gz_path.display()
+                        );
 
-            (gz_path, compressed_bytes)
+                        // Track compressed bytes
+                        total_compressed_bytes.fetch_add(compressed_bytes, Ordering::Relaxed);
+
+                        // Notify ClickHouse indexer with correct compressed path
+                        if let Some(sender) = sender {
+                            let compressed_sealed = SealedSegment {
+                                path: gz_path,
+                                compressed_size_bytes: compressed_bytes,
+                                ..sealed_for_notify
+                            };
+                            if let Err(e) = sender.send(compressed_sealed) {
+                                tracing::warn!(
+                                    "Failed to send sealed segment notification: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to compress segment {}: {}", segment_number, e);
+                        // Still notify indexer with uncompressed segment on error
+                        total_compressed_bytes.fetch_add(size_bytes, Ordering::Relaxed);
+                        if let Some(sender) = sender {
+                            if let Err(e) = sender.send(sealed_for_notify) {
+                                tracing::warn!(
+                                    "Failed to send sealed segment notification: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            });
         } else {
             tracing::info!(
                 "Sealed segment {}: {} events, {} bytes at {}",
@@ -372,35 +430,24 @@ impl SegmentWriter {
                 size_bytes,
                 path.display()
             );
-            (path, size_bytes)
-        };
 
-        // Track compressed bytes
-        self.total_compressed_bytes
-            .fetch_add(compressed_size, Ordering::Relaxed);
+            // Track bytes (no compression)
+            self.total_compressed_bytes
+                .fetch_add(size_bytes, Ordering::Relaxed);
 
-        let sealed = SealedSegment {
-            path: final_path,
-            segment_number,
-            event_count,
-            size_bytes,
-            compressed_size_bytes: compressed_size,
-            event_ids,
-            sealed_at: Utc::now(),
-        };
-
-        // Notify the indexer (if channel is configured)
-        if let Some(sender) = &self.sealed_sender
-            && let Err(e) = sender.send(sealed.clone())
-        {
-            tracing::warn!("Failed to send sealed segment notification: {}", e);
+            // Notify the indexer immediately (no compression to wait for)
+            if let Some(sender) = &self.sealed_sender
+                && let Err(e) = sender.send(sealed.clone())
+            {
+                tracing::warn!("Failed to send sealed segment notification: {}", e);
+            }
         }
 
         Ok(Some(sealed))
     }
 
-    /// Compress a file with gzip, returning the compressed size.
-    fn compress_file(&self, src: &PathBuf, dst: &PathBuf) -> Result<usize> {
+    /// Static version of compress_file for use in background threads.
+    fn compress_file_static(src: &PathBuf, dst: &PathBuf) -> Result<usize> {
         let input = File::open(src)?;
         let mut reader = BufReader::new(input);
 
@@ -564,13 +611,26 @@ mod tests {
         writer.write(test_event(1)).unwrap();
         writer.seal().unwrap();
 
-        // Check compressed file exists (9-digit format)
+        // Compression happens in a background thread, wait for it
         let segment_path = tmp.path().join("segment-000000000.notepack.gz");
-        assert!(segment_path.exists());
-
-        // Uncompressed should not exist
         let uncompressed_path = tmp.path().join("segment-000000000.notepack");
-        assert!(!uncompressed_path.exists());
+
+        // Wait up to 5 seconds for compression to complete
+        for _ in 0..50 {
+            if segment_path.exists() && !uncompressed_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Check compressed file exists (9-digit format)
+        assert!(segment_path.exists(), "Compressed file should exist");
+
+        // Uncompressed should not exist (deleted after compression)
+        assert!(
+            !uncompressed_path.exists(),
+            "Uncompressed file should be deleted"
+        );
     }
 
     #[test]
