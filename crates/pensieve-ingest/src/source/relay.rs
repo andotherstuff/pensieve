@@ -357,7 +357,9 @@ impl RelaySource {
             };
 
             match notification {
-                RelayPoolNotification::Event { relay_url, event, .. } => {
+                RelayPoolNotification::Event {
+                    relay_url, event, ..
+                } => {
                     self.stats.total_events.fetch_add(1, Ordering::Relaxed);
                     self.stats.valid_events.fetch_add(1, Ordering::Relaxed);
                     event_count += 1;
@@ -558,7 +560,8 @@ impl RelaySource {
         for url in &suggestions.exploration_relays {
             tracing::info!("Exploring untested relay: {}", url);
             counter!("relay_exploration_attempts_total").increment(1);
-            self.try_connect_relay(client, filter, url, "exploration").await;
+            self.try_connect_relay(client, filter, url, "exploration")
+                .await;
         }
 
         // Log aggregate stats
@@ -599,8 +602,9 @@ impl RelaySource {
 
                     // Subscribe the new relay
                     if let Ok(relay_url) = RelayUrl::parse(url)
-                        && let Err(e) =
-                            client.subscribe_to(vec![relay_url], (**filter).clone(), None).await
+                        && let Err(e) = client
+                            .subscribe_to(vec![relay_url], (**filter).clone(), None)
+                            .await
                     {
                         tracing::warn!("Failed to subscribe new relay {}: {}", url, e);
                     }
@@ -670,8 +674,8 @@ impl RelaySource {
 
                         // Register with relay manager if available
                         if let Some(ref manager) = self.relay_manager
-                            && let Err(e) =
-                                manager.register_relay(&url_str, crate::relay::RelayTier::Discovered)
+                            && let Err(e) = manager
+                                .register_relay(&url_str, crate::relay::RelayTier::Discovered)
                         {
                             tracing::debug!(
                                 "Failed to register discovered relay {}: {}",

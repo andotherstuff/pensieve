@@ -206,10 +206,10 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let relay_manager = Arc::new(
-        RelayManager::open(relay_manager_config)
-            .with_context(|| format!("Failed to open relay manager at {:?}", args.relay_db_path))?,
-    );
+    let relay_manager =
+        Arc::new(RelayManager::open(relay_manager_config).with_context(|| {
+            format!("Failed to open relay manager at {:?}", args.relay_db_path)
+        })?);
 
     // Load seed relays (tier=seed, protected from eviction)
     // Priority: CLI args > seed file > hardcoded defaults
@@ -304,11 +304,16 @@ async fn main() -> Result<()> {
                 Some(buffered)
             }
             Ok(None) => {
-                tracing::info!("No checkpoint found - fresh start, subscribing to live events only");
+                tracing::info!(
+                    "No checkpoint found - fresh start, subscribing to live events only"
+                );
                 None
             }
             Err(e) => {
-                tracing::warn!("Failed to load checkpoint: {} - starting without catch-up", e);
+                tracing::warn!(
+                    "Failed to load checkpoint: {} - starting without catch-up",
+                    e
+                );
                 None
             }
         }
@@ -346,10 +351,7 @@ async fn main() -> Result<()> {
             None => "disabled (default)".to_string(),
         }
     );
-    tracing::info!(
-        "  Checkpoint interval: {}s",
-        args.checkpoint_interval_secs
-    );
+    tracing::info!("  Checkpoint interval: {}s", args.checkpoint_interval_secs);
 
     // Create relay source with manager for quality tracking and optimization
     // The RelaySource now handles:

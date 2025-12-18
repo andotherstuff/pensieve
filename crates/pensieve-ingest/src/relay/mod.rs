@@ -50,4 +50,3 @@ mod scoring;
 pub use manager::{AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig};
 pub use schema::{RelayStatus, RelayTier};
 pub use scoring::{RelayScore, RelayStatsForScoring};
-

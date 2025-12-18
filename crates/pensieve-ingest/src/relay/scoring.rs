@@ -35,7 +35,6 @@ pub struct RelayStatsForScoring {
     pub tier: RelayTier,
 }
 
-
 /// Computed score result.
 #[derive(Debug, Clone)]
 pub struct RelayScore {
@@ -152,7 +151,7 @@ mod tests {
     fn test_compute_score_seed_floor() {
         let stats = RelayStatsForScoring {
             novel_rate_7d: 0.0, // No events
-            uptime_7d: 0.0,    // Never connected
+            uptime_7d: 0.0,     // Never connected
             tier: RelayTier::Seed,
             ..Default::default()
         };
@@ -186,4 +185,3 @@ mod tests {
         assert!((compute_median(&mut [5.0]) - 5.0).abs() < 0.001);
     }
 }
-

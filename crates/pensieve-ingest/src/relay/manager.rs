@@ -47,8 +47,8 @@ impl Default for RelayManagerConfig {
             optimization_interval_secs: 300, // 5 minutes
             max_swap_percent: 0.05,          // 5%
             block_after_failures: 10,
-            exploration_slots: 3,             // Try 3 new relays per cycle
-            exploration_min_age_secs: 86400,  // 24 hours
+            exploration_slots: 3,            // Try 3 new relays per cycle
+            exploration_min_age_secs: 86400, // 24 hours
         }
     }
 }
@@ -163,8 +163,12 @@ impl RelayManager {
     /// Expected format: JSON object with `functioning_relays` array of URL strings.
     /// This is the format produced by relay discovery tools.
     pub fn import_from_json(&self, path: &Path) -> Result<usize> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to read JSON file: {}", e))))?;
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "Failed to read JSON file: {}",
+                e
+            )))
+        })?;
 
         // Parse as a generic JSON value first
         let json: serde_json::Value = serde_json::from_str(&contents)
@@ -174,7 +178,9 @@ impl RelayManager {
         let relays = json
             .get("functioning_relays")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Serialization("JSON missing 'functioning_relays' array".to_string()))?;
+            .ok_or_else(|| {
+                Error::Serialization("JSON missing 'functioning_relays' array".to_string())
+            })?;
 
         let mut count = 0;
         for relay in relays {
@@ -207,8 +213,12 @@ impl RelayManager {
     /// Returns a Vec of relay URLs suitable for use as seed relays.
     /// This is a static method that doesn't require a RelayManager instance.
     pub fn load_relays_from_json(path: &Path) -> Result<Vec<String>> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("Failed to read JSON file: {}", e))))?;
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "Failed to read JSON file: {}",
+                e
+            )))
+        })?;
 
         let json: serde_json::Value = serde_json::from_str(&contents)
             .map_err(|e| Error::Serialization(format!("Failed to parse JSON: {}", e)))?;
@@ -216,7 +226,9 @@ impl RelayManager {
         let relays = json
             .get("functioning_relays")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Serialization("JSON missing 'functioning_relays' array".to_string()))?;
+            .ok_or_else(|| {
+                Error::Serialization("JSON missing 'functioning_relays' array".to_string())
+            })?;
 
         let mut urls = Vec::new();
         for relay in relays {
@@ -273,7 +285,11 @@ impl RelayManager {
         drop(accumulators);
 
         if let Err(e) = self.update_connection_status(relay_url, success) {
-            tracing::warn!("Failed to update connection status for {}: {}", relay_url, e);
+            tracing::warn!(
+                "Failed to update connection status for {}: {}",
+                relay_url,
+                e
+            );
         }
     }
 
@@ -643,7 +659,9 @@ impl RelayManager {
                  LIMIT 100",
             )
             .map_err(|e| Error::Database(e.to_string()))?
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
             .map_err(|e| Error::Database(e.to_string()))?
             .filter_map(|r| r.ok())
             .filter(|(url, _)| !connected_set.contains(url.as_str()))
@@ -659,7 +677,10 @@ impl RelayManager {
 
         // Compare lowest connected vs highest unconnected
         let threshold = 0.1; // Minimum score improvement to swap
-        for i in 0..max_swaps.min(connected_scores.len()).min(unconnected_scores.len()) {
+        for i in 0..max_swaps
+            .min(connected_scores.len())
+            .min(unconnected_scores.len())
+        {
             let (connected_url, connected_score) = &connected_scores[i];
             let (unconnected_url, unconnected_score) = &unconnected_scores[i];
 
@@ -957,10 +978,7 @@ mod tests {
 
         let manager = RelayManager::open_in_memory().unwrap();
         // Override config for test
-        let manager = RelayManager {
-            config,
-            ..manager
-        };
+        let manager = RelayManager { config, ..manager };
 
         manager
             .register_relay("wss://bad.relay.com", RelayTier::Discovered)
@@ -1050,4 +1068,3 @@ mod tests {
         assert_eq!(checkpoints[0].1, 1700000000);
     }
 }
-

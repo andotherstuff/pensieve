@@ -259,7 +259,10 @@ mod tests {
     #[test]
     fn test_relay_tier_roundtrip() {
         use std::str::FromStr;
-        assert_eq!(RelayTier::from_str(RelayTier::Seed.as_str()), Ok(RelayTier::Seed));
+        assert_eq!(
+            RelayTier::from_str(RelayTier::Seed.as_str()),
+            Ok(RelayTier::Seed)
+        );
         assert_eq!(
             RelayTier::from_str(RelayTier::Discovered.as_str()),
             Ok(RelayTier::Discovered)
@@ -280,4 +283,3 @@ mod tests {
         }
     }
 }
-

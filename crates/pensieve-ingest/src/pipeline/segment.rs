@@ -128,8 +128,7 @@ pub fn pack_nostr_event(event: &nostr_sdk::Event) -> crate::Result<PackedEvent> 
         sig: sig_hex,
     };
 
-    pack_note_into(&note, &mut buf)
-        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+    pack_note_into(&note, &mut buf).map_err(|e| crate::Error::Serialization(e.to_string()))?;
 
     Ok(PackedEvent {
         event_id: *event.id.as_bytes(),
@@ -400,10 +399,7 @@ impl SegmentWriter {
                                 ..sealed_for_notify
                             };
                             if let Err(e) = sender.send(compressed_sealed) {
-                                tracing::warn!(
-                                    "Failed to send sealed segment notification: {}",
-                                    e
-                                );
+                                tracing::warn!("Failed to send sealed segment notification: {}", e);
                             }
                         }
                     }
@@ -411,13 +407,10 @@ impl SegmentWriter {
                         tracing::error!("Failed to compress segment {}: {}", segment_number, e);
                         // Still notify indexer with uncompressed segment on error
                         total_compressed_bytes.fetch_add(size_bytes, Ordering::Relaxed);
-                        if let Some(sender) = sender {
-                            if let Err(e) = sender.send(sealed_for_notify) {
-                                tracing::warn!(
-                                    "Failed to send sealed segment notification: {}",
-                                    e
-                                );
-                            }
+                        if let Some(sender) = sender
+                            && let Err(e) = sender.send(sealed_for_notify)
+                        {
+                            tracing::warn!("Failed to send sealed segment notification: {}", e);
                         }
                     }
                 }
