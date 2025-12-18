@@ -11,7 +11,7 @@
 //! - Bloom filters for fast "not seen" lookups
 //! - Rebuildable from the archive if lost/corrupted
 
-use crate::error::Result;
+use crate::Result;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
 use std::path::Path;
 use std::sync::Arc;

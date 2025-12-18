@@ -1,4 +1,4 @@
-//! Backfill adapter for JSONL Nostr event files.
+//! Backfill command for JSONL Nostr event files.
 //!
 //! This tool reads JSONL files where each line is a JSON Nostr event,
 //! validates each event's ID and signature, deduplicates, and writes
@@ -27,22 +27,16 @@
 //! backfill-jsonl -i ./data/ -o ./segments/ --metrics-port 9091
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use metrics::{counter, gauge};
-use notepack::{pack_note_into, NoteBuf};
-use pensieve_core::{
-    metrics::{init_metrics, start_metrics_server},
-    pack_event_binary_into, validate_event,
-};
+use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    clickhouse::{ClickHouseConfig, ClickHouseIndexer},
-    dedupe::DedupeIndex,
-    segment::{PackedEvent, SealedSegment, SegmentConfig, SegmentWriter},
+    source::{EventSource, JsonlConfig, JsonlSource},
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, SealedSegment, SegmentConfig, SegmentWriter,
 };
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -106,14 +100,10 @@ struct Args {
 #[derive(Default)]
 struct Stats {
     files_processed: usize,
-    total_lines: usize,
     total_events: usize,
     valid_events: usize,
     invalid_events: usize,
     duplicate_events: usize,
-    json_errors: usize,
-    validation_errors: usize,
-    notepack_errors: usize,
     segments_sealed: usize,
     total_json_bytes: usize,
     total_notepack_bytes: usize,
@@ -164,16 +154,10 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
     }
     println!();
     println!("Files processed:   {:>12}", stats.files_processed);
-    println!("Total lines:       {:>12}", stats.total_lines);
     println!("Total events:      {:>12}", stats.total_events);
     println!("Valid events:      {:>12}", stats.valid_events);
     println!("Duplicate events:  {:>12}", stats.duplicate_events);
     println!("Invalid events:    {:>12}", stats.invalid_events);
-    if stats.invalid_events > 0 {
-        println!("  - JSON errors:     {:>10}", stats.json_errors);
-        println!("  - Validation:      {:>10}", stats.validation_errors);
-        println!("  - Notepack:        {:>10}", stats.notepack_errors);
-    }
     println!();
     println!("Segments sealed:   {:>12}", stats.segments_sealed);
     println!();
@@ -235,37 +219,57 @@ fn process(args: &Args) -> Result<Stats> {
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle) = init_pipeline(args)?;
 
-    // Collect input files
-    let files = collect_files(&args.input, args.limit)?;
-    info!("Found {} JSONL files to process", files.len());
+    // Create JSONL source
+    let source_config = JsonlConfig {
+        input: args.input.clone(),
+        skip_validation: args.skip_validation,
+        continue_on_error: args.continue_on_error,
+        limit: args.limit,
+        progress_interval: args.progress_interval,
+    };
+    let mut source = JsonlSource::new(source_config);
 
-    for (file_idx, file_path) in files.iter().enumerate() {
-        info!(
-            "[{}/{}] Processing: {}",
-            file_idx + 1,
-            files.len(),
-            file_path.display()
-        );
+    // Track duplicates in handler (source can't see them)
+    let duplicate_count = Arc::new(AtomicUsize::new(0));
+    let duplicate_count_ref = duplicate_count.clone();
 
-        let file_size = fs::metadata(file_path)?.len() as usize;
-        stats.total_json_bytes += file_size;
-
-        match process_file(file_path, &segment_writer, dedupe.as_ref(), args, &mut stats) {
-            Ok(()) => {
-                stats.files_processed += 1;
-                // Update metrics after each file
-                record_metrics(&stats, process_start.elapsed().as_secs_f64());
+    // Create handler closure
+    let segment_writer_ref = segment_writer.clone();
+    let dedupe_ref = dedupe.clone();
+    let handler =
+        move |packed_event: pensieve_ingest::PackedEvent| -> pensieve_ingest::Result<bool> {
+            // Dedupe check
+            if let Some(ref dedupe) = dedupe_ref
+                && !dedupe.check_and_mark_pending(&packed_event.event_id)?
+            {
+                duplicate_count_ref.fetch_add(1, Ordering::Relaxed);
+                return Ok(true); // Duplicate, continue
             }
-            Err(e) => {
-                warn!("Error processing {}: {}", file_path.display(), e);
-                if !args.continue_on_error {
-                    return Err(e);
-                }
-            }
-        }
+
+            // Write to segment
+            segment_writer_ref.write(packed_event)?;
+            Ok(true) // Continue
+        };
+
+    // Run the source
+    let source_stats = source.process(handler)?;
+
+    // Update stats from source
+    stats.total_events = source_stats.total_events;
+    stats.invalid_events = source_stats.invalid_events;
+    stats.duplicate_events = duplicate_count.load(Ordering::Relaxed);
+    // valid_events = events that passed validation AND were not duplicates
+    stats.valid_events = source_stats
+        .valid_events
+        .saturating_sub(stats.duplicate_events);
+    if let Some(files) = source_stats.source_metadata.files_processed {
+        stats.files_processed = files;
+    }
+    if let Some(bytes) = source_stats.source_metadata.bytes_read {
+        stats.total_json_bytes = bytes;
     }
 
-    // Seal any remaining segment
+    // Finalize pipeline
     finalize_pipeline(&segment_writer, dedupe.as_ref(), &mut stats)?;
 
     // Final metrics update
@@ -282,40 +286,6 @@ fn process(args: &Args) -> Result<Stats> {
     }
 
     Ok(stats)
-}
-
-fn collect_files(input: &PathBuf, limit: Option<usize>) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-
-    if input.is_file() {
-        files.push(input.clone());
-    } else if input.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(input)
-            .with_context(|| format!("Failed to read directory: {}", input.display()))?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let path = e.path();
-                path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext == "jsonl" || ext == "json" || ext == "ndjson")
-            })
-            .map(|e| e.path())
-            .collect();
-
-        // Sort for deterministic processing order
-        entries.sort();
-        files = entries;
-    } else {
-        bail!("Input path does not exist: {}", input.display());
-    }
-
-    // Apply limit if specified
-    if let Some(limit) = limit {
-        files.truncate(limit);
-    }
-
-    Ok(files)
 }
 
 // ============================================================================
@@ -405,141 +375,6 @@ fn finalize_pipeline(
     Ok(())
 }
 
-fn process_file(
-    file_path: &PathBuf,
-    segment_writer: &Arc<SegmentWriter>,
-    dedupe: Option<&Arc<DedupeIndex>>,
-    args: &Args,
-    stats: &mut Stats,
-) -> Result<()> {
-    let file = File::open(file_path)
-        .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-    let reader = BufReader::new(file);
-
-    // Reusable buffer for notepack encoding
-    let mut pack_buf: Vec<u8> = Vec::with_capacity(4096);
-
-    for (line_num, line_result) in reader.lines().enumerate() {
-        stats.total_lines += 1;
-
-        let line = match line_result {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("Line {}: I/O error: {}", line_num + 1, e);
-                stats.invalid_events += 1;
-                stats.json_errors += 1;
-                if args.continue_on_error {
-                    continue;
-                } else {
-                    bail!("I/O error at line {}: {}", line_num + 1, e);
-                }
-            }
-        };
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        stats.total_events += 1;
-        pack_buf.clear();
-
-        // Parse and validate
-        let event_id = if args.skip_validation {
-            match serde_json::from_str::<NoteBuf>(&line) {
-                Ok(note) => {
-                    match pack_note_into(&note, &mut pack_buf) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("Line {}: Notepack encoding error: {}", line_num + 1, e);
-                            stats.invalid_events += 1;
-                            stats.notepack_errors += 1;
-                            if args.continue_on_error {
-                                continue;
-                            } else {
-                                bail!("Notepack encoding error at line {}: {}", line_num + 1, e);
-                            }
-                        }
-                    }
-                    // Parse event ID from the note
-                    hex_to_bytes32(&note.id)?
-                }
-                Err(e) => {
-                    warn!("Line {}: JSON parse error: {}", line_num + 1, e);
-                    stats.invalid_events += 1;
-                    stats.json_errors += 1;
-                    if args.continue_on_error {
-                        continue;
-                    } else {
-                        bail!("JSON parse error at line {}: {}", line_num + 1, e);
-                    }
-                }
-            }
-        } else {
-            match validate_event(&line) {
-                Ok(event) => {
-                    let id_bytes: [u8; 32] = *event.id.as_bytes();
-                    pack_event_binary_into(&event, &mut pack_buf);
-                    id_bytes
-                }
-                Err(e) => {
-                    warn!("Line {}: Validation error: {}", line_num + 1, e);
-                    stats.invalid_events += 1;
-                    stats.validation_errors += 1;
-                    if args.continue_on_error {
-                        continue;
-                    } else {
-                        bail!("Validation error at line {}: {}", line_num + 1, e);
-                    }
-                }
-            }
-        };
-
-        // Dedupe check
-        if let Some(dedupe) = dedupe
-            && !dedupe.check_and_mark_pending(&event_id)?
-        {
-            stats.duplicate_events += 1;
-            continue;
-        }
-
-        // Write to segment
-        let packed_event = PackedEvent {
-            event_id,
-            data: pack_buf.clone(),
-        };
-
-        if segment_writer.write(packed_event)? {
-            stats.segments_sealed += 1;
-        }
-
-        stats.valid_events += 1;
-
-        // Progress reporting
-        if stats.total_events.is_multiple_of(args.progress_interval) {
-            info!(
-                "Progress: {} events, {} valid, {} duplicates, {} invalid, {} segments",
-                stats.total_events,
-                stats.valid_events,
-                stats.duplicate_events,
-                stats.invalid_events,
-                stats.segments_sealed
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn hex_to_bytes32(hex: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex).context("Invalid hex string")?;
-    if bytes.len() != 32 {
-        bail!("Expected 32 bytes, got {}", bytes.len());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
-}
-
 // ============================================================================
 // Metrics
 // ============================================================================
@@ -555,8 +390,7 @@ fn record_metrics(stats: &Stats, elapsed_secs: f64) {
     counter!("backfill_segments_sealed_total").absolute(stats.segments_sealed as u64);
 
     // Bytes by type
-    counter!("backfill_bytes_total", "type" => "json_raw")
-        .absolute(stats.total_json_bytes as u64);
+    counter!("backfill_bytes_total", "type" => "json_raw").absolute(stats.total_json_bytes as u64);
     counter!("backfill_bytes_total", "type" => "notepack_raw")
         .absolute(stats.total_notepack_bytes as u64);
     counter!("backfill_bytes_total", "type" => "notepack_compressed")
@@ -572,208 +406,16 @@ fn record_metrics(stats: &Stats, elapsed_secs: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    // =========================================================================
-    // hex_to_bytes32 tests
-    // =========================================================================
-
-    #[test]
-    fn test_hex_to_bytes32_valid() {
-        let hex = "0000000000000000000000000000000000000000000000000000000000000001";
-        let result = hex_to_bytes32(hex).unwrap();
-        assert_eq!(result[31], 1);
-        assert_eq!(result[0], 0);
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_all_zeros() {
-        let hex = "0000000000000000000000000000000000000000000000000000000000000000";
-        let result = hex_to_bytes32(hex).unwrap();
-        assert!(result.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_all_ff() {
-        let hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        let result = hex_to_bytes32(hex).unwrap();
-        assert!(result.iter().all(|&b| b == 0xff));
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_too_short() {
-        let hex = "0001020304";
-        let result = hex_to_bytes32(hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_too_long() {
-        let hex = "00000000000000000000000000000000000000000000000000000000000000000000";
-        let result = hex_to_bytes32(hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_invalid_chars() {
-        let hex = "000000000000000000000000000000000000000000000000000000000000gggg";
-        let result = hex_to_bytes32(hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_hex_to_bytes32_empty() {
-        let result = hex_to_bytes32("");
-        assert!(result.is_err());
-    }
-
-    // =========================================================================
-    // collect_files tests
-    // =========================================================================
-
-    #[test]
-    fn test_collect_files_single_file() {
-        let tmp = TempDir::new().unwrap();
-        let file_path = tmp.path().join("test.jsonl");
-        File::create(&file_path).unwrap();
-
-        let files = collect_files(&file_path, None).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0], file_path);
-    }
-
-    #[test]
-    fn test_collect_files_directory() {
-        let tmp = TempDir::new().unwrap();
-        File::create(tmp.path().join("a.jsonl")).unwrap();
-        File::create(tmp.path().join("b.jsonl")).unwrap();
-        File::create(tmp.path().join("c.json")).unwrap();
-        File::create(tmp.path().join("d.ndjson")).unwrap();
-        File::create(tmp.path().join("e.txt")).unwrap(); // Should be ignored
-
-        let files = collect_files(&tmp.path().to_path_buf(), None).unwrap();
-        assert_eq!(files.len(), 4);
-    }
-
-    #[test]
-    fn test_collect_files_sorted_order() {
-        let tmp = TempDir::new().unwrap();
-        File::create(tmp.path().join("z.jsonl")).unwrap();
-        File::create(tmp.path().join("a.jsonl")).unwrap();
-        File::create(tmp.path().join("m.jsonl")).unwrap();
-
-        let files = collect_files(&tmp.path().to_path_buf(), None).unwrap();
-        assert_eq!(files.len(), 3);
-        assert!(files[0].file_name().unwrap() == "a.jsonl");
-        assert!(files[1].file_name().unwrap() == "m.jsonl");
-        assert!(files[2].file_name().unwrap() == "z.jsonl");
-    }
-
-    #[test]
-    fn test_collect_files_with_limit() {
-        let tmp = TempDir::new().unwrap();
-        for i in 0..10 {
-            File::create(tmp.path().join(format!("{:02}.jsonl", i))).unwrap();
-        }
-
-        let files = collect_files(&tmp.path().to_path_buf(), Some(3)).unwrap();
-        assert_eq!(files.len(), 3);
-    }
-
-    #[test]
-    fn test_collect_files_empty_directory() {
-        let tmp = TempDir::new().unwrap();
-        let files = collect_files(&tmp.path().to_path_buf(), None).unwrap();
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_files_nonexistent_path() {
-        let result = collect_files(&PathBuf::from("/nonexistent/path"), None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_collect_files_ignores_subdirectories() {
-        let tmp = TempDir::new().unwrap();
-        File::create(tmp.path().join("test.jsonl")).unwrap();
-        fs::create_dir(tmp.path().join("subdir")).unwrap();
-        File::create(tmp.path().join("subdir/nested.jsonl")).unwrap();
-
-        let files = collect_files(&tmp.path().to_path_buf(), None).unwrap();
-        // Should only find the top-level file
-        assert_eq!(files.len(), 1);
-    }
-
-    // =========================================================================
-    // Stats tests
-    // =========================================================================
 
     #[test]
     fn test_stats_default() {
         let stats = Stats::default();
         assert_eq!(stats.files_processed, 0);
-        assert_eq!(stats.total_lines, 0);
         assert_eq!(stats.total_events, 0);
         assert_eq!(stats.valid_events, 0);
         assert_eq!(stats.invalid_events, 0);
         assert_eq!(stats.duplicate_events, 0);
     }
-
-    #[test]
-    fn test_stats_mutation() {
-        let stats = Stats {
-            total_events: 100,
-            valid_events: 80,
-            duplicate_events: 15,
-            invalid_events: 5,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            stats.valid_events + stats.duplicate_events + stats.invalid_events,
-            100
-        );
-    }
-
-    #[test]
-    fn test_collect_files_extensions() {
-        let tmp = TempDir::new().unwrap();
-
-        // Create files with various extensions
-        File::create(tmp.path().join("a.jsonl")).unwrap();
-        File::create(tmp.path().join("b.json")).unwrap();
-        File::create(tmp.path().join("c.ndjson")).unwrap();
-        File::create(tmp.path().join("d.csv")).unwrap();
-        File::create(tmp.path().join("e.txt")).unwrap();
-        File::create(tmp.path().join("f.jsonl.bak")).unwrap();
-
-        let files = collect_files(&tmp.path().to_path_buf(), None).unwrap();
-
-        // Should only match .jsonl, .json, .ndjson
-        assert_eq!(files.len(), 3);
-
-        let names: Vec<_> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect();
-        assert!(names.contains(&"a.jsonl"));
-        assert!(names.contains(&"b.json"));
-        assert!(names.contains(&"c.ndjson"));
-    }
-
-    #[test]
-    fn test_collect_files_limit_zero() {
-        let tmp = TempDir::new().unwrap();
-        File::create(tmp.path().join("test.jsonl")).unwrap();
-
-        let files = collect_files(&tmp.path().to_path_buf(), Some(0)).unwrap();
-        assert!(files.is_empty());
-    }
-
-    // =========================================================================
-    // print_summary tests (smoke test - just ensure it doesn't panic)
-    // =========================================================================
 
     #[test]
     fn test_print_summary_does_not_panic() {
@@ -794,14 +436,10 @@ mod tests {
 
         let stats = Stats {
             files_processed: 10,
-            total_lines: 1000,
             total_events: 900,
             valid_events: 800,
             invalid_events: 50,
             duplicate_events: 50,
-            json_errors: 20,
-            validation_errors: 25,
-            notepack_errors: 5,
             segments_sealed: 3,
             total_json_bytes: 1_000_000,
             total_notepack_bytes: 500_000,

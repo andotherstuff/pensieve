@@ -43,9 +43,8 @@ use pensieve_core::{
     pack_event_binary_into, validate_proto_event,
 };
 use pensieve_ingest::{
-    clickhouse::{ClickHouseConfig, ClickHouseIndexer},
-    dedupe::DedupeIndex,
-    segment::{PackedEvent, SealedSegment, SegmentConfig, SegmentWriter},
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, SealedSegment, SegmentConfig,
+    SegmentWriter,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

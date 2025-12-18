@@ -16,8 +16,8 @@
 //! "segment N fully processed". On restart, we query ClickHouse to reconcile
 //! any partially-indexed segment.
 
-use crate::error::{Error, Result};
-use crate::segment::SealedSegment;
+use super::segment::SealedSegment;
+use crate::{Error, Result};
 use clickhouse::{Client, Row};
 use crossbeam_channel::Receiver;
 use flate2::read::GzDecoder;

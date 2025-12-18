@@ -20,6 +20,10 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Nostr SDK error.
+    #[error("Nostr SDK error: {0}")]
+    NostrSdk(#[from] nostr_sdk::client::Error),
+
     /// Serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -39,5 +43,25 @@ pub enum Error {
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// JSON parsing error.
+    #[error("JSON error: {0}")]
+    Json(String),
+
+    /// Event validation error.
+    #[error("Validation error: {0}")]
+    Validation(String),
+
+    /// Notepack encoding error.
+    #[error("Notepack error: {0}")]
+    Notepack(String),
+
+    /// Protobuf decoding error.
+    #[error("Protobuf error: {0}")]
+    Protobuf(String),
+
+    /// Hex decoding error.
+    #[error("Hex decoding error: {0}")]
+    Hex(String),
 }
 

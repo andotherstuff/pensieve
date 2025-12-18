@@ -43,6 +43,9 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 apt update
 apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
+# Build tools (for compiling Rust)
+apt install -y build-essential pkg-config libssl-dev libclang-dev protobuf-compiler
+
 # Other tools
 apt install -y rclone htop iotop tmux git
 ```

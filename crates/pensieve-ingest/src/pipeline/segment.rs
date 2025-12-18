@@ -21,7 +21,7 @@
 //! 3. Notify ClickHouse indexer via callback
 //! 4. Start a new segment
 
-use crate::error::{Error, Result};
+use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
 use flate2::write::GzEncoder;

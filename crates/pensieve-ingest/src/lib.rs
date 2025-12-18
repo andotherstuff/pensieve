@@ -1,29 +1,54 @@
 //! Pensieve ingestion pipeline components.
 //!
-//! This crate provides the core pipeline for ingesting Nostr events:
+//! This crate provides the core pipeline for ingesting Nostr events from
+//! various sources into the Pensieve archive.
 //!
-//! - [`dedupe::DedupeIndex`] - RocksDB-backed deduplication index
-//! - [`segment::SegmentWriter`] - Writes events to notepack segments
-//! - [`clickhouse::ClickHouseIndexer`] - Indexes events into ClickHouse
+//! # Modules
+//!
+//! - [`pipeline`] - Core pipeline components (dedupe, segment writer, ClickHouse indexer)
+//! - [`source`] - Event source adapters (JSONL, Protobuf, live relays)
 //!
 //! # Architecture
 //!
 //! ```text
-//! [Source Adapters] → [DedupeIndex] → [SegmentWriter] → [ClickHouseIndexer]
-//!                          ↓                ↓
-//!                      RocksDB           S3 Upload
+//! ┌─────────────────┐
+//! │  Event Sources  │  (JSONL files, Protobuf archives, live relays)
+//! └────────┬────────┘
+//!          │
+//!          ▼
+//! ┌─────────────────┐
+//! │   DedupeIndex   │  RocksDB - tracks seen event IDs
+//! └────────┬────────┘
+//!          │
+//!          ▼
+//! ┌─────────────────┐
+//! │  SegmentWriter  │  Writes notepack segments, seals on size threshold
+//! └────────┬────────┘
+//!          │
+//!          ▼
+//! ┌─────────────────┐
+//! │ClickHouseIndexer│  Derived index for analytics queries
+//! └─────────────────┘
 //! ```
 //!
 //! The pipeline is archive-first: the notepack archive is the source of truth,
 //! and ClickHouse is a derived index.
 
-pub mod clickhouse;
-pub mod dedupe;
 pub mod error;
-pub mod segment;
+pub mod pipeline;
+pub mod source;
 
-pub use clickhouse::ClickHouseIndexer;
-pub use dedupe::DedupeIndex;
+// Re-export commonly used types at crate root
 pub use error::{Error, Result};
-pub use segment::SegmentWriter;
 
+// Re-export pipeline components for convenience
+pub use pipeline::{
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, DedupeStats, EventStatus, IndexerStats,
+    PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter,
+};
+
+// Re-export source trait and adapters
+pub use source::{
+    EventSource, JsonlConfig, JsonlSource, ProtoConfig, ProtoSource, RelayConfig, RelaySource,
+    SourceMetadata, SourceStats,
+};
