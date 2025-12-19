@@ -24,6 +24,10 @@ services:
       - clickhouse_logs:/var/log/clickhouse-server
       # Mount schema file from parent docs/ directory
       - ../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Custom config (same as production, scaled down for local dev)
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+      # Users config (for grafana read-only user)
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
     environment:
       - CLICKHOUSE_DB=nostr
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
@@ -65,8 +69,11 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # Install ClickHouse plugin on startup
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     depends_on:
       - prometheus
+      - clickhouse
 
 volumes:
   clickhouse_data:

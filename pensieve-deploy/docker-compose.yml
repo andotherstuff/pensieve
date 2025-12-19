@@ -47,11 +47,15 @@ services:
       - clickhouse_logs:/var/log/clickhouse-server
       # Custom config
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+      # Users config (for grafana read-only user)
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
       # Schema initialization
       - ../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       - CLICKHOUSE_DB=nostr
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      # Password for the Grafana read-only user
+      - CLICKHOUSE_GRAFANA_PASSWORD=${CLICKHOUSE_GRAFANA_PASSWORD:-changeme}
     ulimits:
       nofile:
         soft: 262144
@@ -112,8 +116,13 @@ services:
       # Configure for reverse proxy at /grafana/
       - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      # Install ClickHouse plugin on startup
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      # ClickHouse datasource password (for provisioning)
+      - CLICKHOUSE_GRAFANA_PASSWORD=${CLICKHOUSE_GRAFANA_PASSWORD:-changeme}
     depends_on:
       - prometheus
+      - clickhouse
     logging:
       driver: "json-file"
       options:

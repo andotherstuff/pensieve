@@ -1,0 +1,22 @@
+# Grafana datasource provisioning - ClickHouse
+# Auto-configures ClickHouse as a data source for querying Nostr events
+
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse-nostr
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      # Connection settings
+      host: clickhouse
+      port: 8123
+      protocol: http
+      secure: false
+      # Database
+      defaultDatabase: nostr
+      # Authentication - read-only grafana user (no password for local dev)
+      username: grafana

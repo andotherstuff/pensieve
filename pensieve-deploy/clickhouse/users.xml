@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+<!--
+    ClickHouse users configuration for Pensieve
+
+    This file is mounted to /etc/clickhouse-server/users.d/custom.xml
+    It adds a read-only 'grafana' user for dashboard queries.
+-->
+<clickhouse>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Users -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <users>
+        <!--
+            Grafana user - read-only access for dashboards
+            Password is set via environment variable CLICKHOUSE_GRAFANA_PASSWORD
+        -->
+        <grafana>
+            <!-- Password set from env var (double SHA1 hash) -->
+            <!-- Generate with: echo -n "password" | sha256sum | cut -d' ' -f1 | xxd -r -p | sha256sum -->
+            <password from_env="CLICKHOUSE_GRAFANA_PASSWORD"/>
+
+            <!-- Network access - internal Docker network only -->
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+
+            <!-- Use the readonly profile -->
+            <profile>readonly</profile>
+
+            <!-- Default quota (unlimited) -->
+            <quota>default</quota>
+
+            <!-- Grant access to nostr database only -->
+            <access_management>0</access_management>
+
+            <!-- Database access -->
+            <databases>
+                <nostr>
+                    <!-- Allow access to all tables in nostr database -->
+                    <filter/>
+                </nostr>
+                <!-- Allow access to system tables for introspection -->
+                <system>
+                    <filter/>
+                </system>
+            </databases>
+        </grafana>
+    </users>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Profiles -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <profiles>
+        <!-- Read-only profile for Grafana -->
+        <readonly>
+            <!-- Prevent any data modifications -->
+            <readonly>1</readonly>
+
+            <!-- Limit query resources to prevent dashboard queries from impacting ingestion -->
+            <max_memory_usage>10000000000</max_memory_usage> <!-- 10 GB max per query -->
+            <max_execution_time>60</max_execution_time> <!-- 60 seconds max -->
+            <max_rows_to_read>1000000000</max_rows_to_read> <!-- 1B rows max -->
+
+            <!-- Allow reading from system tables -->
+            <allow_introspection_functions>1</allow_introspection_functions>
+
+            <!--
+                Allow Grafana to modify max_execution_time even in readonly mode.
+                This is required by the clickhouse-go client used by the Grafana plugin.
+                Using changeable_in_readonly is more secure than readonly=2.
+            -->
+            <constraints>
+                <max_execution_time>
+                    <changeable_in_readonly>1</changeable_in_readonly>
+                </max_execution_time>
+            </constraints>
+        </readonly>
+    </profiles>
+</clickhouse>
+

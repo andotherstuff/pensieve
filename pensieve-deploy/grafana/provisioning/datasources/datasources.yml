@@ -1,9 +1,12 @@
 # Grafana datasource provisioning
-# Auto-configures Prometheus as a data source
+# Auto-configures Prometheus and ClickHouse as data sources
 
 apiVersion: 1
 
 datasources:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Prometheus - Metrics (application performance, system metrics)
+  # ═══════════════════════════════════════════════════════════════════════════
   - name: Prometheus
     type: prometheus
     access: proxy
@@ -11,3 +14,23 @@ datasources:
     isDefault: true
     editable: false
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ClickHouse - Analytics (Nostr events, aggregations, exploration)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse-nostr
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      # Connection settings
+      protocol: http
+      host: clickhouse
+      port: 8123
+      defaultDatabase: nostr
+      # Authentication - read-only grafana user
+      username: grafana
+    secureJsonData:
+      # Password from environment variable (set in docker-compose)
+      password: ${CLICKHOUSE_GRAFANA_PASSWORD}

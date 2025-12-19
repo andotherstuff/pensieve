@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<!--
+    ClickHouse users configuration for Pensieve (local development)
+
+    This file is mounted to /etc/clickhouse-server/users.d/custom.xml
+    It adds a read-only 'grafana' user for dashboard queries.
+-->
+<clickhouse>
+    <users>
+        <!--
+            Grafana user - read-only access for dashboards
+            No password required for local development
+        -->
+        <grafana>
+            <!-- Empty password for local dev convenience -->
+            <password></password>
+
+            <!-- Network access -->
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+
+            <!-- Use the readonly profile -->
+            <profile>readonly</profile>
+
+            <!-- Default quota -->
+            <quota>default</quota>
+
+            <!-- Disable access management (can't create users/grants) -->
+            <access_management>0</access_management>
+        </grafana>
+    </users>
+
+    <profiles>
+        <!-- Read-only profile for Grafana -->
+        <readonly>
+            <!-- Prevent any data modifications -->
+            <readonly>1</readonly>
+
+            <!-- Reasonable limits for local dev -->
+            <max_memory_usage>4000000000</max_memory_usage> <!-- 4 GB -->
+            <max_execution_time>60</max_execution_time>
+
+            <!-- Allow reading from system tables -->
+            <allow_introspection_functions>1</allow_introspection_functions>
+
+            <!--
+                Allow Grafana to modify max_execution_time even in readonly mode.
+                This is required by the clickhouse-go client used by the Grafana plugin.
+                Using changeable_in_readonly is more secure than readonly=2.
+            -->
+            <constraints>
+                <max_execution_time>
+                    <changeable_in_readonly>1</changeable_in_readonly>
+                </max_execution_time>
+            </constraints>
+        </readonly>
+    </profiles>
+</clickhouse>
+
