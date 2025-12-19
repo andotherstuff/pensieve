@@ -356,10 +356,12 @@ ORDER BY usage_count DESC;
 -- All other kinds represent legitimate activity from that pubkey,
 -- whether human, service provider, bot, wallet, or relay.
 --
--- Additional columns break down active users by "establishment" level:
+-- Additional columns break down active users and events by "establishment" level:
 -- - has_profile: pubkeys that have published kind 0 (profile metadata)
--- - has_follows: pubkeys that have published kind 3 (follow list)
--- - has_both: pubkeys with both profile AND follows (strongest signal of real user)
+-- - has_follows_list: pubkeys that have published kind 3 (follow list)
+-- - has_profile_and_follows_list: pubkeys with both (strongest signal of real user)
+--
+-- Event counts are also broken down by these same categories.
 
 -- Helper views for pubkey categorization
 CREATE VIEW IF NOT EXISTS pubkeys_with_profile AS
@@ -371,14 +373,22 @@ SELECT DISTINCT pubkey FROM events_local WHERE kind = 3;
 CREATE VIEW IF NOT EXISTS daily_active_users AS
 SELECT
     toDate(created_at) AS date,
+    -- User counts
     uniq(pubkey) AS active_users,
     uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows,
+    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
     uniqIf(pubkey,
         pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
         AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-    ) AS has_both,
-    count() AS total_events
+    ) AS has_profile_and_follows_list,
+    -- Event counts
+    count() AS total_events,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS events_with_profile,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS events_with_follows_list,
+    countIf(
+        pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
+        AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
+    ) AS events_with_profile_and_follows_list
 FROM events_local
 WHERE kind NOT IN (445, 1059)
 GROUP BY date
@@ -387,14 +397,22 @@ ORDER BY date DESC;
 CREATE VIEW IF NOT EXISTS weekly_active_users AS
 SELECT
     toMonday(created_at) AS week,
+    -- User counts
     uniq(pubkey) AS active_users,
     uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows,
+    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
     uniqIf(pubkey,
         pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
         AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-    ) AS has_both,
-    count() AS total_events
+    ) AS has_profile_and_follows_list,
+    -- Event counts
+    count() AS total_events,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS events_with_profile,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS events_with_follows_list,
+    countIf(
+        pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
+        AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
+    ) AS events_with_profile_and_follows_list
 FROM events_local
 WHERE kind NOT IN (445, 1059)
 GROUP BY week
@@ -403,14 +421,22 @@ ORDER BY week DESC;
 CREATE VIEW IF NOT EXISTS monthly_active_users AS
 SELECT
     toStartOfMonth(created_at) AS month,
+    -- User counts
     uniq(pubkey) AS active_users,
     uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows,
+    uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
     uniqIf(pubkey,
         pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
         AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-    ) AS has_both,
-    count() AS total_events
+    ) AS has_profile_and_follows_list,
+    -- Event counts
+    count() AS total_events,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS events_with_profile,
+    countIf(pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS events_with_follows_list,
+    countIf(
+        pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
+        AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
+    ) AS events_with_profile_and_follows_list
 FROM events_local
 WHERE kind NOT IN (445, 1059)
 GROUP BY month

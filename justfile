@@ -114,46 +114,39 @@ dev-logs:
 # ClickHouse
 # ============================================================================
 
-# Default ClickHouse connection for local dev
-CH_HOST := env_var_or_default("CH_HOST", "localhost")
-CH_PORT := env_var_or_default("CH_PORT", "8123")
-CH_USER := env_var_or_default("CH_USER", "default")
-CH_PASS := env_var_or_default("CH_PASS", "")
+# Container name for local dev
+CH_CONTAINER := env_var_or_default("CH_CONTAINER", "pensieve-clickhouse")
 CH_DB := env_var_or_default("CH_DB", "nostr")
 
 # Run a ClickHouse migration (idempotent - safe to run multiple times)
 ch-migrate file:
     @echo "Running migration: {{file}}"
-    @curl -s -X POST "http://{{CH_HOST}}:{{CH_PORT}}/?database={{CH_DB}}&user={{CH_USER}}&password={{CH_PASS}}" \
-        --data-binary @{{file}} \
-        && echo "✓ Migration complete"
+    @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} < {{file}}
+    @echo "✓ Migration complete"
 
 # Run all pending migrations in order
 ch-migrate-all:
     @echo "Running all migrations..."
     @for f in docs/migrations/*.sql; do \
         echo "→ $f"; \
-        curl -s -X POST "http://{{CH_HOST}}:{{CH_PORT}}/?database={{CH_DB}}&user={{CH_USER}}&password={{CH_PASS}}" \
-            --data-binary @"$f" || exit 1; \
+        docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} < "$f" || exit 1; \
     done
     @echo "✓ All migrations complete"
 
 # Initialize ClickHouse with full schema (fresh deployment)
 ch-init:
     @echo "Initializing ClickHouse schema..."
-    @curl -s -X POST "http://{{CH_HOST}}:{{CH_PORT}}/?database={{CH_DB}}&user={{CH_USER}}&password={{CH_PASS}}" \
-        --data-binary @docs/clickhouse_self_hosted.sql \
-        && echo "✓ Schema initialized"
+    @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} < docs/clickhouse_self_hosted.sql
+    @echo "✓ Schema initialized"
 
 # Run a raw ClickHouse query
 ch-query query:
-    @curl -s -X POST "http://{{CH_HOST}}:{{CH_PORT}}/?database={{CH_DB}}&user={{CH_USER}}&password={{CH_PASS}}" \
-        --data "{{query}}"
+    @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} --query "{{query}}"
 
 # Show ClickHouse tables and views
 ch-tables:
-    @curl -s -X POST "http://{{CH_HOST}}:{{CH_PORT}}/?database={{CH_DB}}&user={{CH_USER}}&password={{CH_PASS}}" \
-        --data "SELECT name, engine FROM system.tables WHERE database = '{{CH_DB}}' ORDER BY engine, name FORMAT PrettyCompact"
+    @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} \
+        --query "SELECT name, engine FROM system.tables WHERE database = '{{CH_DB}}' ORDER BY engine, name"
 
 # ============================================================================
 # Utilities

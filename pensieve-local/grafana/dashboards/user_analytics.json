@@ -1,7 +1,5 @@
 {
-  "annotations": {
-    "list": []
-  },
+  "annotations": { "list": [] },
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -11,7 +9,7 @@
     {
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "id": 100,
-      "title": "Daily Active Users",
+      "title": "📅 Daily Metrics",
       "type": "row"
     },
     {
@@ -45,52 +43,17 @@
           "unit": "short"
         },
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "active_users" },
-            "properties": [
-              { "id": "displayName", "value": "All Active Users" },
-              { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_both" },
-            "properties": [
-              { "id": "displayName", "value": "Established (Profile + Follows)" },
-              { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_profile" },
-            "properties": [
-              { "id": "displayName", "value": "Has Profile" },
-              { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_follows" },
-            "properties": [
-              { "id": "displayName", "value": "Has Follows" },
-              { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }
-            ]
-          }
+          { "matcher": { "id": "byName", "options": "active_users" }, "properties": [{ "id": "displayName", "value": "All Active" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
         ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 1 },
+      "gridPos": { "h": 12, "w": 8, "x": 0, "y": 1 },
       "id": 1,
-      "options": {
-        "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "rawSql": "SELECT\n    date AS time,\n    active_users,\n    has_profile,\n    has_follows,\n    has_both\nFROM daily_active_users\nWHERE date >= toDate($__fromTime) AND date <= toDate($__toTime)\nORDER BY date ASC",
-          "refId": "A",
-          "format": "timeseries"
-        }
-      ],
-      "title": "Daily Active Users (DAU)",
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT date AS time, active_users, has_profile, has_follows_list, has_profile_and_follows_list FROM daily_active_users WHERE $__timeFilter(date) ORDER BY date ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Daily Active Users",
       "type": "timeseries"
     },
     {
@@ -105,13 +68,13 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "drawStyle": "bars",
-            "fillOpacity": 80,
+            "drawStyle": "line",
+            "fillOpacity": 10,
             "gradientMode": "opacity",
             "hideFrom": { "legend": false, "tooltip": false, "viz": false },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 1,
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": { "type": "linear" },
             "showPoints": "never",
@@ -124,208 +87,18 @@
           "unit": "short"
         },
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "total_events" },
-            "properties": [
-              { "id": "displayName", "value": "Total Events" },
-              { "id": "color", "value": { "fixedColor": "#8AB8FF", "mode": "fixed" } }
-            ]
-          }
+          { "matcher": { "id": "byName", "options": "total_events" }, "properties": [{ "id": "displayName", "value": "All Events" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
         ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 11 },
+      "gridPos": { "h": 12, "w": 8, "x": 8, "y": 1 },
       "id": 2,
-      "options": {
-        "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "single", "sort": "none" }
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "rawSql": "SELECT\n    date AS time,\n    total_events\nFROM daily_active_users\nWHERE date >= toDate($__fromTime) AND date <= toDate($__toTime)\nORDER BY date ASC",
-          "refId": "A",
-          "format": "timeseries"
-        }
-      ],
+      "options": { "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT date AS time, total_events, events_with_profile, events_with_follows_list, events_with_profile_and_follows_list FROM daily_active_users WHERE $__timeFilter(date) ORDER BY date ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
       "title": "Daily Events",
       "type": "timeseries"
-    },
-    {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
-      "id": 101,
-      "title": "Weekly Active Users",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "opacity",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "active_users" },
-            "properties": [
-              { "id": "displayName", "value": "All Active Users" },
-              { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_both" },
-            "properties": [
-              { "id": "displayName", "value": "Established (Profile + Follows)" },
-              { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_profile" },
-            "properties": [
-              { "id": "displayName", "value": "Has Profile" },
-              { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_follows" },
-            "properties": [
-              { "id": "displayName", "value": "Has Follows" },
-              { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
-      "id": 3,
-      "options": {
-        "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "rawSql": "SELECT\n    week AS time,\n    active_users,\n    has_profile,\n    has_follows,\n    has_both\nFROM weekly_active_users\nWHERE week >= toMonday(toDate($__fromTime)) AND week <= toMonday(toDate($__toTime))\nORDER BY week ASC",
-          "refId": "A",
-          "format": "timeseries"
-        }
-      ],
-      "title": "Weekly Active Users (WAU)",
-      "type": "timeseries"
-    },
-    {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
-      "id": 102,
-      "title": "Monthly Active Users",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "opacity",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "pointSize": 8,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "always",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "active_users" },
-            "properties": [
-              { "id": "displayName", "value": "All Active Users" },
-              { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_both" },
-            "properties": [
-              { "id": "displayName", "value": "Established (Profile + Follows)" },
-              { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_profile" },
-            "properties": [
-              { "id": "displayName", "value": "Has Profile" },
-              { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "has_follows" },
-            "properties": [
-              { "id": "displayName", "value": "Has Follows" },
-              { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }
-            ]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 31 },
-      "id": 4,
-      "options": {
-        "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "rawSql": "SELECT\n    month AS time,\n    active_users,\n    has_profile,\n    has_follows,\n    has_both\nFROM monthly_active_users\nWHERE month >= toStartOfMonth(toDate($__fromTime)) AND month <= toStartOfMonth(toDate($__toTime))\nORDER BY month ASC",
-          "refId": "A",
-          "format": "timeseries"
-        }
-      ],
-      "title": "Monthly Active Users (MAU)",
-      "type": "timeseries"
-    },
-    {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
-      "id": 103,
-      "title": "User Quality Ratios",
-      "type": "row"
     },
     {
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
@@ -361,38 +134,296 @@
           "unit": "percentunit"
         },
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "established_ratio" },
-            "properties": [
-              { "id": "displayName", "value": "% Established Users" },
-              { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "profile_ratio" },
-            "properties": [
-              { "id": "displayName", "value": "% With Profile" },
-              { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }
-            ]
-          }
+          { "matcher": { "id": "byName", "options": "profile_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "follows_list_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "both_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
         ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 42 },
-      "id": 5,
-      "options": {
-        "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+      "gridPos": { "h": 12, "w": 8, "x": 16, "y": 1 },
+      "id": 3,
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT date AS time, has_profile / active_users AS profile_ratio, has_follows_list / active_users AS follows_list_ratio, has_profile_and_follows_list / active_users AS both_ratio FROM daily_active_users WHERE $__timeFilter(date) AND active_users > 0 ORDER BY date ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Daily User Quality",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 101,
+      "title": "📆 Weekly Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 6,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "active_users" }, "properties": [{ "id": "displayName", "value": "All Active" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
       },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "rawSql": "SELECT\n    date AS time,\n    has_both / active_users AS established_ratio,\n    has_profile / active_users AS profile_ratio\nFROM daily_active_users\nWHERE date >= toDate($__fromTime) AND date <= toDate($__toTime)\n    AND active_users > 0\nORDER BY date ASC",
-          "refId": "A",
-          "format": "timeseries"
-        }
-      ],
-      "title": "Daily User Quality Ratios",
+      "gridPos": { "h": 12, "w": 8, "x": 0, "y": 14 },
+      "id": 4,
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT week AS time, active_users, has_profile, has_follows_list, has_profile_and_follows_list FROM weekly_active_users WHERE $__timeFilter(week) ORDER BY week ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Weekly Active Users",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 6,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_events" }, "properties": [{ "id": "displayName", "value": "All Events" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 8, "x": 8, "y": 14 },
+      "id": 5,
+      "options": { "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT week AS time, total_events, events_with_profile, events_with_follows_list, events_with_profile_and_follows_list FROM weekly_active_users WHERE $__timeFilter(week) ORDER BY week ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Weekly Events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 6,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "decimals": 1,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "profile_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "follows_list_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "both_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 8, "x": 16, "y": 14 },
+      "id": 6,
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT week AS time, has_profile / active_users AS profile_ratio, has_follows_list / active_users AS follows_list_ratio, has_profile_and_follows_list / active_users AS both_ratio FROM weekly_active_users WHERE $__timeFilter(week) AND active_users > 0 ORDER BY week ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Weekly User Quality",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "id": 102,
+      "title": "🗓️ Monthly Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 8,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "active_users" }, "properties": [{ "id": "displayName", "value": "All Active" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "has_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 8, "x": 0, "y": 27 },
+      "id": 7,
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT month AS time, active_users, has_profile, has_follows_list, has_profile_and_follows_list FROM monthly_active_users WHERE $__timeFilter(month) ORDER BY month ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Monthly Active Users",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 8,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_events" }, "properties": [{ "id": "displayName", "value": "All Events" }, { "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile" }, "properties": [{ "id": "displayName", "value": "Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "events_with_profile_and_follows_list" }, "properties": [{ "id": "displayName", "value": "Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 8, "x": 8, "y": 27 },
+      "id": 8,
+      "options": { "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT month AS time, total_events, events_with_profile, events_with_follows_list, events_with_profile_and_follows_list FROM monthly_active_users WHERE $__timeFilter(month) ORDER BY month ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Monthly Events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 8,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "decimals": 1,
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "profile_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile" }, { "id": "color", "value": { "fixedColor": "#FADE2A", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "follows_list_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Follows List" }, { "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "both_ratio" }, "properties": [{ "id": "displayName", "value": "% Has Profile & Follows List" }, { "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 8, "x": 16, "y": 27 },
+      "id": 9,
+      "options": { "legend": { "calcs": ["last", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{ "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" }, "queryType": "sql", "rawSql": "SELECT month AS time, has_profile / active_users AS profile_ratio, has_follows_list / active_users AS follows_list_ratio, has_profile_and_follows_list / active_users AS both_ratio FROM monthly_active_users WHERE $__timeFilter(month) AND active_users > 0 ORDER BY month ASC", "refId": "A", "format": 1, "meta": { "builderOptions": { "mode": "list", "fields": [], "limit": 1000 } } }],
+      "title": "Monthly User Quality",
       "type": "timeseries"
     }
   ],
@@ -400,11 +431,10 @@
   "schemaVersion": 39,
   "tags": ["nostr", "users", "analytics"],
   "templating": { "list": [] },
-  "time": { "from": "now-30d", "to": "now" },
+  "time": { "from": "now-90d", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
   "title": "User Analytics",
   "uid": "user-analytics",
-  "version": 1
+  "version": 4
 }
-
