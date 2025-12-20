@@ -24,6 +24,10 @@ path = "src/bin/jsonl.rs"
 name = "backfill-proto"
 path = "src/bin/proto.rs"
 
+[[bin]]
+name = "repair-dedupe"
+path = "src/bin/repair-dedupe.rs"
+
 [dependencies]
 # Internal crates
 pensieve-core = { path = "../pensieve-core" }
