@@ -304,9 +304,35 @@ All services are exposed through Caddy reverse proxy:
 |---------|-----------|----------------|
 | Grafana | http://localhost/grafana/ | https://your-domain.com/grafana/ |
 | Prometheus | http://localhost:9090 (direct) | Internal only |
-| Pensieve API | http://localhost/api/ (when ready) | https://your-domain.com/api/ |
+| Pensieve API | http://localhost:8080/api/v1/ | https://your-domain.com/api/v1/ |
 
 **Grafana Login**: `admin` / `admin` (or value of `GRAFANA_PASSWORD` in `.env`)
+
+**API Authentication**: Set `PENSIEVE_API_TOKENS` in `.env` (see `env.example`).
+
+The API runs as a native binary with its own systemd service:
+
+```bash
+# Enable and start the API
+sudo systemctl enable pensieve-api
+sudo systemctl start pensieve-api
+
+# Check status
+sudo systemctl status pensieve-api
+
+# View logs
+journalctl -u pensieve-api -f
+```
+
+```bash
+# Test API health
+curl https://your-domain.com/health
+
+# Query API (with auth)
+curl -H "Authorization: Bearer your-token" https://your-domain.com/api/v1/stats
+```
+
+See `crates/pensieve-serve/README.md` for full API documentation.
 
 ### Caddy Reverse Proxy
 

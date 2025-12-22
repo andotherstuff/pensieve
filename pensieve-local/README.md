@@ -26,6 +26,42 @@ docker compose logs -f
 | Prometheus | http://localhost:9090 | (none) |
 | Grafana | http://localhost:3000 | `admin` / `admin` |
 
+## Running the API Server
+
+The API runs as a native binary (not in Docker):
+
+```bash
+# From project root
+export PENSIEVE_API_TOKENS=dev-token
+just run-serve
+```
+
+Or with all options:
+
+```bash
+PENSIEVE_API_TOKENS=dev-token \
+CLICKHOUSE_URL=http://localhost:8123 \
+RUST_LOG=info,pensieve_serve=debug \
+cargo run --bin pensieve-serve
+```
+
+### Testing the API
+
+```bash
+# Health check (no auth required)
+curl http://localhost:8080/health
+
+# Get stats (requires auth)
+curl -H "Authorization: Bearer dev-token" \
+  http://localhost:8080/api/v1/stats
+
+# List kinds
+curl -H "Authorization: Bearer dev-token" \
+  http://localhost:8080/api/v1/kinds
+```
+
+See `crates/pensieve-serve/README.md` for full API documentation.
+
 ## Running the Ingester
 
 From the project root:
@@ -77,12 +113,15 @@ docker compose down -v
 pensieve-local/
 ├── docker-compose.yml      # Main compose file
 ├── prometheus.yml          # Prometheus scrape config
+├── clickhouse/             # ClickHouse config
 ├── grafana/
 │   ├── provisioning/
-│   │   ├── datasources/    # Auto-configures Prometheus
+│   │   ├── datasources/    # Auto-configures Prometheus + ClickHouse
 │   │   └── dashboards/     # Auto-loads dashboards
 │   └── dashboards/
 │       └── ingestion.json  # Ingestion monitoring dashboard
 └── README.md               # This file
 ```
+
+The API server runs as a native binary alongside these Docker services.
 

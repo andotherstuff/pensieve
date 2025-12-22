@@ -22,6 +22,9 @@ services:
       - caddy_config:/config
     environment:
       - DOMAIN=${DOMAIN:-localhost}
+    # Allow container to reach host services (API server runs on host)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - grafana
     logging:

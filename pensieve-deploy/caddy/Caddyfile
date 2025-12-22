@@ -37,13 +37,21 @@
     # }
 
     # =========================================================================
-    # Pensieve API - Query Interface (when implemented)
+    # Pensieve API - Query Interface
     # =========================================================================
     # Access at: https://your-domain.com/api/
+    # Health check: https://your-domain.com/health
     #
-    # handle_path /api/* {
-    #     reverse_proxy pensieve-serve:8080
-    # }
+    # The API runs as a native binary on the host (not in Docker).
+    # host.docker.internal resolves to the host machine from within containers.
+
+    handle /api/* {
+        reverse_proxy host.docker.internal:8080
+    }
+
+    handle /health {
+        reverse_proxy host.docker.internal:8080
+    }
 
     # =========================================================================
     # Root - Landing page or redirect
