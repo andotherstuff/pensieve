@@ -164,9 +164,15 @@ sudo cp ~/pensieve/pensieve-deploy/systemd/*.timer /etc/systemd/system/
 # Reload systemd
 sudo systemctl daemon-reload
 
-# Enable and start services
-sudo systemctl enable pensieve
+# Enable services to start on boot
+sudo systemctl enable pensieve          # Infrastructure (Docker)
+sudo systemctl enable pensieve-api      # API server
+sudo systemctl enable pensieve-ingest   # Ingester
+
+# Start everything
 sudo systemctl start pensieve
+sudo systemctl start pensieve-api
+sudo systemctl start pensieve-ingest
 
 # Enable archive sync timer (syncs to Storage Box)
 sudo systemctl enable archive-sync.timer
@@ -215,7 +221,9 @@ docker compose exec clickhouse clickhouse-client \
     ├── prometheus/
     │   └── prometheus.yml            # Scrape targets
     ├── systemd/
-    │   ├── pensieve.service
+    │   ├── pensieve.service          # Infrastructure (Docker Compose)
+    │   ├── pensieve-api.service      # API server binary
+    │   ├── pensieve-ingest.service   # Ingester binary
     │   ├── archive-sync.service
     │   └── archive-sync.timer
     └── scripts/
@@ -225,31 +233,68 @@ docker compose exec clickhouse clickhouse-client \
 
 ---
 
+## Architecture
+
+Pensieve uses a **hybrid deployment model**:
+
+| Component | Runs As | Why |
+|-----------|---------|-----|
+| ClickHouse | Docker | Standard database, easy to manage |
+| Grafana | Docker | Standard monitoring, easy to manage |
+| Prometheus | Docker | Standard monitoring, easy to manage |
+| Caddy | Docker | Reverse proxy with auto-HTTPS |
+| **API Server** | Native binary + systemd | Simpler debugging, faster iteration |
+| **Ingester** | Native binary + systemd | Better I/O performance for RocksDB |
+
+This approach keeps infrastructure in Docker (easy to manage) while running Rust binaries natively (better performance and debugging).
+
+---
+
 ## Operations
 
 ### Start/Stop Services
 
 ```bash
-# Using systemd (recommended)
-sudo systemctl start pensieve
-sudo systemctl stop pensieve
-sudo systemctl status pensieve
+# Start everything
+sudo systemctl start pensieve           # Infrastructure (Docker)
+sudo systemctl start pensieve-api       # API server
+sudo systemctl start pensieve-ingest    # Ingester
 
-# Or directly with docker compose
+# Stop everything
+sudo systemctl stop pensieve-ingest pensieve-api pensieve
+
+# Check status
+sudo systemctl status pensieve pensieve-api pensieve-ingest
+```
+
+Or manage separately:
+
+```bash
+# Infrastructure only (Docker)
 cd ~/pensieve/pensieve-deploy
 docker compose up -d
 docker compose down
-docker compose logs -f
+
+# Rust services only
+sudo systemctl restart pensieve-api
+sudo systemctl restart pensieve-ingest
 ```
 
 ### View Logs
 
 ```bash
-# ClickHouse logs
+# Infrastructure logs (Docker)
 docker compose logs -f clickhouse
+docker compose logs -f grafana
 
-# All service logs
-journalctl -u pensieve -f
+# API server logs
+journalctl -u pensieve-api -f
+
+# Ingester logs
+journalctl -u pensieve-ingest -f
+
+# All Pensieve logs
+journalctl -u 'pensieve*' -f
 ```
 
 ### Check ClickHouse
@@ -280,16 +325,16 @@ rclone size storagebox:pensieve/archive
 ### Run Backfill
 
 ```bash
-# Build the backfill tool (on your dev machine)
+# Build the backfill tool
 cargo build --release -p pensieve-ingest --bin backfill-proto
 
-# Or run from Docker
-docker compose run --rm ingester backfill-proto \
+# Run backfill
+./target/release/backfill-proto \
   --s3-bucket your-bucket \
   --s3-prefix nostr/segments/ \
   -o /archive/segments \
   --rocksdb-path /data/rocksdb \
-  --clickhouse-url http://clickhouse:8123
+  --clickhouse-url http://localhost:8123
 ```
 
 ---

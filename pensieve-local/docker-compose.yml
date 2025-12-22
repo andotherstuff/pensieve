@@ -1,19 +1,24 @@
 # Docker Compose for local Pensieve development
 #
-# Run from this directory (pensieve-local/):
-#   docker compose up -d      # Start all services
-#   docker compose down       # Stop all services
-#   docker compose logs -f    # Follow logs
+# This runs infrastructure services only. Rust binaries run natively for
+# faster iteration and easier debugging.
+#
+# Start infrastructure:
+#   docker compose up -d
+#
+# Run Rust services (from project root):
+#   export PENSIEVE_API_TOKENS=dev-token
+#   just run-serve                    # API server (port 8080)
+#   just run-ingest                   # Ingester (port 9091 for metrics)
 #
 # Services:
 #   ClickHouse UI: http://localhost:8123/play
 #   Prometheus UI: http://localhost:9090
 #   Grafana UI:    http://localhost:3000 (admin/admin)
+#   API Server:    http://localhost:8080 (run separately)
 #
-# Run Pensieve API separately:
-#   just run-serve
-#
-# Connect to ClickHouse: clickhouse-client --host localhost
+# Connect to ClickHouse CLI:
+#   docker compose exec clickhouse clickhouse-client
 
 services:
   clickhouse:

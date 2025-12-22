@@ -1,9 +1,15 @@
 # Pensieve Production Docker Compose
 #
-# Start:  docker compose up -d
-# Stop:   docker compose down
-# Logs:   docker compose logs -f
-# Status: docker compose ps
+# This runs the infrastructure services (ClickHouse, Grafana, Prometheus, Caddy).
+# The Rust binaries (API, Ingester) run as native binaries via systemd.
+#
+# Start infrastructure:  docker compose up -d
+# Stop infrastructure:   docker compose down
+# Logs:                  docker compose logs -f
+# Status:                docker compose ps
+#
+# Start Rust services:   sudo systemctl start pensieve-api pensieve-ingest
+# Stop Rust services:    sudo systemctl stop pensieve-api pensieve-ingest
 
 services:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -133,34 +139,18 @@ services:
         max-file: "3"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Pensieve Ingester (placeholder - uncomment when ready)
+  # Pensieve Rust Services (run as native binaries, not in Docker)
   # ═══════════════════════════════════════════════════════════════════════════
-  # ingester:
-  #   image: ghcr.io/yourname/pensieve-ingest:latest
-  #   container_name: pensieve-ingester
-  #   restart: unless-stopped
-  #   depends_on:
-  #     clickhouse:
-  #       condition: service_healthy
-  #   ports:
-  #     - "127.0.0.1:9091:9091"  # Metrics endpoint
-  #   volumes:
-  #     # RocksDB dedupe index (on fast SSD/NVMe)
-  #     - /data/rocksdb:/data/rocksdb
-  #     # Archive segments (on HDD)
-  #     - /archive/segments:/archive/segments
-  #   environment:
-  #     - CLICKHOUSE_URL=http://clickhouse:8123
-  #     - CLICKHOUSE_DB=nostr
-  #     - ROCKSDB_PATH=/data/rocksdb
-  #     - ARCHIVE_PATH=/archive/segments
-  #     - METRICS_PORT=9091
-  #     - RUST_LOG=info,pensieve_ingest=debug
-  #   logging:
-  #     driver: "json-file"
-  #     options:
-  #       max-size: "100m"
-  #       max-file: "5"
+  # The ingester and API server run as native binaries managed by systemd.
+  # This provides better I/O performance and simpler debugging.
+  #
+  # See systemd/ directory for service files:
+  #   - pensieve-api.service    (API server on port 8080)
+  #   - pensieve-ingest.service (Ingester with metrics on port 9091)
+  #
+  # Start them with:
+  #   sudo systemctl start pensieve-api
+  #   sudo systemctl start pensieve-ingest
 
 volumes:
   clickhouse_logs:

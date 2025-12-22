@@ -1,5 +1,5 @@
 [Unit]
-Description=Pensieve Nostr Indexer
+Description=Pensieve Infrastructure (Docker Compose)
 Documentation=https://github.com/andotherstuff/pensieve
 After=docker.service
 Requires=docker.service
@@ -10,7 +10,7 @@ User=pensieve
 Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve/pensieve-deploy
 
-# Start docker compose
+# Start docker compose (ClickHouse, Grafana, Prometheus, Caddy)
 ExecStart=/usr/bin/docker compose up
 ExecStop=/usr/bin/docker compose down
 

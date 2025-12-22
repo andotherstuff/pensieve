@@ -2,6 +2,11 @@
 
 Local Docker environment for developing and testing Pensieve.
 
+## Architecture
+
+- **Docker**: ClickHouse, Prometheus, Grafana (infrastructure)
+- **Native binaries**: API server, Ingester (run separately for easier debugging)
+
 ## Quick Start
 
 ```bash
@@ -123,5 +128,12 @@ pensieve-local/
 └── README.md               # This file
 ```
 
-The API server runs as a native binary alongside these Docker services.
+## Why Native Binaries?
+
+The Rust services (API, Ingester) run as native binaries rather than in Docker:
+- **Faster iteration**: No container rebuild needed
+- **Easier debugging**: Attach debugger directly, check logs in terminal
+- **Better I/O**: Direct filesystem access for RocksDB/segments
+
+In production, systemd manages these binaries. Locally, just run them in your terminal.
 
