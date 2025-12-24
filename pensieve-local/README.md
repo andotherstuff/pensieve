@@ -90,10 +90,11 @@ mkdir -p ./data/dedupe ./data/segments
   --score-interval-secs 60
 ```
 
-## Grafana Dashboard
+## Grafana Dashboards
 
-A pre-configured "Pensieve Ingestion" dashboard is automatically loaded.
+Pre-configured dashboards are automatically loaded:
 
+### Pensieve Ingestion
 Navigate to: **Dashboards → Pensieve → Pensieve Ingestion**
 
 Panels include:
@@ -101,6 +102,20 @@ Panels include:
 - Dedupe ratio
 - Relay connection counts
 - Optimization activity
+
+### Pensieve Backfill
+Navigate to: **Dashboards → Pensieve → Pensieve Backfill**
+
+For monitoring `backfill-jsonl` and `backfill-proto` jobs. Panels include:
+- Status (Running/Stopped)
+- Valid/Duplicate/Invalid event counts
+- Processing rate (events/sec)
+- Throughput (bytes/sec)
+- Segments sealed
+- Data size comparison (input vs output)
+- Efficiency metrics (duplicate rate, invalid rate, compression savings)
+
+**Note:** Backfill jobs must be run with `--metrics-port` to export metrics.
 
 ## Cleanup
 
@@ -124,7 +139,8 @@ pensieve-local/
 │   │   ├── datasources/    # Auto-configures Prometheus + ClickHouse
 │   │   └── dashboards/     # Auto-loads dashboards
 │   └── dashboards/
-│       └── ingestion.json  # Ingestion monitoring dashboard
+│       ├── ingestion.json  # Live ingestion monitoring
+│       └── backfill.json   # Backfill job monitoring
 └── README.md               # This file
 ```
 

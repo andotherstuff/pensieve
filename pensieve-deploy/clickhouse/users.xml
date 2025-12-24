@@ -33,17 +33,11 @@
             <!-- Grant access to nostr database only -->
             <access_management>0</access_management>
 
-            <!-- Database access -->
-            <databases>
-                <nostr>
-                    <!-- Allow access to all tables in nostr database -->
-                    <filter/>
-                </nostr>
-                <!-- Allow access to system tables for introspection -->
-                <system>
-                    <filter/>
-                </system>
-            </databases>
+            <!--
+                 Note: Database-level restrictions via <databases> tag are deprecated
+                 in newer ClickHouse versions. Access control is handled via the
+                 readonly profile and GRANT statements instead.
+            -->
         </grafana>
     </users>
 
