@@ -49,13 +49,13 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "backfill-jsonl")]
 #[command(about = "Convert JSONL Nostr events to notepack archive format with full pipeline")]
 struct Args {
-    /// Input JSONL file or directory path
+    /// Input JSONL file or directory path (required unless --index-segments)
     #[arg(short, long)]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
-    /// Output directory for notepack segments
+    /// Output directory for notepack segments (required unless --index-segments)
     #[arg(short, long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
     /// RocksDB path for dedupe index (enables deduplication)
     #[arg(long)]
@@ -192,15 +192,23 @@ async fn main() -> Result<()> {
         return result;
     }
 
+    // Validate required args for normal mode
+    let input = args.input.clone().ok_or_else(|| {
+        anyhow::anyhow!("--input is required (unless using --index-segments)")
+    })?;
+    let output = args.output.clone().ok_or_else(|| {
+        anyhow::anyhow!("--output is required (unless using --index-segments)")
+    })?;
+
     let start = Instant::now();
-    let stats = process(&args)?;
+    let stats = process(&args, &input, &output)?;
     let elapsed = start.elapsed();
 
     // Mark as no longer running
     gauge!("backfill_running").set(0.0);
 
     // Print summary
-    print_summary(&args, &stats, elapsed);
+    print_summary(&input, &output, &args, &stats, elapsed);
 
     Ok(())
 }
@@ -343,13 +351,13 @@ fn extract_segment_number(path: &PathBuf) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
-fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
+fn print_summary(input: &PathBuf, output: &PathBuf, args: &Args, stats: &Stats, elapsed: std::time::Duration) {
     println!("\n══════════════════════════════════════════════════════════════════");
     println!("SUMMARY");
     println!("══════════════════════════════════════════════════════════════════\n");
 
-    println!("Input:       {}", args.input.display());
-    println!("Output:      {}", args.output.display());
+    println!("Input:       {}", input.display());
+    println!("Output:      {}", output.display());
     if let Some(ref rocksdb) = args.rocksdb_path {
         println!("RocksDB:     {}", rocksdb.display());
     }
@@ -422,7 +430,7 @@ fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
 // Processing
 // ============================================================================
 
-fn process(args: &Args) -> Result<Stats> {
+fn process(args: &Args, input: &PathBuf, output: &PathBuf) -> Result<Stats> {
     let mut stats = Stats::default();
     let process_start = Instant::now();
 
@@ -430,7 +438,7 @@ fn process(args: &Args) -> Result<Stats> {
     let progress_file = args
         .progress_file
         .clone()
-        .unwrap_or_else(|| args.output.join("jsonl-backfill-progress.json"));
+        .unwrap_or_else(|| output.join("jsonl-backfill-progress.json"));
 
     // Load progress (for resume)
     let mut progress = Progress::load(&progress_file)?;
@@ -441,10 +449,10 @@ fn process(args: &Args) -> Result<Stats> {
     );
 
     // Initialize pipeline components
-    let (segment_writer, dedupe, indexer_handle) = init_pipeline(args)?;
+    let (segment_writer, dedupe, indexer_handle) = init_pipeline(args, output)?;
 
     // Collect input files
-    let files = collect_files(&args.input, args.limit)?;
+    let files = collect_files(input, args.limit)?;
     tracing::info!("Found {} JSONL files to process", files.len());
 
     // Track duplicates
@@ -602,7 +610,7 @@ type PipelineComponents = (
     Option<std::thread::JoinHandle<()>>,
 );
 
-fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
+fn init_pipeline(args: &Args, output: &PathBuf) -> Result<PipelineComponents> {
     // Initialize dedupe index (optional)
     let dedupe = if let Some(ref rocksdb_path) = args.rocksdb_path {
         tracing::info!("Opening dedupe index at {}", rocksdb_path.display());
@@ -622,7 +630,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
 
     // Initialize segment writer
     let segment_config = SegmentConfig {
-        output_dir: args.output.clone(),
+        output_dir: output.clone(),
         max_segment_size: args.segment_size,
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
