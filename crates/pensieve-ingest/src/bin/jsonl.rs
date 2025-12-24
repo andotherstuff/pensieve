@@ -101,6 +101,15 @@ struct Args {
     /// Metrics HTTP server port (0 to disable)
     #[arg(long, default_value = "9091")]
     metrics_port: u16,
+
+    /// Index existing segments to ClickHouse (skips JSONL processing).
+    /// Provide the path to the segments directory.
+    #[arg(long)]
+    index_segments: Option<PathBuf>,
+
+    /// Start indexing from this segment number (use with --index-segments)
+    #[arg(long, default_value = "0")]
+    start_segment: u32,
 }
 
 /// Statistics collected during processing.
@@ -166,6 +175,23 @@ async fn main() -> Result<()> {
         gauge!("backfill_running").set(1.0);
     }
 
+    // Check for index-segments mode
+    if let Some(ref segments_dir) = args.index_segments {
+        let clickhouse_url = args.clickhouse_url.clone().ok_or_else(|| {
+            anyhow::anyhow!("--clickhouse-url is required when using --index-segments")
+        })?;
+
+        let result = index_segments_mode(
+            segments_dir,
+            &clickhouse_url,
+            &args.clickhouse_db,
+            args.start_segment,
+        ).await;
+
+        gauge!("backfill_running").set(0.0);
+        return result;
+    }
+
     let start = Instant::now();
     let stats = process(&args)?;
     let elapsed = start.elapsed();
@@ -177,6 +203,144 @@ async fn main() -> Result<()> {
     print_summary(&args, &stats, elapsed);
 
     Ok(())
+}
+
+/// Index existing segment files to ClickHouse.
+///
+/// This mode reads notepack segment files from a directory and indexes them
+/// to ClickHouse. Useful for re-indexing segments that failed to index due
+/// to ClickHouse being unavailable.
+async fn index_segments_mode(
+    segments_dir: &PathBuf,
+    clickhouse_url: &str,
+    clickhouse_db: &str,
+    start_segment: u32,
+) -> Result<()> {
+    tracing::info!(
+        "Index segments mode: dir={}, start_segment={}, clickhouse={}",
+        segments_dir.display(),
+        start_segment,
+        clickhouse_url
+    );
+
+    // Find all segment files
+    let mut segment_files: Vec<PathBuf> = Vec::new();
+
+    for entry in fs::read_dir(segments_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if filename.starts_with("segment-") && filename.contains(".notepack") {
+                // Extract segment number
+                if let Some(num_str) = filename
+                    .strip_prefix("segment-")
+                    .and_then(|s| s.split('.').next())
+                {
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        if num >= start_segment {
+                            segment_files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by segment number
+    segment_files.sort_by(|a, b| {
+        let num_a = extract_segment_number(a).unwrap_or(0);
+        let num_b = extract_segment_number(b).unwrap_or(0);
+        num_a.cmp(&num_b)
+    });
+
+    tracing::info!("Found {} segments to index (starting from {})", segment_files.len(), start_segment);
+
+    if segment_files.is_empty() {
+        tracing::warn!("No segment files found matching criteria");
+        return Ok(());
+    }
+
+    // Initialize ClickHouse indexer
+    let ch_config = ClickHouseConfig {
+        url: clickhouse_url.to_string(),
+        database: clickhouse_db.to_string(),
+        table: "events_local".to_string(),
+        batch_size: 10000,
+    };
+    let indexer = ClickHouseIndexer::new(ch_config)?;
+
+    // Health check
+    if !indexer.health_check().await? {
+        anyhow::bail!("ClickHouse health check failed");
+    }
+    tracing::info!("ClickHouse connection verified");
+
+    let start_time = Instant::now();
+    let mut total_events = 0usize;
+    let mut segments_indexed = 0usize;
+    let mut errors = 0usize;
+
+    for (i, segment_path) in segment_files.iter().enumerate() {
+        let segment_num = extract_segment_number(segment_path).unwrap_or(0);
+        tracing::info!(
+            "[{}/{}] Indexing segment {} from {}",
+            i + 1,
+            segment_files.len(),
+            segment_num,
+            segment_path.display()
+        );
+
+        match indexer.index_segment_file(segment_path).await {
+            Ok(count) => {
+                total_events += count;
+                segments_indexed += 1;
+                tracing::info!(
+                    "Indexed segment {}: {} events (total: {})",
+                    segment_num,
+                    count,
+                    total_events
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to index segment {}: {}", segment_num, e);
+                errors += 1;
+                // Continue with next segment
+            }
+        }
+    }
+
+    let elapsed = start_time.elapsed();
+    let events_per_sec = if elapsed.as_secs() > 0 {
+        total_events as f64 / elapsed.as_secs_f64()
+    } else {
+        total_events as f64
+    };
+
+    println!("\n══════════════════════════════════════════════════════════════════");
+    println!("INDEX SEGMENTS COMPLETE");
+    println!("══════════════════════════════════════════════════════════════════\n");
+    println!("Segments indexed:  {:>12}", segments_indexed);
+    println!("Segments failed:   {:>12}", errors);
+    println!("Total events:      {:>12}", total_events);
+    println!("Time elapsed:      {:>12.2?}", elapsed);
+    println!("Events/sec:        {:>12.0}", events_per_sec);
+
+    if errors > 0 {
+        anyhow::bail!("{} segments failed to index", errors);
+    }
+
+    Ok(())
+}
+
+/// Extract segment number from a path like "segment-1234.notepack.gz"
+fn extract_segment_number(path: &PathBuf) -> Option<u32> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| s.strip_prefix("segment-"))
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse::<u32>().ok())
 }
 
 fn print_summary(args: &Args, stats: &Stats, elapsed: std::time::Duration) {
