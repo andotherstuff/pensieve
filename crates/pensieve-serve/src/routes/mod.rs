@@ -34,6 +34,7 @@ use crate::state::AppState;
 /// - `GET /api/v1/stats/users/new` - New users time series
 /// - `GET /api/v1/stats/activity/hourly` - Hourly activity pattern
 /// - `GET /api/v1/stats/zaps` - Zap statistics
+/// - `GET /api/v1/stats/zaps/histogram` - Zap amount distribution histogram
 /// - `GET /api/v1/stats/engagement` - Reply/reaction engagement stats
 /// - `GET /api/v1/stats/longform` - Long-form content (kind 30023) stats
 /// - `GET /api/v1/stats/publishers` - Top publishers by event count
@@ -69,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/stats/activity/hourly", get(stats::hourly_activity))
         // Zaps
         .route("/stats/zaps", get(stats::zap_stats))
+        .route("/stats/zaps/histogram", get(stats::zap_histogram))
         // Engagement
         .route("/stats/engagement", get(stats::engagement))
         // Long-form content

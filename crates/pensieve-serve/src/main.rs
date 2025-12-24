@@ -3,9 +3,11 @@
 //! This binary starts the API server that provides analytics queries against
 //! the ClickHouse event store.
 
+use axum::http::Request;
 use clap::Parser;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -48,7 +50,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router with middleware
     let app = router(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::span!(
+                    Level::INFO,
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    query = request.uri().query().unwrap_or("")
+                )
+            }),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

@@ -82,27 +82,26 @@ SELECT
     id AS event_id,
     pubkey AS zapper_pubkey,
     created_at,
+    -- Multipliers convert bolt11 amount to millisatoshis
+    -- 1 BTC = 100,000,000 sats = 100,000,000,000 msats
     multiIf(
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'm',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000000,
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'u',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000,
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'n',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000,
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'p',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100,
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = '',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000000000,
-        0
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'm',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000000,      -- milli: 10^8 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'u',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000,         -- micro: 10^5 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'n',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100,            -- nano: 10^2 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'p',
+        intDiv(toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')), 10),      -- pico: 0.1 msats (truncated)
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = '',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000000000,   -- BTC: 10^11 msats
+        toUInt64(0)
     ) AS amount_msats,
-    arrayElement(arrayFilter(t -> t[1] = 'p', tags), 1)[2] AS recipient_pubkey,
-    arrayElement(arrayFilter(t -> t[1] = 'P', tags), 1)[2] AS sender_pubkey
+    (arrayFilter(t -> t[1] = 'p', tags)[1])[2] AS recipient_pubkey,
+    (arrayFilter(t -> t[1] = 'P', tags)[1])[2] AS sender_pubkey
 FROM events_local
-ARRAY JOIN tags AS tag
 WHERE kind = 9735
-    AND tag[1] = 'bolt11'
-    AND length(tag) >= 2
-    AND match(tag[2], '^lnbc[0-9]')
+    AND arrayExists(t -> length(t) >= 2 AND t[1] = 'bolt11' AND match(t[2], '^lnbc[0-9]'), tags)
 "
 ```
 
@@ -152,6 +151,64 @@ just build-release
 
 ---
 
+## Backfill Time Estimates
+
+For large production databases, backfills can take significant time. Here are rough estimates:
+
+| Backfill | Events Scanned | Estimated Time (800M events) |
+|----------|----------------|------------------------------|
+| pubkey_first_seen | All events | 5-30 minutes |
+| zap_amounts | Only kind 9735 | 30 seconds - 5 minutes |
+
+**Factors affecting performance:**
+- Disk type (SSD vs HDD)
+- Available CPU cores
+- RAM for aggregation buffers
+- Concurrent query load
+
+### Monitoring Backfill Progress
+
+Run in a separate terminal to watch progress:
+
+```bash
+watch -n 5 'docker exec pensieve-clickhouse clickhouse-client --database nostr -q "
+SELECT
+    query_id,
+    round(elapsed, 1) as elapsed_sec,
+    formatReadableQuantity(read_rows) as rows_read,
+    formatReadableQuantity(total_rows_approx) as total_rows,
+    round(100 * read_rows / total_rows_approx, 1) as pct_complete
+FROM system.processes
+WHERE query LIKE '\''%INSERT INTO%'\''
+FORMAT Pretty
+"'
+```
+
+### Check Zap Count Before Backfill
+
+To estimate zap backfill time, first check how many zap receipts exist:
+
+```bash
+just ch-query "SELECT count() FROM events_local WHERE kind = 9735"
+```
+
+### Batched Backfill (Optional)
+
+For very large tables, you can batch the pubkey_first_seen backfill by date range to reduce memory pressure:
+
+```sql
+-- Example: backfill 2024 data only
+INSERT INTO pubkey_first_seen_data
+SELECT pubkey, minState(created_at)
+FROM events_local
+WHERE kind NOT IN (445, 1059)
+  AND created_at >= '2024-01-01'
+  AND created_at < '2025-01-01'
+GROUP BY pubkey
+```
+
+---
+
 ## New API Endpoints
 
 These migrations enable the following new endpoints:
@@ -163,6 +220,7 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/users/new` | New users per period | 002 |
 | `GET /api/v1/stats/activity/hourly` | Activity by hour of day | None |
 | `GET /api/v1/stats/zaps` | Zap statistics | 003 |
+| `GET /api/v1/stats/zaps/histogram` | Zap amount distribution histogram | 003 |
 | `GET /api/v1/stats/engagement` | Reply/reaction ratios | None |
 | `GET /api/v1/stats/longform` | Long-form content stats | None |
 | `GET /api/v1/stats/publishers` | Top publishers | None |

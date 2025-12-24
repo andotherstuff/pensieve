@@ -6,11 +6,11 @@
 -- To run this migration:
 --   just ch-migrate docs/migrations/003_zap_amounts.sql
 --
--- IMPORTANT: After running this migration, you must backfill historical data:
---   just ch-query "INSERT INTO zap_amounts_data SELECT id, pubkey, created_at, extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1] AS amount_raw, extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] AS multiplier, multiIf(multiplier = 'm', toUInt64(amount_raw) * 100000000000, multiplier = 'u', toUInt64(amount_raw) * 100000000, multiplier = 'n', toUInt64(amount_raw) * 100000, multiplier = 'p', toUInt64(amount_raw) * 100, multiplier = '', toUInt64(amount_raw) * 100000000000000, 0) AS amount_msats, arrayElement(arrayFilter(t -> t[1] = 'p', tags), 1)[2] AS recipient_pubkey, arrayElement(arrayFilter(t -> t[1] = 'P', tags), 1)[2] AS sender_pubkey FROM events_local ARRAY JOIN tags AS tag WHERE kind = 9735 AND tag[1] = 'bolt11' AND length(tag) >= 2 AND match(tag[2], '^lnbc[0-9]')"
---
 -- Or via docker:
 --   docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/migrations/003_zap_amounts.sql
+--
+-- IMPORTANT: After running this migration, you must backfill historical data.
+-- See docs/migrations/README.md for the backfill command.
 
 -- =============================================================================
 -- ZAP AMOUNTS TABLE
@@ -21,13 +21,13 @@
 --
 -- Bolt11 format: lnbc<amount><multiplier>1<rest>
 -- Multipliers (amount is in BTC base units):
---   m = milli (10^-3 BTC) = 100,000,000,000 msats per unit
---   u = micro (10^-6 BTC) = 100,000,000 msats per unit
---   n = nano  (10^-9 BTC) = 100,000 msats per unit
---   p = pico  (10^-12 BTC) = 100 msats per unit
---   (none) = 1 BTC = 100,000,000,000,000 msats per unit
+--   m = milli (10^-3 BTC) = 100,000,000 msats per unit (10^8)
+--   u = micro (10^-6 BTC) = 100,000 msats per unit (10^5)
+--   n = nano  (10^-9 BTC) = 100 msats per unit (10^2)
+--   p = pico  (10^-12 BTC) = 0.1 msats per unit (sub-msat, truncated to 0)
+--   (none) = 1 BTC = 100,000,000,000 msats per unit (10^11)
 --
--- Example: lnbc10u1... = 10 micro-BTC = 1,000,000,000 msats = 1000 sats
+-- Example: lnbc420u1... = 420 micro-BTC = 42,000,000 msats = 42,000 sats
 
 CREATE TABLE IF NOT EXISTS zap_amounts_data (
     event_id String,
@@ -40,41 +40,36 @@ CREATE TABLE IF NOT EXISTS zap_amounts_data (
 ORDER BY (event_id);
 
 -- Materialized view to extract zap amounts from new events
+-- Uses separate regex patterns since ClickHouse extract() only returns first capture group
 CREATE MATERIALIZED VIEW IF NOT EXISTS zap_amounts_mv TO zap_amounts_data
 AS SELECT
     id AS event_id,
     pubkey AS zapper_pubkey,
     created_at,
-    -- Parse bolt11 amount: extract digits and multiplier, then convert to msats
+    -- Parse bolt11 amount using separate patterns for number and multiplier
+    -- bolt11 format: lnbc<amount><multiplier>1<rest>
+    -- Note: multipliers convert bolt11 amount to millisatoshis
+    -- 1 BTC = 100,000,000 sats = 100,000,000,000 msats
     multiIf(
-        -- milli: 10^-3 BTC = 10^11 msats per unit
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'm',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000000,
-        -- micro: 10^-6 BTC = 10^8 msats per unit
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'u',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000,
-        -- nano: 10^-9 BTC = 10^5 msats per unit
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'n',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000,
-        -- pico: 10^-12 BTC = 10^2 msats per unit
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = 'p',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100,
-        -- no multiplier: 1 BTC = 10^14 msats per unit (rare but valid)
-        extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][2] = '',
-        toUInt64OrZero(extractAll(tag[2], '^lnbc([0-9]+)([munp]?)1')[1][1]) * 100000000000000,
-        -- fallback
-        0
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'm',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000000,      -- milli: 10^8 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'u',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000,         -- micro: 10^5 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'n',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100,            -- nano: 10^2 msats
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = 'p',
+        intDiv(toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')), 10),      -- pico: 0.1 msats (truncated)
+        extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc[0-9]+([munp]?)1') = '',
+        toUInt64OrZero(extract((arrayFilter(t -> t[1] = 'bolt11', tags)[1])[2], '^lnbc([0-9]+)')) * 100000000000,   -- BTC: 10^11 msats
+        toUInt64(0)
     ) AS amount_msats,
-    -- Extract recipient (p tag)
-    arrayElement(arrayFilter(t -> t[1] = 'p', tags), 1)[2] AS recipient_pubkey,
-    -- Extract sender (P tag, optional)
-    arrayElement(arrayFilter(t -> t[1] = 'P', tags), 1)[2] AS sender_pubkey
+    -- Extract recipient (p tag) - same pattern as d_tag materialized column
+    (arrayFilter(t -> t[1] = 'p', tags)[1])[2] AS recipient_pubkey,
+    -- Extract sender (P tag, optional - may be empty if anonymous zap)
+    (arrayFilter(t -> t[1] = 'P', tags)[1])[2] AS sender_pubkey
 FROM events_local
-ARRAY JOIN tags AS tag
 WHERE kind = 9735
-    AND tag[1] = 'bolt11'
-    AND length(tag) >= 2
-    AND match(tag[2], '^lnbc[0-9]');
+    AND arrayExists(t -> length(t) >= 2 AND t[1] = 'bolt11' AND match(t[2], '^lnbc[0-9]'), tags);
 
 -- =============================================================================
 -- VERIFICATION
@@ -91,4 +86,3 @@ WHERE database = currentDatabase()
 ORDER BY name;
 
 SELECT 'REMINDER: Run backfill query to populate historical zap data!' AS reminder;
-

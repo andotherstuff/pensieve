@@ -454,54 +454,56 @@ pub async fn active_users_monthly(
 /// Query parameters for throughput endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThroughputQuery {
-    /// Number of hours to return (default: 24, max: 168).
-    pub limit: Option<u32>,
     /// Filter by event kind.
     pub kind: Option<u16>,
 }
 
-/// Throughput time series row.
-#[derive(Debug, Clone, Serialize, Deserialize, Row)]
-pub struct ThroughputRow {
-    /// Hour as string (YYYY-MM-DD HH:00:00).
-    pub hour: String,
-    pub event_count: u64,
-    pub unique_pubkeys: u64,
+/// Row type for throughput query.
+#[derive(Debug, Clone, Deserialize, Row)]
+struct ThroughputRow {
+    events_per_hour: f64,
+    total_events_7d: u64,
+}
+
+/// Throughput response: 7-day rolling average of events per hour.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThroughputResponse {
+    /// Average events per hour over the last 7 days.
+    pub events_per_hour: f64,
+    /// Total events in the 7-day window.
+    pub total_events_7d: u64,
 }
 
 /// `GET /api/v1/stats/throughput`
 ///
-/// Returns events per hour time series (based on event created_at).
+/// Returns 7-day rolling average of events created per hour.
 pub async fn throughput(
     State(state): State<AppState>,
     Query(params): Query<ThroughputQuery>,
-) -> Result<Json<Vec<ThroughputRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(24).min(168);
-
+) -> Result<Json<ThroughputResponse>, ApiError> {
     let kind_clause = match params.kind {
         Some(kind) => format!("AND kind = {}", kind),
         None => String::new(),
     };
 
-    let rows: Vec<ThroughputRow> = state
+    let row: ThroughputRow = state
         .clickhouse
         .query(&format!(
             "SELECT
-                toString(toStartOfHour(created_at)) AS hour,
-                count() AS event_count,
-                uniq(pubkey) AS unique_pubkeys
+                toFloat64(count()) / 168.0 AS events_per_hour,
+                count() AS total_events_7d
             FROM events_local
-            WHERE created_at >= now() - INTERVAL {} HOUR
-            {}
-            GROUP BY hour
-            ORDER BY hour DESC
-            LIMIT {}",
-            limit, kind_clause, limit
+            WHERE created_at >= now() - INTERVAL 7 DAY
+            {}",
+            kind_clause
         ))
-        .fetch_all()
+        .fetch_one()
         .await?;
 
-    Ok(Json(rows))
+    Ok(Json(ThroughputResponse {
+        events_per_hour: row.events_per_hour,
+        total_events_7d: row.total_events_7d,
+    }))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -908,6 +910,136 @@ pub async fn zap_stats(
     }
 }
 
+/// Query parameters for zap histogram.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZapHistogramQuery {
+    /// Number of days to include (default: 30).
+    pub days: Option<u32>,
+}
+
+/// A bucket in the zap amount histogram.
+#[derive(Debug, Clone, Serialize, Deserialize, Row)]
+pub struct ZapHistogramBucket {
+    /// Human-readable label for this bucket (e.g., "21-100 sats").
+    pub bucket: String,
+    /// Minimum sats value (inclusive) for this bucket.
+    pub min_sats: u64,
+    /// Maximum sats value (inclusive) for this bucket.
+    pub max_sats: u64,
+    /// Number of zaps in this bucket.
+    pub count: u64,
+    /// Total sats in this bucket.
+    pub total_sats: u64,
+    /// Percentage of total zaps.
+    pub pct_count: f64,
+    /// Percentage of total sats.
+    pub pct_sats: f64,
+}
+
+/// `GET /api/v1/stats/zaps/histogram`
+///
+/// Returns a histogram of zap amounts grouped into meaningful buckets.
+/// Useful for understanding the distribution of zap sizes.
+///
+/// Buckets (17 total):
+/// - 1-10 sats, 11-21 sats (micro zaps)
+/// - 22-50 sats, 51-100 sats (small tips)
+/// - 101-250 sats, 251-500 sats (medium zaps)
+/// - 501-750 sats, 751-1K sats (larger tips)
+/// - 1K-2.5K sats, 2.5K-5K sats (generous zaps)
+/// - 5K-7.5K sats, 7.5K-10K sats (big zaps)
+/// - 10K-25K sats, 25K-50K sats (very large)
+/// - 50K-75K sats, 75K-100K sats (whale zaps)
+/// - 100K+ sats (mega zaps)
+pub async fn zap_histogram(
+    State(state): State<AppState>,
+    Query(params): Query<ZapHistogramQuery>,
+) -> Result<Json<Vec<ZapHistogramBucket>>, ApiError> {
+    let days = params.days.unwrap_or(30);
+
+    // Use ClickHouse's multiIf to bucket amounts, then aggregate
+    // 17 buckets for granular distribution analysis
+    let rows: Vec<ZapHistogramBucket> = state
+        .clickhouse
+        .query(&format!(
+            "WITH
+                total_zaps AS (SELECT count() AS cnt FROM zap_amounts_data WHERE created_at >= now() - INTERVAL {days} DAY AND amount_msats > 0),
+                total_amount AS (SELECT sum(amount_msats) / 1000 AS sats FROM zap_amounts_data WHERE created_at >= now() - INTERVAL {days} DAY AND amount_msats > 0)
+            SELECT
+                multiIf(
+                    amount_msats / 1000 <= 10, '1-10 sats',
+                    amount_msats / 1000 <= 21, '11-21 sats',
+                    amount_msats / 1000 <= 50, '22-50 sats',
+                    amount_msats / 1000 <= 100, '51-100 sats',
+                    amount_msats / 1000 <= 250, '101-250 sats',
+                    amount_msats / 1000 <= 500, '251-500 sats',
+                    amount_msats / 1000 <= 750, '501-750 sats',
+                    amount_msats / 1000 <= 1000, '751-1K sats',
+                    amount_msats / 1000 <= 2500, '1K-2.5K sats',
+                    amount_msats / 1000 <= 5000, '2.5K-5K sats',
+                    amount_msats / 1000 <= 7500, '5K-7.5K sats',
+                    amount_msats / 1000 <= 10000, '7.5K-10K sats',
+                    amount_msats / 1000 <= 25000, '10K-25K sats',
+                    amount_msats / 1000 <= 50000, '25K-50K sats',
+                    amount_msats / 1000 <= 75000, '50K-75K sats',
+                    amount_msats / 1000 <= 100000, '75K-100K sats',
+                    '100K+ sats'
+                ) AS bucket,
+                multiIf(
+                    amount_msats / 1000 <= 10, toUInt64(1),
+                    amount_msats / 1000 <= 21, toUInt64(11),
+                    amount_msats / 1000 <= 50, toUInt64(22),
+                    amount_msats / 1000 <= 100, toUInt64(51),
+                    amount_msats / 1000 <= 250, toUInt64(101),
+                    amount_msats / 1000 <= 500, toUInt64(251),
+                    amount_msats / 1000 <= 750, toUInt64(501),
+                    amount_msats / 1000 <= 1000, toUInt64(751),
+                    amount_msats / 1000 <= 2500, toUInt64(1001),
+                    amount_msats / 1000 <= 5000, toUInt64(2501),
+                    amount_msats / 1000 <= 7500, toUInt64(5001),
+                    amount_msats / 1000 <= 10000, toUInt64(7501),
+                    amount_msats / 1000 <= 25000, toUInt64(10001),
+                    amount_msats / 1000 <= 50000, toUInt64(25001),
+                    amount_msats / 1000 <= 75000, toUInt64(50001),
+                    amount_msats / 1000 <= 100000, toUInt64(75001),
+                    toUInt64(100001)
+                ) AS min_sats,
+                multiIf(
+                    amount_msats / 1000 <= 10, toUInt64(10),
+                    amount_msats / 1000 <= 21, toUInt64(21),
+                    amount_msats / 1000 <= 50, toUInt64(50),
+                    amount_msats / 1000 <= 100, toUInt64(100),
+                    amount_msats / 1000 <= 250, toUInt64(250),
+                    amount_msats / 1000 <= 500, toUInt64(500),
+                    amount_msats / 1000 <= 750, toUInt64(750),
+                    amount_msats / 1000 <= 1000, toUInt64(1000),
+                    amount_msats / 1000 <= 2500, toUInt64(2500),
+                    amount_msats / 1000 <= 5000, toUInt64(5000),
+                    amount_msats / 1000 <= 7500, toUInt64(7500),
+                    amount_msats / 1000 <= 10000, toUInt64(10000),
+                    amount_msats / 1000 <= 25000, toUInt64(25000),
+                    amount_msats / 1000 <= 50000, toUInt64(50000),
+                    amount_msats / 1000 <= 75000, toUInt64(75000),
+                    amount_msats / 1000 <= 100000, toUInt64(100000),
+                    toUInt64(999999999)
+                ) AS max_sats,
+                count() AS count,
+                toUInt64(sum(amount_msats) / 1000) AS total_sats,
+                ifNull(round(100.0 * count() / nullIf((SELECT cnt FROM total_zaps), 0), 2), 0.0) AS pct_count,
+                ifNull(round(100.0 * (sum(amount_msats) / 1000) / nullIf((SELECT sats FROM total_amount), 0), 2), 0.0) AS pct_sats
+            FROM zap_amounts_data
+            WHERE created_at >= now() - INTERVAL {days} DAY
+                AND amount_msats > 0
+            GROUP BY bucket, min_sats, max_sats
+            ORDER BY min_sats ASC",
+            days = days
+        ))
+        .fetch_all()
+        .await?;
+
+    Ok(Json(rows))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Engagement Stats
 // ═══════════════════════════════════════════════════════════════════════════
@@ -922,18 +1054,18 @@ pub struct EngagementQuery {
 /// Engagement statistics (replies and reactions relative to original notes).
 #[derive(Debug, Clone, Serialize)]
 pub struct EngagementStats {
-    /// Total kind 1 events (notes and replies).
-    pub total_notes: u64,
+    /// Number of days included in the calculation.
+    pub period_days: u32,
+    /// Kind 1 events that are NOT replies (original posts).
+    pub original_notes: u64,
     /// Kind 1 events that are replies (have e-tag).
-    pub total_replies: u64,
-    /// Kind 7 events (reactions).
-    pub total_reactions: u64,
-    /// Replies per 100 notes.
-    pub replies_per_100_notes: f64,
-    /// Reactions per 100 notes.
-    pub reactions_per_100_notes: f64,
-    /// Combined engagement per 100 notes.
-    pub engagement_per_100_notes: f64,
+    pub replies: u64,
+    /// Kind 7 events (reactions/likes).
+    pub reactions: u64,
+    /// Average replies per original note.
+    pub replies_per_note: f64,
+    /// Average reactions per original note.
+    pub reactions_per_note: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Row)]
@@ -952,26 +1084,23 @@ pub async fn engagement(
 ) -> Result<Json<EngagementStats>, ApiError> {
     let days = params.days.unwrap_or(30);
 
+    // Calculate all metrics from events_local consistently.
+    // A reply is a kind=1 event that has at least one e-tag (references another event).
     let row: EngagementRow = state
         .clickhouse
         .query(&format!(
             "SELECT
                 countIf(kind = 1) AS total_notes,
-                -- Replies are kind 1 events with an e-tag, created within the time window
-                -- Use uniq(event_id) since one event may have multiple e-tags
-                (SELECT uniq(event_id) FROM event_tags_flat
-                 WHERE kind = 1
-                   AND tag_name = 'e'
-                   AND created_at >= now() - INTERVAL {} DAY
-                ) AS total_replies,
+                countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
                 countIf(kind = 7) AS total_reactions
             FROM events_local
             WHERE created_at >= now() - INTERVAL {} DAY",
-            days, days
+            days
         ))
         .fetch_one()
         .await?;
 
+    // Original notes = total kind=1 events minus replies
     let original_notes = row.total_notes.saturating_sub(row.total_replies);
     let base = if original_notes > 0 {
         original_notes as f64
@@ -980,12 +1109,12 @@ pub async fn engagement(
     };
 
     Ok(Json(EngagementStats {
-        total_notes: row.total_notes,
-        total_replies: row.total_replies,
-        total_reactions: row.total_reactions,
-        replies_per_100_notes: (row.total_replies as f64 / base) * 100.0,
-        reactions_per_100_notes: (row.total_reactions as f64 / base) * 100.0,
-        engagement_per_100_notes: ((row.total_replies + row.total_reactions) as f64 / base) * 100.0,
+        period_days: days,
+        original_notes,
+        replies: row.total_replies,
+        reactions: row.total_reactions,
+        replies_per_note: row.total_replies as f64 / base,
+        reactions_per_note: row.total_reactions as f64 / base,
     }))
 }
 

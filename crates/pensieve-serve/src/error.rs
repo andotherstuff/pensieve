@@ -56,11 +56,16 @@ impl IntoResponse for ApiError {
                 )
             }
             Self::Database(err) => {
-                tracing::error!(error = %err, "database error");
+                // Include the full error details for debugging
+                tracing::error!(
+                    error = %err,
+                    error_debug = ?err,
+                    "database error"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "database_error",
-                    Some("A database error occurred".to_string()),
+                    Some(format!("Database error: {}", err)),
                 )
             }
             Self::Serialization(err) => {
