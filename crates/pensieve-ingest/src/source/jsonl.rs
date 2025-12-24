@@ -9,6 +9,7 @@ use crate::pipeline::PackedEvent;
 use crate::{Error, Result};
 use notepack::{NoteBuf, pack_note_into};
 use pensieve_core::{pack_event_binary_into, validate_event};
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -167,7 +168,19 @@ impl JsonlSource {
                     }
                 }
             } else {
-                match validate_event(&line) {
+                // Try to validate the event, and if it fails due to non-string tags,
+                // attempt to fix and retry
+                let validation_result = validate_event(&line).or_else(|e| {
+                    // Check if this might be a tag type issue and try to fix
+                    if let Some(fixed_json) = fix_tag_values(&line) {
+                        stats.tag_fixes += 1;
+                        validate_event(&fixed_json)
+                    } else {
+                        Err(e)
+                    }
+                });
+
+                match validation_result {
                     Ok(event) => {
                         let id_bytes: [u8; 32] = *event.id.as_bytes();
                         pack_event_binary_into(&event, &mut pack_buf);
@@ -271,6 +284,14 @@ impl EventSource for JsonlSource {
             }
         }
 
+        // Log summary including tag fixes
+        if stats.tag_fixes > 0 {
+            tracing::info!(
+                "Fixed {} events with non-string tag values (NIP-01 compliance)",
+                stats.tag_fixes
+            );
+        }
+
         Ok(SourceStats {
             total_events: stats.total_events,
             valid_events: stats.valid_events,
@@ -298,6 +319,8 @@ struct JsonlStats {
     validation_errors: usize,
     notepack_errors: usize,
     total_json_bytes: usize,
+    /// Events that had non-string tag values fixed.
+    tag_fixes: usize,
 }
 
 fn hex_to_bytes32(hex: &str) -> Result<[u8; 32]> {
@@ -311,4 +334,46 @@ fn hex_to_bytes32(hex: &str) -> Result<[u8; 32]> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+/// Fix non-conformant Nostr events that have non-string values in tags.
+///
+/// NIP-01 requires all tag elements to be strings, but some older events
+/// have integers (e.g., `["e", "eventid", 0]` instead of `["e", "eventid", "0"]`).
+/// This function converts any non-string tag elements to strings.
+///
+/// Returns the fixed JSON string, or None if no fixes were needed.
+fn fix_tag_values(json: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(json).ok()?;
+
+    let tags = value.get_mut("tags")?.as_array_mut()?;
+    let mut modified = false;
+
+    for tag in tags.iter_mut() {
+        if let Some(tag_arr) = tag.as_array_mut() {
+            for elem in tag_arr.iter_mut() {
+                match elem {
+                    Value::Number(n) => {
+                        *elem = Value::String(n.to_string());
+                        modified = true;
+                    }
+                    Value::Bool(b) => {
+                        *elem = Value::String(b.to_string());
+                        modified = true;
+                    }
+                    Value::Null => {
+                        *elem = Value::String(String::new());
+                        modified = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if modified {
+        serde_json::to_string(&value).ok()
+    } else {
+        None
+    }
 }
