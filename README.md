@@ -84,7 +84,7 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 | `--clickhouse-url` | (none) | ClickHouse URL for indexing |
 | `--clickhouse-db` | `nostr` | ClickHouse database name |
 | `--seed-relays` | 8 public relays | Comma-separated relay URLs |
-| `--max-relays` | `100` | Maximum concurrent relay connections |
+| `--max-relays` | `30` | Maximum concurrent relay connections |
 | `--no-discovery` | `false` | Disable NIP-65 relay discovery |
 | `--segment-size` | `268435456` | Max segment size before sealing (256MB) |
 | `--no-compress` | `false` | Disable gzip compression |

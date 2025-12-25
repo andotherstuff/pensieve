@@ -124,7 +124,7 @@ struct Args {
     no_discovery: bool,
 
     /// Maximum number of relay connections
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "30")]
     max_relays: usize,
 
     /// Metrics HTTP server port (0 to disable)

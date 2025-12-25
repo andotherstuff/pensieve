@@ -80,7 +80,7 @@ impl Default for RelayConfig {
                 "wss://relay.nostr.bg".to_string(),
             ],
             discovery_enabled: true,
-            max_relays: 100,
+            max_relays: 30,
             blocklist: HashSet::new(),
             connection_timeout: Duration::from_secs(30),
             subscribe_all: true,
