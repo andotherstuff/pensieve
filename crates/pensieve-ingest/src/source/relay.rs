@@ -326,17 +326,30 @@ impl RelaySource {
         let progress_interval = 10_000;
 
         // Optimization timer
+        // Run first optimization quickly (30s) to bootstrap from imported/discovered relays
+        // Subsequent optimizations use the configured interval
         let optimization_interval = self.config.optimization_interval;
+        let bootstrap_interval = Duration::from_secs(30);
         let mut last_optimization = Instant::now();
+        let mut optimization_count = 0usize;
 
         while self.running.load(Ordering::SeqCst) {
             // Check if it's time to run optimization
+            // First 3 optimizations run at bootstrap_interval (30s) for faster relay discovery
+            // After that, use the configured optimization_interval
+            let current_interval = if optimization_count < 3 {
+                bootstrap_interval
+            } else {
+                optimization_interval
+            };
+
             if self.relay_manager.is_some()
                 && !optimization_interval.is_zero()
-                && last_optimization.elapsed() >= optimization_interval
+                && last_optimization.elapsed() >= current_interval
             {
                 self.run_optimization(&client, &filter).await;
                 last_optimization = Instant::now();
+                optimization_count += 1;
             }
 
             // Use timeout to periodically check running flag and optimization timer
@@ -368,9 +381,10 @@ impl RelaySource {
                     let relay_url_str = relay_url.to_string();
 
                     // Check for NIP-65 relay list events for discovery
+                    // Discovery only registers relays - the optimization loop connects to them
                     if self.config.discovery_enabled
                         && event.kind == Kind::RelayList
-                        && let Err(e) = self.process_relay_list(&event, &client, &filter).await
+                        && let Err(e) = self.process_relay_list(&event).await
                     {
                         tracing::debug!("Failed to process relay list: {}", e);
                     }
@@ -625,20 +639,11 @@ impl RelaySource {
 
     /// Process a NIP-65 relay list event to discover new relays.
     ///
-    /// When a new relay is discovered and connected, we also subscribe it to
-    /// the same filter so it starts sending us events immediately.
-    async fn process_relay_list(
-        &self,
-        event: &Event,
-        client: &Client,
-        filter: &Arc<Filter>,
-    ) -> Result<()> {
-        let current_count = self.known_relays.read().await.len();
-
-        if current_count >= self.config.max_relays {
-            return Ok(()); // Already at max
-        }
-
+    /// Discovery only REGISTERS relays with the manager - it does NOT connect
+    /// immediately. This prevents a flood of connection attempts when many relay
+    /// list events arrive in a short time. The optimization loop handles actually
+    /// connecting to the best relays later.
+    async fn process_relay_list(&self, event: &Event) -> Result<()> {
         // Parse relay URLs from 'r' tags
         for tag in event.tags.iter() {
             let tag_vec: Vec<&str> = tag.as_slice().iter().map(|s| s.as_str()).collect();
@@ -658,97 +663,32 @@ impl RelaySource {
                     // Check if we already know this relay
                     let is_new = {
                         let known = self.known_relays.read().await;
-                        !known.contains(&url_str) && known.len() < self.config.max_relays
+                        !known.contains(&url_str)
                     };
 
                     if is_new {
                         // Add to known set
                         {
                             let mut known = self.known_relays.write().await;
-                            if known.len() < self.config.max_relays {
-                                known.insert(url_str.clone());
-                            } else {
-                                continue;
-                            }
+                            known.insert(url_str.clone());
                         }
 
                         // Register with relay manager if available
-                        if let Some(ref manager) = self.relay_manager
-                            && let Err(e) = manager
-                                .register_relay(&url_str, crate::relay::RelayTier::Discovered)
-                        {
-                            tracing::debug!(
-                                "Failed to register discovered relay {}: {}",
-                                url_str,
-                                e
-                            );
-                        }
-
-                        // Try to add and connect
-                        match client.add_relay(&url_str).await {
-                            Ok(_) => {
-                                self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!("Discovered and added relay: {}", url_str);
-
-                                // Try to connect the new relay
-                                match client.connect_relay(&url_str).await {
-                                    Ok(_) => {
-                                        // Record successful connection
-                                        self.record_connection(&url_str).await;
-                                        self.stats.relays_connected.fetch_add(1, Ordering::Relaxed);
-                                        metrics::counter!("relay_connects_total", "reason" => "discovery").increment(1);
-                                        tracing::info!(
-                                            "Connected to discovered relay: {}",
-                                            url_str
-                                        );
-
-                                        // Subscribe the new relay to the same filter
-                                        // so it starts sending us events immediately
-                                        if let Ok(relay_url) = RelayUrl::parse(&url_str) {
-                                            match client
-                                                .subscribe_to(
-                                                    vec![relay_url],
-                                                    (**filter).clone(),
-                                                    None,
-                                                )
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    tracing::debug!(
-                                                        "Subscribed discovered relay to event stream: {}",
-                                                        url_str
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Failed to subscribe discovered relay {}: {}",
-                                                        url_str,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Record failed connection
-                                        self.record_connection_failure(&url_str);
-                                        metrics::counter!("relay_connect_failures_total", "reason" => "discovery").increment(1);
-                                        tracing::debug!(
-                                            "Failed to connect to discovered relay {}: {}",
-                                            url_str,
-                                            e
-                                        );
-                                    }
+                        // The optimization loop will decide when to connect
+                        if let Some(ref manager) = self.relay_manager {
+                            match manager.register_relay(&url_str, crate::relay::RelayTier::Discovered) {
+                                Ok(_) => {
+                                    self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);
+                                    metrics::counter!("relay_discovered_total").increment(1);
+                                    tracing::debug!("Discovered relay: {}", url_str);
                                 }
-                            }
-                            Err(e) => {
-                                self.record_connection_failure(&url_str);
-                                metrics::counter!("relay_connect_failures_total", "reason" => "discovery").increment(1);
-                                tracing::debug!(
-                                    "Failed to add discovered relay {}: {}",
-                                    url_str,
-                                    e
-                                );
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "Failed to register discovered relay {}: {}",
+                                        url_str,
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
