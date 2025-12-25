@@ -66,7 +66,7 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
   --clickhouse-url http://localhost:8123 \
   --seed-relays "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net" \
   --max-relays 50 \
-  --metrics-port 9090
+  --metrics-port 9091
 ```
 
 **Features:**
@@ -88,7 +88,7 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 | `--no-discovery` | `false` | Disable NIP-65 relay discovery |
 | `--segment-size` | `268435456` | Max segment size before sealing (256MB) |
 | `--no-compress` | `false` | Disable gzip compression |
-| `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
+| `--metrics-port` | `9091` | Prometheus metrics port (0 to disable) |
 | `--relay-db-path` | `./data/relay-stats.db` | SQLite path for relay quality tracking |
 | `--import-relays-csv` | (none) | Import relays from georelays CSV |
 | `--score-interval-secs` | `300` | Score recomputation interval |

@@ -13,6 +13,7 @@ WorkingDirectory=/home/pensieve/pensieve
 # Binary location (after cargo build --release)
 ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
+    --import-discovered-json /home/pensieve/pensieve/data/relays/relay_discovery_results.json \
     --output /archive/segments \
     --rocksdb-path /data/rocksdb \
     --relay-db-path /data/relay-stats.db \

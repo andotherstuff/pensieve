@@ -128,7 +128,7 @@ struct Args {
     max_relays: usize,
 
     /// Metrics HTTP server port (0 to disable)
-    #[arg(long, default_value = "9090")]
+    #[arg(long, default_value = "9091")]
     metrics_port: u16,
 
     /// SQLite database path for relay quality tracking
