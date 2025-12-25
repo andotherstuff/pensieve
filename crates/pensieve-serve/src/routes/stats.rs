@@ -233,65 +233,57 @@ pub struct ActiveUsersCount {
 /// `GET /api/v1/stats/users/active`
 ///
 /// Returns current DAU/WAU/MAU summary.
+/// Queries pre-aggregated materialized views for fast performance.
 pub async fn active_users_summary(
     State(state): State<AppState>,
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
-    // Daily (last 24 hours)
+    // Daily - get most recent day from daily_active_users MV
     let daily: ActiveUsersCount = state
         .clickhouse
         .query(
             "SELECT
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
-                AND created_at >= now() - INTERVAL 1 DAY",
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM daily_active_users
+            ORDER BY date DESC
+            LIMIT 1",
         )
         .fetch_one()
         .await?;
 
-    // Weekly (last 7 days)
+    // Weekly - get most recent week from weekly_active_users MV
     let weekly: ActiveUsersCount = state
         .clickhouse
         .query(
             "SELECT
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
-                AND created_at >= now() - INTERVAL 7 DAY",
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM weekly_active_users
+            ORDER BY week DESC
+            LIMIT 1",
         )
         .fetch_one()
         .await?;
 
-    // Monthly (last 30 days)
+    // Monthly - get most recent month from monthly_active_users MV
     let monthly: ActiveUsersCount = state
         .clickhouse
         .query(
             "SELECT
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
-                AND created_at >= now() - INTERVAL 30 DAY",
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM monthly_active_users
+            ORDER BY month DESC
+            LIMIT 1",
         )
         .fetch_one()
         .await?;
@@ -327,6 +319,7 @@ pub struct ActiveUsersRow {
 /// `GET /api/v1/stats/users/active/daily`
 ///
 /// Returns daily active users time series.
+/// Queries pre-aggregated daily_active_users MV for fast performance.
 pub async fn active_users_daily(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
@@ -334,7 +327,7 @@ pub async fn active_users_daily(
     let limit = params.limit.unwrap_or(30).min(365);
 
     let since_clause = match params.since {
-        Some(date) => format!("AND created_at >= '{}'", date),
+        Some(date) => format!("AND date >= '{}'", date),
         None => String::new(),
     };
 
@@ -342,20 +335,16 @@ pub async fn active_users_daily(
         .clickhouse
         .query(&format!(
             "SELECT
-                toString(toDate(created_at)) AS period,
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
+                toString(date) AS period,
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM daily_active_users
+            WHERE 1=1
             {}
-            GROUP BY period
-            ORDER BY period DESC
+            ORDER BY date DESC
             LIMIT {}",
             since_clause, limit
         ))
@@ -368,6 +357,7 @@ pub async fn active_users_daily(
 /// `GET /api/v1/stats/users/active/weekly`
 ///
 /// Returns weekly active users time series.
+/// Queries pre-aggregated weekly_active_users MV for fast performance.
 pub async fn active_users_weekly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
@@ -375,7 +365,7 @@ pub async fn active_users_weekly(
     let limit = params.limit.unwrap_or(12).min(52);
 
     let since_clause = match params.since {
-        Some(date) => format!("AND created_at >= '{}'", date),
+        Some(date) => format!("AND week >= '{}'", date),
         None => String::new(),
     };
 
@@ -383,20 +373,16 @@ pub async fn active_users_weekly(
         .clickhouse
         .query(&format!(
             "SELECT
-                toString(toMonday(created_at)) AS period,
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
+                toString(week) AS period,
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM weekly_active_users
+            WHERE 1=1
             {}
-            GROUP BY period
-            ORDER BY period DESC
+            ORDER BY week DESC
             LIMIT {}",
             since_clause, limit
         ))
@@ -409,6 +395,7 @@ pub async fn active_users_weekly(
 /// `GET /api/v1/stats/users/active/monthly`
 ///
 /// Returns monthly active users time series.
+/// Queries pre-aggregated monthly_active_users MV for fast performance.
 pub async fn active_users_monthly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
@@ -416,7 +403,7 @@ pub async fn active_users_monthly(
     let limit = params.limit.unwrap_or(12).min(120);
 
     let since_clause = match params.since {
-        Some(date) => format!("AND created_at >= '{}'", date),
+        Some(date) => format!("AND month >= '{}'", date),
         None => String::new(),
     };
 
@@ -424,20 +411,16 @@ pub async fn active_users_monthly(
         .clickhouse
         .query(&format!(
             "SELECT
-                toString(toStartOfMonth(created_at)) AS period,
-                uniq(pubkey) AS active_users,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_profile)) AS has_profile,
-                uniqIf(pubkey, pubkey IN (SELECT pubkey FROM pubkeys_with_follows)) AS has_follows_list,
-                uniqIf(pubkey,
-                    pubkey IN (SELECT pubkey FROM pubkeys_with_profile)
-                    AND pubkey IN (SELECT pubkey FROM pubkeys_with_follows)
-                ) AS has_profile_and_follows_list,
-                count() AS total_events
-            FROM events_local
-            WHERE kind NOT IN (445, 1059)
+                toString(month) AS period,
+                active_users,
+                has_profile,
+                has_follows_list,
+                has_profile_and_follows_list,
+                total_events
+            FROM monthly_active_users
+            WHERE 1=1
             {}
-            GROUP BY period
-            ORDER BY period DESC
+            ORDER BY month DESC
             LIMIT {}",
             since_clause, limit
         ))
