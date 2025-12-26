@@ -28,9 +28,11 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 002_pubkey_first_seen.sql | Track first-seen timestamp per pubkey | **Yes** |
 | 003_zap_amounts.sql | Parse bolt11 invoices from zap receipts | **Yes** |
 | 004_active_users_materialized.sql | Convert active user views to MVs | **Yes** (run automatically) |
-| 005_fix_active_users_views.sql | Fix active user views for large datasets | **Yes** (run automatically) |
+| 005_fix_active_users_views.sql | Fix active user views for large datasets | **Yes** (10-30 min) |
 
-> **Note:** If migration 004 was previously applied, run 005 to fix the performance issues.
+> **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
+> expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
+> Stop all services before running migration 005.
 
 ---
 
@@ -131,7 +133,7 @@ WHERE kind = 9735
 
 ### 005_fix_active_users_views.sql
 
-**Purpose:** Fixes the performance issues from migration 004. The original views used FINAL on billion-row tables with JOINs, causing 60+ second timeouts. This migration replaces them with a pre-aggregated approach.
+**Purpose:** Fixes the performance issues from migration 004. The original views used FINAL on billion-row tables with JOINs, causing 100% CPU and 60+ second timeouts. This migration replaces them with a pre-aggregated approach.
 
 **New objects:**
 - `daily_user_stats` - Stores daily (date, pubkey, has_profile, has_follows, event_count)
@@ -140,17 +142,28 @@ WHERE kind = 9735
 
 **Key improvement:** Profile/follows flags are computed at insert time and stored, so queries just aggregate from pre-computed data (millisecond query times).
 
-**Backfill:** Included in the migration script (runs automatically).
+**Backfill:** Included in the migration script. Takes 10-30 minutes depending on dataset size.
 
-**To apply:**
+**⚠️ CRITICAL: Stop all services before running this migration!**
 
 ```bash
-# If you already ran migration 004 and have timeout issues:
-just ch-migrate docs/migrations/005_fix_active_users_views.sql
+# Step 1: Stop services that query these views
+docker stop pensieve-grafana    # Grafana triggers the expensive queries
+sudo systemctl stop pensieve-ingest
 
-# If you're deploying fresh, run both:
-just ch-migrate docs/migrations/004_active_users_materialized.sql
-just ch-migrate docs/migrations/005_fix_active_users_views.sql
+# Step 2: Verify ClickHouse is idle
+docker exec pensieve-clickhouse clickhouse-client --query "SELECT count() FROM system.processes"
+# Should return 0 or 1
+
+# Step 3: Run the migration
+docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/migrations/005_fix_active_users_views.sql
+
+# Step 4: Verify it worked (should be instant, not 60+ seconds)
+docker exec pensieve-clickhouse clickhouse-client --database nostr --query "SELECT * FROM daily_active_users LIMIT 5"
+
+# Step 5: Restart services
+sudo systemctl start pensieve-ingest
+docker start pensieve-grafana
 ```
 
 ---
