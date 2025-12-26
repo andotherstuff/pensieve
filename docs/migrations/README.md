@@ -27,6 +27,10 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 001_active_user_views.sql | Active user views excluding throwaway keys | No |
 | 002_pubkey_first_seen.sql | Track first-seen timestamp per pubkey | **Yes** |
 | 003_zap_amounts.sql | Parse bolt11 invoices from zap receipts | **Yes** |
+| 004_active_users_materialized.sql | Convert active user views to MVs | **Yes** (run automatically) |
+| 005_fix_active_users_views.sql | Fix active user views for large datasets | **Yes** (run automatically) |
+
+> **Note:** If migration 004 was previously applied, run 005 to fix the performance issues.
 
 ---
 
@@ -103,6 +107,50 @@ FROM events_local
 WHERE kind = 9735
     AND arrayExists(t -> length(t) >= 2 AND t[1] = 'bolt11' AND match(t[2], '^lnbc[0-9]'), tags)
 "
+```
+
+---
+
+### 004_active_users_materialized.sql
+
+**Purpose:** Converts the slow active user views (which scan 800M+ events on every query) to materialized views for millisecond query times.
+
+**Note:** This migration has a design flaw that causes timeouts on large datasets. **Run migration 005 after this one to fix it.**
+
+**New objects:**
+- `pubkeys_with_profile_data` / `pubkeys_with_profile_mv` - Tracks pubkeys with kind=0 events
+- `pubkeys_with_follows_data` / `pubkeys_with_follows_mv` - Tracks pubkeys with kind=3 events
+- `daily_active_users_data` / `daily_active_users_mv` - Daily aggregates
+- `weekly_active_users_data` / `weekly_active_users_mv` - Weekly aggregates
+- `monthly_active_users_data` / `monthly_active_users_mv` - Monthly aggregates
+- `daily_pubkeys_data` / `daily_pubkeys_mv` - Daily pubkey tracking
+
+**Backfill:** Included in the migration script (runs automatically).
+
+---
+
+### 005_fix_active_users_views.sql
+
+**Purpose:** Fixes the performance issues from migration 004. The original views used FINAL on billion-row tables with JOINs, causing 60+ second timeouts. This migration replaces them with a pre-aggregated approach.
+
+**New objects:**
+- `daily_user_stats` - Stores daily (date, pubkey, has_profile, has_follows, event_count)
+- `daily_user_stats_mv` - Populates the stats table from new events
+- Recreates `daily_active_users`, `weekly_active_users`, `monthly_active_users` views
+
+**Key improvement:** Profile/follows flags are computed at insert time and stored, so queries just aggregate from pre-computed data (millisecond query times).
+
+**Backfill:** Included in the migration script (runs automatically).
+
+**To apply:**
+
+```bash
+# If you already ran migration 004 and have timeout issues:
+just ch-migrate docs/migrations/005_fix_active_users_views.sql
+
+# If you're deploying fresh, run both:
+just ch-migrate docs/migrations/004_active_users_materialized.sql
+just ch-migrate docs/migrations/005_fix_active_users_views.sql
 ```
 
 ---
