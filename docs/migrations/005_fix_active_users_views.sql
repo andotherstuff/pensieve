@@ -96,50 +96,51 @@ OPTIMIZE TABLE daily_user_stats FINAL;
 -- No expensive JOINs - just simple aggregations.
 
 -- Daily Active Users
+-- Note: Use table alias 's' to avoid column/alias name conflicts
 CREATE VIEW daily_active_users AS
 SELECT
-    date,
-    uniq(pubkey) AS active_users,
-    uniqIf(pubkey, has_profile > 0) AS has_profile,
-    uniqIf(pubkey, has_follows > 0) AS has_follows_list,
-    uniqIf(pubkey, has_profile > 0 AND has_follows > 0) AS has_profile_and_follows_list,
-    sum(event_count) AS total_events,
-    sumIf(event_count, has_profile > 0) AS events_with_profile,
-    sumIf(event_count, has_follows > 0) AS events_with_follows_list,
-    sumIf(event_count, has_profile > 0 AND has_follows > 0) AS events_with_profile_and_follows_list
-FROM daily_user_stats
-GROUP BY date
+    s.date AS date,
+    uniq(s.pubkey) AS active_users,
+    uniqIf(s.pubkey, s.has_profile = 1) AS has_profile,
+    uniqIf(s.pubkey, s.has_follows = 1) AS has_follows_list,
+    uniqIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list,
+    sum(s.event_count) AS total_events,
+    sumIf(s.event_count, s.has_profile = 1) AS events_with_profile,
+    sumIf(s.event_count, s.has_follows = 1) AS events_with_follows_list,
+    sumIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list
+FROM daily_user_stats s
+GROUP BY s.date
 ORDER BY date DESC;
 
 -- Weekly Active Users
 CREATE VIEW weekly_active_users AS
 SELECT
-    toMonday(date) AS week,
-    uniq(pubkey) AS active_users,
-    uniqIf(pubkey, has_profile > 0) AS has_profile,
-    uniqIf(pubkey, has_follows > 0) AS has_follows_list,
-    uniqIf(pubkey, has_profile > 0 AND has_follows > 0) AS has_profile_and_follows_list,
-    sum(event_count) AS total_events,
-    sumIf(event_count, has_profile > 0) AS events_with_profile,
-    sumIf(event_count, has_follows > 0) AS events_with_follows_list,
-    sumIf(event_count, has_profile > 0 AND has_follows > 0) AS events_with_profile_and_follows_list
-FROM daily_user_stats
+    toMonday(s.date) AS week,
+    uniq(s.pubkey) AS active_users,
+    uniqIf(s.pubkey, s.has_profile = 1) AS has_profile,
+    uniqIf(s.pubkey, s.has_follows = 1) AS has_follows_list,
+    uniqIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list,
+    sum(s.event_count) AS total_events,
+    sumIf(s.event_count, s.has_profile = 1) AS events_with_profile,
+    sumIf(s.event_count, s.has_follows = 1) AS events_with_follows_list,
+    sumIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list
+FROM daily_user_stats s
 GROUP BY week
 ORDER BY week DESC;
 
 -- Monthly Active Users
 CREATE VIEW monthly_active_users AS
 SELECT
-    toStartOfMonth(date) AS month,
-    uniq(pubkey) AS active_users,
-    uniqIf(pubkey, has_profile > 0) AS has_profile,
-    uniqIf(pubkey, has_follows > 0) AS has_follows_list,
-    uniqIf(pubkey, has_profile > 0 AND has_follows > 0) AS has_profile_and_follows_list,
-    sum(event_count) AS total_events,
-    sumIf(event_count, has_profile > 0) AS events_with_profile,
-    sumIf(event_count, has_follows > 0) AS events_with_follows_list,
-    sumIf(event_count, has_profile > 0 AND has_follows > 0) AS events_with_profile_and_follows_list
-FROM daily_user_stats
+    toStartOfMonth(s.date) AS month,
+    uniq(s.pubkey) AS active_users,
+    uniqIf(s.pubkey, s.has_profile = 1) AS has_profile,
+    uniqIf(s.pubkey, s.has_follows = 1) AS has_follows_list,
+    uniqIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list,
+    sum(s.event_count) AS total_events,
+    sumIf(s.event_count, s.has_profile = 1) AS events_with_profile,
+    sumIf(s.event_count, s.has_follows = 1) AS events_with_follows_list,
+    sumIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list
+FROM daily_user_stats s
 GROUP BY month
 ORDER BY month DESC;
 
