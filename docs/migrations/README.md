@@ -29,10 +29,14 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 003_zap_amounts.sql | Parse bolt11 invoices from zap receipts | **Yes** |
 | 004_active_users_materialized.sql | Convert active user views to MVs | **Yes** (run automatically) |
 | 005_fix_active_users_views.sql | Fix active user views for large datasets | **Yes** (10-30 min) |
+| 006_preaggregate_active_users.sql | Pre-aggregate for instant queries | **Yes** (1-5 min) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
 > Stop all services before running migration 005.
+>
+> **Migration 006** is optional but recommended for instant query performance. It creates
+> pre-aggregated summary tables so views return in <100ms instead of 1-2 seconds.
 
 ---
 

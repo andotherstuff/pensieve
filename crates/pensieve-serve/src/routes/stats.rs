@@ -28,17 +28,30 @@ pub struct OverviewResponse {
 /// `GET /api/v1/stats`
 ///
 /// Returns high-level overview statistics.
+///
+/// Uses system tables and pre-aggregated data for performance:
+/// - total_events: from system.parts (instant, approximate)
+/// - total_pubkeys: from pubkey_first_seen_data (pre-aggregated)
+/// - total_kinds: from a small recent sample (kinds don't change much)
+/// - earliest/latest: from pubkey_first_seen_data and recent events
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
     let stats: OverviewResponse = state
         .clickhouse
         .query(
             "SELECT
-                count() AS total_events,
-                uniq(pubkey) AS total_pubkeys,
-                uniq(kind) AS total_kinds,
-                toUInt32(min(created_at)) AS earliest_event,
-                toUInt32(max(created_at)) AS latest_event
-            FROM events_local",
+                -- Approximate total events from system.parts (instant)
+                (SELECT sum(rows) FROM system.parts
+                 WHERE database = currentDatabase() AND table = 'events_local' AND active) AS total_events,
+                -- Total unique pubkeys from pre-aggregated table
+                (SELECT count() FROM pubkey_first_seen_data) AS total_pubkeys,
+                -- Distinct kinds (scan last 7 days - kinds are stable)
+                (SELECT uniq(kind) FROM events_local
+                 WHERE created_at >= now() - INTERVAL 7 DAY) AS total_kinds,
+                -- Earliest event from first-seen data
+                toUInt32((SELECT minMerge(first_seen) FROM pubkey_first_seen_data)) AS earliest_event,
+                -- Latest event from recent data
+                toUInt32((SELECT max(created_at) FROM events_local
+                          WHERE created_at >= now() - INTERVAL 1 HOUR)) AS latest_event",
         )
         .fetch_one()
         .await?;
@@ -233,11 +246,11 @@ pub struct ActiveUsersCount {
 /// `GET /api/v1/stats/users/active`
 ///
 /// Returns current DAU/WAU/MAU summary.
-/// Queries pre-aggregated materialized views for fast performance.
+/// Queries pre-aggregated summary tables for instant performance.
 pub async fn active_users_summary(
     State(state): State<AppState>,
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
-    // Daily - get most recent day from daily_active_users MV
+    // Daily - get most recent day from pre-aggregated summary
     let daily: ActiveUsersCount = state
         .clickhouse
         .query(
@@ -254,7 +267,7 @@ pub async fn active_users_summary(
         .fetch_one()
         .await?;
 
-    // Weekly - get most recent week from weekly_active_users MV
+    // Weekly - get most recent week from pre-aggregated summary
     let weekly: ActiveUsersCount = state
         .clickhouse
         .query(
@@ -271,7 +284,7 @@ pub async fn active_users_summary(
         .fetch_one()
         .await?;
 
-    // Monthly - get most recent month from monthly_active_users MV
+    // Monthly - get most recent month from pre-aggregated summary
     let monthly: ActiveUsersCount = state
         .clickhouse
         .query(
@@ -319,7 +332,7 @@ pub struct ActiveUsersRow {
 /// `GET /api/v1/stats/users/active/daily`
 ///
 /// Returns daily active users time series.
-/// Queries pre-aggregated daily_active_users MV for fast performance.
+/// Queries pre-aggregated summary tables for instant performance.
 pub async fn active_users_daily(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
@@ -357,7 +370,7 @@ pub async fn active_users_daily(
 /// `GET /api/v1/stats/users/active/weekly`
 ///
 /// Returns weekly active users time series.
-/// Queries pre-aggregated weekly_active_users MV for fast performance.
+/// Queries pre-aggregated summary tables for instant performance.
 pub async fn active_users_weekly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
@@ -395,7 +408,7 @@ pub async fn active_users_weekly(
 /// `GET /api/v1/stats/users/active/monthly`
 ///
 /// Returns monthly active users time series.
-/// Queries pre-aggregated monthly_active_users MV for fast performance.
+/// Queries pre-aggregated summary tables for instant performance.
 pub async fn active_users_monthly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
