@@ -33,7 +33,7 @@ pub struct OverviewResponse {
 /// - total_events: from system.parts (instant, approximate)
 /// - total_pubkeys: from pubkey_first_seen_data (pre-aggregated)
 /// - total_kinds: from a small recent sample (kinds don't change much)
-/// - earliest/latest: from pubkey_first_seen_data and recent events
+/// - earliest/latest: from pubkey_first_seen view and recent events
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
     let stats: OverviewResponse = state
         .clickhouse
@@ -47,8 +47,8 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
                 -- Distinct kinds (scan last 7 days - kinds are stable)
                 (SELECT uniq(kind) FROM events_local
                  WHERE created_at >= now() - INTERVAL 7 DAY) AS total_kinds,
-                -- Earliest event from first-seen data
-                toUInt32((SELECT minMerge(first_seen) FROM pubkey_first_seen_data)) AS earliest_event,
+                -- Earliest event from aggregated first-seen data
+                toUInt32((SELECT min(minMerge(first_seen_state)) FROM pubkey_first_seen_data)) AS earliest_event,
                 -- Latest event from recent data
                 toUInt32((SELECT max(created_at) FROM events_local
                           WHERE created_at >= now() - INTERVAL 1 HOUR)) AS latest_event",
