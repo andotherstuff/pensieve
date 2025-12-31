@@ -35,31 +35,51 @@ pub struct OverviewResponse {
 /// - total_kinds: from a small recent sample (kinds don't change much)
 /// - earliest/latest: from pubkey_first_seen view and recent events
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    let stats: OverviewResponse = state
-        .clickhouse
-        .query(
-            "SELECT
-                -- Approximate total events from system.parts (instant)
-                toUInt64((SELECT sum(rows) FROM system.parts
-                 WHERE database = currentDatabase() AND table = 'events_local' AND active)) AS total_events,
-                -- Total unique pubkeys from pre-aggregated table
-                toUInt64((SELECT count() FROM pubkey_first_seen_data)) AS total_pubkeys,
-                -- Distinct kinds (scan last 7 days - kinds are stable)
-                toUInt64((SELECT uniq(kind) FROM events_local
-                 WHERE created_at >= now() - INTERVAL 7 DAY)) AS total_kinds,
-                -- Earliest event from aggregated first-seen data (via helper view)
-                -- Floor at 2020-11-01 (Nostr genesis) to exclude bogus backdated events
-                toUInt32((SELECT min(first_seen) FROM pubkey_first_seen
-                          WHERE first_seen >= toDateTime('2020-11-01 00:00:00'))) AS earliest_event,
-                -- Latest event from recent data (exclude future timestamps)
-                toUInt32((SELECT max(created_at) FROM events_local
-                          WHERE created_at >= now() - INTERVAL 1 HOUR
-                            AND created_at <= now())) AS latest_event",
-        )
-        .fetch_one()
-        .await?;
+    // Query each stat separately to avoid clickhouse-rs deserialization issues
+    // with complex scalar subqueries
 
-    Ok(Json(stats))
+    let total_events: u64 = state
+        .clickhouse
+        .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0);
+
+    let total_pubkeys: u64 = state
+        .clickhouse
+        .query("SELECT count() FROM pubkey_first_seen_data")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0);
+
+    let total_kinds: u64 = state
+        .clickhouse
+        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0);
+
+    let earliest_event: u32 = state
+        .clickhouse
+        .query("SELECT toUInt32(min(first_seen)) FROM pubkey_first_seen WHERE first_seen >= toDateTime('2020-11-01 00:00:00')")
+        .fetch_one::<u32>()
+        .await
+        .unwrap_or(0);
+
+    let latest_event: u32 = state
+        .clickhouse
+        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 1 HOUR AND created_at <= now()")
+        .fetch_one::<u32>()
+        .await
+        .unwrap_or(0);
+
+    Ok(Json(OverviewResponse {
+        total_events,
+        total_pubkeys,
+        total_kinds,
+        earliest_event,
+        latest_event,
+    }))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
