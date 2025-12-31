@@ -40,13 +40,13 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         .query(
             "SELECT
                 -- Approximate total events from system.parts (instant)
-                (SELECT sum(rows) FROM system.parts
-                 WHERE database = currentDatabase() AND table = 'events_local' AND active) AS total_events,
+                toUInt64((SELECT sum(rows) FROM system.parts
+                 WHERE database = currentDatabase() AND table = 'events_local' AND active)) AS total_events,
                 -- Total unique pubkeys from pre-aggregated table
-                (SELECT count() FROM pubkey_first_seen_data) AS total_pubkeys,
+                toUInt64((SELECT count() FROM pubkey_first_seen_data)) AS total_pubkeys,
                 -- Distinct kinds (scan last 7 days - kinds are stable)
-                (SELECT uniq(kind) FROM events_local
-                 WHERE created_at >= now() - INTERVAL 7 DAY) AS total_kinds,
+                toUInt64((SELECT uniq(kind) FROM events_local
+                 WHERE created_at >= now() - INTERVAL 7 DAY)) AS total_kinds,
                 -- Earliest event from aggregated first-seen data (via helper view)
                 -- Floor at 2020-11-01 (Nostr genesis) to exclude bogus backdated events
                 toUInt32((SELECT min(first_seen) FROM pubkey_first_seen

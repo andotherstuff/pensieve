@@ -38,7 +38,7 @@ use pensieve_ingest::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -238,21 +238,24 @@ async fn index_segments_mode(
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if filename.starts_with("segment-") && filename.contains(".notepack") {
-                // Extract segment number
-                if let Some(num_str) = filename
-                    .strip_prefix("segment-")
-                    .and_then(|s| s.split('.').next())
-                {
-                    if let Ok(num) = num_str.parse::<u32>() {
-                        if num >= start_segment {
-                            segment_files.push(path);
-                        }
-                    }
-                }
-            }
+        if !path.is_file() {
+            continue;
+        }
+
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !filename.starts_with("segment-") || !filename.contains(".notepack") {
+            continue;
+        }
+
+        // Extract segment number and filter by start_segment
+        let num = filename
+            .strip_prefix("segment-")
+            .and_then(|s| s.split('.').next())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        if num >= start_segment {
+            segment_files.push(path);
         }
     }
 
@@ -343,7 +346,7 @@ async fn index_segments_mode(
 }
 
 /// Extract segment number from a path like "segment-1234.notepack.gz"
-fn extract_segment_number(path: &PathBuf) -> Option<u32> {
+fn extract_segment_number(path: &Path) -> Option<u32> {
     path.file_name()
         .and_then(|n| n.to_str())
         .and_then(|s| s.strip_prefix("segment-"))
@@ -351,7 +354,7 @@ fn extract_segment_number(path: &PathBuf) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
-fn print_summary(input: &PathBuf, output: &PathBuf, args: &Args, stats: &Stats, elapsed: std::time::Duration) {
+fn print_summary(input: &Path, output: &Path, args: &Args, stats: &Stats, elapsed: std::time::Duration) {
     println!("\n══════════════════════════════════════════════════════════════════");
     println!("SUMMARY");
     println!("══════════════════════════════════════════════════════════════════\n");
@@ -430,7 +433,7 @@ fn print_summary(input: &PathBuf, output: &PathBuf, args: &Args, stats: &Stats, 
 // Processing
 // ============================================================================
 
-fn process(args: &Args, input: &PathBuf, output: &PathBuf) -> Result<Stats> {
+fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
     let process_start = Instant::now();
 
@@ -566,11 +569,11 @@ fn process(args: &Args, input: &PathBuf, output: &PathBuf) -> Result<Stats> {
 }
 
 /// Collect files to process based on input path.
-fn collect_files(input: &PathBuf, limit: Option<usize>) -> Result<Vec<PathBuf>> {
+fn collect_files(input: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     if input.is_file() {
-        files.push(input.clone());
+        files.push(input.to_path_buf());
     } else if input.is_dir() {
         let mut entries: Vec<_> = fs::read_dir(input)?
             .filter_map(|e| e.ok())
@@ -610,7 +613,7 @@ type PipelineComponents = (
     Option<std::thread::JoinHandle<()>>,
 );
 
-fn init_pipeline(args: &Args, output: &PathBuf) -> Result<PipelineComponents> {
+fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
     // Initialize dedupe index (optional)
     let dedupe = if let Some(ref rocksdb_path) = args.rocksdb_path {
         tracing::info!("Opening dedupe index at {}", rocksdb_path.display());
@@ -630,7 +633,7 @@ fn init_pipeline(args: &Args, output: &PathBuf) -> Result<PipelineComponents> {
 
     // Initialize segment writer
     let segment_config = SegmentConfig {
-        output_dir: output.clone(),
+        output_dir: output.to_path_buf(),
         max_segment_size: args.segment_size,
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
@@ -784,8 +787,8 @@ mod tests {
     #[test]
     fn test_print_summary_does_not_panic() {
         let args = Args {
-            input: PathBuf::from("/test/input"),
-            output: PathBuf::from("/test/output"),
+            input: Some(PathBuf::from("/test/input")),
+            output: Some(PathBuf::from("/test/output")),
             rocksdb_path: Some(PathBuf::from("/test/rocksdb")),
             clickhouse_url: Some("http://localhost:8123".to_string()),
             clickhouse_db: "nostr".to_string(),
@@ -797,6 +800,8 @@ mod tests {
             no_compress: false,
             progress_file: None,
             metrics_port: 9091,
+            index_segments: None,
+            start_segment: 0,
         };
 
         let stats = Stats {
@@ -813,16 +818,18 @@ mod tests {
         };
 
         let elapsed = std::time::Duration::from_secs(10);
+        let input = args.input.as_ref().unwrap();
+        let output = args.output.as_ref().unwrap();
 
         // This should not panic
-        print_summary(&args, &stats, elapsed);
+        print_summary(input, output, &args, &stats, elapsed);
     }
 
     #[test]
     fn test_print_summary_zero_values() {
         let args = Args {
-            input: PathBuf::from("/test"),
-            output: PathBuf::from("/out"),
+            input: Some(PathBuf::from("/test")),
+            output: Some(PathBuf::from("/out")),
             rocksdb_path: None,
             clickhouse_url: None,
             clickhouse_db: "nostr".to_string(),
@@ -834,12 +841,16 @@ mod tests {
             no_compress: false,
             progress_file: None,
             metrics_port: 0,
+            index_segments: None,
+            start_segment: 0,
         };
 
         let stats = Stats::default();
         let elapsed = std::time::Duration::from_secs(0);
+        let input = args.input.as_ref().unwrap();
+        let output = args.output.as_ref().unwrap();
 
         // Should handle zeros gracefully
-        print_summary(&args, &stats, elapsed);
+        print_summary(input, output, &args, &stats, elapsed);
     }
 }
