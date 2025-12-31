@@ -1106,7 +1106,7 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT sum(total_events) as total FROM daily_active_users_summary",
+          "rawSql": "SELECT sumMerge(total_events_state) as total FROM daily_active_users_summary",
           "refId": "A",
           "format": 1
         }
@@ -1140,7 +1140,7 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT sum(total_events) as new_events FROM daily_active_users_summary WHERE date >= today() - 1",
+          "rawSql": "SELECT sumMerge(total_events_state) as new_events FROM daily_active_users_summary WHERE date >= today() - 1",
           "refId": "A",
           "format": 1
         }
