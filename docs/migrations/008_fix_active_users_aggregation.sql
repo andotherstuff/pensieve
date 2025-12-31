@@ -44,6 +44,7 @@ ORDER BY date;
 
 -- MV to populate from daily_user_stats inserts
 -- Uses *State functions to create mergeable aggregate states
+-- Note: Cast event_count to UInt64 to match the AggregateFunction type
 CREATE MATERIALIZED VIEW daily_active_users_summary_mv TO daily_active_users_summary AS
 SELECT
     s.date AS date,
@@ -51,10 +52,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY s.date;
 
@@ -82,10 +83,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY week;
 
@@ -113,10 +114,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY month;
 
@@ -132,10 +133,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY s.date;
 
@@ -147,10 +148,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY week;
 
@@ -162,10 +163,10 @@ SELECT
     uniqStateIf(s.pubkey, s.has_profile = 1) AS has_profile_state,
     uniqStateIf(s.pubkey, s.has_follows = 1) AS has_follows_list_state,
     uniqStateIf(s.pubkey, s.has_profile = 1 AND s.has_follows = 1) AS has_profile_and_follows_list_state,
-    sumState(s.event_count) AS total_events_state,
-    sumStateIf(s.event_count, s.has_profile = 1) AS events_with_profile_state,
-    sumStateIf(s.event_count, s.has_follows = 1) AS events_with_follows_list_state,
-    sumStateIf(s.event_count, s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
+    sumState(toUInt64(s.event_count)) AS total_events_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1) AS events_with_profile_state,
+    sumStateIf(toUInt64(s.event_count), s.has_follows = 1) AS events_with_follows_list_state,
+    sumStateIf(toUInt64(s.event_count), s.has_profile = 1 AND s.has_follows = 1) AS events_with_profile_and_follows_list_state
 FROM daily_user_stats s
 GROUP BY month;
 
