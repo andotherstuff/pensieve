@@ -45,6 +45,10 @@ metrics-exporter-prometheus.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 
+# SQLite for relay stats
+rusqlite = { version = "0.32", features = ["bundled"] }
+parking_lot = "0.12"
+
 # CLI
 clap = { version = "4.4", features = ["derive", "env"] }
 

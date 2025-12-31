@@ -22,6 +22,7 @@ Generate a token: `openssl rand -hex 32`
 | `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse connection URL |
 | `CLICKHOUSE_DATABASE` | `nostr` | ClickHouse database name |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
+| `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints |
 
 ---
 
@@ -794,6 +795,95 @@ GET /api/v1/kinds/7/activity?group_by=week&limit=12
 
 # Monthly activity for kind 30023 (long-form content)
 GET /api/v1/kinds/30023/activity?group_by=month
+```
+
+---
+
+### Relays
+
+Relay endpoints require the `RELAY_DB_PATH` environment variable to be set to the path of the ingester's SQLite relay stats database.
+
+#### `GET /api/v1/relays/summary`
+
+Returns aggregate relay statistics.
+
+**Response**
+
+```json
+{
+  "total_discovered": 3500,
+  "total_active": 50,
+  "total_blocked": 120,
+  "total_failing": 45,
+  "total_idle": 85,
+  "total_pending": 3200,
+  "avg_events_per_minute": 2345.67,
+  "events_last_hour": 140740,
+  "novel_events_last_hour": 85234
+}
+```
+
+---
+
+#### `GET /api/v1/relays`
+
+Returns a list of relays with optional filtering and sorting.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `status` | string | - | Filter by status: `active`, `idle`, `pending`, `failing`, `blocked` |
+| `tier` | string | - | Filter by tier: `seed`, `discovered` |
+| `sort_by` | string | `score` | Sort by: `score`, `events`, `url` |
+| `order` | string | `desc` | Sort order: `asc`, `desc` |
+| `limit` | integer | 100 | Maximum results (max 1000) |
+| `offset` | integer | 0 | Offset for pagination |
+
+**Response**
+
+```json
+{
+  "relays": [
+    {
+      "url": "wss://relay.damus.io",
+      "status": "active",
+      "tier": "seed",
+      "last_connected_at": 1735600000,
+      "consecutive_failures": 0,
+      "blocked_reason": null,
+      "score": 0.95,
+      "events_last_hour": 12500,
+      "novel_events_last_hour": 8200
+    }
+  ],
+  "total": 3500
+}
+```
+
+---
+
+#### `GET /api/v1/relays/throughput`
+
+Returns hourly event throughput for the last N hours.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hours` | integer | 24 | Number of hours to include (max 168) |
+
+**Response**
+
+```json
+[
+  {
+    "hour_start": 1735596000,
+    "events_received": 145000,
+    "events_novel": 89000,
+    "active_relays": 48
+  }
+]
 ```
 
 ---

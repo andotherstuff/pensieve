@@ -2,6 +2,7 @@
 
 mod health;
 mod kinds;
+mod relays;
 mod stats;
 
 use axum::extract::Request;
@@ -68,6 +69,11 @@ use crate::state::AppState;
 /// - `GET /api/v1/kinds` - List all kinds with counts
 /// - `GET /api/v1/kinds/{kind}` - Detailed stats for a kind
 /// - `GET /api/v1/kinds/{kind}/activity` - Activity time series for a kind
+///
+/// ### Relays (requires RELAY_DB_PATH env var)
+/// - `GET /api/v1/relays/summary` - Aggregate relay statistics
+/// - `GET /api/v1/relays` - List relays with filtering/sorting
+/// - `GET /api/v1/relays/throughput` - Hourly event throughput
 pub fn router(state: AppState) -> Router {
     // Public routes (no authentication)
     let public = Router::new().route("/health", get(health::health_check));
@@ -113,6 +119,10 @@ pub fn router(state: AppState) -> Router {
         .route("/kinds", get(kinds::list_kinds))
         .route("/kinds/{kind}", get(kinds::get_kind))
         .route("/kinds/{kind}/activity", get(kinds::kind_activity))
+        // Relays
+        .route("/relays/summary", get(relays::summary))
+        .route("/relays", get(relays::list))
+        .route("/relays/throughput", get(relays::throughput))
         // Auth middleware
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         // Cache headers middleware

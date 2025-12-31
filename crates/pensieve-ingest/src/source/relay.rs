@@ -225,6 +225,65 @@ impl RelaySource {
         }
     }
 
+    /// Reconcile relay status by checking actual connection state from nostr-sdk.
+    ///
+    /// This is necessary because `connect_relay()` returns Ok immediately (async),
+    /// but the actual WebSocket connection may fail later. This function checks
+    /// the real status of each relay and updates the database accordingly.
+    ///
+    /// Uses `reconcile_status` which only updates when there's a mismatch and
+    /// doesn't double-count failures for already-idle relays.
+    async fn reconcile_relay_status(&self, client: &Client) {
+        use nostr_sdk::RelayStatus;
+
+        let manager = match &self.relay_manager {
+            Some(m) => m,
+            None => return,
+        };
+
+        let relays = client.relays().await;
+        let mut connected_count: u64 = 0;
+        let mut updates: u64 = 0;
+
+        for (url, relay) in relays {
+            let url_str = url.to_string();
+            let status = relay.status();
+
+            let is_connected = matches!(status, RelayStatus::Connected);
+
+            if is_connected {
+                connected_count += 1;
+            }
+
+            // Only record for connected/disconnected states, not transitional ones
+            if matches!(
+                status,
+                RelayStatus::Connected | RelayStatus::Disconnected | RelayStatus::Terminated
+            ) {
+                match manager.reconcile_status(&url_str, is_connected) {
+                    Ok(true) => updates += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::debug!("Failed to reconcile status for {}: {}", url_str, e);
+                    }
+                }
+            }
+        }
+
+        // Update the connected count gauge
+        self.stats
+            .relays_connected
+            .store(connected_count as usize, std::sync::atomic::Ordering::Relaxed);
+
+        if updates > 0 {
+            tracing::debug!(
+                "Status reconciliation: {} connected, {} status updates",
+                connected_count,
+                updates
+            );
+        }
+    }
+
     /// Run the relay source asynchronously.
     ///
     /// This is the main async implementation that the sync `process` method calls.
@@ -373,6 +432,8 @@ impl RelaySource {
                 && !optimization_interval.is_zero()
                 && last_optimization.elapsed() >= current_interval
             {
+                // Reconcile actual connection status before making optimization decisions
+                self.reconcile_relay_status(&client).await;
                 self.run_optimization(&client, &filter).await;
                 last_optimization = Instant::now();
                 optimization_count += 1;

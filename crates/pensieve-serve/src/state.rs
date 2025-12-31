@@ -1,9 +1,12 @@
 //! Application state and configuration.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clickhouse::Client;
+use parking_lot::Mutex;
+use rusqlite::Connection;
 
 /// Application configuration loaded from environment.
 #[derive(Debug, Clone)]
@@ -19,6 +22,9 @@ pub struct Config {
 
     /// Valid API tokens (loaded from PENSIEVE_API_TOKENS).
     pub api_tokens: HashSet<String>,
+
+    /// Path to the relay stats SQLite database (optional).
+    pub relay_db_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -54,10 +60,17 @@ impl Config {
             anyhow::bail!("PENSIEVE_API_TOKENS must contain at least one token");
         }
 
+        // Optional: path to relay stats SQLite database
+        let relay_db_path = std::env::var("RELAY_DB_PATH")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists());
+
         tracing::info!(
             bind_addr = %bind_addr,
             clickhouse_url = %clickhouse_url,
             token_count = api_tokens.len(),
+            relay_db = ?relay_db_path,
             "configuration loaded"
         );
 
@@ -66,6 +79,7 @@ impl Config {
             clickhouse_url,
             clickhouse_database,
             api_tokens,
+            relay_db_path,
         })
     }
 }
@@ -78,6 +92,9 @@ pub struct AppState {
 
     /// Application configuration.
     pub config: Arc<Config>,
+
+    /// SQLite connection for relay stats (optional, shared via Arc<Mutex>).
+    pub relay_db: Option<Arc<Mutex<Connection>>>,
 }
 
 impl AppState {
@@ -87,9 +104,38 @@ impl AppState {
             .with_url(&config.clickhouse_url)
             .with_database(&config.clickhouse_database);
 
+        // Open SQLite connection if path is configured
+        // Use immutable=1 to safely read WAL-mode databases without write access
+        // to -wal/-shm auxiliary files
+        let relay_db = config.relay_db_path.as_ref().and_then(|path| {
+            // Convert path to file URI with immutable flag for WAL-mode safety
+            // SQLite URI format requires file:///path for absolute POSIX paths
+            // Using file:// so that absolute paths (starting with /) produce file:///
+            let uri = format!(
+                "file://{}?immutable=1",
+                path.to_string_lossy().replace('?', "%3F")
+            );
+            match Connection::open_with_flags(
+                &uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            ) {
+                Ok(conn) => {
+                    tracing::info!("Relay database connected (immutable): {:?}", path);
+                    Some(Arc::new(Mutex::new(conn)))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open relay database {:?}: {}", path, e);
+                    None
+                }
+            }
+        });
+
         Self {
             clickhouse,
             config: Arc::new(config),
+            relay_db,
         }
     }
 }

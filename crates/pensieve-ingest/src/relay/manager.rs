@@ -412,6 +412,97 @@ impl RelayManager {
         Ok(())
     }
 
+    /// Reconcile relay status based on actual connection state.
+    ///
+    /// Unlike `record_connection_attempt`, this only updates status when there's
+    /// a mismatch and doesn't increment failure counts for already-idle relays.
+    /// This prevents double-counting failures during periodic reconciliation.
+    ///
+    /// Returns true if the status was updated, false otherwise.
+    pub fn reconcile_status(&self, relay_url: &str, is_connected: bool) -> Result<bool> {
+        // Normalize URL to match database entries
+        let normalized = match normalize_relay_url(relay_url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(_) | NormalizeResult::Blocked(_) => {
+                return Ok(false);
+            }
+        };
+
+        let conn = self.conn.lock();
+        let now = Self::unix_now();
+
+        // Get current status from database
+        let current_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM relays WHERE url = ?",
+                rusqlite::params![&normalized],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let current_status = match current_status {
+            Some(s) => s,
+            None => return Ok(false), // Relay not registered
+        };
+
+        if is_connected {
+            // Relay is actually connected - ensure marked active
+            if current_status != "active" {
+                conn.execute(
+                    "UPDATE relays SET status = 'active', consecutive_failures = 0, last_connected_at = ? WHERE url = ?",
+                    rusqlite::params![now, &normalized],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+                return Ok(true);
+            }
+        } else {
+            // Relay is not connected
+            if current_status == "active" {
+                // Was active but now disconnected - this is a failure
+                conn.execute(
+                    "UPDATE relays SET consecutive_failures = consecutive_failures + 1 WHERE url = ?",
+                    rusqlite::params![&normalized],
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+
+                // Check if we should block
+                let failures: u32 = conn
+                    .query_row(
+                        "SELECT consecutive_failures FROM relays WHERE url = ?",
+                        rusqlite::params![&normalized],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+
+                if failures >= self.config.block_after_failures {
+                    conn.execute(
+                        "UPDATE relays SET status = 'blocked', blocked_reason = ? WHERE url = ?",
+                        rusqlite::params![
+                            format!("Blocked after {} consecutive failures", failures),
+                            &normalized
+                        ],
+                    )
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                    tracing::warn!(
+                        "Blocked relay {} after {} consecutive failures",
+                        normalized,
+                        failures
+                    );
+                } else {
+                    conn.execute(
+                        "UPDATE relays SET status = 'failing' WHERE url = ?",
+                        rusqlite::params![&normalized],
+                    )
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                }
+                return Ok(true);
+            }
+            // If already idle/pending/failing/blocked, don't increment failures again
+        }
+
+        Ok(false)
+    }
+
     /// Flush accumulators if the hour has changed.
     fn maybe_flush_hour(&self) {
         let current_hour = Self::current_hour_start();
