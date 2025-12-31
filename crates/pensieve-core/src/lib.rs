@@ -12,6 +12,18 @@ mod event;
 pub mod metrics;
 pub mod proto;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Nostr genesis date: November 7, 2020.
+/// This is the date of the first Nostr commit. Events with `created_at` before
+/// this date are considered invalid/bogus.
+pub const NOSTR_GENESIS_TIMESTAMP: u32 = 1604707200; // 2020-11-07 00:00:00 UTC
+
+/// Nostr genesis date as a string for SQL queries.
+pub const NOSTR_GENESIS_DATE_SQL: &str = "2020-11-07 00:00:00";
+
 pub use error::{Error, Result};
 pub use event::{
     event_to_notebuf, pack_event_binary, pack_event_binary_into, validate_event, validate_event_id,

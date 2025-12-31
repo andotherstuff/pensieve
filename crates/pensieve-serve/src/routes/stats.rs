@@ -4,6 +4,7 @@ use axum::extract::{Query, State};
 use axum::Json;
 use chrono::NaiveDate;
 use clickhouse::Row;
+use pensieve_core::NOSTR_GENESIS_DATE_SQL;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -13,7 +14,7 @@ use crate::state::AppState;
 // Overview
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// High-level stats overview.
+/// High-level stats overview (combined endpoint for convenience).
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct OverviewResponse {
     pub total_events: u64,
@@ -27,51 +28,22 @@ pub struct OverviewResponse {
 
 /// `GET /api/v1/stats`
 ///
-/// Returns high-level overview statistics.
-///
-/// Uses system tables and pre-aggregated data for performance:
-/// - total_events: from system.parts (instant, approximate)
-/// - total_pubkeys: from pubkey_first_seen_data (pre-aggregated)
-/// - total_kinds: from a small recent sample (kinds don't change much)
-/// - earliest/latest: from pubkey_first_seen view and recent events
+/// Returns high-level overview statistics (combined endpoint).
+/// For granular queries with independent caching, use the individual endpoints:
+/// - GET /api/v1/stats/events/total
+/// - GET /api/v1/stats/pubkeys/total
+/// - GET /api/v1/stats/kinds/total
+/// - GET /api/v1/stats/events/earliest
+/// - GET /api/v1/stats/events/latest
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    // Query each stat separately to avoid clickhouse-rs deserialization issues
-    // with complex scalar subqueries
-
-    let total_events: u64 = state
-        .clickhouse
-        .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
-        .fetch_one::<u64>()
-        .await
-        .unwrap_or(0);
-
-    let total_pubkeys: u64 = state
-        .clickhouse
-        .query("SELECT count() FROM pubkey_first_seen_data")
-        .fetch_one::<u64>()
-        .await
-        .unwrap_or(0);
-
-    let total_kinds: u64 = state
-        .clickhouse
-        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY")
-        .fetch_one::<u64>()
-        .await
-        .unwrap_or(0);
-
-    let earliest_event: u32 = state
-        .clickhouse
-        .query("SELECT toUInt32(min(first_seen)) FROM pubkey_first_seen WHERE first_seen >= toDateTime('2020-11-01 00:00:00')")
-        .fetch_one::<u32>()
-        .await
-        .unwrap_or(0);
-
-    let latest_event: u32 = state
-        .clickhouse
-        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 1 HOUR AND created_at <= now()")
-        .fetch_one::<u32>()
-        .await
-        .unwrap_or(0);
+    // Run all queries in parallel
+    let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
+        fetch_total_events(&state),
+        fetch_total_pubkeys(&state),
+        fetch_total_kinds(&state),
+        fetch_earliest_event(&state),
+        fetch_latest_event(&state),
+    );
 
     Ok(Json(OverviewResponse {
         total_events,
@@ -80,6 +52,124 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
         earliest_event,
         latest_event,
     }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Granular stat endpoints (for dashboards with independent caching)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Response for a single count value.
+#[derive(Debug, Clone, Serialize)]
+pub struct CountResponse {
+    pub count: u64,
+}
+
+/// Response for a single timestamp value.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimestampResponse {
+    pub timestamp: u32,
+}
+
+/// `GET /api/v1/stats/events/total`
+///
+/// Returns approximate total event count (from system.parts, instant).
+/// Suggested cache TTL: 5 minutes.
+pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
+    let count = fetch_total_events(&state).await;
+    Ok(Json(CountResponse { count }))
+}
+
+/// `GET /api/v1/stats/pubkeys/total`
+///
+/// Returns total unique pubkeys (from pre-aggregated table, instant).
+/// Suggested cache TTL: 5 minutes.
+pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
+    let count = fetch_total_pubkeys(&state).await;
+    Ok(Json(CountResponse { count }))
+}
+
+/// `GET /api/v1/stats/kinds/total`
+///
+/// Returns distinct event kinds seen in the last day.
+/// Suggested cache TTL: 1 hour (kinds are stable).
+pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
+    let count = fetch_total_kinds(&state).await;
+    Ok(Json(CountResponse { count }))
+}
+
+/// `GET /api/v1/stats/events/earliest`
+///
+/// Returns earliest event timestamp (from aggregated first-seen data).
+/// Suggested cache TTL: 1 hour (rarely changes).
+pub async fn earliest_event(
+    State(state): State<AppState>,
+) -> Result<Json<TimestampResponse>, ApiError> {
+    let timestamp = fetch_earliest_event(&state).await;
+    Ok(Json(TimestampResponse { timestamp }))
+}
+
+/// `GET /api/v1/stats/events/latest`
+///
+/// Returns latest event timestamp (from recent data, excludes future timestamps).
+/// Suggested cache TTL: 10 seconds (changes frequently).
+pub async fn latest_event(
+    State(state): State<AppState>,
+) -> Result<Json<TimestampResponse>, ApiError> {
+    let timestamp = fetch_latest_event(&state).await;
+    Ok(Json(TimestampResponse { timestamp }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal fetch functions (reused by both combined and granular endpoints)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn fetch_total_events(state: &AppState) -> u64 {
+    state
+        .clickhouse
+        .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0)
+}
+
+async fn fetch_total_pubkeys(state: &AppState) -> u64 {
+    state
+        .clickhouse
+        .query("SELECT count() FROM pubkey_first_seen_data")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0)
+}
+
+async fn fetch_total_kinds(state: &AppState) -> u64 {
+    state
+        .clickhouse
+        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 1 DAY")
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0)
+}
+
+async fn fetch_earliest_event(state: &AppState) -> u32 {
+    // Use pubkey_first_seen view which filters by genesis date
+    state
+        .clickhouse
+        .query(&format!(
+            "SELECT toUInt32(min(first_seen)) FROM pubkey_first_seen WHERE first_seen >= toDateTime('{}')",
+            NOSTR_GENESIS_DATE_SQL
+        ))
+        .fetch_one::<u32>()
+        .await
+        .unwrap_or(0)
+}
+
+async fn fetch_latest_event(state: &AppState) -> u32 {
+    state
+        .clickhouse
+        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 1 HOUR AND created_at <= now()")
+        .fetch_one::<u32>()
+        .await
+        .unwrap_or(0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -599,7 +599,7 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at >= toDateTime('2020-11-01 00:00:00')",
+          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at >= toDateTime('2020-11-07 00:00:00')",
           "refId": "A",
           "format": 0
         }

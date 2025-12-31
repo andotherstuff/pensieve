@@ -51,8 +51,15 @@ pub fn router(state: AppState) -> Router {
     let api_v1 = Router::new()
         // Health/auth check
         .route("/ping", get(health::authenticated_ping))
-        // Stats overview
+        // Stats overview (combined)
         .route("/stats", get(stats::overview))
+        // Granular stats (for dashboards with independent caching)
+        .route("/stats/events/total", get(stats::total_events))
+        .route("/stats/pubkeys/total", get(stats::total_pubkeys))
+        .route("/stats/kinds/total", get(stats::total_kinds))
+        .route("/stats/events/earliest", get(stats::earliest_event))
+        .route("/stats/events/latest", get(stats::latest_event))
+        // Event stats
         .route("/stats/events", get(stats::events))
         .route("/stats/throughput", get(stats::throughput))
         // Active users
