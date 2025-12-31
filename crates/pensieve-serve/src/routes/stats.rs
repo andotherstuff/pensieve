@@ -47,11 +47,14 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
                 -- Distinct kinds (scan last 7 days - kinds are stable)
                 (SELECT uniq(kind) FROM events_local
                  WHERE created_at >= now() - INTERVAL 7 DAY) AS total_kinds,
-                -- Earliest event from aggregated first-seen data
-                toUInt32((SELECT min(minMerge(first_seen_state)) FROM pubkey_first_seen_data)) AS earliest_event,
-                -- Latest event from recent data
+                -- Earliest event from aggregated first-seen data (via helper view)
+                -- Floor at 2020-11-01 (Nostr genesis) to exclude bogus backdated events
+                toUInt32((SELECT min(first_seen) FROM pubkey_first_seen
+                          WHERE first_seen >= toDateTime('2020-11-01 00:00:00'))) AS earliest_event,
+                -- Latest event from recent data (exclude future timestamps)
                 toUInt32((SELECT max(created_at) FROM events_local
-                          WHERE created_at >= now() - INTERVAL 1 HOUR)) AS latest_event",
+                          WHERE created_at >= now() - INTERVAL 1 HOUR
+                            AND created_at <= now())) AS latest_event",
         )
         .fetch_one()
         .await?;

@@ -599,7 +599,7 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at > toDateTime('1990-01-01')",
+          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at >= toDateTime('2020-11-01 00:00:00')",
           "refId": "A",
           "format": 0
         }
@@ -633,7 +633,7 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT toUnixTimestamp(max(created_at)) * 1000 as newest FROM events_local",
+          "rawSql": "SELECT toUnixTimestamp(max(created_at)) * 1000 as newest FROM events_local WHERE created_at <= now()",
           "refId": "A",
           "format": 0
         }
