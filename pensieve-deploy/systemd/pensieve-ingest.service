@@ -1,8 +1,8 @@
 [Unit]
 Description=Pensieve Nostr Ingester
 Documentation=https://github.com/andotherstuff/pensieve
-After=network.target docker.service
-Wants=docker.service
+After=network.target docker.service tor.service
+Wants=docker.service tor.service
 
 [Service]
 Type=simple
@@ -11,6 +11,8 @@ Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve
 
 # Binary location (after cargo build --release)
+# Tor proxy enabled by default - .onion relays route through Tor, clearnet connects directly
+# Remove --tor-proxy if you don't want Tor support (or don't have tor installed)
 ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
     --import-discovered-json /home/pensieve/pensieve/data/relays/relay_discovery_results.json \
@@ -18,7 +20,8 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --rocksdb-path /data/rocksdb \
     --relay-db-path /data/relay-stats.db \
     --clickhouse-url http://localhost:8123 \
-    --metrics-port 9091
+    --metrics-port 9091 \
+    --tor-proxy 127.0.0.1:9050
 
 # Restart policy
 Restart=always

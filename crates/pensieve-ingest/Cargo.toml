@@ -28,6 +28,10 @@ path = "src/bin/proto.rs"
 name = "repair-dedupe"
 path = "src/bin/repair-dedupe.rs"
 
+[[bin]]
+name = "relay-cleanup"
+path = "src/bin/relay-cleanup.rs"
+
 [dependencies]
 # Internal crates
 pensieve-core = { path = "../pensieve-core" }

@@ -15,6 +15,7 @@ use rusqlite::Connection;
 
 use super::schema::{self, RelayStatus, RelayTier};
 use super::scoring::{self, RelayStatsForScoring};
+use super::url::{NormalizeResult, normalize_relay_url};
 use crate::{Error, Result};
 
 /// Configuration for the relay manager.
@@ -136,14 +137,33 @@ impl RelayManager {
     }
 
     /// Register a relay (if not already known).
+    ///
+    /// The URL is normalized before registration to prevent duplicates from
+    /// trailing slashes, case differences, etc. Returns an error if the URL
+    /// is invalid or blocked.
     pub fn register_relay(&self, url: &str, tier: RelayTier) -> Result<()> {
+        // Normalize the URL
+        let normalized = match normalize_relay_url(url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(reason) => {
+                return Err(Error::Validation(format!(
+                    "Invalid relay URL '{}': {}",
+                    url, reason
+                )));
+            }
+            NormalizeResult::Blocked(reason) => {
+                tracing::debug!("Blocked relay URL '{}': {}", url, reason);
+                return Ok(()); // Silently skip blocked URLs
+            }
+        };
+
         let now = Self::unix_now();
         let conn = self.conn.lock();
 
         conn.execute(
             "INSERT OR IGNORE INTO relays (url, first_seen_at, tier, status)
              VALUES (?, ?, ?, ?)",
-            rusqlite::params![url, now, tier.as_str(), RelayStatus::Pending.as_str()],
+            rusqlite::params![normalized, now, tier.as_str(), RelayStatus::Pending.as_str()],
         )
         .map_err(|e| Error::Database(format!("Failed to register relay: {}", e)))?;
 
@@ -162,6 +182,9 @@ impl RelayManager {
     ///
     /// Expected format: JSON object with `functioning_relays` array of URL strings.
     /// This is the format produced by relay discovery tools.
+    ///
+    /// URLs are normalized and validated before import. Invalid or blocked URLs
+    /// are silently skipped.
     pub fn import_from_json(&self, path: &Path) -> Result<usize> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             Error::Io(std::io::Error::other(format!(
@@ -185,21 +208,9 @@ impl RelayManager {
         let mut count = 0;
         for relay in relays {
             if let Some(url) = relay.as_str() {
-                let url = url.trim();
-                // Only import valid websocket URLs
-                if url.starts_with("wss://") || url.starts_with("ws://") {
-                    // Skip localhost, private IPs, and .onion addresses
-                    if !url.contains("localhost")
-                        && !url.contains("127.0.0.1")
-                        && !url.contains("192.168.")
-                        && !url.contains("10.0.")
-                        && !url.contains(".onion")
-                        && !url.contains(".local")
-                        && !url.contains("umbrel")
-                    {
-                        self.register_relay(url, RelayTier::Discovered)?;
-                        count += 1;
-                    }
+                // register_relay handles normalization and blocklist checking
+                if self.register_relay(url, RelayTier::Discovered).is_ok() {
+                    count += 1;
                 }
             }
         }
@@ -210,8 +221,9 @@ impl RelayManager {
 
     /// Load relay URLs from a JSON discovery results file.
     ///
-    /// Returns a Vec of relay URLs suitable for use as seed relays.
+    /// Returns a Vec of normalized relay URLs suitable for use as seed relays.
     /// This is a static method that doesn't require a RelayManager instance.
+    /// Invalid and blocked URLs are silently filtered out.
     pub fn load_relays_from_json(path: &Path) -> Result<Vec<String>> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             Error::Io(std::io::Error::other(format!(
@@ -230,24 +242,11 @@ impl RelayManager {
                 Error::Serialization("JSON missing 'functioning_relays' array".to_string())
             })?;
 
-        let mut urls = Vec::new();
-        for relay in relays {
-            if let Some(url) = relay.as_str() {
-                let url = url.trim();
-                // Only include valid websocket URLs, skip localhost/private/onion
-                if (url.starts_with("wss://") || url.starts_with("ws://"))
-                    && !url.contains("localhost")
-                    && !url.contains("127.0.0.1")
-                    && !url.contains("192.168.")
-                    && !url.contains("10.0.")
-                    && !url.contains(".onion")
-                    && !url.contains(".local")
-                    && !url.contains("umbrel")
-                {
-                    urls.push(url.to_string());
-                }
-            }
-        }
+        let urls: Vec<String> = relays
+            .iter()
+            .filter_map(|relay| relay.as_str())
+            .filter_map(|url| normalize_relay_url(url).ok())
+            .collect();
 
         Ok(urls)
     }

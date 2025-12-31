@@ -46,7 +46,12 @@
 mod manager;
 mod schema;
 mod scoring;
+pub mod url;
 
 pub use manager::{AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig};
 pub use schema::{RelayStatus, RelayTier};
 pub use scoring::{RelayScore, RelayStatsForScoring};
+pub use url::{
+    NormalizeOptions, NormalizeResult, is_obviously_invalid, is_obviously_invalid_with_opts,
+    is_onion_url, normalize_relay_url, normalize_relay_url_with_opts,
+};

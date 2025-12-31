@@ -35,6 +35,7 @@ use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, RelayManager, RelayManagerConfig,
     SealedSegment, SegmentConfig, SegmentWriter, pack_nostr_event,
+    relay::normalize_relay_url,
     source::{RelayConfig, RelaySource},
 };
 use std::path::PathBuf;
@@ -58,6 +59,8 @@ fn default_seed_relays() -> Vec<String> {
 }
 
 /// Load seed relays from a text file (one URL per line, # for comments).
+///
+/// URLs are normalized before being returned. Invalid or blocked URLs are skipped.
 fn load_seeds_from_file(path: &std::path::Path) -> Result<Vec<String>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read seed file: {}", path.display()))?;
@@ -69,9 +72,11 @@ fn load_seeds_from_file(path: &std::path::Path) -> Result<Vec<String>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Only include valid websocket URLs
-        if line.starts_with("wss://") || line.starts_with("ws://") {
-            seeds.push(line.to_string());
+        // Normalize and validate the URL
+        if let Some(normalized) = normalize_relay_url(line).ok() {
+            seeds.push(normalized);
+        } else {
+            tracing::warn!("Skipping invalid/blocked relay URL in seed file: {}", line);
         }
     }
     Ok(seeds)
@@ -155,6 +160,15 @@ struct Args {
     /// Lower values mean less catch-up work after a crash but more I/O.
     #[arg(long, default_value = "60")]
     checkpoint_interval_secs: u64,
+
+    /// SOCKS5 proxy address for connecting to Tor (.onion) relays.
+    ///
+    /// When set, .onion relay addresses will be routed through this proxy.
+    /// Clearnet relays will continue to connect directly.
+    ///
+    /// Example: 127.0.0.1:9050 (default Tor SOCKS5 port)
+    #[arg(long, value_name = "HOST:PORT")]
+    tor_proxy: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -326,8 +340,13 @@ async fn main() -> Result<()> {
         max_relays: args.max_relays,
         optimization_interval: Duration::from_secs(args.score_interval_secs),
         since_timestamp,
+        tor_proxy: args.tor_proxy,
         ..Default::default()
     };
+
+    if args.tor_proxy.is_some() {
+        tracing::info!("Tor proxy enabled - .onion relays will be routed through proxy");
+    }
 
     tracing::info!("Configuration:");
     tracing::info!("  RocksDB: {}", args.rocksdb_path.display());

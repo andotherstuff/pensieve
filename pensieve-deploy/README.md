@@ -48,6 +48,11 @@ apt install -y build-essential pkg-config libssl-dev libclang-dev protobuf-compi
 
 # Other tools
 apt install -y rclone htop iotop tmux git
+
+# Tor (for .onion relay support)
+apt install -y tor
+systemctl enable tor
+systemctl start tor
 ```
 
 ### 2. Create Application User
@@ -580,4 +585,127 @@ ClickHouse will use available RAM for caching. This is normal. To limit:
 <!-- clickhouse/config.xml -->
 <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
 ```
+
+---
+
+## Tor Relay Support
+
+Pensieve connects to Nostr relays running as Tor hidden services (`.onion` addresses) **by default**.
+This provides additional privacy and access to relays that are only available over Tor.
+
+> **Note**: The systemd service enables Tor by default. If you don't want Tor support,
+> remove the `--tor-proxy` flag from the service file.
+
+### Why Use Tor Relays?
+
+- **Privacy**: Your ingester's IP is hidden from Tor-only relays
+- **Censorship Resistance**: Access relays that may be blocked in your region
+- **Network Coverage**: Some relays are only available as `.onion` services
+
+### 1. Install Tor
+
+```bash
+# Debian/Ubuntu
+apt install -y tor
+
+# Verify Tor is running
+systemctl status tor
+
+# Tor SOCKS5 proxy runs on 127.0.0.1:9050 by default
+```
+
+### 2. Enable Tor in the Ingester
+
+Add the `--tor-proxy` flag to your ingester command:
+
+```bash
+pensieve-ingest \
+    --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
+    --output-dir /archive/segments \
+    --rocksdb-path /data/rocksdb \
+    --clickhouse-url http://localhost:8123 \
+    --tor-proxy 127.0.0.1:9050
+```
+
+Or update the systemd service:
+
+```ini
+# /etc/systemd/system/pensieve-ingest.service
+ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
+    --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
+    --output-dir /archive/segments \
+    --rocksdb-path /data/rocksdb \
+    --clickhouse-url http://localhost:8123 \
+    --metrics-port 9091 \
+    --tor-proxy 127.0.0.1:9050
+```
+
+After editing:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart pensieve-ingest
+```
+
+### 3. Add Tor Relay URLs
+
+Add `.onion` relay addresses to your seed file:
+
+```bash
+# /home/pensieve/pensieve/data/relays/seed.txt
+
+# Clearnet relays (connect directly)
+wss://relay.damus.io
+wss://nos.lol
+wss://relay.primal.net
+
+# Tor relays (routed through proxy)
+# Note: .onion relays use ws:// not wss:// (Tor provides encryption)
+ws://nostrnetl6yd5whkldj3vqsxyyaq3tkuspy23a3qgx7cdepb4564qgqd.onion
+ws://relay.snort.social.onion
+```
+
+### 4. Verify Tor Connectivity
+
+Check the ingester logs to verify Tor connections:
+
+```bash
+journalctl -u pensieve-ingest -f | grep -i tor
+
+# You should see:
+# Tor proxy enabled: 127.0.0.1:9050 (routing .onion addresses only)
+# Added relay: ws://nostrnetl6yd5whkldj3vqsxyyaq3tkuspy23a3qgx7cdepb4564qgqd.onion
+```
+
+### How It Works
+
+When `--tor-proxy` is set:
+
+| Relay Type | Connection |
+|------------|------------|
+| Clearnet (`wss://relay.damus.io`) | Direct connection (fast) |
+| Tor (`.onion` addresses) | Routed through SOCKS5 proxy |
+
+This means clearnet relays are unaffected by Tor - you only pay the latency
+cost for `.onion` relays specifically.
+
+### Finding Tor Relays
+
+Some well-known Nostr relays with Tor support:
+
+| Relay | Tor Address |
+|-------|-------------|
+| relay.nostr.net | `nostrnetl6yd5whkldj3vqsxyyaq3tkuspy23a3qgx7cdepb4564qgqd.onion` |
+
+You can also discover Tor relays by looking at NIP-65 relay lists from privacy-focused
+users, or by checking relay documentation.
+
+### Security Considerations
+
+- **Tor latency**: Expect higher latency (1-5s) for `.onion` connections
+- **Exit nodes**: Clearnet traffic doesn't go through Tor exit nodes
+- **DNS leaks**: The ingester only routes `.onion` URLs through Tor; DNS for
+  clearnet relays is resolved normally
+- **Tor availability**: If Tor daemon stops, `.onion` connections will fail
+  (clearnet continues working)
 

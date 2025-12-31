@@ -358,67 +358,89 @@ pub struct ActiveUsersCount {
 
 /// `GET /api/v1/stats/users/active`
 ///
-/// Returns current DAU/WAU/MAU summary.
-/// Queries pre-aggregated summary tables for instant performance.
+/// Returns current DAU/WAU/MAU summary (most recent values).
+/// Queries the small pre-aggregated summary tables directly.
 pub async fn active_users_summary(
     State(state): State<AppState>,
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
-    // Daily - get most recent day from pre-aggregated summary
-    let daily: ActiveUsersCount = state
+    // Run all three queries in parallel - each fetches from tiny summary tables
+    let (daily, weekly, monthly) = tokio::join!(
+        fetch_latest_daily_active_users(&state),
+        fetch_latest_weekly_active_users(&state),
+        fetch_latest_monthly_active_users(&state),
+    );
+
+    Ok(Json(ActiveUsersSummary {
+        daily: daily?,
+        weekly: weekly?,
+        monthly: monthly?,
+    }))
+}
+
+/// Fetch the most recent daily active users from the summary table.
+async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    state
         .clickhouse
         .query(
             "SELECT
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM daily_active_users
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM daily_active_users_summary
+            WHERE date >= toDate('2020-11-07') AND date <= today()
+            GROUP BY date
             ORDER BY date DESC
             LIMIT 1",
         )
         .fetch_one()
-        .await?;
+        .await
+        .map_err(ApiError::from)
+}
 
-    // Weekly - get most recent week from pre-aggregated summary
-    let weekly: ActiveUsersCount = state
+/// Fetch the most recent weekly active users from the summary table.
+async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    state
         .clickhouse
         .query(
             "SELECT
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM weekly_active_users
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM weekly_active_users_summary
+            WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
+            GROUP BY week
             ORDER BY week DESC
             LIMIT 1",
         )
         .fetch_one()
-        .await?;
+        .await
+        .map_err(ApiError::from)
+}
 
-    // Monthly - get most recent month from pre-aggregated summary
-    let monthly: ActiveUsersCount = state
+/// Fetch the most recent monthly active users from the summary table.
+async fn fetch_latest_monthly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    state
         .clickhouse
         .query(
             "SELECT
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM monthly_active_users
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM monthly_active_users_summary
+            WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
+            GROUP BY month
             ORDER BY month DESC
             LIMIT 1",
         )
         .fetch_one()
-        .await?;
-
-    Ok(Json(ActiveUsersSummary {
-        daily,
-        weekly,
-        monthly,
-    }))
+        .await
+        .map_err(ApiError::from)
 }
 
 /// Query parameters for active users time series.
@@ -445,37 +467,38 @@ pub struct ActiveUsersRow {
 /// `GET /api/v1/stats/users/active/daily`
 ///
 /// Returns daily active users time series.
-/// Queries pre-aggregated summary tables for instant performance.
+/// Fetches from small pre-aggregated summary table (~1500 rows total).
 pub async fn active_users_daily(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(30).min(365);
+    let limit = params.limit.unwrap_or(30).min(365) as usize;
 
-    let since_clause = match params.since {
-        Some(date) => format!("AND date >= '{}'", date),
-        None => String::new(),
-    };
-
-    let rows: Vec<ActiveUsersRow> = state
+    // Fetch all daily data from the small summary table, filter in Rust
+    let mut rows: Vec<ActiveUsersRow> = state
         .clickhouse
-        .query(&format!(
+        .query(
             "SELECT
                 toString(date) AS period,
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM daily_active_users
-            WHERE 1=1
-            {}
-            ORDER BY date DESC
-            LIMIT {}",
-            since_clause, limit
-        ))
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM daily_active_users_summary
+            WHERE date >= toDate('2020-11-07') AND date <= today()
+            GROUP BY date
+            ORDER BY date DESC",
+        )
         .fetch_all()
         .await?;
+
+    // Apply filters in Rust (simple and fast for small data)
+    if let Some(since) = params.since {
+        let since_str = since.to_string();
+        rows.retain(|r| r.period >= since_str);
+    }
+    rows.truncate(limit);
 
     Ok(Json(rows))
 }
@@ -483,37 +506,38 @@ pub async fn active_users_daily(
 /// `GET /api/v1/stats/users/active/weekly`
 ///
 /// Returns weekly active users time series.
-/// Queries pre-aggregated summary tables for instant performance.
+/// Fetches from small pre-aggregated summary table (~215 rows total).
 pub async fn active_users_weekly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(12).min(52);
+    let limit = params.limit.unwrap_or(12).min(52) as usize;
 
-    let since_clause = match params.since {
-        Some(date) => format!("AND week >= '{}'", date),
-        None => String::new(),
-    };
-
-    let rows: Vec<ActiveUsersRow> = state
+    // Fetch all weekly data from the small summary table, filter in Rust
+    let mut rows: Vec<ActiveUsersRow> = state
         .clickhouse
-        .query(&format!(
+        .query(
             "SELECT
                 toString(week) AS period,
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM weekly_active_users
-            WHERE 1=1
-            {}
-            ORDER BY week DESC
-            LIMIT {}",
-            since_clause, limit
-        ))
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM weekly_active_users_summary
+            WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
+            GROUP BY week
+            ORDER BY week DESC",
+        )
         .fetch_all()
         .await?;
+
+    // Apply filters in Rust
+    if let Some(since) = params.since {
+        let since_str = since.to_string();
+        rows.retain(|r| r.period >= since_str);
+    }
+    rows.truncate(limit);
 
     Ok(Json(rows))
 }
@@ -521,37 +545,38 @@ pub async fn active_users_weekly(
 /// `GET /api/v1/stats/users/active/monthly`
 ///
 /// Returns monthly active users time series.
-/// Queries pre-aggregated summary tables for instant performance.
+/// Fetches from small pre-aggregated summary table (~50 rows total).
 pub async fn active_users_monthly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
-    let limit = params.limit.unwrap_or(12).min(120);
+    let limit = params.limit.unwrap_or(12).min(120) as usize;
 
-    let since_clause = match params.since {
-        Some(date) => format!("AND month >= '{}'", date),
-        None => String::new(),
-    };
-
-    let rows: Vec<ActiveUsersRow> = state
+    // Fetch all monthly data from the small summary table, filter in Rust
+    let mut rows: Vec<ActiveUsersRow> = state
         .clickhouse
-        .query(&format!(
+        .query(
             "SELECT
                 toString(month) AS period,
-                active_users,
-                has_profile,
-                has_follows_list,
-                has_profile_and_follows_list,
-                total_events
-            FROM monthly_active_users
-            WHERE 1=1
-            {}
-            ORDER BY month DESC
-            LIMIT {}",
-            since_clause, limit
-        ))
+                uniqMerge(active_users_state) AS active_users,
+                uniqMerge(has_profile_state) AS has_profile,
+                uniqMerge(has_follows_list_state) AS has_follows_list,
+                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                sumMerge(total_events_state) AS total_events
+            FROM monthly_active_users_summary
+            WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
+            GROUP BY month
+            ORDER BY month DESC",
+        )
         .fetch_all()
         .await?;
+
+    // Apply filters in Rust
+    if let Some(since) = params.since {
+        let since_str = since.to_string();
+        rows.retain(|r| r.period >= since_str);
+    }
+    rows.truncate(limit);
 
     Ok(Json(rows))
 }

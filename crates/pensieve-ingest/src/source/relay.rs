@@ -25,6 +25,7 @@ use crate::{Error, Result};
 use chrono::DateTime;
 use nostr_sdk::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -64,6 +65,14 @@ pub struct RelayConfig {
     ///
     /// The dedupe index will handle any duplicates from the overlap window.
     pub since_timestamp: Option<u64>,
+
+    /// Optional SOCKS5 proxy address for connecting to Tor (.onion) relays.
+    ///
+    /// When set, .onion relay addresses will be routed through this proxy.
+    /// Typically this is the Tor daemon at `127.0.0.1:9050`.
+    ///
+    /// Clearnet relays (wss://...) will continue to connect directly.
+    pub tor_proxy: Option<SocketAddr>,
 }
 
 impl Default for RelayConfig {
@@ -86,6 +95,7 @@ impl Default for RelayConfig {
             subscribe_all: true,
             optimization_interval: Duration::from_secs(300), // 5 minutes
             since_timestamp: None,
+            tor_proxy: None,
         }
     }
 }
@@ -249,8 +259,24 @@ impl RelaySource {
                 .unwrap_or_else(|_| "unknown".to_string())
         );
 
+        // Build client options with optional Tor proxy
+        let mut client_builder = Client::builder().signer(keys);
+
+        if let Some(proxy_addr) = self.config.tor_proxy {
+            tracing::info!(
+                "Tor proxy enabled: {} (routing .onion addresses only)",
+                proxy_addr
+            );
+            // Configure proxy for .onion addresses only
+            // Clearnet relays will connect directly
+            let connection = Connection::new()
+                .proxy(proxy_addr)
+                .target(ConnectionTarget::Onion);
+            client_builder = client_builder.opts(ClientOptions::new().connection(connection));
+        }
+
         // Create client with signer for NIP-42 authentication
-        let client = Client::builder().signer(keys).build();
+        let client = client_builder.build();
 
         // Enable automatic authentication (NIP-42)
         client.automatic_authentication(true);
@@ -651,44 +677,46 @@ impl RelaySource {
             if tag_vec.first() == Some(&"r") && tag_vec.len() >= 2 {
                 let relay_url = tag_vec[1];
 
-                // Normalize and validate
-                if let Ok(url) = RelayUrl::parse(relay_url) {
-                    let url_str = url.to_string();
+                // Normalize and validate URL
+                let normalized = match crate::relay::normalize_relay_url(relay_url) {
+                    crate::relay::NormalizeResult::Ok(u) => u,
+                    _ => continue, // Skip invalid or blocked URLs
+                };
 
-                    // Check blocklist
-                    if self.config.blocklist.contains(&url_str) {
-                        continue;
+                // Check blocklist (using normalized URL)
+                if self.config.blocklist.contains(&normalized) {
+                    continue;
+                }
+
+                // Check if we already know this relay
+                let is_new = {
+                    let known = self.known_relays.read().await;
+                    !known.contains(&normalized)
+                };
+
+                if is_new {
+                    // Add to known set
+                    {
+                        let mut known = self.known_relays.write().await;
+                        known.insert(normalized.clone());
                     }
 
-                    // Check if we already know this relay
-                    let is_new = {
-                        let known = self.known_relays.read().await;
-                        !known.contains(&url_str)
-                    };
-
-                    if is_new {
-                        // Add to known set
+                    // Register with relay manager if available
+                    // The optimization loop will decide when to connect
+                    if let Some(ref manager) = self.relay_manager {
+                        match manager.register_relay(&normalized, crate::relay::RelayTier::Discovered)
                         {
-                            let mut known = self.known_relays.write().await;
-                            known.insert(url_str.clone());
-                        }
-
-                        // Register with relay manager if available
-                        // The optimization loop will decide when to connect
-                        if let Some(ref manager) = self.relay_manager {
-                            match manager.register_relay(&url_str, crate::relay::RelayTier::Discovered) {
-                                Ok(_) => {
-                                    self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);
-                                    metrics::counter!("relay_discovered_total").increment(1);
-                                    tracing::debug!("Discovered relay: {}", url_str);
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Failed to register discovered relay {}: {}",
-                                        url_str,
-                                        e
-                                    );
-                                }
+                            Ok(_) => {
+                                self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);
+                                metrics::counter!("relay_discovered_total").increment(1);
+                                tracing::debug!("Discovered relay: {}", normalized);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed to register discovered relay {}: {}",
+                                    normalized,
+                                    e
+                                );
                             }
                         }
                     }

@@ -82,6 +82,10 @@ run-backfill-jsonl *ARGS:
 run-backfill-proto *ARGS:
     cargo run --bin backfill-proto -- {{ARGS}}
 
+# Run the relay cleanup tool
+run-relay-cleanup *ARGS:
+    cargo run --bin relay-cleanup -- {{ARGS}}
+
 # ============================================================================
 # Documentation
 # ============================================================================

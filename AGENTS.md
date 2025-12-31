@@ -41,6 +41,7 @@ just run-ingest         # Live relay ingestion
 just run-serve          # Serve API (placeholder)
 just run-backfill-jsonl # JSONL backfill
 just run-backfill-proto # Protobuf backfill
+just run-relay-cleanup  # Normalize and dedupe relay database
 
 # Local dev environment
 just dev-up             # Start Docker services (ClickHouse, Prometheus, Grafana)
@@ -66,7 +67,7 @@ pensieve/
 │   ├── pensieve-core/       # Core types, validation, notepack encoding, metrics
 │   ├── pensieve-ingest/     # Ingestion pipeline (relay source, dedupe, segments, ClickHouse)
 │   │   └── src/
-│   │       ├── bin/         # CLI binaries (backfill-jsonl, backfill-proto)
+│   │       ├── bin/         # CLI binaries (backfill-jsonl, backfill-proto, relay-cleanup)
 │   │       ├── pipeline/    # Core pipeline: dedupe.rs, segment.rs, clickhouse.rs
 │   │       ├── relay/       # Relay quality tracking and management
 │   │       └── source/      # Event sources: relay.rs, jsonl.rs, proto.rs
@@ -125,6 +126,12 @@ Review [rust-code-style.mdc](./.cursor/rules/rust-code-style.mdc) for full code 
 - **NIP-42**: Client authentication
 - **NIP-65**: Relay list metadata (used for relay discovery)
 - **Event kinds**: Integers identifying event types (e.g., 1 = text note, 10002 = relay list)
+
+### Relay Connectivity
+- **Seed relays**: Curated list in `data/relays/seed.txt`, protected from eviction
+- **Discovery**: NIP-65 relay lists used to discover new relays automatically
+- **Quality scoring**: Relays tracked in SQLite with novel rate + uptime scores
+- **Tor support**: `.onion` relays supported via `--tor-proxy` flag (requires Tor daemon)
 
 ### Notepack Format
 - Binary encoding by jb55 (Damus creator)
