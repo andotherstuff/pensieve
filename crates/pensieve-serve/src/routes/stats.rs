@@ -797,17 +797,19 @@ pub struct NewUsersRow {
 /// `GET /api/v1/stats/users/new`
 ///
 /// Returns count of new pubkeys (first seen) per period.
-/// Requires the pubkey_first_seen materialized view (migration 002).
+/// Requires the daily_new_users_summary table (migration 011).
 pub async fn new_users(
     State(state): State<AppState>,
     Query(params): Query<NewUsersQuery>,
 ) -> Result<Json<Vec<NewUsersRow>>, ApiError> {
     let limit = params.limit.unwrap_or(30).min(365);
 
+    // Use pre-aggregated daily_new_users view for fast queries.
+    // For weekly/monthly, aggregate the daily counts.
     let (group_expr, max_limit) = match params.group_by.as_deref() {
-        Some("week") => ("toMonday(first_seen)", 52u32),
-        Some("month") => ("toStartOfMonth(first_seen)", 120u32),
-        Some("day") | None => ("toDate(first_seen)", 365u32),
+        Some("week") => ("toMonday(date)", 52u32),
+        Some("month") => ("toStartOfMonth(date)", 120u32),
+        Some("day") | None => ("date", 365u32),
         Some(other) => {
             return Err(ApiError::BadRequest(format!(
                 "invalid group_by value: '{}'. Valid options: day, week, month",
@@ -819,7 +821,7 @@ pub async fn new_users(
     let limit = limit.min(max_limit);
 
     let since_clause = match params.since {
-        Some(date) => format!("WHERE first_seen >= '{}'", date),
+        Some(date) => format!("AND date >= '{}'", date),
         None => String::new(),
     };
 
@@ -828,9 +830,9 @@ pub async fn new_users(
         .query(&format!(
             "SELECT
                 toString({}) AS period,
-                count() AS new_users
-            FROM pubkey_first_seen
-            {}
+                sum(new_users) AS new_users
+            FROM daily_new_users
+            WHERE 1=1 {}
             GROUP BY period
             ORDER BY period DESC
             LIMIT {}",

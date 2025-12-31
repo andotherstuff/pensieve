@@ -32,6 +32,9 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 006_preaggregate_active_users.sql | Pre-aggregate for instant queries (BROKEN) | Superseded by 008 |
 | 007_filter_future_dates_in_views.sql | Filter future dates from views | No |
 | 008_fix_active_users_aggregation.sql | **FIX:** Proper AggregatingMergeTree for summaries | **Yes** (1-5 min) |
+| 009_fix_zap_amounts.sql | Fix zap amount parsing | **Yes** |
+| 010_fix_pubkey_first_seen_dates.sql | Filter invalid dates from new users view | No |
+| 011_new_users_summary.sql | Pre-aggregate new users for fast queries | **Yes** (1-5 min) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -199,6 +202,62 @@ Some events have invalid timestamps far in the future; this migration excludes t
 views to filter dates between Nostr genesis (2020-11-07) and today.
 
 **Backfill:** None required.
+
+---
+
+### 009_fix_zap_amounts.sql
+
+**Purpose:** Fixes zap amount parsing issues from migration 003.
+
+---
+
+### 010_fix_pubkey_first_seen_dates.sql
+
+**Purpose:** Filters invalid dates from the `pubkey_first_seen` view, similar to the fix in
+migration 007 for active user views.
+
+**The Problem:** The `pubkey_first_seen` view was returning pubkeys with invalid `first_seen`
+timestamps, including:
+- Future dates (events with created_at like 2100, 2077, etc.)
+- Pre-Nostr genesis dates (before 2020-11-07)
+
+This caused the "New Users" dashboard charts and API endpoints to show incorrect data.
+
+**The Fix:** Updates the view to filter: `first_seen >= '2020-11-07' AND first_seen <= now()`
+
+**Backfill:** None required. The underlying data in `pubkey_first_seen_data` is unchanged;
+only the view query is updated.
+
+**To run:**
+
+```bash
+just ch-migrate docs/migrations/010_fix_pubkey_first_seen_dates.sql
+```
+
+---
+
+### 011_new_users_summary.sql
+
+**Purpose:** Creates a pre-aggregated summary table for new users per day, enabling fast queries
+for the "new users" time series.
+
+**The Problem:** The `pubkey_first_seen` view requires scanning and merging all rows in
+`pubkey_first_seen_data` (~6M+ pubkeys) on every query, making queries take many seconds.
+
+**The Solution:** Pre-aggregate new user counts per day into an `AggregatingMergeTree` summary table.
+
+**New objects:**
+- `daily_new_users_summary` - AggregatingMergeTree table storing uniqState(pubkey) per date
+- `daily_new_users_summary_mv` - Materialized view from events_local inserts
+- `daily_new_users` - Query view with date filtering and uniqMerge finalization
+
+**Backfill:** Included in migration (1-5 minutes depending on data size).
+
+**To run:**
+
+```bash
+just ch-migrate docs/migrations/011_new_users_summary.sql
+```
 
 ---
 
