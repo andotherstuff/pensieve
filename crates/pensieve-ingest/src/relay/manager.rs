@@ -254,11 +254,24 @@ impl RelayManager {
     /// Record an event received from a relay.
     ///
     /// Call this after the dedupe check to attribute novelty.
+    /// Record an event received from a relay.
+    ///
+    /// The URL is normalized before recording to ensure it matches the
+    /// registered URL in the database.
     pub fn record_event(&self, relay_url: &str, is_novel: bool) {
+        // Normalize URL to match database entries
+        let normalized = match normalize_relay_url(relay_url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(_) | NormalizeResult::Blocked(_) => {
+                // URL was blocked/invalid, skip tracking
+                return;
+            }
+        };
+
         self.maybe_flush_hour();
 
         let mut accumulators = self.accumulators.lock();
-        let acc = accumulators.entry(relay_url.to_string()).or_default();
+        let acc = accumulators.entry(normalized).or_default();
 
         acc.events_received += 1;
         if is_novel {
@@ -269,11 +282,23 @@ impl RelayManager {
     }
 
     /// Record a connection attempt.
+    ///
+    /// The URL is normalized before recording to ensure it matches the
+    /// registered URL in the database.
     pub fn record_connection_attempt(&self, relay_url: &str, success: bool) {
+        // Normalize URL to match database entries
+        let normalized = match normalize_relay_url(relay_url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(_) | NormalizeResult::Blocked(_) => {
+                // URL was blocked/invalid, skip tracking
+                return;
+            }
+        };
+
         self.maybe_flush_hour();
 
         let mut accumulators = self.accumulators.lock();
-        let acc = accumulators.entry(relay_url.to_string()).or_default();
+        let acc = accumulators.entry(normalized.clone()).or_default();
 
         acc.connection_attempts += 1;
         if success {
@@ -283,24 +308,51 @@ impl RelayManager {
         // Update relay status and failure count
         drop(accumulators);
 
-        if let Err(e) = self.update_connection_status(relay_url, success) {
+        if let Err(e) = self.update_connection_status(&normalized, success) {
             tracing::warn!(
                 "Failed to update connection status for {}: {}",
-                relay_url,
+                normalized,
                 e
             );
         }
     }
 
-    /// Record a disconnection.
+    /// Record a disconnection and set status to idle.
+    ///
+    /// The URL is normalized before recording to ensure it matches the
+    /// registered URL in the database.
     pub fn record_disconnect(&self, relay_url: &str, connected_seconds: u64) {
+        // Normalize URL to match database entries
+        let normalized = match normalize_relay_url(relay_url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(_) | NormalizeResult::Blocked(_) => {
+                // URL was blocked/invalid, skip tracking
+                return;
+            }
+        };
+
         self.maybe_flush_hour();
 
-        let mut accumulators = self.accumulators.lock();
-        let acc = accumulators.entry(relay_url.to_string()).or_default();
+        // Update in-memory accumulators
+        {
+            let mut accumulators = self.accumulators.lock();
+            let acc = accumulators.entry(normalized.clone()).or_default();
+            acc.disconnects += 1;
+            acc.connection_seconds += connected_seconds;
+        }
 
-        acc.disconnects += 1;
-        acc.connection_seconds += connected_seconds;
+        // Update status to idle (no longer active)
+        let conn = self.conn.lock();
+        if let Err(e) = conn.execute(
+            "UPDATE relays SET status = ? WHERE url = ? AND status = ?",
+            rusqlite::params![
+                RelayStatus::Idle.as_str(),
+                &normalized,
+                RelayStatus::Active.as_str()
+            ],
+        ) {
+            tracing::error!("Failed to update relay status on disconnect: {}", e);
+        }
     }
 
     /// Update relay status after connection attempt.

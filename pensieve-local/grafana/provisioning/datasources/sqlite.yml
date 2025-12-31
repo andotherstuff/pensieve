@@ -1,0 +1,16 @@
+# SQLite datasource for relay stats
+# Provides access to the relay quality database
+
+apiVersion: 1
+
+datasources:
+  - name: SQLite Relays
+    type: frser-sqlite-datasource
+    uid: sqlite-relays
+    access: proxy
+    isDefault: false
+    editable: true
+    jsonData:
+      # Path inside the Grafana container (mounted from host)
+      path: /var/lib/grafana/relay-stats.db
+

@@ -119,14 +119,16 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Mount relay database for SQLite datasource (read-only)
+      - /data/relay-stats.db:/var/lib/grafana/relay-stats.db:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
       # Configure for reverse proxy at /grafana/
       - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
-      # Install ClickHouse plugin on startup
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      # Install plugins on startup
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,frser-sqlite-datasource
       # ClickHouse datasource password (for provisioning)
       - CLICKHOUSE_GRAFANA_PASSWORD=${CLICKHOUSE_GRAFANA_PASSWORD:-changeme}
     depends_on:

@@ -11,21 +11,26 @@
     {
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "id": 100,
-      "title": "Throughput",
+      "title": "📊 Throughput",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#37872D", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
       "id": 1,
       "options": {
         "colorMode": "value",
@@ -38,26 +43,31 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "ingest_events_received_rate",
-          "legendFormat": "Received/sec",
+          "expr": "ingest_events_received_total",
+          "legendFormat": "Total Received",
           "refId": "A"
         }
       ],
-      "title": "Events Received/sec",
+      "title": "Events Received (Total)",
       "type": "stat"
     },
     {
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#3274D9", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
       "id": 2,
       "options": {
         "colorMode": "value",
@@ -70,12 +80,12 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "ingest_events_processed_rate",
-          "legendFormat": "Processed/sec",
+          "expr": "ingest_events_processed_total",
+          "legendFormat": "Novel Events",
           "refId": "A"
         }
       ],
-      "title": "Events Processed/sec (Novel)",
+      "title": "Novel Events Processed",
       "type": "stat"
     },
     {
@@ -90,15 +100,16 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.7 },
-              { "color": "red", "value": 0.9 }
+              { "color": "yellow", "value": 0.6 },
+              { "color": "orange", "value": 0.8 },
+              { "color": "red", "value": 0.95 }
             ]
           },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
       "id": 3,
       "options": {
         "colorMode": "value",
@@ -116,7 +127,44 @@
           "refId": "A"
         }
       ],
-      "title": "Duplicate Ratio",
+      "title": "Duplicate Ratio %",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#8F3BB8", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "ingest_events_received_rate",
+          "legendFormat": "Events/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Current Throughput (events/sec)",
       "type": "stat"
     },
     {
@@ -132,12 +180,12 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
             "hideFrom": { "legend": false, "tooltip": false, "viz": false },
             "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": { "type": "linear" },
             "showPoints": "never",
@@ -149,12 +197,25 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Received" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#37872D", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Novel" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#3274D9", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Duplicated" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF7383", "mode": "fixed" } }]
+          }
+        ]
       },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 9 },
-      "id": 4,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "id": 5,
       "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["mean", "max", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "pluginVersion": "11.0.0",
@@ -166,37 +227,80 @@
         },
         {
           "expr": "rate(ingest_events_processed_total[1m])",
-          "legendFormat": "Processed (Novel)",
+          "legendFormat": "Novel",
           "refId": "B"
         },
         {
           "expr": "rate(ingest_events_deduplicated_total[1m])",
-          "legendFormat": "Deduplicated",
+          "legendFormat": "Duplicated",
           "refId": "C"
         }
       ],
-      "title": "Event Throughput (events/sec)",
+      "title": "Event Throughput Over Time (events/sec)",
       "type": "timeseries"
     },
+
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
-      "id": 101,
-      "title": "Relay Connections",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 },
+      "id": 200,
+      "title": "📡 Relays",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#3274D9", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 20 },
-      "id": 5,
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 17 },
+      "id": 201,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "relay_manager_total_relays",
+          "legendFormat": "Total",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Known Relays",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#37872D", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 17 },
+      "id": 202,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -213,39 +317,7 @@
           "refId": "A"
         }
       ],
-      "title": "Active Relays",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 20 },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "expr": "relay_manager_total_relays",
-          "legendFormat": "Total",
-          "refId": "A"
-        }
-      ],
-      "title": "Total Relays Known",
+      "title": "Connected Relays",
       "type": "stat"
     },
     {
@@ -257,20 +329,19 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 5 },
-              { "color": "red", "value": 20 }
+              { "color": "#FF7383", "value": null },
+              { "color": "red", "value": 100 }
             ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 20 },
-      "id": 7,
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 17 },
+      "id": 203,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
@@ -291,18 +362,23 @@
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
+          "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#8F3BB8", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 20 },
-      "id": 8,
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 17 },
+      "id": 204,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
@@ -323,6 +399,80 @@
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#73BF69", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 17 },
+      "id": 205,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "relay_manager_events_novel_1h",
+          "legendFormat": "Novel/1h",
+          "refId": "A"
+        }
+      ],
+      "title": "Novel Events (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#FF9830", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 17 },
+      "id": 206,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "relay_manager_events_duplicate_1h",
+          "legendFormat": "Dupe/1h",
+          "refId": "A"
+        }
+      ],
+      "title": "Duplicate Events (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
             "axisBorderShow": false,
@@ -333,11 +483,11 @@
             "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 10,
-            "gradientMode": "none",
+            "gradientMode": "opacity",
             "hideFrom": { "legend": false, "tooltip": false, "viz": false },
             "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": { "type": "linear" },
             "showPoints": "never",
@@ -349,12 +499,25 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Active" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#37872D", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Total Known" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#3274D9", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Blocked" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF7383", "mode": "fixed" } }]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 },
-      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "id": 207,
       "options": {
-        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "pluginVersion": "11.0.0",
@@ -379,12 +542,6 @@
       "type": "timeseries"
     },
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
-      "id": 102,
-      "title": "Optimization",
-      "type": "row"
-    },
-    {
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": {
         "defaults": {
@@ -396,28 +553,45 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "hue",
             "hideFrom": { "legend": false, "tooltip": false, "viz": false },
             "insertNulls": false,
-            "lineInterpolation": "stepAfter",
+            "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": { "type": "linear" },
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
+            "stacking": { "group": "A", "mode": "normal" },
             "thresholdsStyle": { "mode": "off" }
           },
           "mappings": [],
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*seed.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#37872D", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*optimization.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#8F3BB8", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*explore.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*reject.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF7383", "mode": "fixed" } }]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
-      "id": 10,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "id": 208,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
@@ -426,12 +600,12 @@
       "targets": [
         {
           "expr": "increase(relay_connects_total[5m])",
-          "legendFormat": "Connects ({{reason}})",
+          "legendFormat": "Connect ({{reason}})",
           "refId": "A"
         },
         {
           "expr": "increase(relay_disconnects_total[5m])",
-          "legendFormat": "Disconnects ({{reason}})",
+          "legendFormat": "Disconnect ({{reason}})",
           "refId": "B"
         }
       ],
@@ -452,11 +626,11 @@
             "barAlignment": 0,
             "drawStyle": "line",
             "fillOpacity": 10,
-            "gradientMode": "none",
+            "gradientMode": "opacity",
             "hideFrom": { "legend": false, "tooltip": false, "viz": false },
             "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": { "type": "linear" },
             "showPoints": "never",
@@ -468,34 +642,442 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Swaps" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#8F3BB8", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Explorations" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Cycles" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#3274D9", "mode": "fixed" } }]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
-      "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "id": 209,
       "options": {
-        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "pluginVersion": "11.0.0",
       "targets": [
         {
+          "expr": "increase(relay_optimization_cycles_total[5m])",
+          "legendFormat": "Cycles",
+          "refId": "A"
+        },
+        {
           "expr": "relay_optimization_swaps",
           "legendFormat": "Swaps",
-          "refId": "A"
+          "refId": "B"
         },
         {
           "expr": "relay_optimization_explorations",
           "legendFormat": "Explorations",
-          "refId": "B"
+          "refId": "C"
         }
       ],
-      "title": "Optimization Activity",
+      "title": "Relay Optimization Activity",
       "type": "timeseries"
     },
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
-      "id": 200,
-      "title": "ClickHouse Data",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Discovered" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Connection Failures" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF7383", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Exploration Attempts" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "id": 210,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "increase(relay_discovered_total[5m])",
+          "legendFormat": "Discovered",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(relay_exploration_attempts_total[5m])",
+          "legendFormat": "Exploration Attempts",
+          "refId": "B"
+        },
+        {
+          "expr": "increase(relay_connect_failures_total[5m])",
+          "legendFormat": "Connection Failures",
+          "refId": "C"
+        }
+      ],
+      "title": "Relay Discovery & Failures (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "url" },
+            "properties": [{ "id": "custom.width", "value": 300 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "score" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge", "valueDisplayMode": "text" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "status" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "mappings", "value": [
+                { "options": { "active": { "color": "green", "index": 0 } }, "type": "value" },
+                { "options": { "idle": { "color": "blue", "index": 1 } }, "type": "value" },
+                { "options": { "pending": { "color": "yellow", "index": 2 } }, "type": "value" },
+                { "options": { "failing": { "color": "orange", "index": 3 } }, "type": "value" },
+                { "options": { "blocked": { "color": "red", "index": 4 } }, "type": "value" }
+              ]}
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "tier" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "mappings", "value": [
+                { "options": { "seed": { "color": "purple", "index": 0 } }, "type": "value" },
+                { "options": { "discovered": { "color": "blue", "index": 1 } }, "type": "value" }
+              ]}
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "novel_rate_1h" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "decimals", "value": 1 },
+              { "id": "unit", "value": "short" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "uptime_24h" },
+            "properties": [
+              { "id": "custom.width", "value": 90 },
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "last_connected" },
+            "properties": [
+              { "id": "custom.width", "value": 150 },
+              { "id": "unit", "value": "dateTimeAsIso" }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 38 },
+      "id": 211,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "score" }]
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+          "queryType": "table",
+          "rawQueryText": "SELECT r.url, r.status, r.tier, s.score, s.novel_rate_1h, s.uptime_24h, r.last_connected_at * 1000 as last_connected FROM relays r LEFT JOIN relay_scores s ON r.url = s.relay_url WHERE r.status = 'active' ORDER BY s.score DESC LIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "title": "Currently Connected Relays (Top 100 by Score)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "url" },
+            "properties": [{ "id": "custom.width", "value": 350 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "status" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "mappings", "value": [
+                { "options": { "active": { "color": "green", "index": 0 } }, "type": "value" },
+                { "options": { "idle": { "color": "blue", "index": 1 } }, "type": "value" },
+                { "options": { "pending": { "color": "yellow", "index": 2 } }, "type": "value" },
+                { "options": { "failing": { "color": "orange", "index": 3 } }, "type": "value" },
+                { "options": { "blocked": { "color": "red", "index": 4 } }, "type": "value" }
+              ]}
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "failures" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 3 }, { "color": "red", "value": 5 }] } },
+              { "id": "custom.cellOptions", "value": { "mode": "basic", "type": "color-background" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "blocked_reason" },
+            "properties": [{ "id": "custom.width", "value": 200 }]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 50 },
+      "id": 212,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "failures" }]
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+          "queryType": "table",
+          "rawQueryText": "SELECT url, status, consecutive_failures as failures, blocked_reason FROM relays WHERE status IN ('failing', 'blocked') ORDER BY consecutive_failures DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Failing & Blocked Relays",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "status" },
+            "properties": [{ "id": "custom.width", "value": 100 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge", "valueDisplayMode": "text" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 50 },
+      "id": 213,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": true },
+        "showHeader": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+          "queryType": "table",
+          "rawQueryText": "SELECT status, COUNT(*) as count FROM relays GROUP BY status ORDER BY count DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Relays by Status",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "tier" },
+            "properties": [{ "id": "custom.width", "value": 100 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge", "valueDisplayMode": "text" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 50 },
+      "id": 214,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": true },
+        "showHeader": true
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+          "queryType": "table",
+          "rawQueryText": "SELECT tier, COUNT(*) as count FROM relays GROUP BY tier ORDER BY count DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Relays by Tier",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "relay_url" },
+            "properties": [{ "id": "custom.width", "value": 300 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "events_novel" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge", "valueDisplayMode": "text" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "events_received" },
+            "properties": [{ "id": "custom.width", "value": 120 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "events_duplicate" },
+            "properties": [{ "id": "custom.width", "value": 120 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "novel_pct" },
+            "properties": [
+              { "id": "custom.width", "value": 90 },
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 1 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 55 },
+      "id": 215,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "events_novel" }]
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "frser-sqlite-datasource", "uid": "sqlite-relays" },
+          "queryType": "table",
+          "rawQueryText": "SELECT relay_url, SUM(events_received) as events_received, SUM(events_novel) as events_novel, SUM(events_duplicate) as events_duplicate, CAST(SUM(events_novel) AS REAL) / NULLIF(SUM(events_received), 0) as novel_pct FROM relay_stats_hourly WHERE hour_start >= strftime('%s', 'now') - 86400 GROUP BY relay_url ORDER BY events_novel DESC LIMIT 50",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Relays by Novel Events (24h)",
+      "type": "table"
+    },
+
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
+      "id": 300,
+      "title": "🗄️ ClickHouse Data",
       "type": "row"
     },
     {
@@ -504,13 +1086,13 @@
         "defaults": {
           "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#3274D9", "value": null }] },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 10, "w": 6, "x": 0, "y": 44 },
-      "id": 201,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 66 },
+      "id": 301,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -537,55 +1119,14 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "inspect": false
-          },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "count" },
-            "properties": [{ "id": "custom.width", "value": 120 }]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 18, "x": 6, "y": 44 },
-      "id": 205,
-      "options": {
-        "cellHeight": "sm",
-        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
-        "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "count" }]
-      },
-      "pluginVersion": "11.0.0",
-      "targets": [
-        {
-          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-          "queryType": "sql",
-          "rawSql": "SELECT kind, count() as count FROM events_local GROUP BY kind ORDER BY count DESC",
-          "refId": "A",
-          "format": 1
-        }
-      ],
-      "title": "All Event Kinds",
-      "type": "table"
-    },
-    {
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "dateTimeAsIso"
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#37872D", "value": null }] },
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 54 },
-      "id": 202,
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 66 },
+      "id": 302,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -599,7 +1140,109 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at > toDateTime('1990-01-01')",
+          "rawSql": "SELECT count() as new_events FROM events_local WHERE created_at >= now() - INTERVAL 24 HOUR",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "New Events (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#8F3BB8", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 66 },
+      "id": 303,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT uniq(pubkey) as unique_authors FROM events_local",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Unique Authors",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#FF9830", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 66 },
+      "id": 304,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT uniq(kind) as unique_kinds FROM events_local",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Unique Event Kinds",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#73BF69", "value": null }] },
+          "unit": "dateTimeAsIso"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 71 },
+      "id": 305,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT toUnixTimestamp(min(created_at)) * 1000 as oldest FROM events_local WHERE created_at >= toDateTime('2020-11-07 00:00:00')",
           "refId": "A",
           "format": 0
         }
@@ -613,13 +1256,13 @@
         "defaults": {
           "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#FF9830", "value": null }] },
           "unit": "dateTimeAsIso"
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 54 },
-      "id": 203,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 71 },
+      "id": 306,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -633,16 +1276,409 @@
         {
           "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
           "queryType": "sql",
-          "rawSql": "SELECT toUnixTimestamp(max(created_at)) * 1000 as newest FROM events_local",
+          "rawSql": "SELECT toUnixTimestamp(max(created_at)) * 1000 as newest FROM events_local WHERE created_at <= now()",
           "refId": "A",
           "format": 0
         }
       ],
       "title": "Newest Event",
       "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#3274D9", "value": null }] },
+          "unit": "decbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 71 },
+      "id": 307,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT sum(data_compressed_bytes) as compressed_size FROM system.parts WHERE database = 'nostr' AND active = 1",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Storage (Compressed)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#8F3BB8", "value": null }] },
+          "unit": "decbytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 71 },
+      "id": 308,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT sum(data_uncompressed_bytes) as uncompressed_size FROM system.parts WHERE database = 'nostr' AND active = 1",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Storage (Uncompressed)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [
+              { "id": "custom.width", "value": 130 },
+              { "id": "custom.cellOptions", "value": { "mode": "gradient", "type": "gauge", "valueDisplayMode": "text" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "kind" },
+            "properties": [{ "id": "custom.width", "value": 80 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "percentage" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.width", "value": 100 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 14, "w": 12, "x": 0, "y": 75 },
+      "id": 309,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "count" }]
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT kind, count() as count, count() / (SELECT count() FROM events_local) as percentage FROM events_local GROUP BY kind ORDER BY count DESC LIMIT 50",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Top Event Kinds",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "table" },
+            "properties": [{ "id": "custom.width", "value": 180 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rows" },
+            "properties": [{ "id": "custom.width", "value": 120 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "compressed" },
+            "properties": [
+              { "id": "unit", "value": "decbytes" },
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "uncompressed" },
+            "properties": [
+              { "id": "unit", "value": "decbytes" },
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "ratio" },
+            "properties": [
+              { "id": "decimals", "value": 2 },
+              { "id": "custom.width", "value": 80 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 14, "w": 12, "x": 12, "y": 75 },
+      "id": 310,
+      "options": {
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "compressed" }]
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT table, sum(rows) as rows, sum(data_compressed_bytes) as compressed, sum(data_uncompressed_bytes) as uncompressed, round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) as ratio FROM system.parts WHERE database = 'nostr' AND active = 1 GROUP BY table ORDER BY compressed DESC",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "title": "Table Storage Stats",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "hue",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 89 },
+      "id": 311,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse-nostr" },
+          "queryType": "sql",
+          "rawSql": "SELECT toStartOfHour(created_at) as time, count() as events FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY GROUP BY time ORDER BY time",
+          "refId": "A",
+          "format": 0
+        }
+      ],
+      "title": "Events by Hour (Last 7 Days)",
+      "type": "timeseries"
+    },
+
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 97 },
+      "id": 400,
+      "title": "⚙️ System",
+      "type": "row",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "mappings": [
+                { "options": { "0": { "color": "red", "index": 0, "text": "Stopped" } }, "type": "value" },
+                { "options": { "1": { "color": "green", "index": 1, "text": "Running" } }, "type": "value" }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 98 },
+          "id": 401,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "textMode": "auto"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "expr": "ingestion_running",
+              "legendFormat": "Status",
+              "refId": "A"
+            }
+          ],
+          "title": "Ingestion Status",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "mappings": [],
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#3274D9", "value": null }] },
+              "unit": "dateTimeAsIso"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 98 },
+          "id": 402,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "textMode": "auto"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "expr": "ingest_checkpoint_timestamp * 1000",
+              "legendFormat": "Checkpoint",
+              "refId": "A"
+            }
+          ],
+          "title": "Last Checkpoint",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "mappings": [],
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "#8F3BB8", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 98 },
+          "id": 403,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "textMode": "auto"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "expr": "clickhouse_queue_depth",
+              "legendFormat": "Queue",
+              "refId": "A"
+            }
+          ],
+          "title": "ClickHouse Queue Depth",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 1 },
+                  { "color": "red", "value": 5 }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 98 },
+          "id": 404,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "textMode": "auto"
+          },
+          "pluginVersion": "11.0.0",
+          "targets": [
+            {
+              "expr": "increase(clickhouse_insert_errors_total[1h])",
+              "legendFormat": "Errors",
+              "refId": "A"
+            }
+          ],
+          "title": "ClickHouse Errors (1h)",
+          "type": "stat"
+        }
+      ]
     }
   ],
-  "refresh": "5s",
+  "refresh": "10s",
   "schemaVersion": 39,
   "tags": ["pensieve", "nostr", "ingestion"],
   "templating": { "list": [] },
@@ -651,7 +1687,6 @@
   "timezone": "utc",
   "title": "Pensieve Ingestion",
   "uid": "pensieve-ingestion",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
-

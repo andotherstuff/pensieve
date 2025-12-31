@@ -1,5 +1,5 @@
 # Grafana datasource provisioning
-# Auto-configures Prometheus and ClickHouse as data sources
+# Auto-configures Prometheus, ClickHouse, and SQLite as data sources
 
 apiVersion: 1
 
@@ -9,6 +9,7 @@ datasources:
   # ═══════════════════════════════════════════════════════════════════════════
   - name: Prometheus
     type: prometheus
+    uid: PBFA97CFB590B2093
     access: proxy
     url: http://prometheus:9090
     isDefault: true
@@ -34,3 +35,16 @@ datasources:
     secureJsonData:
       # Password from environment variable (set in docker-compose)
       password: ${CLICKHOUSE_GRAFANA_PASSWORD}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SQLite - Relay Stats (relay quality, connection history)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: SQLite Relays
+    type: frser-sqlite-datasource
+    uid: sqlite-relays
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      # Path inside the Grafana container (mounted from host)
+      path: /var/lib/grafana/relay-stats.db

@@ -71,14 +71,16 @@ services:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Mount relay database for SQLite datasource (read-only)
+      - ../data/relay-stats.db:/var/lib/grafana/relay-stats.db:ro
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
-      # Install ClickHouse plugin on startup
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      # Install plugins on startup
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,frser-sqlite-datasource
     depends_on:
       - prometheus
       - clickhouse
