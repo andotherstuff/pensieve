@@ -58,25 +58,119 @@ Authenticated ping. Use to verify your token is valid.
 
 ---
 
-### Stats
+### Stats Overview
 
 #### `GET /api/v1/stats`
 
-High-level overview of the event store.
+High-level overview of the event store. Combines multiple metrics in a single call.
 
 **Response**
 
 ```json
 {
-  "total_events": 123456789,
-  "total_pubkeys": 987654,
-  "total_kinds": 142,
-  "earliest_event": "2020-01-17T00:00:00Z",
-  "latest_event": "2024-12-22T15:30:00Z"
+  "total_events": 790715576,
+  "total_pubkeys": 56499585,
+  "total_kinds": 1020,
+  "earliest_event": 1606719600,
+  "latest_event": 1735689000
 }
 ```
 
+| Field | Description |
+|-------|-------------|
+| `total_events` | Total events in the store |
+| `total_pubkeys` | Unique pubkeys ever seen |
+| `total_kinds` | Distinct event kinds (last 30 days) |
+| `earliest_event` | Timestamp of earliest event (Unix seconds) |
+| `latest_event` | Timestamp of latest event (Unix seconds) |
+
 ---
+
+### Granular Stats
+
+These endpoints return individual metrics for efficient dashboard caching.
+
+#### `GET /api/v1/stats/events/total`
+
+Returns approximate total event count.
+
+**Response**
+
+```json
+{
+  "count": 790715576
+}
+```
+
+**Suggested cache TTL:** 5 minutes
+
+---
+
+#### `GET /api/v1/stats/pubkeys/total`
+
+Returns total unique pubkeys.
+
+**Response**
+
+```json
+{
+  "count": 56499585
+}
+```
+
+**Suggested cache TTL:** 5 minutes
+
+---
+
+#### `GET /api/v1/stats/kinds/total`
+
+Returns distinct event kinds seen in the last 30 days.
+
+**Response**
+
+```json
+{
+  "count": 1020
+}
+```
+
+**Suggested cache TTL:** 1 hour
+
+---
+
+#### `GET /api/v1/stats/events/earliest`
+
+Returns earliest event timestamp (Nostr genesis: Nov 7, 2020).
+
+**Response**
+
+```json
+{
+  "timestamp": 1606719600
+}
+```
+
+**Suggested cache TTL:** 1 hour
+
+---
+
+#### `GET /api/v1/stats/events/latest`
+
+Returns latest event timestamp (excludes future timestamps).
+
+**Response**
+
+```json
+{
+  "timestamp": 1735689000
+}
+```
+
+**Suggested cache TTL:** 10 seconds
+
+---
+
+### Event Stats
 
 #### `GET /api/v1/stats/events`
 
@@ -137,9 +231,30 @@ GET /api/v1/stats/events?since=2024-01-01&until=2024-02-01
 
 ---
 
+#### `GET /api/v1/stats/throughput`
+
+7-day rolling average of events per hour.
+
+**Query Parameters**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `kind` | integer | Filter by event kind |
+
+**Response**
+
+```json
+{
+  "events_per_hour": 42500.5,
+  "total_events_7d": 4998000
+}
+```
+
+---
+
 ### Active Users
 
-Active users exclude throwaway keys (kinds 445 and 1059 per NIP-59).
+Active user metrics exclude throwaway keys (kinds 445 and 1059 per NIP-59).
 
 #### `GET /api/v1/stats/users/active`
 
@@ -207,14 +322,6 @@ Daily active users time series.
     "has_follows_list": 28000,
     "has_profile_and_follows_list": 25000,
     "total_events": 150000
-  },
-  {
-    "period": "2024-12-21",
-    "active_users": 44500,
-    "has_profile": 31800,
-    "has_follows_list": 27500,
-    "has_profile_and_follows_list": 24800,
-    "total_events": 148000
   }
 ]
 ```
@@ -264,6 +371,300 @@ GET /api/v1/stats/users/active/weekly?since=2024-01-01
 
 # Monthly active users for all of 2024
 GET /api/v1/stats/users/active/monthly?since=2024-01-01&limit=12
+```
+
+---
+
+### User Analytics
+
+#### `GET /api/v1/stats/users/new`
+
+New users (first seen) per period.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `group_by` | string | `day` | Group by: `day`, `week`, or `month` |
+| `limit` | integer | 30 | Max results (max: 365 for day, 52 for week, 120 for month) |
+| `since` | date | - | Only include data from this date onwards |
+
+**Response**
+
+```json
+[
+  {
+    "period": "2024-12-22",
+    "new_users": 1234
+  },
+  {
+    "period": "2024-12-21",
+    "new_users": 1156
+  }
+]
+```
+
+---
+
+#### `GET /api/v1/stats/users/retention`
+
+Cohort retention analysis showing how users return over time.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `cohort_start` | date | 12 weeks ago | Start date for first cohort |
+| `cohort_size` | string | `week` | Cohort size: `week` or `month` |
+| `limit` | integer | 12 | Number of cohorts (max: 52) |
+
+**Response**
+
+```json
+[
+  {
+    "cohort": "2024-12-02",
+    "cohort_size": 5000,
+    "retention": [5000, 2500, 1800, 1200],
+    "retention_pct": [100.0, 50.0, 36.0, 24.0]
+  },
+  {
+    "cohort": "2024-11-25",
+    "cohort_size": 4800,
+    "retention": [4800, 2400, 1700, 1150, 900],
+    "retention_pct": [100.0, 50.0, 35.4, 24.0, 18.8]
+  }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `cohort` | Start date of the cohort |
+| `cohort_size` | Users who first appeared in this cohort |
+| `retention` | Active user counts in each subsequent period |
+| `retention_pct` | Retention as percentages (0-100) |
+
+---
+
+### Activity Patterns
+
+#### `GET /api/v1/stats/activity/hourly`
+
+Event activity grouped by hour of day (0-23 UTC).
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `days` | integer | 7 | Days to aggregate (max: 90) |
+| `kind` | integer | - | Filter by event kind |
+
+**Response**
+
+```json
+[
+  {
+    "hour": 0,
+    "event_count": 125000,
+    "unique_pubkeys": 8500,
+    "avg_per_day": 17857.14
+  },
+  {
+    "hour": 1,
+    "event_count": 98000,
+    "unique_pubkeys": 7200,
+    "avg_per_day": 14000.0
+  }
+]
+```
+
+---
+
+### Zaps
+
+#### `GET /api/v1/stats/zaps`
+
+Zap statistics (requires migration 003_zap_amounts).
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `days` | integer | 30 | Days to include |
+| `group_by` | string | - | Group by: `day`, `week`, or `month`. If omitted, returns aggregate. |
+| `limit` | integer | 30 | Max periods (max: 365) |
+
+**Response (aggregate)**
+
+```json
+{
+  "total_zaps": 125000,
+  "total_sats": 45000000,
+  "unique_senders": 8500,
+  "unique_recipients": 12000,
+  "avg_zap_sats": 360.0
+}
+```
+
+**Response (with `group_by`)**
+
+```json
+[
+  {
+    "period": "2024-12-22",
+    "total_zaps": 4500,
+    "total_sats": 1500000,
+    "unique_senders": 1200,
+    "unique_recipients": 1800,
+    "avg_zap_sats": 333.33
+  }
+]
+```
+
+---
+
+#### `GET /api/v1/stats/zaps/histogram`
+
+Zap amount distribution across meaningful buckets.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `days` | integer | 30 | Days to include |
+
+**Response**
+
+```json
+[
+  {
+    "bucket": "1-10 sats",
+    "min_sats": 1,
+    "max_sats": 10,
+    "count": 15000,
+    "total_sats": 75000,
+    "pct_count": 12.0,
+    "pct_sats": 0.17
+  },
+  {
+    "bucket": "11-21 sats",
+    "min_sats": 11,
+    "max_sats": 21,
+    "count": 25000,
+    "total_sats": 400000,
+    "pct_count": 20.0,
+    "pct_sats": 0.89
+  }
+]
+```
+
+**Buckets (17 total):**
+- 1-10, 11-21 sats (micro zaps)
+- 22-50, 51-100 sats (small tips)
+- 101-250, 251-500 sats (medium)
+- 501-750, 751-1K sats (larger tips)
+- 1K-2.5K, 2.5K-5K sats (generous)
+- 5K-7.5K, 7.5K-10K sats (big)
+- 10K-25K, 25K-50K sats (very large)
+- 50K-75K, 75K-100K sats (whale)
+- 100K+ sats (mega zaps)
+
+---
+
+### Engagement
+
+#### `GET /api/v1/stats/engagement`
+
+Reply and reaction ratios relative to original notes.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `days` | integer | 30 | Days to include |
+
+**Response**
+
+```json
+{
+  "period_days": 30,
+  "original_notes": 2500000,
+  "replies": 750000,
+  "reactions": 3200000,
+  "replies_per_note": 0.3,
+  "reactions_per_note": 1.28
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `original_notes` | Kind 1 events that are NOT replies |
+| `replies` | Kind 1 events with an e-tag (references another event) |
+| `reactions` | Kind 7 events |
+| `replies_per_note` | Average replies per original note |
+| `reactions_per_note` | Average reactions per original note |
+
+---
+
+### Long-form Content
+
+#### `GET /api/v1/stats/longform`
+
+Statistics for long-form content (kind 30023).
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `days` | integer | - | Days to include (omit for all time) |
+
+**Response**
+
+```json
+{
+  "articles_count": 125000,
+  "unique_authors": 8500,
+  "avg_content_length": 4250.5,
+  "total_content_length": 531312500,
+  "estimated_total_words": 106262500
+}
+```
+
+---
+
+### Publishers
+
+#### `GET /api/v1/stats/publishers`
+
+Top publishers by event count.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `kind` | integer | - | Filter by event kind |
+| `days` | integer | 30 | Days to include |
+| `limit` | integer | 100 | Number of publishers (max: 1000) |
+
+**Response**
+
+```json
+[
+  {
+    "pubkey": "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
+    "event_count": 15000,
+    "kinds_count": 12,
+    "first_event": 1606719600,
+    "last_event": 1735689000
+  },
+  {
+    "pubkey": "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2",
+    "event_count": 12500,
+    "kinds_count": 8,
+    "first_event": 1620000000,
+    "last_event": 1735680000
+  }
+]
 ```
 
 ---
@@ -438,4 +839,3 @@ For reference, here are some common event kinds:
 | 34236 | Short Video | NIP-71 |
 
 See the [NIPs repository](https://github.com/nostr-protocol/nips) for the complete list.
-

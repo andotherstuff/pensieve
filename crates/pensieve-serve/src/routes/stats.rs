@@ -90,7 +90,7 @@ pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountRe
 
 /// `GET /api/v1/stats/kinds/total`
 ///
-/// Returns distinct event kinds seen in the last day.
+/// Returns distinct event kinds seen in the last 30 days.
 /// Suggested cache TTL: 1 hour (kinds are stable).
 pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
     let count = fetch_total_kinds(&state).await;
@@ -144,7 +144,7 @@ async fn fetch_total_pubkeys(state: &AppState) -> u64 {
 async fn fetch_total_kinds(state: &AppState) -> u64 {
     state
         .clickhouse
-        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 1 DAY")
+        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY")
         .fetch_one::<u64>()
         .await
         .unwrap_or(0)

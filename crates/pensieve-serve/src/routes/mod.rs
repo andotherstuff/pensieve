@@ -4,8 +4,9 @@ mod health;
 mod kinds;
 mod stats;
 
+use axum::extract::Request;
 use axum::http::header;
-use axum::middleware;
+use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
@@ -22,20 +23,44 @@ use crate::state::AppState;
 ///
 /// ## Protected (auth required)
 ///
-/// ### Stats
-/// - `GET /api/v1/stats` - High-level overview
+/// ### Health
+/// - `GET /api/v1/ping` - Authenticated ping
+///
+/// ### Stats Overview
+/// - `GET /api/v1/stats` - High-level overview (combined metrics)
+///
+/// ### Granular Stats
+/// - `GET /api/v1/stats/events/total` - Approximate total event count (TTL: 5min)
+/// - `GET /api/v1/stats/pubkeys/total` - Total unique pubkeys (TTL: 5min)
+/// - `GET /api/v1/stats/kinds/total` - Distinct event kinds in last 30 days (TTL: 1hr)
+/// - `GET /api/v1/stats/events/earliest` - Earliest event timestamp (TTL: 1hr)
+/// - `GET /api/v1/stats/events/latest` - Latest event timestamp (TTL: 10s)
+///
+/// ### Event Stats
 /// - `GET /api/v1/stats/events` - Event counts with filters
-/// - `GET /api/v1/stats/throughput` - Events per hour time series
+/// - `GET /api/v1/stats/throughput` - Events per hour (7-day rolling avg)
+///
+/// ### Active Users
 /// - `GET /api/v1/stats/users/active` - DAU/WAU/MAU summary
 /// - `GET /api/v1/stats/users/active/daily` - Daily active users time series
 /// - `GET /api/v1/stats/users/active/weekly` - Weekly active users time series
 /// - `GET /api/v1/stats/users/active/monthly` - Monthly active users time series
-/// - `GET /api/v1/stats/users/retention` - User retention cohort analysis
-/// - `GET /api/v1/stats/users/new` - New users time series
-/// - `GET /api/v1/stats/activity/hourly` - Hourly activity pattern
+///
+/// ### User Analytics
+/// - `GET /api/v1/stats/users/new` - New users per period
+/// - `GET /api/v1/stats/users/retention` - Cohort retention analysis
+///
+/// ### Activity Patterns
+/// - `GET /api/v1/stats/activity/hourly` - Hourly activity pattern (0-23 UTC)
+///
+/// ### Zaps
 /// - `GET /api/v1/stats/zaps` - Zap statistics
-/// - `GET /api/v1/stats/zaps/histogram` - Zap amount distribution histogram
+/// - `GET /api/v1/stats/zaps/histogram` - Zap amount distribution
+///
+/// ### Engagement
 /// - `GET /api/v1/stats/engagement` - Reply/reaction engagement stats
+///
+/// ### Content
 /// - `GET /api/v1/stats/longform` - Long-form content (kind 30023) stats
 /// - `GET /api/v1/stats/publishers` - Top publishers by event count
 ///
@@ -91,7 +116,7 @@ pub fn router(state: AppState) -> Router {
         // Auth middleware
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         // Cache headers middleware
-        .layer(middleware::map_response(add_cache_headers));
+        .layer(middleware::from_fn(add_cache_headers));
 
     Router::new()
         .merge(public)
@@ -99,23 +124,42 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Add cache headers to API responses.
+/// Add cache headers to API responses based on the endpoint.
 ///
-/// Sets a default cache duration of 60 seconds for successful responses.
-/// This allows CDNs and clients to cache analytics data appropriately.
-async fn add_cache_headers(response: Response) -> Response {
+/// TTLs are set per-endpoint based on how frequently the data changes:
+/// - `/stats/events/latest`: 10 seconds (changes frequently)
+/// - `/stats/events/total`, `/stats/pubkeys/total`: 5 minutes
+/// - `/stats/kinds/total`, `/stats/events/earliest`: 1 hour (stable data)
+/// - Other endpoints: 60 seconds default
+async fn add_cache_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+
     // Only cache successful responses
-    if response.status().is_success() {
-        let (mut parts, body) = response.into_parts();
-        // Cache for 60 seconds, allow stale responses for up to 5 minutes during revalidation
-        parts.headers.insert(
-            header::CACHE_CONTROL,
-            "public, max-age=60, stale-while-revalidate=300"
-                .parse()
-                .expect("valid header value"),
-        );
-        Response::from_parts(parts, body)
-    } else {
-        response
+    if !response.status().is_success() {
+        return response;
     }
+
+    // Determine TTL based on endpoint path (paths are relative to /api/v1 nest)
+    let (max_age, stale_while_revalidate) = match path.as_str() {
+        // Latest event changes frequently - short TTL
+        "/api/v1/stats/events/latest" => (10, 30),
+        // Total counts - moderate TTL (5 minutes)
+        "/api/v1/stats/events/total" | "/api/v1/stats/pubkeys/total" => (300, 600),
+        // Stable data - long TTL (1 hour)
+        "/api/v1/stats/kinds/total" | "/api/v1/stats/events/earliest" => (3600, 7200),
+        // Default for all other endpoints (1 minute)
+        _ => (60, 300),
+    };
+
+    let cache_value = format!(
+        "public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}"
+    );
+
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        cache_value.parse().expect("valid header value"),
+    );
+    Response::from_parts(parts, body)
 }

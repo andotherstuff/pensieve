@@ -29,14 +29,16 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 003_zap_amounts.sql | Parse bolt11 invoices from zap receipts | **Yes** |
 | 004_active_users_materialized.sql | Convert active user views to MVs | **Yes** (run automatically) |
 | 005_fix_active_users_views.sql | Fix active user views for large datasets | **Yes** (10-30 min) |
-| 006_preaggregate_active_users.sql | Pre-aggregate for instant queries | **Yes** (1-5 min) |
+| 006_preaggregate_active_users.sql | Pre-aggregate for instant queries (BROKEN) | Superseded by 008 |
+| 007_filter_future_dates_in_views.sql | Filter future dates from views | No |
+| 008_fix_active_users_aggregation.sql | **FIX:** Proper AggregatingMergeTree for summaries | **Yes** (1-5 min) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
 > Stop all services before running migration 005.
 >
-> **Migration 006** is optional but recommended for instant query performance. It creates
-> pre-aggregated summary tables so views return in <100ms instead of 1-2 seconds.
+> **⚠️ CRITICAL:** Migration 006 has a fundamental flaw and should NOT be used. If you ran it,
+> run **migration 008** immediately to fix the data. See details below.
 
 ---
 
@@ -169,6 +171,72 @@ docker exec pensieve-clickhouse clickhouse-client --database nostr --query "SELE
 sudo systemctl start pensieve-ingest
 docker start pensieve-grafana
 ```
+
+---
+
+### 006_preaggregate_active_users.sql (SUPERSEDED)
+
+**⚠️ WARNING: This migration has a fundamental design flaw and is superseded by migration 008.**
+
+The problem: It used `ReplacingMergeTree` for the summary tables, but the MVs compute aggregates
+per INSERT batch. When multiple batches are inserted for the same date, ReplacingMergeTree
+**replaces** rows (keeps only the latest) instead of **combining** them. This causes massive
+data loss where only one batch's worth of data survives per day.
+
+**Symptoms:** Most days show 1-20 active users and tiny event counts, with random days showing
+realistic numbers (those days happened to have only one batch inserted).
+
+**Fix:** Run migration 008.
+
+---
+
+### 007_filter_future_dates_in_views.sql
+
+**Purpose:** Filters out future-dated events (created_at in 2100, 2077, etc.) from active user views.
+Some events have invalid timestamps far in the future; this migration excludes them at query time.
+
+**Changes:** Updates the `daily_active_users`, `weekly_active_users`, and `monthly_active_users`
+views to filter dates between Nostr genesis (2020-11-07) and today.
+
+**Backfill:** None required.
+
+---
+
+### 008_fix_active_users_aggregation.sql
+
+**Purpose:** Fixes the critical bug in migration 006 by using `AggregatingMergeTree` with proper
+`*State`/`*Merge` functions instead of `ReplacingMergeTree`.
+
+**The Problem:** Migration 006 used `ReplacingMergeTree` for summary tables. When multiple batches
+are inserted for the same date, ClickHouse keeps only ONE row (the latest), losing all previous
+batches' data. This caused ~99% data loss on most days.
+
+**The Fix:** Uses `AggregatingMergeTree` with:
+- `uniqState(pubkey)` / `sumState(event_count)` in the materialized views
+- `uniqMerge()` / `sumMerge()` in the query views
+
+This properly combines aggregate states across batches instead of replacing them.
+
+**To run:**
+
+```bash
+# Step 1: Stop services
+docker stop pensieve-grafana
+sudo systemctl stop pensieve-ingest
+
+# Step 2: Run the migration (drops old tables, creates new ones, backfills)
+just ch-migrate docs/migrations/008_fix_active_users_aggregation.sql
+
+# Step 3: Verify the fix worked
+just ch-query "SELECT date, active_users, total_events FROM daily_active_users ORDER BY date DESC LIMIT 14"
+# Should now show consistent, realistic numbers (not 1-20 users per day)
+
+# Step 4: Restart services
+sudo systemctl start pensieve-ingest
+docker start pensieve-grafana
+```
+
+**Backfill:** Included in the migration script (1-5 minutes depending on dataset size).
 
 ---
 
