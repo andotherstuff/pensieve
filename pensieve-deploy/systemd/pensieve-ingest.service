@@ -27,8 +27,9 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --tor-proxy 127.0.0.1:9050 \
     --negentropy \
     --negentropy-db-path /data/sync-state \
-    --negentropy-interval-secs 600 \
-    --negentropy-lookback-days 7
+    --negentropy-relays-file /home/pensieve/pensieve/data/relays/negentropy.txt \
+    --negentropy-interval-secs 1800 \
+    --negentropy-lookback-days 14
 
 # Restart policy
 Restart=always
