@@ -257,6 +257,9 @@ impl NegentropySyncer {
         let start = Instant::now();
         let mut stats = SyncStats::default();
 
+        // Mark sync as in progress
+        gauge!("negentropy_sync_in_progress").set(1.0);
+
         tracing::info!(
             "Starting negentropy sync with {} relays, lookback {}s",
             self.config.relays.len(),
@@ -273,13 +276,24 @@ impl NegentropySyncer {
 
         // Collect events as they stream through
         let collected_events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let events_received_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let collector_events = Arc::clone(&collected_events);
+        let collector_counter = Arc::clone(&events_received_count);
 
         // Spawn a task to collect events from the channel
+        // This updates the "receiving" gauge in real-time as events stream in
         let collector_handle = tokio::spawn(async move {
             while let Some(event) = event_receiver.recv().await {
+                let count = collector_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                // Update receiving progress gauge every 100 events
+                if count.is_multiple_of(100) {
+                    gauge!("negentropy_events_receiving").set(count as f64);
+                }
                 collector_events.lock().await.push(event);
             }
+            // Final update
+            let final_count = collector_counter.load(Ordering::Relaxed);
+            gauge!("negentropy_events_receiving").set(final_count as f64);
         });
 
         // Create a client with our sync state database
@@ -367,6 +381,10 @@ impl NegentropySyncer {
         histogram!("negentropy_sync_duration_seconds").record(stats.duration.as_secs_f64());
         gauge!("negentropy_last_sync_unix").set(Timestamp::now().as_secs() as f64);
 
+        // Mark sync as complete
+        gauge!("negentropy_sync_in_progress").set(0.0);
+        gauge!("negentropy_events_receiving").set(0.0);
+
         Ok((stats, discovered_events))
     }
 
@@ -406,11 +424,14 @@ impl NegentropySyncer {
 
                     // Track batch processing statistics
                     let total_events = events.len();
-                    let mut events_written = 0usize;
+                    let mut events_succeeded = 0usize;
                     let mut events_failed = 0usize;
                     let process_start = Instant::now();
 
                     // Process discovered events through the handler
+                    // Note: The handler is responsible for emitting detailed metrics
+                    // (written vs deduplicated) since it knows the distinction.
+                    // We only track success/failure here at the batch level.
                     for event in events {
                         match event_handler(&event) {
                             Ok(true) => {
@@ -422,7 +443,7 @@ impl NegentropySyncer {
                                 {
                                     tracing::warn!("Failed to record event in sync state: {}", e);
                                 }
-                                events_written += 1;
+                                events_succeeded += 1;
                             }
                             Ok(false) => {
                                 tracing::info!("Event handler signaled stop");
@@ -434,28 +455,26 @@ impl NegentropySyncer {
                                 // It will be re-fetched on the next sync cycle.
                                 tracing::debug!("Event handler error (will retry next sync): {}", e);
                                 events_failed += 1;
+                                counter!("negentropy_events_failed_total").increment(1);
                             }
                         }
                     }
 
-                    // Calculate deduplicated count (total - written - failed = deduplicated by our dedupe index)
-                    let events_deduplicated = total_events.saturating_sub(events_written).saturating_sub(events_failed);
                     let process_duration = process_start.elapsed();
 
                     // Log batch summary
                     tracing::info!(
-                        "Negentropy batch processed: {} events → {} written, {} deduplicated, {} failed in {:?}",
+                        "Negentropy batch processed: {} events → {} succeeded, {} failed in {:?}",
                         total_events,
-                        events_written,
-                        events_deduplicated,
+                        events_succeeded,
                         events_failed,
                         process_duration
                     );
 
-                    // Update batch metrics
+                    // Update batch metrics (gauges for last-batch visibility)
+                    // Note: succeeded includes both novel (written) and deduplicated events
                     gauge!("negentropy_last_batch_total").set(total_events as f64);
-                    gauge!("negentropy_last_batch_written").set(events_written as f64);
-                    gauge!("negentropy_last_batch_deduplicated").set(events_deduplicated as f64);
+                    gauge!("negentropy_last_batch_succeeded").set(events_succeeded as f64);
                     gauge!("negentropy_last_batch_failed").set(events_failed as f64);
                     histogram!("negentropy_batch_process_duration_seconds").record(process_duration.as_secs_f64());
 

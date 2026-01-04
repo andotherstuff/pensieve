@@ -798,6 +798,8 @@ async fn main() -> Result<()> {
 
             // Count all received events (before dedupe)
             handler_events_received.fetch_add(1, Ordering::Relaxed);
+            // Emit relay-specific counter in real-time
+            counter!("relay_events_received_total").increment(1);
 
             // Get the event ID bytes for dedupe check (CHEAP - just a reference)
             let event_id = event.id.as_bytes();
@@ -824,6 +826,8 @@ async fn main() -> Result<()> {
                             // Continue processing despite write errors
                         } else {
                             handler_events_processed.fetch_add(1, Ordering::Relaxed);
+                            // Emit relay-specific counter in real-time
+                            counter!("relay_events_written_total").increment(1);
 
                             // Track max created_at for checkpoint
                             // Use fetch_max to atomically update to the highest value
@@ -844,6 +848,8 @@ async fn main() -> Result<()> {
             } else {
                 // Duplicate - skip (no packing needed!)
                 handler_events_deduplicated.fetch_add(1, Ordering::Relaxed);
+                // Emit relay-specific counter in real-time
+                counter!("relay_events_deduplicated_total").increment(1);
             }
 
             Ok(true) // Continue

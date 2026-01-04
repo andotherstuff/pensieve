@@ -197,6 +197,11 @@ impl RelaySource {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Get the current number of connected relays (live WebSocket connections).
+    pub fn connected_count(&self) -> usize {
+        self.stats.relays_connected.load(Ordering::Relaxed)
+    }
+
     /// Record a successful connection to a relay.
     async fn record_connection(&self, relay_url: &str) {
         // Track connection time for uptime calculation
@@ -280,11 +285,14 @@ impl RelaySource {
             }
         }
 
-        // Update the connected count gauge
+        // Update the connected count
         self.stats.relays_connected.store(
             connected_count as usize,
             std::sync::atomic::Ordering::Relaxed,
         );
+
+        // Emit as Prometheus gauge - this is the ACTUAL WebSocket connection count
+        metrics::gauge!("relay_connections_current").set(connected_count as f64);
 
         if updates > 0 {
             tracing::debug!(
