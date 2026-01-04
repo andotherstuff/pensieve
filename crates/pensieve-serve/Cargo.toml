@@ -54,3 +54,6 @@ clap = { version = "4.4", features = ["derive", "env"] }
 
 # Environment
 dotenvy = "0.15"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }

@@ -8,6 +8,8 @@ use clickhouse::Client;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
+use crate::cache::{self, ResponseCache};
+
 /// Application configuration loaded from environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -95,6 +97,9 @@ pub struct AppState {
 
     /// SQLite connection for relay stats (optional, shared via Arc<Mutex>).
     pub relay_db: Option<Arc<Mutex<Connection>>>,
+
+    /// In-memory response cache for expensive queries.
+    pub cache: ResponseCache,
 }
 
 impl AppState {
@@ -132,10 +137,19 @@ impl AppState {
             }
         });
 
+        // Create response cache
+        let cache = cache::new_cache();
+        tracing::info!(
+            capacity = cache::DEFAULT_CACHE_CAPACITY,
+            ttl_secs = cache::DEFAULT_TTL.as_secs(),
+            "response cache initialized"
+        );
+
         Self {
             clickhouse,
             config: Arc::new(config),
             relay_db,
+            cache,
         }
     }
 }

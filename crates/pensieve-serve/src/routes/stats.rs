@@ -7,6 +7,7 @@ use clickhouse::Row;
 use pensieve_core::NOSTR_GENESIS_DATE_SQL;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::get_or_compute;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -29,6 +30,7 @@ pub struct OverviewResponse {
 /// `GET /api/v1/stats`
 ///
 /// Returns high-level overview statistics (combined endpoint).
+/// Cached for 1 minute.
 /// For granular queries with independent caching, use the individual endpoints:
 /// - GET /api/v1/stats/events/total
 /// - GET /api/v1/stats/pubkeys/total
@@ -36,22 +38,27 @@ pub struct OverviewResponse {
 /// - GET /api/v1/stats/events/earliest
 /// - GET /api/v1/stats/events/latest
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    // Run all queries in parallel
-    let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
-        fetch_total_events(&state),
-        fetch_total_pubkeys(&state),
-        fetch_total_kinds(&state),
-        fetch_earliest_event(&state),
-        fetch_latest_event(&state),
-    );
+    let result = get_or_compute(&state.cache, "overview", || async {
+        // Run all queries in parallel
+        let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
+            fetch_total_events(&state),
+            fetch_total_pubkeys(&state),
+            fetch_total_kinds(&state),
+            fetch_earliest_event(&state),
+            fetch_latest_event(&state),
+        );
 
-    Ok(Json(OverviewResponse {
-        total_events,
-        total_pubkeys,
-        total_kinds,
-        earliest_event,
-        latest_event,
-    }))
+        Ok(OverviewResponse {
+            total_events,
+            total_pubkeys,
+            total_kinds,
+            earliest_event,
+            latest_event,
+        })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,13 +66,13 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResp
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Response for a single count value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountResponse {
     pub count: u64,
 }
 
 /// Response for a single timestamp value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimestampResponse {
     pub timestamp: u32,
 }
@@ -73,50 +80,75 @@ pub struct TimestampResponse {
 /// `GET /api/v1/stats/events/total`
 ///
 /// Returns approximate total event count (from system.parts, instant).
-/// Suggested cache TTL: 5 minutes.
+/// Cached for 5 minutes.
 pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let count = fetch_total_events(&state).await;
-    Ok(Json(CountResponse { count }))
+    let result = get_or_compute(&state.cache, "total_events", || async {
+        let count = fetch_total_events(&state).await;
+        Ok(CountResponse { count })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/pubkeys/total`
 ///
 /// Returns total unique pubkeys (from pre-aggregated table, instant).
-/// Suggested cache TTL: 5 minutes.
+/// Cached for 5 minutes.
 pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let count = fetch_total_pubkeys(&state).await;
-    Ok(Json(CountResponse { count }))
+    let result = get_or_compute(&state.cache, "total_pubkeys", || async {
+        let count = fetch_total_pubkeys(&state).await;
+        Ok(CountResponse { count })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/kinds/total`
 ///
 /// Returns distinct event kinds seen in the last 30 days.
-/// Suggested cache TTL: 1 hour (kinds are stable).
+/// Cached for 1 hour (kinds are stable).
 pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let count = fetch_total_kinds(&state).await;
-    Ok(Json(CountResponse { count }))
+    let result = get_or_compute(&state.cache, "total_kinds", || async {
+        let count = fetch_total_kinds(&state).await;
+        Ok(CountResponse { count })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/events/earliest`
 ///
 /// Returns earliest event timestamp (from aggregated first-seen data).
-/// Suggested cache TTL: 1 hour (rarely changes).
+/// Cached for 1 hour (rarely changes).
 pub async fn earliest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let timestamp = fetch_earliest_event(&state).await;
-    Ok(Json(TimestampResponse { timestamp }))
+    let result = get_or_compute(&state.cache, "earliest_event", || async {
+        let timestamp = fetch_earliest_event(&state).await;
+        Ok(TimestampResponse { timestamp })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/events/latest`
 ///
 /// Returns latest event timestamp (from recent data, excludes future timestamps).
-/// Suggested cache TTL: 10 seconds (changes frequently).
+/// Cached for 10 seconds.
 pub async fn latest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let timestamp = fetch_latest_event(&state).await;
-    Ok(Json(TimestampResponse { timestamp }))
+    let result = get_or_compute(&state.cache, "latest_event", || async {
+        let timestamp = fetch_latest_event(&state).await;
+        Ok(TimestampResponse { timestamp })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,127 +244,136 @@ pub struct EventCountByPeriod {
 /// `GET /api/v1/stats/events`
 ///
 /// Returns event counts with optional filters and grouping.
+/// Cached for 1 minute.
 pub async fn events(
     State(state): State<AppState>,
     Query(params): Query<EventStatsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
+    let kind = params.kind;
+    let days = params.days;
+    let since = params.since;
+    let until = params.until;
+    let group_by = params.group_by.clone();
 
-    // Build WHERE clause
-    let mut conditions = Vec::new();
-    let mut bind_values: Vec<String> = Vec::new();
-
-    if let Some(kind) = params.kind {
-        conditions.push(format!("kind = {}", kind));
-    }
-
-    if let Some(days) = params.days {
-        conditions.push(format!("created_at >= now() - INTERVAL {} DAY", days));
-    } else {
-        if let Some(since) = params.since {
-            conditions.push("created_at >= ?".to_string());
-            bind_values.push(since.to_string());
-        }
-        if let Some(until) = params.until {
-            conditions.push("created_at < ?".to_string());
-            bind_values.push(until.to_string());
-        }
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    // Determine if we're grouping by time period
-    match params.group_by.as_deref() {
-        Some("day") => {
-            let query = format!(
-                "SELECT
-                    toString(toDate(created_at)) AS period,
-                    count() AS count,
-                    uniq(pubkey) AS unique_pubkeys
-                FROM events_local
-                {}
-                GROUP BY period
-                ORDER BY period DESC
-                LIMIT {}",
-                where_clause, limit
-            );
-
-            let mut q = state.clickhouse.query(&query);
-            for val in &bind_values {
-                q = q.bind(val);
-            }
-            let rows: Vec<EventCountByPeriod> = q.fetch_all().await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some("week") => {
-            let query = format!(
-                "SELECT
-                    toString(toMonday(created_at)) AS period,
-                    count() AS count,
-                    uniq(pubkey) AS unique_pubkeys
-                FROM events_local
-                {}
-                GROUP BY period
-                ORDER BY period DESC
-                LIMIT {}",
-                where_clause, limit
-            );
-
-            let mut q = state.clickhouse.query(&query);
-            for val in &bind_values {
-                q = q.bind(val);
-            }
-            let rows: Vec<EventCountByPeriod> = q.fetch_all().await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some("month") => {
-            let query = format!(
-                "SELECT
-                    toString(toStartOfMonth(created_at)) AS period,
-                    count() AS count,
-                    uniq(pubkey) AS unique_pubkeys
-                FROM events_local
-                {}
-                GROUP BY period
-                ORDER BY period DESC
-                LIMIT {}",
-                where_clause, limit
-            );
-
-            let mut q = state.clickhouse.query(&query);
-            for val in &bind_values {
-                q = q.bind(val);
-            }
-            let rows: Vec<EventCountByPeriod> = q.fetch_all().await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some(other) => Err(ApiError::BadRequest(format!(
+    // Validate group_by before caching
+    if let Some(ref g) = group_by
+        && !["day", "week", "month"].contains(&g.as_str())
+    {
+        return Err(ApiError::BadRequest(format!(
             "invalid group_by value: '{}'. Valid options: day, week, month",
-            other
-        ))),
-        None => {
-            // No grouping - return aggregate
-            let query = format!(
-                "SELECT
-                    count() AS count,
-                    uniq(pubkey) AS unique_pubkeys
-                FROM events_local
-                {}",
-                where_clause
-            );
-
-            let mut q = state.clickhouse.query(&query);
-            for val in &bind_values {
-                q = q.bind(val);
-            }
-            let stats: EventCountResponse = q.fetch_one().await?;
-            Ok(Json(serde_json::to_value(stats)?))
-        }
+            g
+        )));
     }
+
+    // Build cache key from all params
+    let cache_key = format!(
+        "events:kind={}&days={}&since={}&until={}&group_by={}&limit={}",
+        kind.map(|k| k.to_string()).unwrap_or_default(),
+        days.map(|d| d.to_string()).unwrap_or_default(),
+        since.map(|d| d.to_string()).unwrap_or_default(),
+        until.map(|d| d.to_string()).unwrap_or_default(),
+        group_by.as_deref().unwrap_or(""),
+        limit
+    );
+
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Build WHERE clause
+        let mut conditions = Vec::new();
+
+        if let Some(kind) = kind {
+            conditions.push(format!("kind = {}", kind));
+        }
+
+        if let Some(days) = days {
+            conditions.push(format!("created_at >= now() - INTERVAL {} DAY", days));
+        } else {
+            if let Some(since) = since {
+                conditions.push(format!("created_at >= '{}'", since));
+            }
+            if let Some(until) = until {
+                conditions.push(format!("created_at < '{}'", until));
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        // Determine if we're grouping by time period
+        match group_by.as_deref() {
+            Some("day") => {
+                let query = format!(
+                    "SELECT
+                        toString(toDate(created_at)) AS period,
+                        count() AS count,
+                        uniq(pubkey) AS unique_pubkeys
+                    FROM events_local
+                    {}
+                    GROUP BY period
+                    ORDER BY period DESC
+                    LIMIT {}",
+                    where_clause, limit
+                );
+
+                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            Some("week") => {
+                let query = format!(
+                    "SELECT
+                        toString(toMonday(created_at)) AS period,
+                        count() AS count,
+                        uniq(pubkey) AS unique_pubkeys
+                    FROM events_local
+                    {}
+                    GROUP BY period
+                    ORDER BY period DESC
+                    LIMIT {}",
+                    where_clause, limit
+                );
+
+                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            Some("month") => {
+                let query = format!(
+                    "SELECT
+                        toString(toStartOfMonth(created_at)) AS period,
+                        count() AS count,
+                        uniq(pubkey) AS unique_pubkeys
+                    FROM events_local
+                    {}
+                    GROUP BY period
+                    ORDER BY period DESC
+                    LIMIT {}",
+                    where_clause, limit
+                );
+
+                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            _ => {
+                // No grouping - return aggregate
+                let query = format!(
+                    "SELECT
+                        count() AS count,
+                        uniq(pubkey) AS unique_pubkeys
+                    FROM events_local
+                    {}",
+                    where_clause
+                );
+
+                let stats: EventCountResponse = state.clickhouse.query(&query).fetch_one().await?;
+                Ok(serde_json::to_value(stats)?)
+            }
+        }
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -340,7 +381,7 @@ pub async fn events(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Active users summary (current DAU/WAU/MAU).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveUsersSummary {
     pub daily: ActiveUsersCount,
     pub weekly: ActiveUsersCount,
@@ -360,21 +401,27 @@ pub struct ActiveUsersCount {
 ///
 /// Returns current DAU/WAU/MAU summary (most recent values).
 /// Queries the small pre-aggregated summary tables directly.
+/// Cached for 10 minutes.
 pub async fn active_users_summary(
     State(state): State<AppState>,
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
-    // Run all three queries in parallel - each fetches from tiny summary tables
-    let (daily, weekly, monthly) = tokio::join!(
-        fetch_latest_daily_active_users(&state),
-        fetch_latest_weekly_active_users(&state),
-        fetch_latest_monthly_active_users(&state),
-    );
+    let result = get_or_compute(&state.cache, "active_users_summary", || async {
+        // Run all three queries in parallel - each fetches from tiny summary tables
+        let (daily, weekly, monthly) = tokio::join!(
+            fetch_latest_daily_active_users(&state),
+            fetch_latest_weekly_active_users(&state),
+            fetch_latest_monthly_active_users(&state),
+        );
 
-    Ok(Json(ActiveUsersSummary {
-        daily: daily?,
-        weekly: weekly?,
-        monthly: monthly?,
-    }))
+        Ok(ActiveUsersSummary {
+            daily: daily?,
+            weekly: weekly?,
+            monthly: monthly?,
+        })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// Fetch the most recent daily active users from the summary table.
@@ -468,117 +515,157 @@ pub struct ActiveUsersRow {
 ///
 /// Returns daily active users time series.
 /// Fetches from small pre-aggregated summary table (~1500 rows total).
+/// Cached for 10 minutes.
 pub async fn active_users_daily(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
     let limit = params.limit.unwrap_or(30).min(365) as usize;
+    let since = params.since;
 
-    // Fetch all daily data from the small summary table, filter in Rust
-    let mut rows: Vec<ActiveUsersRow> = state
-        .clickhouse
-        .query(
-            "SELECT
-                toString(date) AS period,
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM daily_active_users_summary
-            WHERE date >= toDate('2020-11-07') AND date <= today()
-            GROUP BY date
-            ORDER BY date DESC",
-        )
-        .fetch_all()
-        .await?;
+    // Cache key includes query params
+    let cache_key = format!(
+        "active_users_daily:limit={}&since={}",
+        limit,
+        since.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    // Apply filters in Rust (simple and fast for small data)
-    if let Some(since) = params.since {
-        let since_str = since.to_string();
-        rows.retain(|r| r.period >= since_str);
-    }
-    rows.truncate(limit);
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Fetch all daily data from the small summary table, filter in Rust
+        let mut rows: Vec<ActiveUsersRow> = state
+            .clickhouse
+            .query(
+                "SELECT
+                    toString(date) AS period,
+                    uniqMerge(active_users_state) AS active_users,
+                    uniqMerge(has_profile_state) AS has_profile,
+                    uniqMerge(has_follows_list_state) AS has_follows_list,
+                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                    sumMerge(total_events_state) AS total_events
+                FROM daily_active_users_summary
+                WHERE date >= toDate('2020-11-07') AND date <= today()
+                GROUP BY date
+                ORDER BY date DESC",
+            )
+            .fetch_all()
+            .await?;
 
-    Ok(Json(rows))
+        // Apply filters in Rust (simple and fast for small data)
+        if let Some(since) = since {
+            let since_str = since.to_string();
+            rows.retain(|r| r.period >= since_str);
+        }
+        rows.truncate(limit);
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/users/active/weekly`
 ///
 /// Returns weekly active users time series.
 /// Fetches from small pre-aggregated summary table (~215 rows total).
+/// Cached for 10 minutes.
 pub async fn active_users_weekly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
     let limit = params.limit.unwrap_or(12).min(52) as usize;
+    let since = params.since;
 
-    // Fetch all weekly data from the small summary table, filter in Rust
-    let mut rows: Vec<ActiveUsersRow> = state
-        .clickhouse
-        .query(
-            "SELECT
-                toString(week) AS period,
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM weekly_active_users_summary
-            WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
-            GROUP BY week
-            ORDER BY week DESC",
-        )
-        .fetch_all()
-        .await?;
+    let cache_key = format!(
+        "active_users_weekly:limit={}&since={}",
+        limit,
+        since.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    // Apply filters in Rust
-    if let Some(since) = params.since {
-        let since_str = since.to_string();
-        rows.retain(|r| r.period >= since_str);
-    }
-    rows.truncate(limit);
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Fetch all weekly data from the small summary table, filter in Rust
+        let mut rows: Vec<ActiveUsersRow> = state
+            .clickhouse
+            .query(
+                "SELECT
+                    toString(week) AS period,
+                    uniqMerge(active_users_state) AS active_users,
+                    uniqMerge(has_profile_state) AS has_profile,
+                    uniqMerge(has_follows_list_state) AS has_follows_list,
+                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                    sumMerge(total_events_state) AS total_events
+                FROM weekly_active_users_summary
+                WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
+                GROUP BY week
+                ORDER BY week DESC",
+            )
+            .fetch_all()
+            .await?;
 
-    Ok(Json(rows))
+        // Apply filters in Rust
+        if let Some(since) = since {
+            let since_str = since.to_string();
+            rows.retain(|r| r.period >= since_str);
+        }
+        rows.truncate(limit);
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/stats/users/active/monthly`
 ///
 /// Returns monthly active users time series.
 /// Fetches from small pre-aggregated summary table (~50 rows total).
+/// Cached for 10 minutes.
 pub async fn active_users_monthly(
     State(state): State<AppState>,
     Query(params): Query<ActiveUsersQuery>,
 ) -> Result<Json<Vec<ActiveUsersRow>>, ApiError> {
     let limit = params.limit.unwrap_or(12).min(120) as usize;
+    let since = params.since;
 
-    // Fetch all monthly data from the small summary table, filter in Rust
-    let mut rows: Vec<ActiveUsersRow> = state
-        .clickhouse
-        .query(
-            "SELECT
-                toString(month) AS period,
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM monthly_active_users_summary
-            WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
-            GROUP BY month
-            ORDER BY month DESC",
-        )
-        .fetch_all()
-        .await?;
+    let cache_key = format!(
+        "active_users_monthly:limit={}&since={}",
+        limit,
+        since.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    // Apply filters in Rust
-    if let Some(since) = params.since {
-        let since_str = since.to_string();
-        rows.retain(|r| r.period >= since_str);
-    }
-    rows.truncate(limit);
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Fetch all monthly data from the small summary table, filter in Rust
+        let mut rows: Vec<ActiveUsersRow> = state
+            .clickhouse
+            .query(
+                "SELECT
+                    toString(month) AS period,
+                    uniqMerge(active_users_state) AS active_users,
+                    uniqMerge(has_profile_state) AS has_profile,
+                    uniqMerge(has_follows_list_state) AS has_follows_list,
+                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
+                    sumMerge(total_events_state) AS total_events
+                FROM monthly_active_users_summary
+                WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
+                GROUP BY month
+                ORDER BY month DESC",
+            )
+            .fetch_all()
+            .await?;
 
-    Ok(Json(rows))
+        // Apply filters in Rust
+        if let Some(since) = since {
+            let since_str = since.to_string();
+            rows.retain(|r| r.period >= since_str);
+        }
+        rows.truncate(limit);
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -600,7 +687,7 @@ struct ThroughputRow {
 }
 
 /// Throughput response: 7-day rolling average of events per hour.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputResponse {
     /// Average events per hour over the last 7 days.
     pub events_per_hour: f64,
@@ -611,33 +698,45 @@ pub struct ThroughputResponse {
 /// `GET /api/v1/stats/throughput`
 ///
 /// Returns 7-day rolling average of events created per hour.
+/// Cached for 5 minutes.
 pub async fn throughput(
     State(state): State<AppState>,
     Query(params): Query<ThroughputQuery>,
 ) -> Result<Json<ThroughputResponse>, ApiError> {
-    let kind_clause = match params.kind {
-        Some(kind) => format!("AND kind = {}", kind),
-        None => String::new(),
-    };
+    let kind = params.kind;
+    let cache_key = format!(
+        "throughput:kind={}",
+        kind.map(|k| k.to_string()).unwrap_or_default()
+    );
 
-    let row: ThroughputRow = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                toFloat64(count()) / 168.0 AS events_per_hour,
-                count() AS total_events_7d
-            FROM events_local
-            WHERE created_at >= now() - INTERVAL 7 DAY
-            {}",
-            kind_clause
-        ))
-        .fetch_one()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let kind_clause = match kind {
+            Some(kind) => format!("AND kind = {}", kind),
+            None => String::new(),
+        };
 
-    Ok(Json(ThroughputResponse {
-        events_per_hour: row.events_per_hour,
-        total_events_7d: row.total_events_7d,
-    }))
+        let row: ThroughputRow = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    toFloat64(count()) / 168.0 AS events_per_hour,
+                    count() AS total_events_7d
+                FROM events_local
+                WHERE created_at >= now() - INTERVAL 7 DAY
+                {}",
+                kind_clause
+            ))
+            .fetch_one()
+            .await?;
+
+        Ok(ThroughputResponse {
+            events_per_hour: row.events_per_hour,
+            total_events_7d: row.total_events_7d,
+        })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -656,7 +755,7 @@ pub struct RetentionQuery {
 }
 
 /// A single cohort's retention data.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CohortRetention {
     /// Cohort period start (YYYY-MM-DD).
     pub cohort: String,
@@ -680,13 +779,17 @@ struct CohortActivityRow {
 ///
 /// Returns cohort retention analysis.
 /// Requires the pubkey_first_seen materialized view (migration 002).
+/// Cached for 10 minutes (expensive query).
 pub async fn user_retention(
     State(state): State<AppState>,
     Query(params): Query<RetentionQuery>,
 ) -> Result<Json<Vec<CohortRetention>>, ApiError> {
     let limit = params.limit.unwrap_or(12).min(52);
-    let cohort_size = params.cohort_size.as_deref().unwrap_or("week");
+    let cohort_size_param = params.cohort_size.clone();
+    let cohort_start = params.cohort_start;
 
+    // Validate before caching
+    let cohort_size = cohort_size_param.as_deref().unwrap_or("week");
     let (period_func, interval_unit) = match cohort_size {
         "month" => ("toStartOfMonth", "MONTH"),
         "week" => ("toMonday", "WEEK"),
@@ -698,74 +801,86 @@ pub async fn user_retention(
         }
     };
 
-    let cohort_start_clause = match params.cohort_start {
-        Some(date) => format!("AND first_seen >= '{}'", date),
-        None => format!("AND first_seen >= now() - INTERVAL {} {}", limit, interval_unit),
-    };
+    let cache_key = format!(
+        "user_retention:cohort_size={}&limit={}&cohort_start={}",
+        cohort_size,
+        limit,
+        cohort_start.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    // Query: for each cohort (users grouped by first_seen period),
-    // count how many were active in each subsequent period
-    let rows: Vec<CohortActivityRow> = state
-        .clickhouse
-        .query(&format!(
-            "WITH cohort_users AS (
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let cohort_start_clause = match cohort_start {
+            Some(date) => format!("AND first_seen >= '{}'", date),
+            None => format!("AND first_seen >= now() - INTERVAL {} {}", limit, interval_unit),
+        };
+
+        // Query: for each cohort (users grouped by first_seen period),
+        // count how many were active in each subsequent period
+        let rows: Vec<CohortActivityRow> = state
+            .clickhouse
+            .query(&format!(
+                "WITH cohort_users AS (
+                    SELECT
+                        pubkey,
+                        {}(first_seen) AS cohort
+                    FROM pubkey_first_seen
+                    WHERE 1=1
+                    {}
+                )
                 SELECT
-                    pubkey,
-                    {}(first_seen) AS cohort
-                FROM pubkey_first_seen
-                WHERE 1=1
-                {}
-            )
-            SELECT
-                toString(cu.cohort) AS cohort,
-                toString({}(e.created_at)) AS activity_period,
-                uniq(e.pubkey) AS active_count
-            FROM events_local e
-            INNER JOIN cohort_users cu ON e.pubkey = cu.pubkey
-            WHERE e.kind NOT IN (445, 1059)
-                AND e.created_at >= cu.cohort
-            GROUP BY cu.cohort, activity_period
-            ORDER BY cu.cohort, activity_period",
-            period_func, cohort_start_clause, period_func
-        ))
-        .fetch_all()
-        .await?;
+                    toString(cu.cohort) AS cohort,
+                    toString({}(e.created_at)) AS activity_period,
+                    uniq(e.pubkey) AS active_count
+                FROM events_local e
+                INNER JOIN cohort_users cu ON e.pubkey = cu.pubkey
+                WHERE e.kind NOT IN (445, 1059)
+                    AND e.created_at >= cu.cohort
+                GROUP BY cu.cohort, activity_period
+                ORDER BY cu.cohort, activity_period",
+                period_func, cohort_start_clause, period_func
+            ))
+            .fetch_all()
+            .await?;
 
-    // Process rows into cohort retention structure
-    let mut cohorts: std::collections::BTreeMap<String, Vec<(String, u64)>> =
-        std::collections::BTreeMap::new();
-    for row in rows {
-        cohorts
-            .entry(row.cohort.clone())
-            .or_default()
-            .push((row.activity_period, row.active_count));
-    }
+        // Process rows into cohort retention structure
+        let mut cohorts: std::collections::BTreeMap<String, Vec<(String, u64)>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            cohorts
+                .entry(row.cohort.clone())
+                .or_default()
+                .push((row.activity_period, row.active_count));
+        }
 
-    let result: Vec<CohortRetention> = cohorts
-        .into_iter()
-        .take(limit as usize)
-        .map(|(cohort, mut periods)| {
-            periods.sort_by(|a, b| a.0.cmp(&b.0));
-            let cohort_size = periods.first().map(|(_, c)| *c).unwrap_or(0);
-            let retention: Vec<u64> = periods.iter().map(|(_, c)| *c).collect();
-            let retention_pct: Vec<f64> = retention
-                .iter()
-                .map(|&c| {
-                    if cohort_size > 0 {
-                        (c as f64 / cohort_size as f64) * 100.0
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            CohortRetention {
-                cohort,
-                cohort_size,
-                retention,
-                retention_pct,
-            }
-        })
-        .collect();
+        let result: Vec<CohortRetention> = cohorts
+            .into_iter()
+            .take(limit as usize)
+            .map(|(cohort, mut periods)| {
+                periods.sort_by(|a, b| a.0.cmp(&b.0));
+                let cohort_size = periods.first().map(|(_, c)| *c).unwrap_or(0);
+                let retention: Vec<u64> = periods.iter().map(|(_, c)| *c).collect();
+                let retention_pct: Vec<f64> = retention
+                    .iter()
+                    .map(|&c| {
+                        if cohort_size > 0 {
+                            (c as f64 / cohort_size as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                CohortRetention {
+                    cohort,
+                    cohort_size,
+                    retention,
+                    retention_pct,
+                }
+            })
+            .collect();
+
+        Ok(result)
+    })
+    .await?;
 
     Ok(Json(result))
 }
@@ -798,15 +913,17 @@ pub struct NewUsersRow {
 ///
 /// Returns count of new pubkeys (first seen) per period.
 /// Requires the daily_new_users_summary table (migration 011).
+/// Cached for 5 minutes.
 pub async fn new_users(
     State(state): State<AppState>,
     Query(params): Query<NewUsersQuery>,
 ) -> Result<Json<Vec<NewUsersRow>>, ApiError> {
     let limit = params.limit.unwrap_or(30).min(365);
+    let group_by = params.group_by.clone();
+    let since = params.since;
 
-    // Use pre-aggregated daily_new_users view for fast queries.
-    // For weekly/monthly, aggregate the daily counts.
-    let (group_expr, max_limit) = match params.group_by.as_deref() {
+    // Validate group_by before caching
+    let (group_expr, max_limit) = match group_by.as_deref() {
         Some("week") => ("toMonday(date)", 52u32),
         Some("month") => ("toStartOfMonth(date)", 120u32),
         Some("day") | None => ("date", 365u32),
@@ -820,28 +937,40 @@ pub async fn new_users(
 
     let limit = limit.min(max_limit);
 
-    let since_clause = match params.since {
-        Some(date) => format!("AND date >= '{}'", date),
-        None => String::new(),
-    };
+    let cache_key = format!(
+        "new_users:group_by={}&limit={}&since={}",
+        group_by.as_deref().unwrap_or("day"),
+        limit,
+        since.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    let rows: Vec<NewUsersRow> = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                toString({}) AS period,
-                sum(new_users) AS new_users
-            FROM daily_new_users
-            WHERE 1=1 {}
-            GROUP BY period
-            ORDER BY period DESC
-            LIMIT {}",
-            group_expr, since_clause, limit
-        ))
-        .fetch_all()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let since_clause = match since {
+            Some(date) => format!("AND date >= '{}'", date),
+            None => String::new(),
+        };
 
-    Ok(Json(rows))
+        let rows: Vec<NewUsersRow> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    toString({}) AS period,
+                    sum(new_users) AS new_users
+                FROM daily_new_users
+                WHERE 1=1 {}
+                GROUP BY period
+                ORDER BY period DESC
+                LIMIT {}",
+                group_expr, since_clause, limit
+            ))
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -871,36 +1000,49 @@ pub struct HourlyActivityRow {
 /// `GET /api/v1/stats/activity/hourly`
 ///
 /// Returns event activity grouped by hour of day (0-23) to show usage patterns.
+/// Cached for 5 minutes.
 pub async fn hourly_activity(
     State(state): State<AppState>,
     Query(params): Query<HourlyActivityQuery>,
 ) -> Result<Json<Vec<HourlyActivityRow>>, ApiError> {
     let days = params.days.unwrap_or(7).min(90);
+    let kind = params.kind;
 
-    let kind_clause = match params.kind {
-        Some(kind) => format!("AND kind = {}", kind),
-        None => String::new(),
-    };
+    let cache_key = format!(
+        "hourly_activity:days={}&kind={}",
+        days,
+        kind.map(|k| k.to_string()).unwrap_or_default()
+    );
 
-    let rows: Vec<HourlyActivityRow> = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                toHour(created_at) AS hour,
-                count() AS event_count,
-                uniq(pubkey) AS unique_pubkeys,
-                toFloat64(count()) / {} AS avg_per_day
-            FROM events_local
-            WHERE created_at >= now() - INTERVAL {} DAY
-            {}
-            GROUP BY hour
-            ORDER BY hour ASC",
-            days, days, kind_clause
-        ))
-        .fetch_all()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let kind_clause = match kind {
+            Some(kind) => format!("AND kind = {}", kind),
+            None => String::new(),
+        };
 
-    Ok(Json(rows))
+        let rows: Vec<HourlyActivityRow> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    toHour(created_at) AS hour,
+                    count() AS event_count,
+                    uniq(pubkey) AS unique_pubkeys,
+                    toFloat64(count()) / {} AS avg_per_day
+                FROM events_local
+                WHERE created_at >= now() - INTERVAL {} DAY
+                {}
+                GROUP BY hour
+                ORDER BY hour ASC",
+                days, days, kind_clause
+            ))
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -942,108 +1084,128 @@ pub struct ZapStatsByPeriod {
 /// `GET /api/v1/stats/zaps`
 ///
 /// Returns zap statistics (requires migration 003_zap_amounts).
+/// Cached for 5 minutes.
 pub async fn zap_stats(
     State(state): State<AppState>,
     Query(params): Query<ZapStatsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let days = params.days.unwrap_or(30);
     let limit = params.limit.unwrap_or(30).min(365);
+    let group_by = params.group_by.clone();
 
-    match params.group_by.as_deref() {
-        Some("day") => {
-            let rows: Vec<ZapStatsByPeriod> = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                        toString(toDate(created_at)) AS period,
-                        count() AS total_zaps,
-                        toUInt64(sum(amount_msats) / 1000) AS total_sats,
-                        uniq(sender_pubkey) AS unique_senders,
-                        uniq(recipient_pubkey) AS unique_recipients,
-                        avg(amount_msats) / 1000 AS avg_zap_sats
-                    FROM zap_amounts_data
-                    WHERE created_at >= now() - INTERVAL {} DAY
-                        AND amount_msats > 0
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    days, limit
-                ))
-                .fetch_all()
-                .await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some("week") => {
-            let rows: Vec<ZapStatsByPeriod> = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                        toString(toMonday(created_at)) AS period,
-                        count() AS total_zaps,
-                        toUInt64(sum(amount_msats) / 1000) AS total_sats,
-                        uniq(sender_pubkey) AS unique_senders,
-                        uniq(recipient_pubkey) AS unique_recipients,
-                        avg(amount_msats) / 1000 AS avg_zap_sats
-                    FROM zap_amounts_data
-                    WHERE created_at >= now() - INTERVAL {} DAY
-                        AND amount_msats > 0
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    days, limit
-                ))
-                .fetch_all()
-                .await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some("month") => {
-            let rows: Vec<ZapStatsByPeriod> = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                        toString(toStartOfMonth(created_at)) AS period,
-                        count() AS total_zaps,
-                        toUInt64(sum(amount_msats) / 1000) AS total_sats,
-                        uniq(sender_pubkey) AS unique_senders,
-                        uniq(recipient_pubkey) AS unique_recipients,
-                        avg(amount_msats) / 1000 AS avg_zap_sats
-                    FROM zap_amounts_data
-                    WHERE created_at >= now() - INTERVAL {} DAY
-                        AND amount_msats > 0
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    days, limit
-                ))
-                .fetch_all()
-                .await?;
-            Ok(Json(serde_json::to_value(rows)?))
-        }
-        Some(other) => Err(ApiError::BadRequest(format!(
+    // Validate before caching
+    if let Some(ref g) = group_by
+        && !["day", "week", "month"].contains(&g.as_str())
+    {
+        return Err(ApiError::BadRequest(format!(
             "invalid group_by value: '{}'. Valid options: day, week, month",
-            other
-        ))),
-        None => {
-            // Return aggregate stats
-            let stats: ZapStatsAggregate = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                        count() AS total_zaps,
-                        toUInt64(sum(amount_msats) / 1000) AS total_sats,
-                        uniq(sender_pubkey) AS unique_senders,
-                        uniq(recipient_pubkey) AS unique_recipients,
-                        avg(amount_msats) / 1000 AS avg_zap_sats
-                    FROM zap_amounts_data
-                    WHERE created_at >= now() - INTERVAL {} DAY
-                        AND amount_msats > 0",
-                    days
-                ))
-                .fetch_one()
-                .await?;
-            Ok(Json(serde_json::to_value(stats)?))
-        }
+            g
+        )));
     }
+
+    let cache_key = format!(
+        "zap_stats:days={}&group_by={}&limit={}",
+        days,
+        group_by.as_deref().unwrap_or(""),
+        limit
+    );
+
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        match group_by.as_deref() {
+            Some("day") => {
+                let rows: Vec<ZapStatsByPeriod> = state
+                    .clickhouse
+                    .query(&format!(
+                        "SELECT
+                            toString(toDate(created_at)) AS period,
+                            count() AS total_zaps,
+                            toUInt64(sum(amount_msats) / 1000) AS total_sats,
+                            uniq(sender_pubkey) AS unique_senders,
+                            uniq(recipient_pubkey) AS unique_recipients,
+                            avg(amount_msats) / 1000 AS avg_zap_sats
+                        FROM zap_amounts_data
+                        WHERE created_at >= now() - INTERVAL {} DAY
+                            AND amount_msats > 0
+                        GROUP BY period
+                        ORDER BY period DESC
+                        LIMIT {}",
+                        days, limit
+                    ))
+                    .fetch_all()
+                    .await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            Some("week") => {
+                let rows: Vec<ZapStatsByPeriod> = state
+                    .clickhouse
+                    .query(&format!(
+                        "SELECT
+                            toString(toMonday(created_at)) AS period,
+                            count() AS total_zaps,
+                            toUInt64(sum(amount_msats) / 1000) AS total_sats,
+                            uniq(sender_pubkey) AS unique_senders,
+                            uniq(recipient_pubkey) AS unique_recipients,
+                            avg(amount_msats) / 1000 AS avg_zap_sats
+                        FROM zap_amounts_data
+                        WHERE created_at >= now() - INTERVAL {} DAY
+                            AND amount_msats > 0
+                        GROUP BY period
+                        ORDER BY period DESC
+                        LIMIT {}",
+                        days, limit
+                    ))
+                    .fetch_all()
+                    .await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            Some("month") => {
+                let rows: Vec<ZapStatsByPeriod> = state
+                    .clickhouse
+                    .query(&format!(
+                        "SELECT
+                            toString(toStartOfMonth(created_at)) AS period,
+                            count() AS total_zaps,
+                            toUInt64(sum(amount_msats) / 1000) AS total_sats,
+                            uniq(sender_pubkey) AS unique_senders,
+                            uniq(recipient_pubkey) AS unique_recipients,
+                            avg(amount_msats) / 1000 AS avg_zap_sats
+                        FROM zap_amounts_data
+                        WHERE created_at >= now() - INTERVAL {} DAY
+                            AND amount_msats > 0
+                        GROUP BY period
+                        ORDER BY period DESC
+                        LIMIT {}",
+                        days, limit
+                    ))
+                    .fetch_all()
+                    .await?;
+                Ok(serde_json::to_value(rows)?)
+            }
+            _ => {
+                // Return aggregate stats
+                let stats: ZapStatsAggregate = state
+                    .clickhouse
+                    .query(&format!(
+                        "SELECT
+                            count() AS total_zaps,
+                            toUInt64(sum(amount_msats) / 1000) AS total_sats,
+                            uniq(sender_pubkey) AS unique_senders,
+                            uniq(recipient_pubkey) AS unique_recipients,
+                            avg(amount_msats) / 1000 AS avg_zap_sats
+                        FROM zap_amounts_data
+                        WHERE created_at >= now() - INTERVAL {} DAY
+                            AND amount_msats > 0",
+                        days
+                    ))
+                    .fetch_one()
+                    .await?;
+                Ok(serde_json::to_value(stats)?)
+            }
+        }
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// Query parameters for zap histogram.
@@ -1076,6 +1238,7 @@ pub struct ZapHistogramBucket {
 ///
 /// Returns a histogram of zap amounts grouped into meaningful buckets.
 /// Useful for understanding the distribution of zap sizes.
+/// Cached for 10 minutes.
 ///
 /// Buckets (17 total):
 /// - 1-10 sats, 11-21 sats (micro zaps)
@@ -1092,12 +1255,14 @@ pub async fn zap_histogram(
     Query(params): Query<ZapHistogramQuery>,
 ) -> Result<Json<Vec<ZapHistogramBucket>>, ApiError> {
     let days = params.days.unwrap_or(30);
+    let cache_key = format!("zap_histogram:days={}", days);
 
-    // Use ClickHouse's multiIf to bucket amounts, then aggregate
-    // 17 buckets for granular distribution analysis
-    let rows: Vec<ZapHistogramBucket> = state
-        .clickhouse
-        .query(&format!(
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Use ClickHouse's multiIf to bucket amounts, then aggregate
+        // 17 buckets for granular distribution analysis
+        let rows: Vec<ZapHistogramBucket> = state
+            .clickhouse
+            .query(&format!(
             "WITH
                 total_zaps AS (SELECT count() AS cnt FROM zap_amounts_data WHERE created_at >= now() - INTERVAL {days} DAY AND amount_msats > 0),
                 total_amount AS (SELECT sum(amount_msats) / 1000 AS sats FROM zap_amounts_data WHERE created_at >= now() - INTERVAL {days} DAY AND amount_msats > 0)
@@ -1173,7 +1338,11 @@ pub async fn zap_histogram(
         .fetch_all()
         .await?;
 
-    Ok(Json(rows))
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1188,7 +1357,7 @@ pub struct EngagementQuery {
 }
 
 /// Engagement statistics (replies and reactions relative to original notes).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngagementStats {
     /// Number of days included in the calculation.
     pub period_days: u32,
@@ -1214,44 +1383,51 @@ struct EngagementRow {
 /// `GET /api/v1/stats/engagement`
 ///
 /// Returns reply and reaction ratios relative to original notes.
+/// Cached for 10 minutes.
 pub async fn engagement(
     State(state): State<AppState>,
     Query(params): Query<EngagementQuery>,
 ) -> Result<Json<EngagementStats>, ApiError> {
     let days = params.days.unwrap_or(30);
+    let cache_key = format!("engagement:days={}", days);
 
-    // Calculate all metrics from events_local consistently.
-    // A reply is a kind=1 event that has at least one e-tag (references another event).
-    let row: EngagementRow = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                countIf(kind = 1) AS total_notes,
-                countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
-                countIf(kind = 7) AS total_reactions
-            FROM events_local
-            WHERE created_at >= now() - INTERVAL {} DAY",
-            days
-        ))
-        .fetch_one()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Calculate all metrics from events_local consistently.
+        // A reply is a kind=1 event that has at least one e-tag (references another event).
+        let row: EngagementRow = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    countIf(kind = 1) AS total_notes,
+                    countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
+                    countIf(kind = 7) AS total_reactions
+                FROM events_local
+                WHERE created_at >= now() - INTERVAL {} DAY",
+                days
+            ))
+            .fetch_one()
+            .await?;
 
-    // Original notes = total kind=1 events minus replies
-    let original_notes = row.total_notes.saturating_sub(row.total_replies);
-    let base = if original_notes > 0 {
-        original_notes as f64
-    } else {
-        1.0
-    };
+        // Original notes = total kind=1 events minus replies
+        let original_notes = row.total_notes.saturating_sub(row.total_replies);
+        let base = if original_notes > 0 {
+            original_notes as f64
+        } else {
+            1.0
+        };
 
-    Ok(Json(EngagementStats {
-        period_days: days,
-        original_notes,
-        replies: row.total_replies,
-        reactions: row.total_reactions,
-        replies_per_note: row.total_replies as f64 / base,
-        reactions_per_note: row.total_reactions as f64 / base,
-    }))
+        Ok(EngagementStats {
+            period_days: days,
+            original_notes,
+            replies: row.total_replies,
+            reactions: row.total_reactions,
+            replies_per_note: row.total_replies as f64 / base,
+            reactions_per_note: row.total_reactions as f64 / base,
+        })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1279,33 +1455,45 @@ pub struct LongformStats {
 /// `GET /api/v1/stats/longform`
 ///
 /// Returns statistics for long-form content (kind 30023).
+/// Cached for 10 minutes.
 pub async fn longform(
     State(state): State<AppState>,
     Query(params): Query<LongformQuery>,
 ) -> Result<Json<LongformStats>, ApiError> {
-    let days_clause = match params.days {
-        Some(days) => format!("AND created_at >= now() - INTERVAL {} DAY", days),
-        None => String::new(),
-    };
+    let days = params.days;
+    let cache_key = format!(
+        "longform:days={}",
+        days.map(|d| d.to_string()).unwrap_or_default()
+    );
 
-    let stats: LongformStats = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                count() AS articles_count,
-                uniq(pubkey) AS unique_authors,
-                avg(length(content)) AS avg_content_length,
-                sum(length(content)) AS total_content_length,
-                toUInt64(sum(length(content)) / 5) AS estimated_total_words
-            FROM events_local
-            WHERE kind = 30023
-            {}",
-            days_clause
-        ))
-        .fetch_one()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let days_clause = match days {
+            Some(days) => format!("AND created_at >= now() - INTERVAL {} DAY", days),
+            None => String::new(),
+        };
 
-    Ok(Json(stats))
+        let stats: LongformStats = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    count() AS articles_count,
+                    uniq(pubkey) AS unique_authors,
+                    avg(length(content)) AS avg_content_length,
+                    sum(length(content)) AS total_content_length,
+                    toUInt64(sum(length(content)) / 5) AS estimated_total_words
+                FROM events_local
+                WHERE kind = 30023
+                {}",
+                days_clause
+            ))
+            .fetch_one()
+            .await?;
+
+        Ok(stats)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1336,38 +1524,52 @@ pub struct PublisherRow {
 /// `GET /api/v1/stats/publishers`
 ///
 /// Returns top publishers by event count.
+/// Cached for 5 minutes.
 pub async fn publishers(
     State(state): State<AppState>,
     Query(params): Query<PublishersQuery>,
 ) -> Result<Json<Vec<PublisherRow>>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
     let days = params.days.unwrap_or(30);
+    let kind = params.kind;
 
-    let kind_clause = match params.kind {
-        Some(kind) => format!("AND kind = {}", kind),
-        None => String::new(),
-    };
+    let cache_key = format!(
+        "publishers:days={}&kind={}&limit={}",
+        days,
+        kind.map(|k| k.to_string()).unwrap_or_default(),
+        limit
+    );
 
-    let rows: Vec<PublisherRow> = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                pubkey,
-                count() AS event_count,
-                uniq(kind) AS kinds_count,
-                toUInt32(min(created_at)) AS first_event,
-                toUInt32(max(created_at)) AS last_event
-            FROM events_local
-            WHERE created_at >= now() - INTERVAL {} DAY
-            {}
-            GROUP BY pubkey
-            ORDER BY event_count DESC
-            LIMIT {}",
-            days, kind_clause, limit
-        ))
-        .fetch_all()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let kind_clause = match kind {
+            Some(kind) => format!("AND kind = {}", kind),
+            None => String::new(),
+        };
 
-    Ok(Json(rows))
+        let rows: Vec<PublisherRow> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    pubkey,
+                    count() AS event_count,
+                    uniq(kind) AS kinds_count,
+                    toUInt32(min(created_at)) AS first_event,
+                    toUInt32(max(created_at)) AS last_event
+                FROM events_local
+                WHERE created_at >= now() - INTERVAL {} DAY
+                {}
+                GROUP BY pubkey
+                ORDER BY event_count DESC
+                LIMIT {}",
+                days, kind_clause, limit
+            ))
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 

@@ -16,11 +16,13 @@
 //! - **Routes**: Endpoint handlers grouped by domain
 
 mod auth;
+pub mod cache;
 mod error;
 mod routes;
 mod state;
 
 pub use self::auth::require_auth;
+pub use self::cache::{get_or_compute, new_cache, ResponseCache};
 pub use self::error::ApiError;
 pub use self::routes::router;
 pub use self::state::{AppState, Config};
