@@ -1,7 +1,7 @@
 # Negentropy Sync for Live Ingestion
 
-**Status:** Planning  
-**Branch:** `negentropy`  
+**Status:** Planning
+**Branch:** `negentropy`
 **Created:** 2026-01-04
 
 ## Overview
@@ -30,7 +30,77 @@ The ingester runs as a single process because:
 - Single process simplifies coordination between live and sync operations
 - Memory pressure is manageable with careful batching
 
-### Component Flow
+### Event Convergence: The Critical Insight
+
+**Both event sources feed into the SAME event handler function.** This is the key to understanding how the system works:
+
+```
+                    ┌────────────────────────────┐
+                    │      Live RelaySource      │
+                    │   (streaming from relays)  │
+                    │                            │
+                    │   Runs continuously,       │
+                    │   receives events as they  │
+                    │   happen across network    │
+                    └─────────────┬──────────────┘
+                                  │
+                                  │ Event
+                                  ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│              SHARED EVENT HANDLER (single instance)                 │
+│                                                                     │
+│   fn handle_event(event: &Event) -> Result<bool> {                  │
+│                                                                     │
+│       // Step 1: Dedupe check via RocksDB                           │
+│       // This is the CRITICAL synchronization point!                │
+│       // Both sources hit this same check.                          │
+│       if !dedupe.check_and_mark_pending(&event.id)? {               │
+│           // Already have this event (from other source or earlier) │
+│           metrics::counter!("events_deduplicated").increment(1);    │
+│           return Ok(true);  // Skip, continue processing            │
+│       }                                                             │
+│                                                                     │
+│       // Step 2: Novel event - pack and write                       │
+│       let packed = pack_nostr_event(event)?;                        │
+│       segment_writer.write(packed)?;                                │
+│       metrics::counter!("events_written").increment(1);             │
+│                                                                     │
+│       Ok(true)                                                      │
+│   }                                                                 │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+                                  ▲
+                                  │ Event
+                                  │
+                    ┌─────────────┴──────────────┐
+                    │    Negentropy Fetcher      │
+                    │   (periodic sync task)     │
+                    │                            │
+                    │   Runs every N minutes,    │
+                    │   discovers missing events │
+                    │   from trusted relays      │
+                    └────────────────────────────┘
+```
+
+### Why This Works
+
+1. **RocksDB is the single source of truth for "have we seen this event?"**
+   - Both sources check the same RocksDB instance
+   - `check_and_mark_pending()` is atomic
+   - If live streaming gets an event first, negentropy fetch will skip it
+   - If negentropy gets an event first, live streaming will skip it
+
+2. **SegmentWriter handles concurrent writes**
+   - Events from both sources write to the same segment
+   - The writer is already designed to handle this (mutex-protected)
+
+3. **No coordination needed between sources**
+   - They can run completely independently
+   - Duplicates are naturally filtered at the RocksDB check
+   - The only shared state is the dedupe index and segment writer
+
+### Full Component Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -41,28 +111,36 @@ The ingester runs as a single process because:
 │  │   Live Ingester  │       │  Negentropy Sync │                    │
 │  │   (RelaySource)  │       │     (Periodic)   │                    │
 │  │                  │       │                  │                    │
-│  │ • Stream events  │       │ • Sync every N   │                    │
-│  │ • All relays     │       │   minutes        │                    │
-│  │ • Discovery      │       │ • Trusted relays │                    │
-│  │                  │       │   only           │                    │
+│  │ • Stream events  │       │ • Every 10 min   │                    │
+│  │ • All relays     │       │ • Trusted relays │                    │
+│  │ • Continuous     │       │ • Batch fetch    │                    │
 │  └────────┬─────────┘       └────────┬─────────┘                    │
 │           │                          │                              │
-│           │     Events               │     Event IDs                │
-│           ▼                          ▼                              │
+│           │ Event                    │ Event                        │
+│           │                          │                              │
+│           └──────────┬───────────────┘                              │
+│                      │                                              │
+│                      ▼                                              │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                      Event Handler                            │   │
+│  │                  Shared Event Handler                         │   │
 │  │                                                               │   │
-│  │  1. Dedupe check (RocksDB)                                    │   │
-│  │  2. Pack to notepack                                          │   │
-│  │  3. Write to segment                                          │   │
-│  │  4. Record relay quality                                      │   │
+│  │  handle_event(event) called from BOTH sources                 │   │
+│  │                                                               │   │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │   │
+│  │  │   Dedupe    │───▶│    Pack     │───▶│    Write    │        │   │
+│  │  │  (RocksDB)  │    │ (notepack)  │    │  (segment)  │        │   │
+│  │  └─────────────┘    └─────────────┘    └─────────────┘        │   │
+│  │        │                                                      │   │
+│  │        │ duplicate?                                           │   │
+│  │        ▼                                                      │   │
+│  │      skip                                                     │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                              │                                      │
 │                              ▼                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    SegmentWriter                              │   │
 │  │                                                               │   │
-│  │  • Write to current segment                                   │   │
+│  │  • Append to current segment (thread-safe)                    │   │
 │  │  • Seal when threshold reached                                │   │
 │  │  • Index to ClickHouse                                        │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -103,17 +181,106 @@ pub struct SyncOptions {
 }
 ```
 
-### How It Works
+### The nostr-sdk Database Challenge
 
-1. Client builds a filter for events to sync (e.g., all events since X)
-2. Client calls `sync_with(trusted_relays, filter, opts)` with `direction = Down`
-3. nostr-sdk:
-   - Queries local database for matching event IDs + timestamps
-   - Sends negentropy `NEG-OPEN` with initial fingerprint
-   - Exchanges `NEG-MSG` until reconciliation complete
-   - Returns which event IDs the relay has that we don't
-4. For each missing event ID, fetch the actual event via `REQ`
-5. Process through the normal ingestion pipeline
+nostr-sdk's `sync_with` method requires a `NostrDatabase` implementation:
+- It calls `database.negentropy_items(filter)` to get local event IDs + timestamps
+- It uses these to compute the initial fingerprint for the negentropy protocol
+- After reconciliation, it automatically fetches missing events via REQ
+
+**Problem:** Our architecture uses RocksDB for dedupe (event IDs only, no timestamps or full events) and notepack segments for storage. We don't have a `NostrDatabase`-compatible store.
+
+### Our Approach: Two Options
+
+#### Option A: Lightweight Sync State Database (Recommended)
+
+Maintain a small SQLite database just for negentropy sync state:
+
+```rust
+// Store (event_id, created_at) for events in the sync window
+// This is ~40 bytes per event, manageable for a week of events
+CREATE TABLE sync_state (
+    event_id BLOB PRIMARY KEY,  -- 32 bytes
+    created_at INTEGER NOT NULL  -- 8 bytes (unix timestamp)
+);
+```
+
+Then implement `NostrDatabase` trait:
+
+```rust
+impl NostrDatabase for SyncStateDb {
+    async fn negentropy_items(&self, filter: Filter) -> Result<Vec<(EventId, Timestamp)>> {
+        // Query sync_state table with filter criteria
+        // Return (event_id, created_at) pairs
+    }
+    
+    // Implement store method to populate sync_state
+    async fn save_event(&self, event: &Event) -> Result<bool> {
+        // Insert (event.id, event.created_at) into sync_state
+        // Also forward event to our normal handler!
+    }
+}
+```
+
+This gives nostr-sdk what it needs while keeping our main architecture intact.
+
+#### Option B: Bypass nostr-sdk, Implement NIP-77 Directly
+
+Implement negentropy protocol ourselves:
+- More control, fewer dependencies
+- Significant implementation effort
+- Would need to handle `NEG-OPEN`, `NEG-MSG`, `NEG-CLOSE` manually
+
+**Recommendation:** Option A - the sync state database is small and focused.
+
+### How Negentropy Sync Actually Works
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Negentropy Sync Cycle                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. BUILD FILTER                                                    │
+│     filter = Filter::new().since(now - 7 days)                      │
+│                                                                     │
+│  2. QUERY LOCAL SYNC STATE                                          │
+│     local_items = sync_state_db.negentropy_items(filter)            │
+│     // Returns [(event_id, timestamp), ...]                         │
+│                                                                     │
+│  3. NEGENTROPY RECONCILIATION (nostr-sdk handles this)              │
+│     ┌─────────────┐          ┌─────────────────────┐                │
+│     │   Client    │          │    Trusted Relay    │                │
+│     └──────┬──────┘          └──────────┬──────────┘                │
+│            │                            │                           │
+│            │  NEG-OPEN (filter, fingerprint of local_items)         │
+│            │───────────────────────────▶│                           │
+│            │                            │                           │
+│            │  NEG-MSG (relay's fingerprint)                         │
+│            │◀───────────────────────────│                           │
+│            │                            │                           │
+│            │        ... repeat until reconciled ...                 │
+│            │                            │                           │
+│            │  Result: "you're missing event IDs: [A, B, C, ...]"    │
+│            │                            │                           │
+│                                                                     │
+│  4. FETCH MISSING EVENTS                                            │
+│     for each missing_id:                                            │
+│         event = fetch_event_by_id(missing_id)                       │
+│                                                                     │
+│  5. PROCESS THROUGH SHARED HANDLER                                  │
+│     for each event:                                                 │
+│         handle_event(event)  // Same handler as live streaming!     │
+│         sync_state_db.save(event.id, event.created_at)              │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Points
+
+1. **Events from negentropy go through the SAME `handle_event()` function** as live streaming
+2. **RocksDB dedupe catches duplicates** - if live streaming already got the event, we skip it
+3. **Sync state database is separate from the main storage** - it only tracks what we've synced, not the full events
+4. **nostr-sdk handles the negentropy protocol** - we just provide the local state and receive missing events
 
 ## Trusted Relays for Negentropy
 
@@ -140,20 +307,20 @@ wss://nostr.wine
 pub struct NegentropySyncConfig {
     /// Relay URLs to sync from (must support NIP-77)
     pub relays: Vec<String>,
-    
+
     /// How often to run sync (e.g., every 10 minutes)
     pub interval: Duration,
-    
+
     /// How far back to sync (e.g., last 7 days)
     /// This creates the `since` filter
     pub lookback: Duration,
-    
+
     /// Maximum events to fetch per sync cycle
     pub max_events_per_cycle: usize,
-    
+
     /// Timeout for negentropy protocol messages
     pub protocol_timeout: Duration,
-    
+
     /// Timeout for fetching missing events
     pub fetch_timeout: Duration,
 }
@@ -178,7 +345,7 @@ impl NegentropySyncer {
         // 1. Build filter: all events in lookback window
         let since = Timestamp::now() - self.config.lookback;
         let filter = Filter::new().since(since);
-        
+
         // 2. Run negentropy reconciliation
         let opts = SyncOptions::default()
             .direction(SyncDirection::Down);
@@ -187,18 +354,18 @@ impl NegentropySyncer {
             filter,
             &opts,
         ).await?;
-        
+
         // 3. Fetch missing events
         // The events in output.received are already fetched by nostr-sdk
         // We need to process them through our pipeline
-        
+
         // 4. Return stats
         Ok(SyncStats {
             events_discovered: output.received.len(),
             // ...
         })
     }
-    
+
     /// Run periodic sync in background
     pub async fn run_periodic<F>(&self, handler: F) -> Result<(), Error>
     where
@@ -242,24 +409,82 @@ if let Some(handle) = sync_handle {
 }
 ```
 
-### Phase 3: Database Requirements
+### Phase 3: Sync State Database
 
-The nostr-sdk negentropy requires a local database to compare against. Options:
+Add a SQLite database for negentropy sync state. This is **separate** from:
+- RocksDB (dedupe index - event IDs only)
+- Notepack segments (full event storage)
+- ClickHouse (analytics)
 
-1. **Use RocksDB dedupe index** 
-   - Already have event IDs
-   - Need to add timestamps
-   - Implement `NostrDatabase` trait adapter
+```rust
+// crates/pensieve-ingest/src/sync/state.rs
 
-2. **Add separate LMDB/SQLite for sync state**
-   - Store (event_id, created_at) pairs
-   - Only for negentropy-relevant window
-   - Cleaner separation of concerns
+pub struct SyncStateDb {
+    conn: rusqlite::Connection,
+}
 
-**Recommendation:** Option 2 - Add a small SQLite database for sync state. This:
-- Keeps the dedupe index focused on its purpose
-- Allows independent sync window management
-- Easier to reset/rebuild if needed
+impl SyncStateDb {
+    pub fn new(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sync_state (
+                event_id BLOB PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_created_at ON sync_state(created_at)",
+            [],
+        )?;
+        Ok(Self { conn })
+    }
+    
+    /// Get events in time window for negentropy
+    pub fn get_items(&self, since: Timestamp) -> Result<Vec<(EventId, Timestamp)>> {
+        // Query and return
+    }
+    
+    /// Record that we've synced an event
+    pub fn record(&self, event_id: &EventId, created_at: Timestamp) -> Result<()> {
+        // Insert or ignore
+    }
+    
+    /// Prune old entries outside sync window
+    pub fn prune(&self, before: Timestamp) -> Result<usize> {
+        // Delete old entries to keep database small
+    }
+}
+```
+
+**Size estimate:**
+- 40 bytes per event (32 byte ID + 8 byte timestamp)
+- ~1M events/day → ~40MB/day
+- 7-day window → ~280MB total
+- Manageable, and we prune old entries
+
+**Integration with shared handler:**
+
+```rust
+fn handle_event(event: &Event, source: EventSource) {
+    // Step 1: Dedupe check (RocksDB) - ALWAYS
+    if !dedupe.check_and_mark_pending(&event.id)? {
+        return Ok(true);  // Skip duplicate
+    }
+    
+    // Step 2: Pack and write (SegmentWriter) - ALWAYS  
+    let packed = pack_nostr_event(event)?;
+    segment_writer.write(packed)?;
+    
+    // Step 3: Record in sync state - ONLY for negentropy tracking
+    // This is optional - we only need it if negentropy is enabled
+    if let Some(sync_db) = &sync_state_db {
+        sync_db.record(&event.id, event.created_at)?;
+    }
+    
+    Ok(true)
+}
+```
 
 ### Phase 4: CLI Arguments
 
@@ -342,7 +567,7 @@ histogram!("negentropy_sync_duration_seconds")
 ## Testing Plan
 
 1. **Unit tests:** Mock nostr-sdk client, verify sync logic
-2. **Integration tests:** 
+2. **Integration tests:**
    - Stand up test relay with known event set
    - Run sync, verify missing events discovered
 3. **Production validation:**
