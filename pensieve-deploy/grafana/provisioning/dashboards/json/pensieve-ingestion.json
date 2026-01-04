@@ -47,7 +47,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "up{job=\"ingest\"}",
+          "expr": "up{job=~\"ingest|pensieve-ingester\"}",
           "legendFormat": "Status",
           "refId": "A"
         }
