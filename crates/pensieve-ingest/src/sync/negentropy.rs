@@ -38,14 +38,13 @@ pub struct NegentropySyncConfig {
 impl Default for NegentropySyncConfig {
     fn default() -> Self {
         Self {
-            relays: vec![
-                "wss://relay.damus.io".to_string(),
-                "wss://relay.primal.net".to_string(),
-            ],
-            interval: Duration::from_secs(600), // 10 minutes
-            lookback: Duration::from_secs(7 * 24 * 3600), // 7 days
-            protocol_timeout: Duration::from_secs(60),
-            fetch_timeout: Duration::from_secs(120),
+            // Only Damus confirmed to support NIP-77
+            // Primal does NOT support NIP-77 (connects but ignores NEG-OPEN)
+            relays: vec!["wss://relay.damus.io".to_string()],
+            interval: Duration::from_secs(1800), // 30 minutes
+            lookback: Duration::from_secs(14 * 24 * 3600), // 14 days
+            protocol_timeout: Duration::from_secs(900), // 15 min for reconciliation
+            fetch_timeout: Duration::from_secs(900), // 15 min for fetching
             direction: SyncDirection::Down,
         }
     }
@@ -277,7 +276,7 @@ impl NegentropySyncer {
                     stats.events_discovered
                 );
 
-                // Fetch the actual events for the discovered IDs
+                // Fetch the actual events for the discovered IDs in batches
                 if !output.received.is_empty() {
                     // The events should already be fetched by nostr-sdk during sync
                     // Query them from the database (they were saved during sync)
@@ -285,29 +284,62 @@ impl NegentropySyncer {
                     // and calls save_event on the database. But our adapter doesn't store
                     // full events, so we need to fetch them again.
 
-                    // Build a filter for the received event IDs
+                    // Batch fetch to avoid overwhelming relays with huge filters
+                    const BATCH_SIZE: usize = 500;
                     let ids: Vec<EventId> = output.received.iter().cloned().collect();
-                    let id_filter = Filter::new().ids(ids.clone());
+                    let total_batches = ids.len().div_ceil(BATCH_SIZE);
 
-                    // Fetch events using REQ
-                    match tokio::time::timeout(
-                        self.config.fetch_timeout,
-                        client.fetch_events(id_filter, self.config.fetch_timeout),
-                    )
-                    .await
-                    {
-                        Ok(Ok(events)) => {
-                            stats.events_fetched = events.len();
-                            discovered_events = events.into_iter().collect();
-                            tracing::info!("Fetched {} events from relays", stats.events_fetched);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Failed to fetch events: {}", e);
-                        }
-                        Err(_) => {
-                            tracing::warn!("Timeout fetching events");
+                    tracing::info!(
+                        "Fetching {} events in {} batches of up to {}",
+                        ids.len(),
+                        total_batches,
+                        BATCH_SIZE
+                    );
+
+                    for (batch_idx, batch) in ids.chunks(BATCH_SIZE).enumerate() {
+                        let id_filter = Filter::new().ids(batch.to_vec());
+
+                        // Fetch events using REQ
+                        match tokio::time::timeout(
+                            self.config.fetch_timeout,
+                            client.fetch_events(id_filter, self.config.fetch_timeout),
+                        )
+                        .await
+                        {
+                            Ok(Ok(events)) => {
+                                let batch_count = events.len();
+                                stats.events_fetched += batch_count;
+                                discovered_events.extend(events);
+                                tracing::debug!(
+                                    "Batch {}/{}: fetched {} events",
+                                    batch_idx + 1,
+                                    total_batches,
+                                    batch_count
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "Batch {}/{}: failed to fetch events: {}",
+                                    batch_idx + 1,
+                                    total_batches,
+                                    e
+                                );
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Batch {}/{}: timeout fetching events",
+                                    batch_idx + 1,
+                                    total_batches
+                                );
+                            }
                         }
                     }
+
+                    tracing::info!(
+                        "Fetched {} of {} discovered events",
+                        stats.events_fetched,
+                        ids.len()
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -535,8 +567,8 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = NegentropySyncConfig::default();
-        assert_eq!(config.relays.len(), 2);
-        assert_eq!(config.interval, Duration::from_secs(600));
-        assert_eq!(config.lookback, Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(config.relays.len(), 1);
+        assert_eq!(config.interval, Duration::from_secs(1800));
+        assert_eq!(config.lookback, Duration::from_secs(14 * 24 * 3600));
     }
 }

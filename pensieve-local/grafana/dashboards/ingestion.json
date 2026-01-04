@@ -1260,7 +1260,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
+      "gridPos": { "h": 12, "w": 12, "x": 0, "y": 71 },
       "id": 505,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1269,9 +1269,19 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_sync_duration_seconds",
-          "legendFormat": "Sync Duration",
+          "expr": "histogram_quantile(0.5, rate(negentropy_sync_duration_seconds_bucket[10m]))",
+          "legendFormat": "Median (p50)",
           "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(negentropy_sync_duration_seconds_bucket[10m]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(negentropy_sync_duration_seconds_sum[10m]) / rate(negentropy_sync_duration_seconds_count[10m])",
+          "legendFormat": "Average",
+          "refId": "C"
         }
       ],
       "title": "Sync Duration Over Time",
@@ -1326,7 +1336,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
+      "gridPos": { "h": 12, "w": 12, "x": 12, "y": 71 },
       "id": 506,
       "options": {
         "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
