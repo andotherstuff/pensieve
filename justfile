@@ -114,6 +114,66 @@ dev-down:
 dev-logs:
     docker compose -f pensieve-local/docker-compose.yml logs -f
 
+# Restart local Grafana
+dev-grafana-restart:
+    docker compose -f pensieve-local/docker-compose.yml restart grafana
+
+# ============================================================================
+# Production Deployment
+# ============================================================================
+
+# Stop the ingester service
+prod-ingest-stop:
+    sudo systemctl stop pensieve-ingest
+
+# Start the ingester service
+prod-ingest-start:
+    sudo systemctl start pensieve-ingest
+
+# Restart the ingester service
+prod-ingest-restart:
+    sudo systemctl restart pensieve-ingest
+
+# Stop the API service
+prod-api-stop:
+    sudo systemctl stop pensieve-api
+
+# Start the API service
+prod-api-start:
+    sudo systemctl start pensieve-api
+
+# Restart the API service
+prod-api-restart:
+    sudo systemctl restart pensieve-api
+
+# Stop both ingester and API
+prod-stop: prod-ingest-stop prod-api-stop
+    @echo "✓ All services stopped"
+
+# Start both ingester and API
+prod-start: prod-api-start prod-ingest-start
+    @echo "✓ All services started"
+
+# Restart both ingester and API
+prod-restart: prod-ingest-restart prod-api-restart
+    @echo "✓ All services restarted"
+
+# Restart production Grafana
+prod-grafana-restart:
+    cd ~/pensieve/pensieve-deploy && docker compose restart grafana
+
+# Show status of all Pensieve services
+prod-status:
+    sudo systemctl status pensieve-api pensieve-ingest --no-pager
+
+# View ingester logs
+prod-logs-ingest:
+    journalctl -u pensieve-ingest -f
+
+# View API logs
+prod-logs-api:
+    journalctl -u pensieve-api -f
+
 # ============================================================================
 # ClickHouse
 # ============================================================================
