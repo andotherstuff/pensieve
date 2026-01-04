@@ -8,11 +8,11 @@ use clap::Parser;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Level;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
-use pensieve_serve::{router, AppState, Config};
+use pensieve_serve::{AppState, Config, router};
 
 /// Pensieve API server for Nostr analytics.
 #[derive(Parser, Debug)]

@@ -31,8 +31,5 @@ pub struct PingResponse {
 }
 
 pub async fn authenticated_ping() -> Json<PingResponse> {
-    Json(PingResponse {
-        message: "pong",
-    })
+    Json(PingResponse { message: "pong" })
 }
-

@@ -22,8 +22,7 @@ mod routes;
 mod state;
 
 pub use self::auth::require_auth;
-pub use self::cache::{get_or_compute, new_cache, ResponseCache};
+pub use self::cache::{ResponseCache, get_or_compute, new_cache};
 pub use self::error::ApiError;
 pub use self::routes::router;
 pub use self::state::{AppState, Config};
-

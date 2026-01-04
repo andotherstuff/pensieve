@@ -33,9 +33,11 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, RelayManager, RelayManagerConfig,
-    SealedSegment, SegmentConfig, SegmentWriter, pack_nostr_event,
+    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, NegentropySyncConfig, NegentropySyncer,
+    RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
+    pack_nostr_event,
     relay::normalize_relay_url,
+    seed_from_clickhouse,
     source::{RelayConfig, RelaySource},
 };
 use std::path::PathBuf;
@@ -169,6 +171,49 @@ struct Args {
     /// Example: 127.0.0.1:9050 (default Tor SOCKS5 port)
     #[arg(long, value_name = "HOST:PORT")]
     tor_proxy: Option<std::net::SocketAddr>,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Negentropy Sync (NIP-77)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Enable periodic negentropy sync (NIP-77) with trusted relays.
+    ///
+    /// Negentropy sync periodically reconciles with trusted relays to discover
+    /// events that may have been missed during normal streaming. This is more
+    /// efficient than catch-up mode for filling gaps in coverage.
+    #[arg(long)]
+    negentropy: bool,
+
+    /// RocksDB path for negentropy sync state.
+    ///
+    /// Stores (timestamp, event_id) pairs for efficient negentropy reconciliation.
+    #[arg(long, default_value = "./data/sync-state")]
+    negentropy_db_path: PathBuf,
+
+    /// Negentropy sync interval in seconds.
+    ///
+    /// How often to run negentropy reconciliation with trusted relays.
+    #[arg(long, default_value = "600")]
+    negentropy_interval_secs: u64,
+
+    /// Negentropy lookback window in days.
+    ///
+    /// How far back to sync. Larger windows catch more missed events but
+    /// require more bandwidth and memory.
+    #[arg(long, default_value = "7")]
+    negentropy_lookback_days: u64,
+
+    /// Path to negentropy trusted relays file (one URL per line, # for comments).
+    ///
+    /// If not specified, uses default trusted relays (relay.damus.io, relay.primal.net).
+    /// Only relays that support NIP-77 should be listed.
+    #[arg(long)]
+    negentropy_relays_file: Option<PathBuf>,
+
+    /// Comma-separated list of negentropy trusted relay URLs.
+    ///
+    /// Overrides --negentropy-relays-file if specified.
+    #[arg(long, value_delimiter = ',')]
+    negentropy_relays: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -371,6 +416,129 @@ async fn main() -> Result<()> {
         }
     );
     tracing::info!("  Checkpoint interval: {}s", args.checkpoint_interval_secs);
+    tracing::info!(
+        "  Negentropy sync: {}",
+        if args.negentropy {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    // Initialize negentropy sync (if enabled)
+    let negentropy_syncer = if args.negentropy {
+        // Load trusted relays for negentropy sync
+        let negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
+            tracing::info!(
+                "Using {} negentropy relays from CLI arguments",
+                relays.len()
+            );
+            relays.clone()
+        } else if let Some(ref file_path) = args.negentropy_relays_file {
+            match load_seeds_from_file(file_path) {
+                Ok(relays) if !relays.is_empty() => {
+                    tracing::info!(
+                        "Loaded {} negentropy relays from file: {}",
+                        relays.len(),
+                        file_path.display()
+                    );
+                    relays
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "Negentropy relays file {} is empty, using defaults",
+                        file_path.display()
+                    );
+                    NegentropySyncConfig::default().relays
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load negentropy relays file {}: {}. Using defaults.",
+                        file_path.display(),
+                        e
+                    );
+                    NegentropySyncConfig::default().relays
+                }
+            }
+        } else {
+            tracing::info!("Using default negentropy relays");
+            NegentropySyncConfig::default().relays
+        };
+
+        // Open sync state database
+        let sync_state = Arc::new(SyncStateDb::open(&args.negentropy_db_path).with_context(
+            || {
+                format!(
+                    "Failed to open negentropy sync state at {:?}",
+                    args.negentropy_db_path
+                )
+            },
+        )?);
+
+        tracing::info!(
+            "Negentropy sync state opened: ~{} items",
+            sync_state.approximate_count().unwrap_or(0)
+        );
+
+        // Seed from ClickHouse if sync state is empty and ClickHouse is available
+        if sync_state.is_empty().unwrap_or(true) {
+            if let Some(ref ch_url) = args.clickhouse_url {
+                tracing::info!(
+                    "Sync state is empty, seeding from ClickHouse (lookback: {} days)",
+                    args.negentropy_lookback_days
+                );
+                match seed_from_clickhouse(
+                    &sync_state,
+                    ch_url,
+                    &args.clickhouse_db,
+                    args.negentropy_lookback_days,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        tracing::info!("Seeded {} events into sync state from ClickHouse", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to seed sync state from ClickHouse: {}. \
+                             First negentropy sync may request more events than necessary.",
+                            e
+                        );
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "Sync state is empty but ClickHouse is disabled - skipping seeding. \
+                     First negentropy sync may request more events than necessary."
+                );
+            }
+        }
+
+        // Build config
+        let negentropy_config = NegentropySyncConfig {
+            relays: negentropy_relays,
+            interval: Duration::from_secs(args.negentropy_interval_secs),
+            lookback: Duration::from_secs(args.negentropy_lookback_days * 24 * 3600),
+            ..Default::default()
+        };
+
+        tracing::info!(
+            "  Negentropy interval: {}s",
+            negentropy_config.interval.as_secs()
+        );
+        tracing::info!(
+            "  Negentropy lookback: {} days",
+            args.negentropy_lookback_days
+        );
+        tracing::info!("  Negentropy relays: {:?}", negentropy_config.relays);
+
+        Some(Arc::new(NegentropySyncer::new(
+            negentropy_config,
+            sync_state,
+        )))
+    } else {
+        None
+    };
 
     // Create relay source with manager for quality tracking and optimization
     // The RelaySource now handles:
@@ -534,6 +702,90 @@ async fn main() -> Result<()> {
         tracing::debug!("Checkpoint update task stopped");
     });
 
+    // Spawn negentropy sync task (if enabled)
+    let negentropy_handle = if let Some(ref syncer) = negentropy_syncer {
+        let negentropy_syncer = Arc::clone(syncer);
+        let negentropy_running = Arc::clone(&running);
+        let negentropy_dedupe = Arc::clone(&dedupe);
+        let negentropy_segment_writer = Arc::clone(&segment_writer);
+        let negentropy_events_processed = Arc::clone(&events_processed);
+        let negentropy_events_deduplicated = Arc::clone(&events_deduplicated);
+        let negentropy_max_created_at = Arc::clone(&max_created_at);
+
+        Some(tokio::spawn(async move {
+            tracing::info!("Starting negentropy sync task...");
+
+            // Run the periodic sync with a handler that uses the shared pipeline
+            if let Err(e) = negentropy_syncer
+                .run_periodic(|event| {
+                    // Check if we should stop
+                    if !negentropy_running.load(Ordering::SeqCst) {
+                        return Ok(false);
+                    }
+
+                    // Get the event ID bytes for dedupe check
+                    let event_id = event.id.as_bytes();
+
+                    // Dedupe check - same logic as live ingestion
+                    // The atomic mutex ensures only one source can "win" for a given event ID
+                    let is_novel = match negentropy_dedupe.check_and_mark_pending(event_id) {
+                        Ok(novel) => novel,
+                        Err(e) => {
+                            tracing::warn!("Negentropy dedupe check error: {}", e);
+                            false
+                        }
+                    };
+
+                    if is_novel {
+                        // New event - pack and write
+                        let packed = match pack_nostr_event(event) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::debug!("Failed to pack negentropy event: {}", e);
+                                // Return error so event is NOT recorded in sync state
+                                // and will be re-fetched on next sync cycle
+                                return Err(pensieve_ingest::Error::Notepack(e.to_string()));
+                            }
+                        };
+
+                        // Write to segment - must succeed for event to be recorded in sync state
+                        if let Err(e) = negentropy_segment_writer.write(packed) {
+                            tracing::error!("Failed to write negentropy event: {}", e);
+                            // Return error so event is NOT recorded in sync state
+                            // and will be re-fetched on next sync cycle
+                            return Err(e);
+                        }
+
+                        negentropy_events_processed.fetch_add(1, Ordering::Relaxed);
+
+                        // Track max created_at for checkpoint
+                        let event_ts = event.created_at.as_secs();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let clamped_ts = event_ts.min(now);
+                        negentropy_max_created_at.fetch_max(clamped_ts, Ordering::Relaxed);
+
+                        counter!("negentropy_events_written_total").increment(1);
+                    } else {
+                        negentropy_events_deduplicated.fetch_add(1, Ordering::Relaxed);
+                        counter!("negentropy_events_deduplicated_total").increment(1);
+                    }
+
+                    Ok(true)
+                })
+                .await
+            {
+                tracing::error!("Negentropy sync task failed: {}", e);
+            }
+
+            tracing::debug!("Negentropy sync task stopped");
+        }))
+    } else {
+        None
+    };
+
     // Run the ingestion loop
     tracing::info!("Starting live ingestion...");
 
@@ -600,6 +852,31 @@ async fn main() -> Result<()> {
 
     // Shutdown sequence
     tracing::info!("Shutting down...");
+
+    // Stop negentropy sync if running
+    if let Some(ref syncer) = negentropy_syncer {
+        syncer.stop();
+    }
+
+    // Wait for negentropy task to finish
+    if let Some(handle) = negentropy_handle {
+        tracing::info!("Waiting for negentropy sync to finish...");
+        // Give it a moment to clean up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort(); // Force stop if still running
+    }
+
+    // Flush negentropy sync state
+    if let Some(ref syncer) = negentropy_syncer {
+        if let Err(e) = syncer.sync_state().flush() {
+            tracing::warn!("Failed to flush negentropy sync state: {}", e);
+        } else {
+            tracing::info!(
+                "Negentropy sync state flushed: ~{} items",
+                syncer.sync_state().approximate_count().unwrap_or(0)
+            );
+        }
+    }
 
     // Seal final segment
     if let Some(sealed) = segment_writer.seal()? {

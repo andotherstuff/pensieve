@@ -104,15 +104,15 @@ doc-open:
 
 # Start local dev services (ClickHouse, etc.)
 dev-up:
-    docker compose up -d
+    docker compose -f pensieve-local/docker-compose.yml up -d
 
 # Stop local dev services
 dev-down:
-    docker compose down
+    docker compose -f pensieve-local/docker-compose.yml down
 
 # View local dev service logs
 dev-logs:
-    docker compose logs -f
+    docker compose -f pensieve-local/docker-compose.yml logs -f
 
 # ============================================================================
 # ClickHouse

@@ -162,10 +162,7 @@ fn main() -> Result<()> {
     println!("Invalid URLs:         {}", removed_invalid);
     println!("Blocked URLs:         {}", removed_blocked);
     println!("Duplicate entries:    {}", merged_duplicates);
-    println!(
-        "Final relay count:    {}",
-        normalized_map.len()
-    );
+    println!("Final relay count:    {}", normalized_map.len());
     println!();
 
     if args.dry_run {
@@ -200,7 +197,10 @@ fn main() -> Result<()> {
             for (norm, entries) in duplicates {
                 println!("  {} ({} entries):", norm, entries.len());
                 for entry in entries {
-                    println!("    - {} (tier={}, events={})", entry.url, entry.tier, entry.events_novel);
+                    println!(
+                        "    - {} (tier={}, events={})",
+                        entry.url, entry.tier, entry.events_novel
+                    );
                 }
             }
             println!();
@@ -240,10 +240,7 @@ fn main() -> Result<()> {
 
             // Merge stats from all entries into the best one
             let earliest_first_seen = entries.iter().map(|e| e.first_seen_at).min().unwrap_or(0);
-            let latest_connected = entries
-                .iter()
-                .filter_map(|e| e.last_connected_at)
-                .max();
+            let latest_connected = entries.iter().filter_map(|e| e.last_connected_at).max();
 
             // Delete the duplicate entries
             for entry in rest {
@@ -253,7 +250,12 @@ fn main() -> Result<()> {
             // Update the best entry with normalized URL and merged stats
             tx.execute(
                 "UPDATE relays SET url = ?, first_seen_at = ?, last_connected_at = ? WHERE url = ?",
-                params![normalized_url, earliest_first_seen, latest_connected, best.url],
+                params![
+                    normalized_url,
+                    earliest_first_seen,
+                    latest_connected,
+                    best.url
+                ],
             )?;
 
             // Update hourly stats to point to normalized URL
@@ -393,4 +395,3 @@ fn update_relay_url(conn: &Connection, old_url: &str, new_url: &str) -> Result<(
     )?;
     Ok(())
 }
-

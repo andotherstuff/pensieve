@@ -10,8 +10,15 @@
 //! - Values: 1 byte status flag
 //! - Bloom filters for fast "not seen" lookups
 //! - Rebuildable from the archive if lost/corrupted
+//!
+//! # Thread Safety
+//!
+//! The [`DedupeIndex::check_and_mark_pending`] method is atomic - it uses an
+//! internal mutex to prevent race conditions when multiple sources (e.g., live
+//! ingestion and negentropy sync) concurrently process the same event ID.
 
 use crate::Result;
+use parking_lot::Mutex;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -43,8 +50,16 @@ impl EventStatus {
 /// RocksDB-backed deduplication index for event IDs.
 ///
 /// Thread-safe: can be shared across multiple threads via `Arc<DedupeIndex>`.
+/// The `check_and_mark_pending` method uses an internal mutex to ensure atomicity
+/// when multiple sources concurrently attempt to claim the same event ID.
 pub struct DedupeIndex {
     db: Arc<DBWithThreadMode<MultiThreaded>>,
+    /// Mutex for atomic check-and-mark operations.
+    ///
+    /// This ensures that when multiple sources (e.g., live ingestion and negentropy
+    /// sync) concurrently process the same event, only one "wins" and marks it pending.
+    /// Without this, a race between check and put could allow duplicates.
+    write_lock: Mutex<()>,
 }
 
 impl DedupeIndex {
@@ -93,7 +108,10 @@ impl DedupeIndex {
 
         let db = DBWithThreadMode::<MultiThreaded>::open(&opts, path)?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Check if an event ID has been seen.
@@ -124,14 +142,21 @@ impl DedupeIndex {
         Ok(self.get_status(event_id)?.is_none())
     }
 
-    /// Check and mark an event as pending in one operation.
+    /// Check and mark an event as pending in one atomic operation.
     ///
     /// Returns `true` if the event is new (was not seen before),
     /// `false` if it was already seen.
     ///
-    /// This is the main API for deduplication during ingestion.
+    /// This is the main API for deduplication during ingestion. The operation
+    /// is atomic: a mutex ensures that concurrent calls from different sources
+    /// (e.g., live ingestion and negentropy sync) cannot both "win" for the
+    /// same event ID.
     pub fn check_and_mark_pending(&self, event_id: &[u8; 32]) -> Result<bool> {
-        // First check if it exists (uses bloom filter for fast path)
+        // Hold the lock for the entire check-and-mark operation to prevent races.
+        // Without this, two sources could both see "not exists" and both write.
+        let _guard = self.write_lock.lock();
+
+        // Check if it exists (uses bloom filter for fast path)
         if self.get_status(event_id)?.is_some() {
             return Ok(false);
         }
