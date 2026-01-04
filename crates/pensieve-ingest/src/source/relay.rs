@@ -435,6 +435,12 @@ impl RelaySource {
         let mut last_optimization = Instant::now();
         let mut optimization_count = 0usize;
 
+        // Rate-limited lag warning (avoid log spam during bursts)
+        let mut last_lag_warning = Instant::now();
+        let mut lag_count_since_warning = 0u64;
+        let mut lag_messages_since_warning = 0u64;
+        let lag_warning_interval = Duration::from_secs(10);
+
         while self.running.load(Ordering::SeqCst) {
             // Check if it's time to run optimization
             // First 3 optimizations run at bootstrap_interval (30s) for faster relay discovery
@@ -469,12 +475,24 @@ impl RelaySource {
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(count))) => {
                     // Receiver fell behind - some notifications were dropped
-                    // This can happen during heavy negentropy sync or high relay traffic
-                    // Just log and continue receiving
-                    tracing::warn!(
-                        "Notification receiver lagged behind, skipped {} messages",
-                        count
-                    );
+                    // This can happen during heavy relay traffic
+                    // Track metrics and rate-limit warnings to avoid log spam
+                    metrics::counter!("relay_notifications_lagged_total").increment(count);
+                    lag_count_since_warning += 1;
+                    lag_messages_since_warning += count;
+
+                    // Only log every lag_warning_interval to avoid spam
+                    if last_lag_warning.elapsed() >= lag_warning_interval {
+                        tracing::warn!(
+                            "Notification receiver lagged {} times, dropped {} messages in last {:?}",
+                            lag_count_since_warning,
+                            lag_messages_since_warning,
+                            last_lag_warning.elapsed()
+                        );
+                        last_lag_warning = Instant::now();
+                        lag_count_since_warning = 0;
+                        lag_messages_since_warning = 0;
+                    }
                     continue;
                 }
                 Err(_) => {

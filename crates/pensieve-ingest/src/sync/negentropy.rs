@@ -2,6 +2,21 @@
 //!
 //! This module provides periodic sync with trusted relays using the negentropy
 //! set reconciliation protocol (NIP-77).
+//!
+//! ## Event Flow
+//!
+//! Events are captured as they stream through the nostr-sdk `save_event()` callback
+//! during negentropy reconciliation. This eliminates the need for a separate fetch step:
+//!
+//! 1. Negentropy reconciliation identifies missing event IDs
+//! 2. nostr-sdk automatically fetches those events via REQ
+//! 3. As events arrive, `save_event()` forwards them to a channel
+//! 4. `sync_once()` collects events from the channel
+//! 5. Events are passed to the handler for dedupe/segment writing
+//! 6. Only after successful segment write is the event recorded in sync-state
+//!
+//! This ensures that sync-state only contains events we've actually archived,
+//! so failed events will be re-fetched on the next sync cycle.
 
 use super::SyncStateDb;
 use crate::Result;
@@ -11,6 +26,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 /// Configuration for negentropy sync.
 #[derive(Debug, Clone)]
@@ -25,11 +41,9 @@ pub struct NegentropySyncConfig {
     /// This creates the `since` filter for negentropy reconciliation.
     pub lookback: Duration,
 
-    /// Timeout for the negentropy protocol messages.
+    /// Timeout for the negentropy protocol and event fetching.
+    /// Events stream through as they're fetched, so this is the overall timeout.
     pub protocol_timeout: Duration,
-
-    /// Timeout for fetching missing events after reconciliation.
-    pub fetch_timeout: Duration,
 
     /// Direction for sync (default: Down = receive only).
     pub direction: SyncDirection,
@@ -43,8 +57,7 @@ impl Default for NegentropySyncConfig {
             relays: vec!["wss://relay.damus.io".to_string()],
             interval: Duration::from_secs(1800), // 30 minutes
             lookback: Duration::from_secs(14 * 24 * 3600), // 14 days
-            protocol_timeout: Duration::from_secs(900), // 15 min for reconciliation
-            fetch_timeout: Duration::from_secs(900), // 15 min for fetching
+            protocol_timeout: Duration::from_secs(900), // 15 min for full sync
             direction: SyncDirection::Down,
         }
     }
@@ -55,8 +68,8 @@ impl Default for NegentropySyncConfig {
 pub struct SyncStats {
     /// Number of events discovered during reconciliation.
     pub events_discovered: usize,
-    /// Number of events successfully fetched.
-    pub events_fetched: usize,
+    /// Number of events received via streaming (same as discovered for successful syncs).
+    pub events_received: usize,
     /// Number of events that were already in our dedupe index.
     pub events_deduplicated: usize,
     /// Number of events written to segments.
@@ -69,13 +82,17 @@ pub struct SyncStats {
     pub relays_errored: usize,
 }
 
-/// NostrDatabase adapter that wraps SyncStateDb.
+/// NostrDatabase adapter that captures events during negentropy sync.
 ///
-/// This provides a minimal implementation of the NostrDatabase trait,
-/// storing only (event_id, timestamp) pairs for negentropy reconciliation.
-/// It does NOT store full events.
+/// This provides a minimal implementation of the NostrDatabase trait that:
+/// - Provides (event_id, timestamp) pairs for negentropy reconciliation via `negentropy_items()`
+/// - Captures full events as they stream through `save_event()` via a channel
+/// - Does NOT record events to sync-state (that's done after successful segment write)
 pub struct SyncStateAdapter {
-    inner: Arc<SyncStateDb>,
+    /// Reference to sync state for querying what we have (negentropy_items).
+    sync_state: Arc<SyncStateDb>,
+    /// Channel to send captured events to the collector.
+    event_sender: mpsc::UnboundedSender<Event>,
 }
 
 impl Debug for SyncStateAdapter {
@@ -85,15 +102,26 @@ impl Debug for SyncStateAdapter {
 }
 
 impl SyncStateAdapter {
-    /// Create a new adapter wrapping a SyncStateDb.
-    pub fn new(db: Arc<SyncStateDb>) -> Self {
-        Self { inner: db }
+    /// Create a new adapter with an event capture channel.
+    ///
+    /// Returns the adapter and a receiver for captured events.
+    pub fn new(
+        sync_state: Arc<SyncStateDb>,
+    ) -> (Self, mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                sync_state,
+                event_sender: tx,
+            },
+            rx,
+        )
     }
 }
 
 impl NostrDatabase for SyncStateAdapter {
     fn backend(&self) -> Backend {
-        Backend::Custom("sync-state".to_string())
+        Backend::Custom("sync-state-capture".to_string())
     }
 
     fn save_event<'a>(
@@ -101,10 +129,16 @@ impl NostrDatabase for SyncStateAdapter {
         event: &'a Event,
     ) -> BoxedFuture<'a, std::result::Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
-            // Record the event in sync state (just id + timestamp)
-            self.inner
-                .record(event.id.as_bytes(), event.created_at.as_secs())
-                .map_err(DatabaseError::backend)?;
+            // Forward the event to the channel for processing.
+            // DO NOT record to sync-state here - that happens only after
+            // successful segment write in the event handler.
+            //
+            // This ensures that if segment write fails, the event is NOT
+            // recorded in sync-state and will be re-fetched on the next cycle.
+            if self.event_sender.send(event.clone()).is_err() {
+                // Channel closed, receiver dropped - sync is ending
+                tracing::debug!("Event channel closed, sync ending");
+            }
             Ok(SaveEventStatus::Success)
         })
     }
@@ -113,7 +147,8 @@ impl NostrDatabase for SyncStateAdapter {
         &'a self,
         _event_id: &'a EventId,
     ) -> BoxedFuture<'a, std::result::Result<DatabaseEventStatus, DatabaseError>> {
-        // We don't track deleted events in sync state
+        // Always return NotExistent so nostr-sdk fetches events we're missing.
+        // The actual deduplication happens in our pipeline via DedupeIndex.
         Box::pin(async move { Ok(DatabaseEventStatus::NotExistent) })
     }
 
@@ -128,7 +163,7 @@ impl NostrDatabase for SyncStateAdapter {
     fn count(&self, _filter: Filter) -> BoxedFuture<'_, std::result::Result<usize, DatabaseError>> {
         Box::pin(async move {
             let count = self
-                .inner
+                .sync_state
                 .approximate_count()
                 .map_err(DatabaseError::backend)?;
             Ok(count as usize)
@@ -148,9 +183,10 @@ impl NostrDatabase for SyncStateAdapter {
             // Get the `since` timestamp from the filter
             let since = filter.since.map(|t| t.as_secs()).unwrap_or(0);
 
-            // Query all items since that timestamp
+            // Query all items since that timestamp from sync-state.
+            // These are events we've successfully archived.
             let items = self
-                .inner
+                .sync_state
                 .get_items_since(since)
                 .map_err(DatabaseError::backend)?;
 
@@ -212,8 +248,11 @@ impl NegentropySyncer {
 
     /// Run a single sync cycle.
     ///
-    /// Returns statistics about the sync and the events that were discovered
-    /// but need to be processed by the caller.
+    /// Returns statistics about the sync and the events that were captured
+    /// as they streamed through during reconciliation.
+    ///
+    /// Events are captured directly from the nostr-sdk `save_event()` callback,
+    /// eliminating the need for a separate fetch step.
     pub async fn sync_once(&self) -> Result<(SyncStats, Vec<Event>)> {
         let start = Instant::now();
         let mut stats = SyncStats::default();
@@ -229,8 +268,19 @@ impl NegentropySyncer {
         let since = Timestamp::from(now.as_secs().saturating_sub(self.config.lookback.as_secs()));
         let filter = Filter::new().since(since);
 
-        // Create the database adapter
-        let adapter = SyncStateAdapter::new(Arc::clone(&self.sync_state));
+        // Create the database adapter with event capture channel
+        let (adapter, mut event_receiver) = SyncStateAdapter::new(Arc::clone(&self.sync_state));
+
+        // Collect events as they stream through
+        let collected_events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let collector_events = Arc::clone(&collected_events);
+
+        // Spawn a task to collect events from the channel
+        let collector_handle = tokio::spawn(async move {
+            while let Some(event) = event_receiver.recv().await {
+                collector_events.lock().await.push(event);
+            }
+        });
 
         // Create a client with our sync state database
         let keys = Keys::generate();
@@ -257,14 +307,12 @@ impl NegentropySyncer {
         let opts = SyncOptions::default().direction(self.config.direction);
 
         // Run negentropy reconciliation
+        // Events stream through save_event() as they're fetched by nostr-sdk
         let sync_result = tokio::time::timeout(
-            self.config.protocol_timeout + self.config.fetch_timeout,
+            self.config.protocol_timeout,
             client.sync(filter.clone(), &opts),
         )
         .await;
-
-        // Collect discovered events
-        let mut discovered_events = Vec::new();
 
         match sync_result {
             Ok(Ok(output)) => {
@@ -275,92 +323,47 @@ impl NegentropySyncer {
                     "Negentropy reconciliation complete: {} events discovered",
                     stats.events_discovered
                 );
-
-                // Fetch the actual events for the discovered IDs in batches
-                if !output.received.is_empty() {
-                    // The events should already be fetched by nostr-sdk during sync
-                    // Query them from the database (they were saved during sync)
-                    // Actually, nostr-sdk fetches events after reconciliation automatically
-                    // and calls save_event on the database. But our adapter doesn't store
-                    // full events, so we need to fetch them again.
-
-                    // Batch fetch to avoid overwhelming relays with huge filters
-                    const BATCH_SIZE: usize = 500;
-                    let ids: Vec<EventId> = output.received.iter().cloned().collect();
-                    let total_batches = ids.len().div_ceil(BATCH_SIZE);
-
-                    tracing::info!(
-                        "Fetching {} events in {} batches of up to {}",
-                        ids.len(),
-                        total_batches,
-                        BATCH_SIZE
-                    );
-
-                    for (batch_idx, batch) in ids.chunks(BATCH_SIZE).enumerate() {
-                        let id_filter = Filter::new().ids(batch.to_vec());
-
-                        // Fetch events using REQ
-                        match tokio::time::timeout(
-                            self.config.fetch_timeout,
-                            client.fetch_events(id_filter, self.config.fetch_timeout),
-                        )
-                        .await
-                        {
-                            Ok(Ok(events)) => {
-                                let batch_count = events.len();
-                                stats.events_fetched += batch_count;
-                                discovered_events.extend(events);
-                                tracing::debug!(
-                                    "Batch {}/{}: fetched {} events",
-                                    batch_idx + 1,
-                                    total_batches,
-                                    batch_count
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    "Batch {}/{}: failed to fetch events: {}",
-                                    batch_idx + 1,
-                                    total_batches,
-                                    e
-                                );
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "Batch {}/{}: timeout fetching events",
-                                    batch_idx + 1,
-                                    total_batches
-                                );
-                            }
-                        }
-                    }
-
-                    tracing::info!(
-                        "Fetched {} of {} discovered events",
-                        stats.events_fetched,
-                        ids.len()
-                    );
-                }
             }
             Ok(Err(e)) => {
                 tracing::warn!("Negentropy sync failed: {}", e);
                 stats.relays_errored = self.config.relays.len();
             }
             Err(_) => {
-                tracing::warn!("Negentropy sync timed out");
+                tracing::warn!("Negentropy sync timed out after {:?}", self.config.protocol_timeout);
                 stats.relays_errored = self.config.relays.len();
             }
         }
 
-        // Disconnect
+        // Disconnect - this closes the adapter's channel sender
         client.disconnect().await;
 
+        // Drop the client to ensure the adapter (and its sender) is dropped
+        drop(client);
+
+        // Wait for collector to finish receiving all events
+        // The channel will close when the adapter is dropped
+        if let Err(e) = collector_handle.await {
+            tracing::warn!("Event collector task failed: {}", e);
+        }
+
+        // Get collected events
+        let discovered_events = Arc::try_unwrap(collected_events)
+            .expect("collector handle finished, should be sole owner")
+            .into_inner();
+
+        stats.events_received = discovered_events.len();
         stats.duration = start.elapsed();
+
+        tracing::info!(
+            "Negentropy sync captured {} events in {:?}",
+            stats.events_received,
+            stats.duration
+        );
 
         // Update metrics
         counter!("negentropy_syncs_total").increment(1);
         counter!("negentropy_events_discovered_total").increment(stats.events_discovered as u64);
-        counter!("negentropy_events_fetched_total").increment(stats.events_fetched as u64);
+        counter!("negentropy_events_received_total").increment(stats.events_received as u64);
         histogram!("negentropy_sync_duration_seconds").record(stats.duration.as_secs_f64());
         gauge!("negentropy_last_sync_unix").set(Timestamp::now().as_secs() as f64);
 
@@ -375,7 +378,9 @@ impl NegentropySyncer {
     /// The handler is responsible for:
     /// - Dedupe checking via DedupeIndex
     /// - Packing and writing to segments
-    /// - Recording in sync state (already done by this syncer)
+    ///
+    /// Sync state is updated ONLY after the handler returns `Ok(true)`,
+    /// ensuring that failed events will be re-fetched on the next sync cycle.
     pub async fn run_periodic<F>(&self, mut event_handler: F) -> Result<()>
     where
         F: FnMut(&Event) -> Result<bool> + Send,
@@ -393,23 +398,31 @@ impl NegentropySyncer {
             match self.sync_once().await {
                 Ok((stats, events)) => {
                     tracing::info!(
-                        "Negentropy sync complete: {} discovered, {} fetched in {:?}",
+                        "Negentropy sync complete: {} discovered, {} received in {:?}",
                         stats.events_discovered,
-                        stats.events_fetched,
+                        stats.events_received,
                         stats.duration
                     );
+
+                    // Track batch processing statistics
+                    let total_events = events.len();
+                    let mut events_written = 0usize;
+                    let mut events_failed = 0usize;
+                    let process_start = Instant::now();
 
                     // Process discovered events through the handler
                     for event in events {
                         match event_handler(&event) {
                             Ok(true) => {
-                                // Event processed, record in sync state
+                                // Event processed successfully, NOW record in sync state.
+                                // This ensures we only record events that were actually archived.
                                 if let Err(e) = self
                                     .sync_state
                                     .record(event.id.as_bytes(), event.created_at.as_secs())
                                 {
                                     tracing::warn!("Failed to record event in sync state: {}", e);
                                 }
+                                events_written += 1;
                             }
                             Ok(false) => {
                                 tracing::info!("Event handler signaled stop");
@@ -417,11 +430,34 @@ impl NegentropySyncer {
                                 break;
                             }
                             Err(e) => {
-                                tracing::error!("Event handler error: {}", e);
-                                // Continue processing other events
+                                // Event failed to process - do NOT record in sync state.
+                                // It will be re-fetched on the next sync cycle.
+                                tracing::debug!("Event handler error (will retry next sync): {}", e);
+                                events_failed += 1;
                             }
                         }
                     }
+
+                    // Calculate deduplicated count (total - written - failed = deduplicated by our dedupe index)
+                    let events_deduplicated = total_events.saturating_sub(events_written).saturating_sub(events_failed);
+                    let process_duration = process_start.elapsed();
+
+                    // Log batch summary
+                    tracing::info!(
+                        "Negentropy batch processed: {} events → {} written, {} deduplicated, {} failed in {:?}",
+                        total_events,
+                        events_written,
+                        events_deduplicated,
+                        events_failed,
+                        process_duration
+                    );
+
+                    // Update batch metrics
+                    gauge!("negentropy_last_batch_total").set(total_events as f64);
+                    gauge!("negentropy_last_batch_written").set(events_written as f64);
+                    gauge!("negentropy_last_batch_deduplicated").set(events_deduplicated as f64);
+                    gauge!("negentropy_last_batch_failed").set(events_failed as f64);
+                    histogram!("negentropy_batch_process_duration_seconds").record(process_duration.as_secs_f64());
 
                     // Prune sync state entries older than the lookback window
                     // This bounds storage to approximately lookback_duration worth of events
