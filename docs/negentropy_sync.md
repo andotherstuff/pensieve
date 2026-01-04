@@ -26,9 +26,9 @@ Negentropy (NIP-77) solves this by:
 ### Single Process Design
 
 The ingester runs as a single process because:
-- RocksDB dedupe index doesn't support concurrent writers
+- We need **atomic dedupe + write** semantics across live and sync sources (see "Why This Works" / "Dedupe atomicity" below)
 - Single process simplifies coordination between live and sync operations
-- Memory pressure is manageable with careful batching
+- Memory pressure is manageable with careful batching; if needed, we can fall back to **partitioned sync windows** (time/kind sharding)
 
 ### Event Convergence: The Critical Insight
 
@@ -86,19 +86,18 @@ The ingester runs as a single process because:
 ### Why This Works
 
 1. **RocksDB is the single source of truth for "have we seen this event?"**
-   - Both sources check the same RocksDB instance
-   - `check_and_mark_pending()` is atomic
-   - If live streaming gets an event first, negentropy fetch will skip it
-   - If negentropy gets an event first, live streaming will skip it
+   - Both sources check the same `DedupeIndex`
+   - **Important:** `check_and_mark_pending()` must be atomic across sources (today it's a read+write)
+   - Plan: make `check_and_mark_pending()` a **single critical section** (e.g., internal mutex) so only one source can "win" a given event ID
+   - If live streaming gets an event first, negentropy fetch will skip it (and vice versa)
 
 2. **SegmentWriter handles concurrent writes**
    - Events from both sources write to the same segment
    - The writer is already designed to handle this (mutex-protected)
 
-3. **No coordination needed between sources**
-   - They can run completely independently
-   - Duplicates are naturally filtered at the RocksDB check
-   - The only shared state is the dedupe index and segment writer
+3. **Coordination is minimal (but explicit)**
+   - Live and negentropy can run independently, but they share the same `DedupeIndex` + `SegmentWriter`
+   - The only required coordination is making the dedupe check+mark atomic so duplicates cannot slip through under concurrency
 
 ### Full Component Flow
 
@@ -200,8 +199,8 @@ Maintain a separate RocksDB database for negentropy sync state:
 // Key: [timestamp_be (8 bytes)][event_id (32 bytes)]
 // Value: empty
 //
-// Big-endian timestamp prefix enables efficient range scans
-// to get all events since a given timestamp.
+// Big-endian timestamp prefix enables efficient ordered range scans
+// (via IteratorMode::From) to get all events since a given timestamp.
 ```
 
 Then implement `NostrDatabase` trait backed by this RocksDB:
@@ -209,7 +208,7 @@ Then implement `NostrDatabase` trait backed by this RocksDB:
 ```rust
 impl NostrDatabase for SyncStateDb {
     async fn negentropy_items(&self, filter: Filter) -> Result<Vec<(EventId, Timestamp)>> {
-        // Use prefix iterator starting at filter.since timestamp
+        // Use an ordered iterator starting at key [since_be][0x00...]
         // Return (event_id, created_at) pairs
         self.get_items_since(filter.since.unwrap_or(0))
     }
@@ -329,6 +328,31 @@ pub struct NegentropySyncConfig {
 
 ## Implementation Plan
 
+### Phase 0: Seed Sync State from ClickHouse (bootstrap)
+
+If the sync-state DB starts empty, negentropy will believe we have *no* local items in the lookback
+window and can trigger a huge first-cycle delta (wasted bandwidth + higher chance of relay blocking).
+To avoid that cold-start behavior, do a best-effort seed from ClickHouse **before** the first sync:
+
+- **When to seed**: if `--negentropy` is enabled and `sync_state_db` is empty (or below a small threshold)
+- **Query**: pull `(id, created_at)` from `events_local` for the lookback window (example: 7-day default):
+
+```sql
+SELECT
+  id,
+  toUnixTimestamp(created_at) AS created_at
+FROM events_local
+WHERE created_at >= now() - INTERVAL 7 DAY
+```
+
+- **Insert**:
+  - Decode `id` (hex string) into a 32-byte event ID
+  - `sync_state_db.record(&event_id_bytes, created_at)`
+
+Notes:
+- This is best-effort: if ClickHouse is unavailable, skip seeding and let sync proceed (but consider shrinking the initial sync window).
+- This seeds the *local set representation* for negentropy; dedupe remains the source of truth for writes.
+
 ### Phase 1: Negentropy Sync Module
 
 Create `crates/pensieve-ingest/src/sync/negentropy.rs`:
@@ -343,7 +367,11 @@ pub struct NegentropySyncer {
 impl NegentropySyncer {
     /// Run a single sync cycle
     pub async fn sync_once(&self) -> Result<SyncStats, Error> {
-        // 1. Build filter: all events in lookback window
+        // 1. Build filters for the lookback window
+        //
+        // Start with a single lookback filter for simplicity.
+        // If we hit `NEG-ERR: blocked` or the local item set is too large (memory/latency),
+        // fall back to partitioned sync (time and/or kind sharding).
         let since = Timestamp::now() - self.config.lookback;
         let filter = Filter::new().since(since);
 
@@ -392,6 +420,7 @@ let sync_handle = if args.negentropy_enabled {
     Some(tokio::spawn(async move {
         syncer.run_periodic(|event| {
             // Same handler as live ingestion
+            // NOTE: this is only correct if the dedupe check+mark is atomic across tasks
             handle_event(event)
         }).await
     }))
@@ -434,8 +463,9 @@ Add a **separate RocksDB database** for negentropy sync state. This is independe
 /// Key format: [timestamp_be (8 bytes)][event_id (32 bytes)]
 /// Value: empty (we only need to know the key exists)
 ///
-/// Using big-endian timestamp as prefix allows RocksDB's prefix iterator
-/// to efficiently scan all events >= a given timestamp.
+/// Using big-endian timestamp as the leading bytes allows RocksDB to efficiently
+/// scan all events >= a given timestamp using an ordered iterator
+/// (IteratorMode::From). Note: `prefix_iterator()` is not appropriate for range scans.
 pub struct SyncStateDb {
     db: rocksdb::DB,
 }
@@ -445,10 +475,11 @@ impl SyncStateDb {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        
-        // Optimize for prefix seeks (timestamp prefix)
+
+        // Optional: optimize for prefix seeks (timestamp prefix).
+        // We still use range iteration (IteratorMode::From), not prefix_iterator().
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
-        
+
         let db = rocksdb::DB::open(&opts, path)?;
         Ok(Self { db })
     }
@@ -463,11 +494,13 @@ impl SyncStateDb {
 
     /// Get all events since a timestamp (for negentropy)
     pub fn get_items_since(&self, since: u64) -> Result<Vec<([u8; 32], u64)>> {
-        let prefix = since.to_be_bytes();
         let mut items = Vec::new();
 
-        // Iterate from `since` timestamp to end
-        let iter = self.db.prefix_iterator(&prefix);
+        // Iterate from key [since_be][0x00...] to end
+        let start_key = Self::make_key(since, &[0u8; 32]);
+        let iter =
+            self.db
+                .iterator(rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward));
         for item in iter {
             let (key, _) = item?;
             if key.len() == 40 {
@@ -490,24 +523,13 @@ impl SyncStateDb {
 
     /// Prune entries older than the given timestamp
     pub fn prune_before(&self, before: u64) -> Result<usize> {
-        let mut count = 0;
-        let end_prefix = before.to_be_bytes();
+        // Prefer range deletion over per-key deletes for performance.
+        let start_key = [0u8; 40];
+        let end_key = Self::make_key(before, &[0u8; 32]);
+        self.db.delete_range(&start_key, &end_key)?;
 
-        // Iterate from beginning to `before` timestamp
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item?;
-            if key.len() >= 8 {
-                let ts = u64::from_be_bytes(key[0..8].try_into().unwrap());
-                if ts >= before {
-                    break; // Past our prune window
-                }
-                self.db.delete(&key)?;
-                count += 1;
-            }
-        }
-
-        Ok(count)
+        // Exact count would require scanning; return 0 (or track metrics elsewhere).
+        Ok(0)
     }
 }
 ```
@@ -535,7 +557,7 @@ fn handle_event(event: &Event, source: EventSource) {
     // Step 3: Record in sync state - ONLY for negentropy tracking
     // This is optional - we only need it if negentropy is enabled
     if let Some(sync_db) = &sync_state_db {
-        sync_db.record(&event.id, event.created_at)?;
+        sync_db.record(event.id.as_bytes(), event.created_at.as_secs())?;
     }
 
     Ok(true)
@@ -564,7 +586,17 @@ negentropy_relays: Option<PathBuf>,
 
 ## Challenges & Considerations
 
-### 1. Database Adapter for nostr-sdk
+### 1. Dedupe Atomicity / Concurrency (Correctness)
+
+This plan assumes the dedupe gate (`check_and_mark_pending()`) is atomic. In the current codebase
+it is implemented as a **read followed by a write**, which can race if live ingestion and negentropy
+run concurrently.
+
+To prevent double-writes:
+- Make `check_and_mark_pending()` a **single critical section** (e.g., internal mutex), *or*
+- Serialize all event handling through a single consumer.
+
+### 2. Database Adapter for nostr-sdk
 
 nostr-sdk's `sync_with` method requires a `NostrDatabase` implementation:
 
@@ -577,28 +609,36 @@ pub trait NostrDatabase: Send + Sync {
 
 We need to implement this trait backed by our sync state storage.
 
-### 2. Event Deduplication
+### 3. Cold-Start Sync State Seeding (ClickHouse)
+
+If the sync-state DB is empty, negentropy will treat the local set as empty and can request a very
+large delta. We mitigate this with a best-effort seed from ClickHouse (`events_local`) for the last
+lookback window (default 7 days) before running the first sync.
+
+### 4. Event Deduplication
 
 Events from negentropy sync must go through the same dedupe pipeline:
 - Check RocksDB for duplicates
 - Only write novel events to segments
 - This is already handled by our event handler
 
-### 3. Rate Limiting
+### 5. Rate Limiting
 
 Some relays may rate-limit negentropy requests:
 - Implement exponential backoff
 - Track relay health for sync operations
 - Consider reducing sync frequency if rate limited
+- If we see `NEG-ERR: blocked`, shrink scope by **sharding** the sync (smaller time windows and/or kinds)
 
-### 4. Memory Pressure
+### 6. Memory Pressure
 
 Large sync windows can discover many missing events:
 - Process in batches
 - Limit `max_events_per_cycle`
 - Monitor memory usage
+- If memory/latency is too high, use **partitioned sync** (time buckets, optionally kind buckets) to keep `negentropy_items()` bounded
 
-### 5. Relay Support Detection
+### 7. Relay Support Detection
 
 Before syncing, verify relay supports NIP-77:
 - Try `NEG-OPEN`, expect `NEG-MSG` or `NEG-ERR`
@@ -655,11 +695,13 @@ histogram!("negentropy_sync_duration_seconds")
 
 ## Next Steps
 
-1. [ ] Create basic `NegentropySyncer` struct
-2. [ ] Implement `NostrDatabase` adapter for sync state
-3. [ ] Add CLI arguments for negentropy config
-4. [ ] Test with single trusted relay
-5. [ ] Add metrics and logging
-6. [ ] Expand to full trusted relay list
-7. [ ] Document relay NIP-77 support status
+1. [ ] Make dedupe check+mark atomic across live + sync (critical section or single-consumer)
+2. [ ] Create basic `NegentropySyncer` struct
+3. [ ] Implement `NostrDatabase` adapter for sync state
+4. [ ] Add ClickHouse seeding step for last lookback window into sync-state DB
+5. [ ] Add CLI arguments for negentropy config
+6. [ ] Test with single trusted relay
+7. [ ] Add metrics and logging
+8. [ ] Expand to full trusted relay list
+9. [ ] Document relay NIP-77 support status
 
