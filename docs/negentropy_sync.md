@@ -192,37 +192,41 @@ nostr-sdk's `sync_with` method requires a `NostrDatabase` implementation:
 
 ### Our Approach: Two Options
 
-#### Option A: Lightweight Sync State Database (Recommended)
+#### Option A: Separate RocksDB for Sync State (Recommended)
 
-Maintain a small SQLite database just for negentropy sync state:
+Maintain a separate RocksDB database for negentropy sync state:
 
 ```rust
-// Store (event_id, created_at) for events in the sync window
-// This is ~40 bytes per event, manageable for a week of events
-CREATE TABLE sync_state (
-    event_id BLOB PRIMARY KEY,  -- 32 bytes
-    created_at INTEGER NOT NULL  -- 8 bytes (unix timestamp)
-);
+// Key: [timestamp_be (8 bytes)][event_id (32 bytes)]
+// Value: empty
+//
+// Big-endian timestamp prefix enables efficient range scans
+// to get all events since a given timestamp.
 ```
 
-Then implement `NostrDatabase` trait:
+Then implement `NostrDatabase` trait backed by this RocksDB:
 
 ```rust
 impl NostrDatabase for SyncStateDb {
     async fn negentropy_items(&self, filter: Filter) -> Result<Vec<(EventId, Timestamp)>> {
-        // Query sync_state table with filter criteria
+        // Use prefix iterator starting at filter.since timestamp
         // Return (event_id, created_at) pairs
+        self.get_items_since(filter.since.unwrap_or(0))
     }
-    
-    // Implement store method to populate sync_state
+
     async fn save_event(&self, event: &Event) -> Result<bool> {
-        // Insert (event.id, event.created_at) into sync_state
-        // Also forward event to our normal handler!
+        // Record in sync state for future negentropy comparisons
+        self.record(&event.id.as_bytes(), event.created_at.as_secs())?;
+        Ok(true)
     }
 }
 ```
 
-This gives nostr-sdk what it needs while keeping our main architecture intact.
+**Why RocksDB over SQLite?**
+- Faster for simple key-value operations
+- Lighter overhead (no SQL engine)
+- LZ4 compression built-in
+- Consistent with existing codebase patterns
 
 #### Option B: Bypass nostr-sdk, Implement NIP-77 Directly
 
@@ -231,7 +235,7 @@ Implement negentropy protocol ourselves:
 - Significant implementation effort
 - Would need to handle `NEG-OPEN`, `NEG-MSG`, `NEG-CLOSE` manually
 
-**Recommendation:** Option A - the sync state database is small and focused.
+**Recommendation:** Option A - separate RocksDB is fast, light, and familiar.
 
 ### How Negentropy Sync Actually Works
 
@@ -294,10 +298,7 @@ Not all relays support NIP-77. We need a curated list of relays that:
 ```txt
 # Known NIP-77 relays with good archives
 wss://relay.damus.io
-wss://relay.nostr.band
-wss://purplepag.es
 wss://relay.primal.net
-wss://nostr.wine
 ```
 
 ### Configuration
@@ -411,57 +412,112 @@ if let Some(handle) = sync_handle {
 
 ### Phase 3: Sync State Database
 
-Add a SQLite database for negentropy sync state. This is **separate** from:
-- RocksDB (dedupe index - event IDs only)
+Add a **separate RocksDB database** for negentropy sync state. This is independent from:
+- RocksDB dedupe index (event IDs only, for deduplication)
 - Notepack segments (full event storage)
 - ClickHouse (analytics)
+
+**Why a separate RocksDB (not SQLite)?**
+- Faster for this workload (simple key-value operations)
+- Lighter overhead (no SQL query engine)
+- Consistent with existing codebase patterns
+- Independent lifecycle - can prune/rebuild without affecting dedupe
+
+**Key structure for efficient time-range queries:**
 
 ```rust
 // crates/pensieve-ingest/src/sync/state.rs
 
+/// Sync state database for negentropy reconciliation.
+///
+/// Stores (timestamp, event_id) pairs to enable efficient time-range queries.
+/// Key format: [timestamp_be (8 bytes)][event_id (32 bytes)]
+/// Value: empty (we only need to know the key exists)
+///
+/// Using big-endian timestamp as prefix allows RocksDB's prefix iterator
+/// to efficiently scan all events >= a given timestamp.
 pub struct SyncStateDb {
-    conn: rusqlite::Connection,
+    db: rocksdb::DB,
 }
 
 impl SyncStateDb {
     pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS sync_state (
-                event_id BLOB PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_created_at ON sync_state(created_at)",
-            [],
-        )?;
-        Ok(Self { conn })
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        
+        // Optimize for prefix seeks (timestamp prefix)
+        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+        
+        let db = rocksdb::DB::open(&opts, path)?;
+        Ok(Self { db })
     }
-    
-    /// Get events in time window for negentropy
-    pub fn get_items(&self, since: Timestamp) -> Result<Vec<(EventId, Timestamp)>> {
-        // Query and return
+
+    /// Build key from timestamp and event_id
+    fn make_key(created_at: u64, event_id: &[u8; 32]) -> [u8; 40] {
+        let mut key = [0u8; 40];
+        key[0..8].copy_from_slice(&created_at.to_be_bytes()); // Big-endian for sorting
+        key[8..40].copy_from_slice(event_id);
+        key
     }
-    
-    /// Record that we've synced an event
-    pub fn record(&self, event_id: &EventId, created_at: Timestamp) -> Result<()> {
-        // Insert or ignore
+
+    /// Get all events since a timestamp (for negentropy)
+    pub fn get_items_since(&self, since: u64) -> Result<Vec<([u8; 32], u64)>> {
+        let prefix = since.to_be_bytes();
+        let mut items = Vec::new();
+
+        // Iterate from `since` timestamp to end
+        let iter = self.db.prefix_iterator(&prefix);
+        for item in iter {
+            let (key, _) = item?;
+            if key.len() == 40 {
+                let ts = u64::from_be_bytes(key[0..8].try_into().unwrap());
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&key[8..40]);
+                items.push((event_id, ts));
+            }
+        }
+
+        Ok(items)
     }
-    
-    /// Prune old entries outside sync window
-    pub fn prune(&self, before: Timestamp) -> Result<usize> {
-        // Delete old entries to keep database small
+
+    /// Record that we've processed an event
+    pub fn record(&self, event_id: &[u8; 32], created_at: u64) -> Result<()> {
+        let key = Self::make_key(created_at, event_id);
+        self.db.put(&key, &[])?; // Empty value
+        Ok(())
+    }
+
+    /// Prune entries older than the given timestamp
+    pub fn prune_before(&self, before: u64) -> Result<usize> {
+        let mut count = 0;
+        let end_prefix = before.to_be_bytes();
+
+        // Iterate from beginning to `before` timestamp
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item?;
+            if key.len() >= 8 {
+                let ts = u64::from_be_bytes(key[0..8].try_into().unwrap());
+                if ts >= before {
+                    break; // Past our prune window
+                }
+                self.db.delete(&key)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 }
 ```
 
 **Size estimate:**
-- 40 bytes per event (32 byte ID + 8 byte timestamp)
-- ~1M events/day → ~40MB/day
-- 7-day window → ~280MB total
-- Manageable, and we prune old entries
+- 40 bytes per key (8 byte timestamp + 32 byte event ID), no value
+- With LZ4 compression: ~25-30 bytes per event effective
+- ~1M events/day → ~25-30MB/day
+- 7-day window → ~175-210MB total
+- Periodic pruning keeps it bounded
 
 **Integration with shared handler:**
 
@@ -471,17 +527,17 @@ fn handle_event(event: &Event, source: EventSource) {
     if !dedupe.check_and_mark_pending(&event.id)? {
         return Ok(true);  // Skip duplicate
     }
-    
-    // Step 2: Pack and write (SegmentWriter) - ALWAYS  
+
+    // Step 2: Pack and write (SegmentWriter) - ALWAYS
     let packed = pack_nostr_event(event)?;
     segment_writer.write(packed)?;
-    
+
     // Step 3: Record in sync state - ONLY for negentropy tracking
     // This is optional - we only need it if negentropy is enabled
     if let Some(sync_db) = &sync_state_db {
         sync_db.record(&event.id, event.created_at)?;
     }
-    
+
     Ok(true)
 }
 ```
