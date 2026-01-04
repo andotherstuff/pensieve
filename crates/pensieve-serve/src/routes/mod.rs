@@ -5,12 +5,14 @@ mod kinds;
 mod relays;
 mod stats;
 
+use axum::body::Body;
 use axum::extract::Request;
-use axum::http::header;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use http_body_util::BodyExt;
 
 use crate::auth::require_auth;
 use crate::state::AppState;
@@ -136,13 +138,23 @@ pub fn router(state: AppState) -> Router {
 
 /// Add cache headers to API responses based on the endpoint.
 ///
+/// Sets both `Cache-Control` and `ETag` headers for browser and CDN caching.
+///
 /// TTLs are set per-endpoint based on how frequently the data changes:
 /// - `/stats/events/latest`: 10 seconds (changes frequently)
 /// - `/stats/events/total`, `/stats/pubkeys/total`: 5 minutes
 /// - `/stats/kinds/total`, `/stats/events/earliest`: 1 hour (stable data)
 /// - Other endpoints: 60 seconds default
+///
+/// ETag enables conditional requests (If-None-Match) for cache validation.
 async fn add_cache_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
+    let if_none_match = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let response = next.run(request).await;
 
     // Only cache successful responses
@@ -166,10 +178,53 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
         "public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}"
     );
 
-    let (mut parts, body) = response.into_parts();
-    parts.headers.insert(
+    // Collect body bytes to compute ETag
+    let (parts, body) = response.into_parts();
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            // Body stream is consumed and cannot be recovered. Return 500 to signal
+            // the error rather than silently returning empty content with 200 OK.
+            tracing::error!("Failed to collect response body for ETag computation: {}", e);
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Internal server error: failed to process response"))
+                .unwrap();
+        }
+    };
+
+    // Generate ETag from body content hash (xxHash for speed)
+    let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
+    let etag = format!("\"{}\"", hex_fmt::HexFmt(&hash.to_be_bytes()));
+
+    // Check If-None-Match for conditional request
+    if let Some(client_etag) = if_none_match {
+        // Handle weak ETags (W/"...") and strong ETags ("...")
+        let client_etag_clean = client_etag.trim_start_matches("W/");
+        if client_etag_clean == etag {
+            // Content unchanged - return 304 Not Modified
+            let mut not_modified = Response::new(Body::empty());
+            *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+            not_modified
+                .headers_mut()
+                .insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+            not_modified.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_str(&cache_value).unwrap(),
+            );
+            return not_modified;
+        }
+    }
+
+    // Build response with cache headers
+    let mut response = Response::from_parts(parts, Body::from(bytes));
+    response.headers_mut().insert(
         header::CACHE_CONTROL,
-        cache_value.parse().expect("valid header value"),
+        HeaderValue::from_str(&cache_value).unwrap(),
     );
-    Response::from_parts(parts, body)
+    response
+        .headers_mut()
+        .insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
+
+    response
 }

@@ -5,6 +5,7 @@ use axum::Json;
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::get_or_compute;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -32,13 +33,16 @@ pub struct KindSummary {
 /// `GET /api/v1/kinds`
 ///
 /// Returns a list of event kinds with counts.
+/// Cached for 5 minutes.
 pub async fn list_kinds(
     State(state): State<AppState>,
     Query(params): Query<KindsQuery>,
 ) -> Result<Json<Vec<KindSummary>>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
+    let sort = params.sort.clone();
 
-    let order_by = match params.sort.as_deref() {
+    // Validate sort before caching
+    let order_by = match sort.as_deref() {
         Some("kind") => "kind ASC",
         Some("count") | None => "event_count DESC",
         Some(other) => {
@@ -49,29 +53,40 @@ pub async fn list_kinds(
         }
     };
 
-    let rows: Vec<KindSummary> = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                kind,
-                count() AS event_count,
-                uniq(pubkey) AS unique_pubkeys,
-                toUInt32(min(created_at)) AS first_seen,
-                toUInt32(max(created_at)) AS last_seen
-            FROM events_local
-            GROUP BY kind
-            ORDER BY {}
-            LIMIT {}",
-            order_by, limit
-        ))
-        .fetch_all()
-        .await?;
+    let cache_key = format!(
+        "kinds:limit={}&sort={}",
+        limit,
+        sort.as_deref().unwrap_or("count")
+    );
 
-    Ok(Json(rows))
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let rows: Vec<KindSummary> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    kind,
+                    count() AS event_count,
+                    uniq(pubkey) AS unique_pubkeys,
+                    toUInt32(min(created_at)) AS first_seen,
+                    toUInt32(max(created_at)) AS last_seen
+                FROM events_local
+                GROUP BY kind
+                ORDER BY {}
+                LIMIT {}",
+                order_by, limit
+            ))
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// Detailed stats for a single kind.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KindDetail {
     pub kind: u16,
     pub event_count: u64,
@@ -109,56 +124,64 @@ struct KindRecentStats {
 /// `GET /api/v1/kinds/{kind}`
 ///
 /// Returns detailed statistics for a specific event kind.
+/// Cached for 5 minutes.
 pub async fn get_kind(
     State(state): State<AppState>,
     Path(kind): Path<u16>,
 ) -> Result<Json<KindDetail>, ApiError> {
-    // Get basic stats
-    let basic: KindBasicStats = state
-        .clickhouse
-        .query(
-            "SELECT
-                kind,
-                count() AS event_count,
-                uniq(pubkey) AS unique_pubkeys,
-                toUInt32(min(created_at)) AS first_seen,
-                toUInt32(max(created_at)) AS last_seen,
-                avg(length(content)) AS avg_content_length
-            FROM events_local
-            WHERE kind = ?
-            GROUP BY kind",
-        )
-        .bind(kind)
-        .fetch_optional()
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("kind {} not found", kind)))?;
+    let cache_key = format!("kind_detail:{}", kind);
 
-    // Get recent activity
-    let recent: KindRecentStats = state
-        .clickhouse
-        .query(
-            "SELECT
-                countIf(created_at >= now() - INTERVAL 1 DAY) AS events_24h,
-                countIf(created_at >= now() - INTERVAL 7 DAY) AS events_7d,
-                countIf(created_at >= now() - INTERVAL 30 DAY) AS events_30d
-            FROM events_local
-            WHERE kind = ?",
-        )
-        .bind(kind)
-        .fetch_one()
-        .await?;
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Get basic stats
+        let basic: KindBasicStats = state
+            .clickhouse
+            .query(
+                "SELECT
+                    kind,
+                    count() AS event_count,
+                    uniq(pubkey) AS unique_pubkeys,
+                    toUInt32(min(created_at)) AS first_seen,
+                    toUInt32(max(created_at)) AS last_seen,
+                    avg(length(content)) AS avg_content_length
+                FROM events_local
+                WHERE kind = ?
+                GROUP BY kind",
+            )
+            .bind(kind)
+            .fetch_optional()
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("kind {} not found", kind)))?;
 
-    Ok(Json(KindDetail {
-        kind: basic.kind,
-        event_count: basic.event_count,
-        unique_pubkeys: basic.unique_pubkeys,
-        first_seen: basic.first_seen,
-        last_seen: basic.last_seen,
-        avg_content_length: basic.avg_content_length,
-        events_24h: recent.events_24h,
-        events_7d: recent.events_7d,
-        events_30d: recent.events_30d,
-    }))
+        // Get recent activity
+        let recent: KindRecentStats = state
+            .clickhouse
+            .query(
+                "SELECT
+                    countIf(created_at >= now() - INTERVAL 1 DAY) AS events_24h,
+                    countIf(created_at >= now() - INTERVAL 7 DAY) AS events_7d,
+                    countIf(created_at >= now() - INTERVAL 30 DAY) AS events_30d
+                FROM events_local
+                WHERE kind = ?",
+            )
+            .bind(kind)
+            .fetch_one()
+            .await?;
+
+        Ok(KindDetail {
+            kind: basic.kind,
+            event_count: basic.event_count,
+            unique_pubkeys: basic.unique_pubkeys,
+            first_seen: basic.first_seen,
+            last_seen: basic.last_seen,
+            avg_content_length: basic.avg_content_length,
+            events_24h: recent.events_24h,
+            events_7d: recent.events_7d,
+            events_30d: recent.events_30d,
+        })
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// Query parameters for kind time series.
@@ -182,14 +205,17 @@ pub struct KindTimeSeriesRow {
 /// `GET /api/v1/kinds/{kind}/activity`
 ///
 /// Returns activity time series for a specific kind.
+/// Cached for 5 minutes.
 pub async fn kind_activity(
     State(state): State<AppState>,
     Path(kind): Path<u16>,
     Query(params): Query<KindTimeSeriesQuery>,
 ) -> Result<Json<Vec<KindTimeSeriesRow>>, ApiError> {
     let limit = params.limit.unwrap_or(30).min(365);
+    let group_by = params.group_by.clone();
 
-    let (group_expr, max_limit) = match params.group_by.as_deref() {
+    // Validate group_by before caching
+    let (group_expr, max_limit) = match group_by.as_deref() {
         Some("week") => ("toString(toMonday(created_at))", 52u32),
         Some("month") => ("toString(toStartOfMonth(created_at))", 120u32),
         Some("day") | None => ("toString(toDate(created_at))", 365u32),
@@ -203,24 +229,36 @@ pub async fn kind_activity(
 
     let limit = limit.min(max_limit);
 
-    let rows: Vec<KindTimeSeriesRow> = state
-        .clickhouse
-        .query(&format!(
-            "SELECT
-                {} AS period,
-                count() AS event_count,
-                uniq(pubkey) AS unique_pubkeys
-            FROM events_local
-            WHERE kind = ?
-            GROUP BY period
-            ORDER BY period DESC
-            LIMIT {}",
-            group_expr, limit
-        ))
-        .bind(kind)
-        .fetch_all()
-        .await?;
+    let cache_key = format!(
+        "kind_activity:kind={}&group_by={}&limit={}",
+        kind,
+        group_by.as_deref().unwrap_or("day"),
+        limit
+    );
 
-    Ok(Json(rows))
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let rows: Vec<KindTimeSeriesRow> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    {} AS period,
+                    count() AS event_count,
+                    uniq(pubkey) AS unique_pubkeys
+                FROM events_local
+                WHERE kind = ?
+                GROUP BY period
+                ORDER BY period DESC
+                LIMIT {}",
+                group_expr, limit
+            ))
+            .bind(kind)
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 

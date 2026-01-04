@@ -458,8 +458,10 @@ fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
     let files = collect_files(input, args.limit)?;
     tracing::info!("Found {} JSONL files to process", files.len());
 
-    // Track duplicates
+    // Track duplicates and valid events for periodic metrics
     let duplicate_count = Arc::new(AtomicUsize::new(0));
+    let valid_event_count = Arc::new(AtomicUsize::new(0));
+    let metrics_interval = args.progress_interval;
 
     for (file_idx, file_path) in files.iter().enumerate() {
         let file_path_str = file_path.to_string_lossy().to_string();
@@ -497,22 +499,59 @@ fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
         };
         let mut source = JsonlSource::new(source_config);
 
-        // Create handler closure
+        // Create handler closure with periodic metrics updates
         let segment_writer_ref = segment_writer.clone();
         let dedupe_ref = dedupe.clone();
         let duplicate_count_ref = duplicate_count.clone();
+        let valid_event_count_ref = valid_event_count.clone();
+        let process_start_ref = process_start;
         let handler =
             move |packed_event: pensieve_ingest::PackedEvent| -> pensieve_ingest::Result<bool> {
+                // Track this valid event (validation already passed in source)
+                let event_num = valid_event_count_ref.fetch_add(1, Ordering::Relaxed) + 1;
+
                 // Dedupe check
                 if let Some(ref dedupe) = dedupe_ref
                     && !dedupe.check_and_mark_pending(&packed_event.event_id)?
                 {
                     duplicate_count_ref.fetch_add(1, Ordering::Relaxed);
+
+                    // Still update metrics periodically even for duplicates
+                    if event_num.is_multiple_of(metrics_interval) {
+                        let duplicates = duplicate_count_ref.load(Ordering::Relaxed);
+                        let written = event_num.saturating_sub(duplicates);
+                        let elapsed = process_start_ref.elapsed().as_secs_f64();
+
+                        counter!("backfill_events_valid_total").absolute(event_num as u64);
+                        counter!("backfill_events_duplicate_total").absolute(duplicates as u64);
+                        counter!("backfill_events_written_total").absolute(written as u64);
+
+                        if elapsed > 0.0 {
+                            gauge!("backfill_events_per_second").set(event_num as f64 / elapsed);
+                        }
+                    }
+
                     return Ok(true); // Duplicate, continue
                 }
 
                 // Write to segment
                 segment_writer_ref.write(packed_event)?;
+
+                // Update metrics periodically (every metrics_interval events)
+                if event_num.is_multiple_of(metrics_interval) {
+                    let duplicates = duplicate_count_ref.load(Ordering::Relaxed);
+                    let written = event_num.saturating_sub(duplicates);
+                    let elapsed = process_start_ref.elapsed().as_secs_f64();
+
+                    counter!("backfill_events_valid_total").absolute(event_num as u64);
+                    counter!("backfill_events_duplicate_total").absolute(duplicates as u64);
+                    counter!("backfill_events_written_total").absolute(written as u64);
+
+                    if elapsed > 0.0 {
+                        gauge!("backfill_events_per_second").set(event_num as f64 / elapsed);
+                    }
+                }
+
                 Ok(true) // Continue
             };
 

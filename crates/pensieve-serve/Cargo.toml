@@ -57,3 +57,8 @@ dotenvy = "0.15"
 
 # Caching
 moka = { version = "0.12", features = ["future"] }
+
+# HTTP body utilities (for ETag computation)
+http-body-util = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+hex_fmt = "0.3"

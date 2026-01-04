@@ -778,8 +778,8 @@ struct CohortActivityRow {
 /// `GET /api/v1/stats/users/retention`
 ///
 /// Returns cohort retention analysis.
-/// Requires the pubkey_first_seen materialized view (migration 002).
-/// Cached for 10 minutes (expensive query).
+/// Requires the cohort_retention_weekly/monthly tables (migration 012).
+/// Cached for 5 minutes.
 pub async fn user_retention(
     State(state): State<AppState>,
     Query(params): Query<RetentionQuery>,
@@ -790,9 +790,9 @@ pub async fn user_retention(
 
     // Validate before caching
     let cohort_size = cohort_size_param.as_deref().unwrap_or("week");
-    let (period_func, interval_unit) = match cohort_size {
-        "month" => ("toStartOfMonth", "MONTH"),
-        "week" => ("toMonday", "WEEK"),
+    let (view_name, interval_unit) = match cohort_size {
+        "month" => ("cohort_retention_monthly_view", "MONTH"),
+        "week" => ("cohort_retention_weekly_view", "WEEK"),
         other => {
             return Err(ApiError::BadRequest(format!(
                 "invalid cohort_size value: '{}'. Valid options: week, month",
@@ -809,35 +809,28 @@ pub async fn user_retention(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
-        let cohort_start_clause = match cohort_start {
-            Some(date) => format!("AND first_seen >= '{}'", date),
-            None => format!("AND first_seen >= now() - INTERVAL {} {}", limit, interval_unit),
+        // Build cohort filter clause
+        let cohort_filter = match cohort_start {
+            Some(date) => format!("WHERE cohort >= '{}'", date),
+            None => format!(
+                "WHERE cohort >= toString(today() - INTERVAL {} {})",
+                limit, interval_unit
+            ),
         };
 
-        // Query: for each cohort (users grouped by first_seen period),
-        // count how many were active in each subsequent period
+        // Query pre-aggregated summary tables (migration 012)
+        // These tables are much faster than joining events_local with pubkey_first_seen
         let rows: Vec<CohortActivityRow> = state
             .clickhouse
             .query(&format!(
-                "WITH cohort_users AS (
-                    SELECT
-                        pubkey,
-                        {}(first_seen) AS cohort
-                    FROM pubkey_first_seen
-                    WHERE 1=1
-                    {}
-                )
-                SELECT
-                    toString(cu.cohort) AS cohort,
-                    toString({}(e.created_at)) AS activity_period,
-                    uniq(e.pubkey) AS active_count
-                FROM events_local e
-                INNER JOIN cohort_users cu ON e.pubkey = cu.pubkey
-                WHERE e.kind NOT IN (445, 1059)
-                    AND e.created_at >= cu.cohort
-                GROUP BY cu.cohort, activity_period
-                ORDER BY cu.cohort, activity_period",
-                period_func, cohort_start_clause, period_func
+                "SELECT
+                    cohort,
+                    activity_period,
+                    active_count
+                FROM {}
+                {}
+                ORDER BY cohort, activity_period",
+                view_name, cohort_filter
             ))
             .fetch_all()
             .await?;
@@ -857,7 +850,14 @@ pub async fn user_retention(
             .take(limit as usize)
             .map(|(cohort, mut periods)| {
                 periods.sort_by(|a, b| a.0.cmp(&b.0));
-                let cohort_size = periods.first().map(|(_, c)| *c).unwrap_or(0);
+                // cohort_size is the count from the period matching the cohort (period 0).
+                // We must find activity_period == cohort explicitly, not just take the first
+                // sorted entry, because users may have no activity in their cohort period.
+                let cohort_size = periods
+                    .iter()
+                    .find(|(period, _)| period == &cohort)
+                    .map(|(_, c)| *c)
+                    .unwrap_or(0);
                 let retention: Vec<u64> = periods.iter().map(|(_, c)| *c).collect();
                 let retention_pct: Vec<f64> = retention
                     .iter()

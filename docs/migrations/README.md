@@ -35,6 +35,7 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 009_fix_zap_amounts.sql | Fix zap amount parsing | **Yes** |
 | 010_fix_pubkey_first_seen_dates.sql | Filter invalid dates from new users view | No |
 | 011_new_users_summary.sql | Pre-aggregate new users for fast queries | **Yes** (1-5 min) |
+| 012_cohort_retention_summary.sql | Pre-aggregate cohort retention (auto-refreshes daily) | **Yes** (5-15 min) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -257,6 +258,66 @@ for the "new users" time series.
 
 ```bash
 just ch-migrate docs/migrations/011_new_users_summary.sql
+```
+
+---
+
+### 012_cohort_retention_summary.sql
+
+**Purpose:** Creates pre-aggregated summary tables for cohort retention analysis, enabling fast
+queries for the `/stats/users/retention` endpoint. Uses **Refreshable Materialized Views**
+(ClickHouse 23.12+) for automatic daily updates.
+
+**The Problem:** The retention endpoint performs an extremely expensive query that:
+1. Scans `pubkey_first_seen` (6M+ rows with aggregation finalization)
+2. JOINs against `events_local` (800M+ rows)
+3. Groups by cohort period and activity period
+
+This query can take 60+ seconds or timeout entirely.
+
+**The Solution:** Use Refreshable MVs to pre-aggregate cohort retention data. The MVs:
+- Perform a full table replacement on each refresh (handles shifting cohort assignments)
+- Run automatically on schedule (no external cron needed)
+- Use `daily_user_stats` and `pubkey_first_seen` as source data
+
+**New objects:**
+- `cohort_retention_weekly` - Target table for weekly cohort retention
+- `cohort_retention_weekly_mv` - Refreshable MV (daily at 03:00 UTC)
+- `cohort_retention_monthly` - Target table for monthly cohort retention
+- `cohort_retention_monthly_mv` - Refreshable MV (daily at 03:15 UTC)
+- `cohort_retention_weekly_view` - Query view for API compatibility
+- `cohort_retention_monthly_view` - Query view for API compatibility
+
+**Dependencies:** Requires migrations 002 (pubkey_first_seen) and 005 (daily_user_stats).
+
+**Initial refresh:** The migration triggers initial data population (5-15 minutes).
+
+**To run:**
+
+```bash
+just ch-migrate docs/migrations/012_cohort_retention_summary.sql
+```
+
+**Automatic refresh:** Data refreshes daily at 03:00/03:15 UTC. No manual intervention needed.
+
+**To manually trigger a refresh:**
+
+```bash
+just ch-query "SYSTEM REFRESH VIEW cohort_retention_weekly_mv"
+just ch-query "SYSTEM REFRESH VIEW cohort_retention_monthly_mv"
+```
+
+**To check refresh status:**
+
+```bash
+just ch-query "SELECT view, status, last_refresh_time, next_refresh_time FROM system.view_refreshes WHERE database = 'nostr'"
+```
+
+**To modify refresh schedule:**
+
+```bash
+# Change to weekly refresh
+just ch-query "ALTER TABLE cohort_retention_weekly_mv MODIFY REFRESH EVERY 1 WEEK"
 ```
 
 ---

@@ -82,10 +82,10 @@
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" } },
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 4 },
-      "id": 6,
+      "id": 8,
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "expr": "backfill_files_total", "legendFormat": "Files", "refId": "A" }],
-      "title": "Files Processed",
+      "targets": [{ "expr": "backfill_events_written_total", "legendFormat": "Written", "refId": "A" }],
+      "title": "Events Written",
       "type": "stat"
     },
     {
@@ -114,8 +114,9 @@
       "options": { "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(backfill_events_valid_total[1m]) * 60", "legendFormat": "Valid", "refId": "A" },
-        { "expr": "rate(backfill_events_duplicate_total[1m]) * 60", "legendFormat": "Duplicate", "refId": "B" },
-        { "expr": "rate(backfill_events_invalid_total[1m]) * 60", "legendFormat": "Invalid", "refId": "C" }
+        { "expr": "rate(backfill_events_written_total[1m]) * 60", "legendFormat": "Written", "refId": "B" },
+        { "expr": "rate(backfill_events_duplicate_total[1m]) * 60", "legendFormat": "Duplicate", "refId": "C" },
+        { "expr": "rate(backfill_events_invalid_total[1m]) * 60", "legendFormat": "Invalid", "refId": "D" }
       ],
       "title": "Events per Minute (by status)",
       "type": "timeseries"
