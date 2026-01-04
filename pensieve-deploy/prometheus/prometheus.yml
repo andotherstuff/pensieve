@@ -1,9 +1,10 @@
-# Prometheus configuration for Pensieve
+# Prometheus configuration for Pensieve Production
 #
 # Scrapes metrics from:
-# - ClickHouse (built-in metrics)
-# - Pensieve ingester/backfill (custom metrics)
 # - Prometheus itself
+# - ClickHouse (built-in metrics)
+# - Pensieve ingester (native binary on host, port 9091)
+# - Pensieve backfill (native binary on host, port 9092)
 
 global:
   scrape_interval: 15s
@@ -24,25 +25,20 @@ scrape_configs:
     static_configs:
       - targets: ['clickhouse:8123']
     metrics_path: '/metrics'
-    # ClickHouse exposes Prometheus metrics at /metrics by default
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # Pensieve Ingester (when running in Docker)
+  # Pensieve Ingester (native binary on host via systemd)
+  # Metrics exposed on port 9091
   # ═══════════════════════════════════════════════════════════════════════════
-  - job_name: 'pensieve-ingester'
+  - job_name: 'ingest'
     static_configs:
-      - targets: ['ingester:9091']
-    # Will show as "down" until ingester is running
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Pensieve Backfill (when running locally on host)
-  # ═══════════════════════════════════════════════════════════════════════════
-  - job_name: 'pensieve-backfill'
-    static_configs:
-      # host.docker.internal works on Docker Desktop (Mac/Windows)
-      # For Linux, use the host's actual IP or --add-host flag
+      # host.docker.internal reaches the host from inside Docker (Linux needs extra_hosts)
       - targets: ['host.docker.internal:9091']
-        labels:
-          instance: 'backfill-local'
-    # Will show as "down" when no backfill is running
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Pensieve Backfill (native binary on host, when running)
+  # Metrics exposed on port 9092
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'backfill'
+    static_configs:
+      - targets: ['host.docker.internal:9092']
