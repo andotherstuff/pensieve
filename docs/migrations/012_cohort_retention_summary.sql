@@ -49,6 +49,9 @@ DROP VIEW IF EXISTS cohort_retention_monthly_view;
 DROP TABLE IF EXISTS cohort_retention_weekly;
 DROP TABLE IF EXISTS cohort_retention_monthly;
 
+-- Enable experimental refreshable materialized views (required for ClickHouse < 25.x)
+SET allow_experimental_refreshable_materialized_view = 1;
+
 -- =============================================================================
 -- STEP 2: CREATE WEEKLY TARGET TABLE AND REFRESHABLE MV
 -- =============================================================================
