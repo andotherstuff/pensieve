@@ -87,7 +87,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "relay_connections_current",
+          "expr": "relay_connections_current{job=\"ingest\"}",
           "legendFormat": "Connected",
           "refId": "A"
         }
@@ -128,7 +128,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_sync_in_progress",
+          "expr": "negentropy_sync_in_progress{job=\"ingest\"}",
           "legendFormat": "Status",
           "refId": "A"
         }
@@ -166,7 +166,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "ingest_events_received_rate",
+          "expr": "ingest_events_received_rate{job=\"ingest\"}",
           "legendFormat": "Rate",
           "refId": "A"
         }
@@ -204,7 +204,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "relay_events_written_total",
+          "expr": "relay_events_written_total{job=\"ingest\"}",
           "legendFormat": "Written",
           "refId": "A"
         }
@@ -242,7 +242,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_events_written_total",
+          "expr": "negentropy_events_written_total{job=\"ingest\"}",
           "legendFormat": "Written",
           "refId": "A"
         }
@@ -284,7 +284,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "ingest_dedupe_ratio",
+          "expr": "ingest_dedupe_ratio{job=\"ingest\"}",
           "legendFormat": "Ratio",
           "refId": "A"
         }
@@ -383,17 +383,17 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "rate(ingest_events_received_total[1m])",
+          "expr": "rate(ingest_events_received_total{job=\"ingest\"}[1m])",
           "legendFormat": "Total Received",
           "refId": "A"
         },
         {
-          "expr": "rate(ingest_events_processed_total[1m])",
+          "expr": "rate(ingest_events_processed_total{job=\"ingest\"}[1m])",
           "legendFormat": "Novel (Written)",
           "refId": "B"
         },
         {
-          "expr": "rate(ingest_events_deduplicated_total[1m])",
+          "expr": "rate(ingest_events_deduplicated_total{job=\"ingest\"}[1m])",
           "legendFormat": "Duplicates",
           "refId": "C"
         }
@@ -460,22 +460,22 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "rate(relay_events_written_total[1m])",
+          "expr": "rate(relay_events_written_total{job=\"ingest\"}[1m])",
           "legendFormat": "Relay Written",
           "refId": "A"
         },
         {
-          "expr": "rate(relay_events_deduplicated_total[1m])",
+          "expr": "rate(relay_events_deduplicated_total{job=\"ingest\"}[1m])",
           "legendFormat": "Relay Deduped",
           "refId": "B"
         },
         {
-          "expr": "rate(negentropy_events_written_total[1m])",
+          "expr": "rate(negentropy_events_written_total{job=\"ingest\"}[1m])",
           "legendFormat": "Negentropy Written",
           "refId": "C"
         },
         {
-          "expr": "rate(negentropy_events_deduplicated_total[1m])",
+          "expr": "rate(negentropy_events_deduplicated_total{job=\"ingest\"}[1m])",
           "legendFormat": "Negentropy Deduped",
           "refId": "D"
         }
@@ -545,17 +545,17 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "relay_connections_current",
+          "expr": "relay_connections_current{job=\"ingest\"}",
           "legendFormat": "Connected",
           "refId": "A"
         },
         {
-          "expr": "relay_manager_total_relays",
+          "expr": "relay_manager_total_relays{job=\"ingest\"}",
           "legendFormat": "Known (DB)",
           "refId": "B"
         },
         {
-          "expr": "relay_manager_blocked_relays",
+          "expr": "relay_manager_blocked_relays{job=\"ingest\"}",
           "legendFormat": "Blocked",
           "refId": "C"
         }
@@ -618,17 +618,17 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "increase(relay_connects_total[5m])",
+          "expr": "increase(relay_connects_total{job=\"ingest\"}[5m])",
           "legendFormat": "Connect ({{reason}})",
           "refId": "A"
         },
         {
-          "expr": "increase(relay_disconnects_total[5m])",
+          "expr": "increase(relay_disconnects_total{job=\"ingest\"}[5m])",
           "legendFormat": "Disconnect ({{reason}})",
           "refId": "B"
         },
         {
-          "expr": "increase(relay_connect_failures_total[5m])",
+          "expr": "increase(relay_connect_failures_total{job=\"ingest\"}[5m])",
           "legendFormat": "Failures",
           "refId": "C"
         }
@@ -802,7 +802,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "time() - negentropy_last_sync_unix",
+          "expr": "time() - negentropy_last_sync_unix{job=\"ingest\"}",
           "legendFormat": "Ago",
           "refId": "A"
         }
@@ -839,7 +839,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_syncs_total",
+          "expr": "negentropy_syncs_total{job=\"ingest\"}",
           "legendFormat": "Syncs",
           "refId": "A"
         }
@@ -877,7 +877,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_events_receiving",
+          "expr": "negentropy_events_receiving{job=\"ingest\"}",
           "legendFormat": "Receiving",
           "refId": "A"
         }
@@ -915,7 +915,7 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_sync_state_items",
+          "expr": "negentropy_sync_state_items{job=\"ingest\"}",
           "legendFormat": "Items",
           "refId": "A"
         }
@@ -974,12 +974,12 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "rate(negentropy_events_written_total[1m])",
+          "expr": "rate(negentropy_events_written_total{job=\"ingest\"}[1m])",
           "legendFormat": "Written",
           "refId": "A"
         },
         {
-          "expr": "rate(negentropy_events_deduplicated_total[1m])",
+          "expr": "rate(negentropy_events_deduplicated_total{job=\"ingest\"}[1m])",
           "legendFormat": "Deduped",
           "refId": "B"
         }
@@ -1038,12 +1038,12 @@
       "pluginVersion": "11.0.0",
       "targets": [
         {
-          "expr": "negentropy_events_written_total",
+          "expr": "negentropy_events_written_total{job=\"ingest\"}",
           "legendFormat": "Written",
           "refId": "A"
         },
         {
-          "expr": "negentropy_sync_state_items",
+          "expr": "negentropy_sync_state_items{job=\"ingest\"}",
           "legendFormat": "Sync State",
           "refId": "B"
         }
