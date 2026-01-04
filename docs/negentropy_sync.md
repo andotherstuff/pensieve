@@ -294,11 +294,15 @@ Not all relays support NIP-77. We need a curated list of relays that:
 
 ### Suggested Initial List
 
+These relays are known to support NIP-77 and have comprehensive archives:
+
 ```txt
 # Known NIP-77 relays with good archives
 wss://relay.damus.io
 wss://relay.primal.net
 ```
+
+A default list is provided at `data/relays/negentropy.txt`.
 
 ### Configuration
 
@@ -539,7 +543,7 @@ impl SyncStateDb {
 - With LZ4 compression: ~25-30 bytes per event effective
 - ~1M events/day → ~25-30MB/day
 - 7-day window → ~175-210MB total
-- Periodic pruning keeps it bounded
+- **Automatic pruning after each sync cycle** removes entries older than the lookback window
 
 **Integration with shared handler:**
 
@@ -695,13 +699,13 @@ histogram!("negentropy_sync_duration_seconds")
 
 ## Next Steps
 
-1. [ ] Make dedupe check+mark atomic across live + sync (critical section or single-consumer)
-2. [ ] Create basic `NegentropySyncer` struct
-3. [ ] Implement `NostrDatabase` adapter for sync state
-4. [ ] Add ClickHouse seeding step for last lookback window into sync-state DB
-5. [ ] Add CLI arguments for negentropy config
+1. [x] Make dedupe check+mark atomic across live + sync (critical section or single-consumer)
+2. [x] Create basic `NegentropySyncer` struct
+3. [x] Implement `NostrDatabase` adapter for sync state
+4. [x] Add ClickHouse seeding step for last lookback window into sync-state DB
+5. [x] Add CLI arguments for negentropy config
 6. [ ] Test with single trusted relay
-7. [ ] Add metrics and logging
-8. [ ] Expand to full trusted relay list
-9. [ ] Document relay NIP-77 support status
+7. [x] Add metrics and logging
+8. [x] Expand to full trusted relay list (see `data/relays/negentropy.txt`)
+9. [x] Document relay NIP-77 support status (Damus + Primal confirmed)
 

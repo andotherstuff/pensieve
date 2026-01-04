@@ -1,8 +1,8 @@
 //! API error types and response formatting.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 /// API error type that converts to appropriate HTTP responses.
@@ -86,4 +86,3 @@ impl IntoResponse for ApiError {
         (status, Json(body)).into_response()
     }
 }
-

@@ -271,9 +271,10 @@ impl RelaySource {
         }
 
         // Update the connected count gauge
-        self.stats
-            .relays_connected
-            .store(connected_count as usize, std::sync::atomic::Ordering::Relaxed);
+        self.stats.relays_connected.store(
+            connected_count as usize,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         if updates > 0 {
             tracing::debug!(
@@ -765,7 +766,8 @@ impl RelaySource {
                     // Register with relay manager if available
                     // The optimization loop will decide when to connect
                     if let Some(ref manager) = self.relay_manager {
-                        match manager.register_relay(&normalized, crate::relay::RelayTier::Discovered)
+                        match manager
+                            .register_relay(&normalized, crate::relay::RelayTier::Discovered)
                         {
                             Ok(_) => {
                                 self.stats.relays_discovered.fetch_add(1, Ordering::Relaxed);

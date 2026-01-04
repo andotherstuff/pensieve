@@ -3,8 +3,8 @@
 //! Provides endpoints for querying relay discovery, connection status,
 //! and event throughput metrics from the ingester's SQLite database.
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -123,17 +123,16 @@ pub struct ThroughputQuery {
 ///
 /// Returns aggregate relay statistics.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<RelaySummary>, ApiError> {
-    let relay_db = state.relay_db.as_ref().ok_or_else(|| {
-        internal_error("Relay database not configured")
-    })?;
+    let relay_db = state
+        .relay_db
+        .as_ref()
+        .ok_or_else(|| internal_error("Relay database not configured"))?;
 
     let conn = relay_db.lock();
 
     // Get status counts
     let mut stmt = conn
-        .prepare(
-            "SELECT status, COUNT(*) as cnt FROM relays GROUP BY status",
-        )
+        .prepare("SELECT status, COUNT(*) as cnt FROM relays GROUP BY status")
         .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
 
     let mut total_discovered: u64 = 0;
@@ -207,9 +206,10 @@ pub async fn list(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<RelayListQuery>,
 ) -> Result<Json<RelayListResponse>, ApiError> {
-    let relay_db = state.relay_db.as_ref().ok_or_else(|| {
-        internal_error("Relay database not configured")
-    })?;
+    let relay_db = state
+        .relay_db
+        .as_ref()
+        .ok_or_else(|| internal_error("Relay database not configured"))?;
 
     let conn = relay_db.lock();
 
@@ -320,10 +320,7 @@ pub async fn list(
     }
 
     // Get total count
-    let count_query = format!(
-        "SELECT COUNT(*) FROM relays r {}",
-        where_sql
-    );
+    let count_query = format!("SELECT COUNT(*) FROM relays r {}", where_sql);
     let total: u64 = conn
         .query_row(&count_query, params_iter.as_slice(), |row| row.get(0))
         .unwrap_or(0);
@@ -338,9 +335,10 @@ pub async fn throughput(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<ThroughputQuery>,
 ) -> Result<Json<Vec<RelayHourlyThroughput>>, ApiError> {
-    let relay_db = state.relay_db.as_ref().ok_or_else(|| {
-        internal_error("Relay database not configured")
-    })?;
+    let relay_db = state
+        .relay_db
+        .as_ref()
+        .ok_or_else(|| internal_error("Relay database not configured"))?;
 
     let conn = relay_db.lock();
     let hours = params.hours.unwrap_or(24).min(168); // Max 1 week
@@ -381,4 +379,3 @@ pub async fn throughput(
 
     Ok(Json(results))
 }
-

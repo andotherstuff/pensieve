@@ -1,7 +1,7 @@
 //! Stats endpoints for aggregate analytics.
 
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use chrono::NaiveDate;
 use clickhouse::Row;
 use pensieve_core::NOSTR_GENESIS_DATE_SQL;
@@ -318,7 +318,8 @@ pub async fn events(
                     where_clause, limit
                 );
 
-                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                let rows: Vec<EventCountByPeriod> =
+                    state.clickhouse.query(&query).fetch_all().await?;
                 Ok(serde_json::to_value(rows)?)
             }
             Some("week") => {
@@ -335,7 +336,8 @@ pub async fn events(
                     where_clause, limit
                 );
 
-                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                let rows: Vec<EventCountByPeriod> =
+                    state.clickhouse.query(&query).fetch_all().await?;
                 Ok(serde_json::to_value(rows)?)
             }
             Some("month") => {
@@ -352,7 +354,8 @@ pub async fn events(
                     where_clause, limit
                 );
 
-                let rows: Vec<EventCountByPeriod> = state.clickhouse.query(&query).fetch_all().await?;
+                let rows: Vec<EventCountByPeriod> =
+                    state.clickhouse.query(&query).fetch_all().await?;
                 Ok(serde_json::to_value(rows)?)
             }
             _ => {
@@ -1572,4 +1575,3 @@ pub async fn publishers(
 
     Ok(Json(result))
 }
-

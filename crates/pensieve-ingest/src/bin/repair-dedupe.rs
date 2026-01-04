@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, DB};
+use rocksdb::{DB, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -47,9 +47,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = Args::parse();
 
@@ -99,8 +97,8 @@ fn check_database(path: &PathBuf, show_stats: bool) -> Result<()> {
     block_opts.set_bloom_filter(10.0, false);
     opts.set_block_based_table_factory(&block_opts);
 
-    let db = DBWithThreadMode::<MultiThreaded>::open(&opts, path)
-        .context("Failed to open database")?;
+    let db =
+        DBWithThreadMode::<MultiThreaded>::open(&opts, path).context("Failed to open database")?;
 
     println!("✓ Database opened successfully");
 
@@ -115,7 +113,11 @@ fn check_database(path: &PathBuf, show_stats: bool) -> Result<()> {
         let sst_size = db
             .property_int_value("rocksdb.total-sst-files-size")?
             .unwrap_or(0);
-        println!("  Total SST size: {} bytes ({:.2} GB)", sst_size, sst_size as f64 / 1_073_741_824.0);
+        println!(
+            "  Total SST size: {} bytes ({:.2} GB)",
+            sst_size,
+            sst_size as f64 / 1_073_741_824.0
+        );
 
         // Count actual keys by iterating (sample)
         let mut count = 0u64;
@@ -154,7 +156,11 @@ fn check_database(path: &PathBuf, show_stats: bool) -> Result<()> {
 }
 
 fn copy_database(src: &PathBuf, dest: &PathBuf) -> Result<()> {
-    println!("Copying valid data from {} to {}", src.display(), dest.display());
+    println!(
+        "Copying valid data from {} to {}",
+        src.display(),
+        dest.display()
+    );
 
     // Check destination doesn't exist
     if dest.exists() {
@@ -231,4 +237,3 @@ fn copy_database(src: &PathBuf, dest: &PathBuf) -> Result<()> {
 
     Ok(())
 }
-

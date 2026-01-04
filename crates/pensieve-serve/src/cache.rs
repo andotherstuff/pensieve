@@ -23,7 +23,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use moka::future::Cache;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::ApiError;
 
@@ -177,5 +177,3 @@ mod tests {
         assert_eq!(result2, 2);
     }
 }
-
-

@@ -1,7 +1,7 @@
 //! Event kinds endpoints.
 
-use axum::extract::{Path, Query, State};
 use axum::Json;
+use axum::extract::{Path, Query, State};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
@@ -261,4 +261,3 @@ pub async fn kind_activity(
 
     Ok(Json(result))
 }
-

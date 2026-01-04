@@ -204,10 +204,7 @@ fn extract_host(url: &str) -> &str {
         .unwrap_or(url);
 
     // Take up to path or end
-    without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
+    without_scheme.split('/').next().unwrap_or(without_scheme)
 }
 
 /// Check if a URL is a Tor .onion address.
@@ -274,7 +271,10 @@ mod tests {
     fn test_normalize_preserves_path() {
         // Paths should be preserved (minus trailing slash)
         let result = normalize_relay_url("wss://relay.example.com/nostr");
-        assert_eq!(result.ok(), Some("wss://relay.example.com/nostr".to_string()));
+        assert_eq!(
+            result.ok(),
+            Some("wss://relay.example.com/nostr".to_string())
+        );
     }
 
     #[test]
@@ -400,4 +400,3 @@ mod tests {
         assert!(is_obviously_invalid("ws://relay.onion"));
     }
 }
-

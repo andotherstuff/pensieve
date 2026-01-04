@@ -41,4 +41,3 @@ pub async fn require_auth(
 
     Ok(next.run(request).await)
 }
-

@@ -5,13 +5,13 @@ mod kinds;
 mod relays;
 mod stats;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
 use http_body_util::BodyExt;
 
 use crate::auth::require_auth;
@@ -98,7 +98,10 @@ pub fn router(state: AppState) -> Router {
         // Active users
         .route("/stats/users/active", get(stats::active_users_summary))
         .route("/stats/users/active/daily", get(stats::active_users_daily))
-        .route("/stats/users/active/weekly", get(stats::active_users_weekly))
+        .route(
+            "/stats/users/active/weekly",
+            get(stats::active_users_weekly),
+        )
         .route(
             "/stats/users/active/monthly",
             get(stats::active_users_monthly),
@@ -174,9 +177,8 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
         _ => (60, 300),
     };
 
-    let cache_value = format!(
-        "public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}"
-    );
+    let cache_value =
+        format!("public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}");
 
     // Collect body bytes to compute ETag
     let (parts, body) = response.into_parts();
@@ -185,10 +187,15 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
         Err(e) => {
             // Body stream is consumed and cannot be recovered. Return 500 to signal
             // the error rather than silently returning empty content with 200 OK.
-            tracing::error!("Failed to collect response body for ETag computation: {}", e);
+            tracing::error!(
+                "Failed to collect response body for ETag computation: {}",
+                e
+            );
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Internal server error: failed to process response"))
+                .body(Body::from(
+                    "Internal server error: failed to process response",
+                ))
                 .unwrap();
         }
     };

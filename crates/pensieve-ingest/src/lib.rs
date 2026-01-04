@@ -7,28 +7,32 @@
 //!
 //! - [`pipeline`] - Core pipeline components (dedupe, segment writer, ClickHouse indexer)
 //! - [`source`] - Event source adapters (JSONL, Protobuf, live relays)
+//! - [`sync`] - Negentropy sync for NIP-77 reconciliation with trusted relays
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────┐
-//! │  Event Sources  │  (JSONL files, Protobuf archives, live relays)
-//! └────────┬────────┘
-//!          │
-//!          ▼
-//! ┌─────────────────┐
-//! │   DedupeIndex   │  RocksDB - tracks seen event IDs
-//! └────────┬────────┘
-//!          │
-//!          ▼
-//! ┌─────────────────┐
-//! │  SegmentWriter  │  Writes notepack segments, seals on size threshold
-//! └────────┬────────┘
-//!          │
-//!          ▼
-//! ┌─────────────────┐
-//! │ClickHouseIndexer│  Derived index for analytics queries
-//! └─────────────────┘
+//! ┌─────────────────┐       ┌─────────────────┐
+//! │  Event Sources  │       │ Negentropy Sync │
+//! │ (JSONL, relays) │       │ (NIP-77, periodic)
+//! └────────┬────────┘       └────────┬────────┘
+//!          │                         │
+//!          └──────────┬──────────────┘
+//!                     │
+//!                     ▼
+//!          ┌─────────────────┐
+//!          │   DedupeIndex   │  RocksDB - tracks seen event IDs
+//!          └────────┬────────┘
+//!                   │
+//!                   ▼
+//!          ┌─────────────────┐
+//!          │  SegmentWriter  │  Writes notepack segments, seals on size threshold
+//!          └────────┬────────┘
+//!                   │
+//!                   ▼
+//!          ┌─────────────────┐
+//!          │ClickHouseIndexer│  Derived index for analytics queries
+//!          └─────────────────┘
 //! ```
 //!
 //! The pipeline is archive-first: the notepack archive is the source of truth,
@@ -38,6 +42,7 @@ pub mod error;
 pub mod pipeline;
 pub mod relay;
 pub mod source;
+pub mod sync;
 
 // Re-export commonly used types at crate root
 pub use error::{Error, Result};
@@ -58,4 +63,9 @@ pub use source::{
 pub use relay::{
     AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig, RelayStatus,
     RelayTier,
+};
+
+// Re-export sync types
+pub use sync::{
+    NegentropySyncConfig, NegentropySyncer, SyncStateDb, SyncStats, seed_from_clickhouse,
 };

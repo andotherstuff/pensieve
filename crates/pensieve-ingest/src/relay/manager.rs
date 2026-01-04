@@ -163,7 +163,12 @@ impl RelayManager {
         conn.execute(
             "INSERT OR IGNORE INTO relays (url, first_seen_at, tier, status)
              VALUES (?, ?, ?, ?)",
-            rusqlite::params![normalized, now, tier.as_str(), RelayStatus::Pending.as_str()],
+            rusqlite::params![
+                normalized,
+                now,
+                tier.as_str(),
+                RelayStatus::Pending.as_str()
+            ],
         )
         .map_err(|e| Error::Database(format!("Failed to register relay: {}", e)))?;
 

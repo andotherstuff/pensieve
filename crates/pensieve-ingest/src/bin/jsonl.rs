@@ -186,19 +186,22 @@ async fn main() -> Result<()> {
             &clickhouse_url,
             &args.clickhouse_db,
             args.start_segment,
-        ).await;
+        )
+        .await;
 
         gauge!("backfill_running").set(0.0);
         return result;
     }
 
     // Validate required args for normal mode
-    let input = args.input.clone().ok_or_else(|| {
-        anyhow::anyhow!("--input is required (unless using --index-segments)")
-    })?;
-    let output = args.output.clone().ok_or_else(|| {
-        anyhow::anyhow!("--output is required (unless using --index-segments)")
-    })?;
+    let input = args
+        .input
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--input is required (unless using --index-segments)"))?;
+    let output = args
+        .output
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--output is required (unless using --index-segments)"))?;
 
     let start = Instant::now();
     let stats = process(&args, &input, &output)?;
@@ -266,7 +269,11 @@ async fn index_segments_mode(
         num_a.cmp(&num_b)
     });
 
-    tracing::info!("Found {} segments to index (starting from {})", segment_files.len(), start_segment);
+    tracing::info!(
+        "Found {} segments to index (starting from {})",
+        segment_files.len(),
+        start_segment
+    );
 
     if segment_files.is_empty() {
         tracing::warn!("No segment files found matching criteria");
@@ -354,7 +361,13 @@ fn extract_segment_number(path: &Path) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
-fn print_summary(input: &Path, output: &Path, args: &Args, stats: &Stats, elapsed: std::time::Duration) {
+fn print_summary(
+    input: &Path,
+    output: &Path,
+    args: &Args,
+    stats: &Stats,
+    elapsed: std::time::Duration,
+) {
     println!("\n══════════════════════════════════════════════════════════════════");
     println!("SUMMARY");
     println!("══════════════════════════════════════════════════════════════════\n");
@@ -573,8 +586,9 @@ fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
                 let current_duplicates = duplicate_count.load(Ordering::Relaxed);
                 let mut metrics_stats = stats.clone();
                 metrics_stats.duplicate_events = current_duplicates;
-                metrics_stats.valid_events =
-                    metrics_stats.valid_events.saturating_sub(current_duplicates);
+                metrics_stats.valid_events = metrics_stats
+                    .valid_events
+                    .saturating_sub(current_duplicates);
                 record_metrics(&metrics_stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
