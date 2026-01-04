@@ -25,10 +25,6 @@ pub struct NegentropySyncConfig {
     /// This creates the `since` filter for negentropy reconciliation.
     pub lookback: Duration,
 
-    /// Maximum events to fetch per sync cycle.
-    /// Limits memory usage during large syncs.
-    pub max_events_per_cycle: usize,
-
     /// Timeout for the negentropy protocol messages.
     pub protocol_timeout: Duration,
 
@@ -48,7 +44,6 @@ impl Default for NegentropySyncConfig {
             ],
             interval: Duration::from_secs(600), // 10 minutes
             lookback: Duration::from_secs(7 * 24 * 3600), // 7 days
-            max_events_per_cycle: 1_000_000, // 1 million
             protocol_timeout: Duration::from_secs(60),
             fetch_timeout: Duration::from_secs(120),
             direction: SyncDirection::Down,

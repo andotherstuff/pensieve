@@ -73,6 +73,15 @@ pub struct RelayConfig {
     ///
     /// Clearnet relays (wss://...) will continue to connect directly.
     pub tor_proxy: Option<SocketAddr>,
+
+    /// Size of the notification channel buffer.
+    ///
+    /// When running negentropy sync alongside live ingestion, the notification
+    /// channel can overflow if the receiver can't keep up with all the relay
+    /// activity. Increase this value to reduce `Lagged` warnings.
+    ///
+    /// Default: 16384 (4x the nostr-sdk default of 4096)
+    pub notification_channel_size: usize,
 }
 
 impl Default for RelayConfig {
@@ -96,6 +105,7 @@ impl Default for RelayConfig {
             optimization_interval: Duration::from_secs(300), // 5 minutes
             since_timestamp: None,
             tor_proxy: None,
+            notification_channel_size: 131072, // 32x nostr-sdk default (4096) - generous buffer for heavy sync
         }
     }
 }
@@ -319,8 +329,11 @@ impl RelaySource {
                 .unwrap_or_else(|_| "unknown".to_string())
         );
 
-        // Build client options with optional Tor proxy
-        let mut client_builder = Client::builder().signer(keys);
+        // Build client options with larger notification buffer and optional Tor proxy
+        let pool_opts = RelayPoolOptions::default()
+            .notification_channel_size(self.config.notification_channel_size);
+
+        let mut client_opts = ClientOptions::new().pool(pool_opts);
 
         if let Some(proxy_addr) = self.config.tor_proxy {
             tracing::info!(
@@ -332,11 +345,14 @@ impl RelaySource {
             let connection = Connection::new()
                 .proxy(proxy_addr)
                 .target(ConnectionTarget::Onion);
-            client_builder = client_builder.opts(ClientOptions::new().connection(connection));
+            client_opts = client_opts.connection(connection);
         }
 
         // Create client with signer for NIP-42 authentication
-        let client = client_builder.build();
+        let client = Client::builder()
+            .signer(keys)
+            .opts(client_opts)
+            .build();
 
         // Enable automatic authentication (NIP-42)
         client.automatic_authentication(true);
@@ -446,10 +462,20 @@ impl RelaySource {
 
             let notification = match notification {
                 Ok(Ok(n)) => n,
-                Ok(Err(_)) => {
-                    // Channel closed
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    // All senders dropped - channel is truly closed
                     tracing::info!("Notification channel closed");
                     break;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(count))) => {
+                    // Receiver fell behind - some notifications were dropped
+                    // This can happen during heavy negentropy sync or high relay traffic
+                    // Just log and continue receiving
+                    tracing::warn!(
+                        "Notification receiver lagged behind, skipped {} messages",
+                        count
+                    );
+                    continue;
                 }
                 Err(_) => {
                     // Timeout - check running flag and continue

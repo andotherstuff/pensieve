@@ -1076,6 +1076,291 @@
 
     {
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
+      "id": 500,
+      "title": "🔄 Negentropy Sync",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#3274D9", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 66 },
+      "id": 501,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "negentropy_syncs_total",
+          "legendFormat": "Sync Cycles",
+          "refId": "A"
+        }
+      ],
+      "title": "Sync Cycles (Total)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#37872D", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 66 },
+      "id": 502,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "negentropy_events_discovered_total",
+          "legendFormat": "Discovered",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Discovered",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#73BF69", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 66 },
+      "id": 503,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "negentropy_events_fetched_total",
+          "legendFormat": "Fetched",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Fetched",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#8F3BB8", "value": null }
+            ]
+          },
+          "unit": "dateTimeAsIso"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 66 },
+      "id": 504,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "negentropy_last_sync_unix * 1000",
+          "legendFormat": "Last Sync",
+          "refId": "A"
+        }
+      ],
+      "title": "Last Sync Time",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
+      "id": 505,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "negentropy_sync_duration_seconds",
+          "legendFormat": "Sync Duration",
+          "refId": "A"
+        }
+      ],
+      "title": "Sync Duration Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Discovered" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#37872D", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Fetched" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Relays Synced" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#3274D9", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Relays Errored" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "#FF7383", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
+      "id": 506,
+      "options": {
+        "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "expr": "increase(negentropy_events_discovered_total[5m])",
+          "legendFormat": "Discovered",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(negentropy_events_fetched_total[5m])",
+          "legendFormat": "Fetched",
+          "refId": "B"
+        },
+        {
+          "expr": "increase(negentropy_relays_synced_total[5m])",
+          "legendFormat": "Relays Synced",
+          "refId": "C"
+        },
+        {
+          "expr": "increase(negentropy_relays_errored_total[5m])",
+          "legendFormat": "Relays Errored",
+          "refId": "D"
+        }
+      ],
+      "title": "Negentropy Activity (5m window)",
+      "type": "timeseries"
+    },
+
+    {
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 79 },
       "id": 300,
       "title": "🗄️ ClickHouse Data",
       "type": "row"
@@ -1091,7 +1376,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 66 },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 80 },
       "id": 301,
       "options": {
         "colorMode": "value",
@@ -1125,7 +1410,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 66 },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 80 },
       "id": 302,
       "options": {
         "colorMode": "value",
@@ -1159,7 +1444,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 66 },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 80 },
       "id": 303,
       "options": {
         "colorMode": "value",
@@ -1193,7 +1478,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 66 },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 80 },
       "id": 304,
       "options": {
         "colorMode": "value",
@@ -1227,7 +1512,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 71 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 85 },
       "id": 305,
       "options": {
         "colorMode": "value",
@@ -1261,7 +1546,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 71 },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 85 },
       "id": 306,
       "options": {
         "colorMode": "value",
@@ -1295,7 +1580,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 71 },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 85 },
       "id": 307,
       "options": {
         "colorMode": "value",
@@ -1329,7 +1614,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 71 },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 85 },
       "id": 308,
       "options": {
         "colorMode": "value",
@@ -1386,7 +1671,7 @@
           }
         ]
       },
-      "gridPos": { "h": 14, "w": 12, "x": 0, "y": 75 },
+      "gridPos": { "h": 14, "w": 12, "x": 0, "y": 89 },
       "id": 309,
       "options": {
         "cellHeight": "sm",
@@ -1452,7 +1737,7 @@
           }
         ]
       },
-      "gridPos": { "h": 14, "w": 12, "x": 12, "y": 75 },
+      "gridPos": { "h": 14, "w": 12, "x": 12, "y": 89 },
       "id": 310,
       "options": {
         "cellHeight": "sm",
@@ -1505,7 +1790,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 89 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 103 },
       "id": 311,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -1526,7 +1811,7 @@
     },
 
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 97 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
       "id": 400,
       "title": "⚙️ System",
       "type": "row",
@@ -1551,7 +1836,7 @@
             },
             "overrides": []
           },
-          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 98 },
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 112 },
           "id": 401,
           "options": {
             "colorMode": "background",
@@ -1583,7 +1868,7 @@
             },
             "overrides": []
           },
-          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 98 },
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 112 },
           "id": 402,
           "options": {
             "colorMode": "value",
@@ -1615,7 +1900,7 @@
             },
             "overrides": []
           },
-          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 98 },
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 112 },
           "id": 403,
           "options": {
             "colorMode": "value",
@@ -1654,7 +1939,7 @@
             },
             "overrides": []
           },
-          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 98 },
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 112 },
           "id": 404,
           "options": {
             "colorMode": "value",
