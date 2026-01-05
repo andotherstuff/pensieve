@@ -23,6 +23,7 @@ use crate::state::AppState;
 ///
 /// ## Public (no auth)
 /// - `GET /health` - Health check
+/// - `GET /docs` - API documentation (Markdown)
 ///
 /// ## Protected (auth required)
 ///
@@ -72,13 +73,18 @@ use crate::state::AppState;
 /// - `GET /api/v1/kinds/{kind}` - Detailed stats for a kind
 /// - `GET /api/v1/kinds/{kind}/activity` - Activity time series for a kind
 ///
+/// ### Relay Distribution (NIP-65)
+/// - `GET /api/v1/stats/relays/distribution` - Relay popularity from NIP-65 lists
+///
 /// ### Relays (requires RELAY_DB_PATH env var)
 /// - `GET /api/v1/relays/summary` - Aggregate relay statistics
 /// - `GET /api/v1/relays` - List relays with filtering/sorting
 /// - `GET /api/v1/relays/throughput` - Hourly event throughput
 pub fn router(state: AppState) -> Router {
     // Public routes (no authentication)
-    let public = Router::new().route("/health", get(health::health_check));
+    let public = Router::new()
+        .route("/health", get(health::health_check))
+        .route("/docs", get(health::docs));
 
     // Protected API routes
     let api_v1 = Router::new()
@@ -120,6 +126,11 @@ pub fn router(state: AppState) -> Router {
         .route("/stats/longform", get(stats::longform))
         // Publishers
         .route("/stats/publishers", get(stats::publishers))
+        // Relay distribution (NIP-65)
+        .route(
+            "/stats/relays/distribution",
+            get(stats::relay_distribution),
+        )
         // Kinds
         .route("/kinds", get(kinds::list_kinds))
         .route("/kinds/{kind}", get(kinds::get_kind))

@@ -1,6 +1,8 @@
-//! Health check endpoints.
+//! Health check and documentation endpoints.
 
 use axum::Json;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 /// Health check response.
@@ -32,4 +34,15 @@ pub struct PingResponse {
 
 pub async fn authenticated_ping() -> Json<PingResponse> {
     Json(PingResponse { message: "pong" })
+}
+
+/// API documentation (README.md) embedded at compile time.
+const API_DOCS: &str = include_str!("../../README.md");
+
+/// Public API documentation endpoint.
+///
+/// Returns the API documentation as Markdown.
+/// No authentication required.
+pub async fn docs() -> Response {
+    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], API_DOCS).into_response()
 }

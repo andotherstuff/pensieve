@@ -45,6 +45,14 @@ Health check endpoint. No authentication required.
 
 ---
 
+#### `GET /docs`
+
+API documentation (this file). No authentication required.
+
+Returns the API documentation as Markdown (`text/markdown`).
+
+---
+
 #### `GET /api/v1/ping`
 
 Authenticated ping. Use to verify your token is valid.
@@ -806,6 +814,65 @@ GET /api/v1/kinds/7/activity?group_by=week&limit=12
 # Monthly activity for kind 30023 (long-form content)
 GET /api/v1/kinds/30023/activity?group_by=month
 ```
+
+---
+
+### Relay Distribution (NIP-65)
+
+#### `GET /api/v1/stats/relays/distribution`
+
+Returns relay popularity distribution based on NIP-65 relay lists (kind 10002 events). Only includes each user's latest relay list event.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | 100 | Maximum relays to return (max: 1000) |
+
+**Response**
+
+```json
+[
+  {
+    "relay_url": "wss://relay.damus.io",
+    "user_count": 322768,
+    "read_count": 280000,
+    "write_count": 310000
+  },
+  {
+    "relay_url": "wss://nos.lol",
+    "user_count": 216707,
+    "read_count": 200000,
+    "write_count": 210000
+  }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `relay_url` | Normalized relay URL (lowercase, no trailing slash, wss:// only) |
+| `user_count` | Number of users listing this relay in their latest NIP-65 event |
+| `read_count` | Users listing this relay for reading (includes read+write) |
+| `write_count` | Users listing this relay for writing (includes read+write) |
+
+**Notes**
+
+- Data is pre-computed and refreshed every 6 hours
+- Only includes relays with 10+ users (filters noise)
+- Excludes invalid URLs (localhost, malformed, ws://, etc.)
+- Shows current relay preferences (latest event per user, not historical)
+
+**Examples**
+
+```bash
+# Top 50 relays
+GET /api/v1/stats/relays/distribution?limit=50
+
+# Default top 100
+GET /api/v1/stats/relays/distribution
+```
+
+**Suggested cache TTL:** 10 minutes
 
 ---
 

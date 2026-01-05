@@ -244,6 +244,13 @@ pub struct EventCountByPeriod {
 /// `GET /api/v1/stats/events`
 ///
 /// Returns event counts with optional filters and grouping.
+///
+/// **Performance notes:**
+/// - When `kind` is not specified and `group_by` is set, uses pre-aggregated
+///   `daily_user_stats` table for instant results.
+/// - When `kind` is specified, queries `events_local` with projection optimization.
+/// - Defaults to last 30 days if no time filter is provided.
+///
 /// Cached for 1 minute.
 pub async fn events(
     State(state): State<AppState>,
@@ -251,10 +258,18 @@ pub async fn events(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
     let kind = params.kind;
-    let days = params.days;
     let since = params.since;
     let until = params.until;
     let group_by = params.group_by.clone();
+
+    // Default to 30 days if no time filter specified (prevents full table scans)
+    let days = params.days.or_else(|| {
+        if since.is_none() && until.is_none() {
+            Some(30)
+        } else {
+            None
+        }
+    });
 
     // Validate group_by before caching
     if let Some(ref g) = group_by
@@ -278,8 +293,88 @@ pub async fn events(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
-        // Build WHERE clause
+        // Use pre-aggregated daily_user_stats when possible (no kind filter)
+        // This is MUCH faster than scanning events_local
+        let use_preaggregated = kind.is_none() && group_by.is_some();
+
+        if use_preaggregated {
+            // Build date filter for daily_user_stats
+            let mut date_conditions = vec!["date <= today()".to_string()];
+
+            if let Some(days) = days {
+                date_conditions.push(format!("date >= today() - INTERVAL {} DAY", days));
+            } else {
+                if let Some(since) = since {
+                    date_conditions.push(format!("date >= '{}'", since));
+                }
+                if let Some(until) = until {
+                    date_conditions.push(format!("date < '{}'", until));
+                }
+            }
+
+            let date_where = format!("WHERE {}", date_conditions.join(" AND "));
+
+            match group_by.as_deref() {
+                Some("day") => {
+                    let query = format!(
+                        "SELECT
+                            toString(date) AS period,
+                            sum(event_count) AS count,
+                            count() AS unique_pubkeys
+                        FROM daily_user_stats FINAL
+                        {}
+                        GROUP BY date
+                        ORDER BY date DESC
+                        LIMIT {}",
+                        date_where, limit
+                    );
+                    let rows: Vec<EventCountByPeriod> =
+                        state.clickhouse.query(&query).fetch_all().await?;
+                    return Ok(serde_json::to_value(rows)?);
+                }
+                Some("week") => {
+                    let query = format!(
+                        "SELECT
+                            toString(toMonday(date)) AS period,
+                            sum(event_count) AS count,
+                            uniq(pubkey) AS unique_pubkeys
+                        FROM daily_user_stats FINAL
+                        {}
+                        GROUP BY period
+                        ORDER BY period DESC
+                        LIMIT {}",
+                        date_where, limit
+                    );
+                    let rows: Vec<EventCountByPeriod> =
+                        state.clickhouse.query(&query).fetch_all().await?;
+                    return Ok(serde_json::to_value(rows)?);
+                }
+                Some("month") => {
+                    let query = format!(
+                        "SELECT
+                            toString(toStartOfMonth(date)) AS period,
+                            sum(event_count) AS count,
+                            uniq(pubkey) AS unique_pubkeys
+                        FROM daily_user_stats FINAL
+                        {}
+                        GROUP BY period
+                        ORDER BY period DESC
+                        LIMIT {}",
+                        date_where, limit
+                    );
+                    let rows: Vec<EventCountByPeriod> =
+                        state.clickhouse.query(&query).fetch_all().await?;
+                    return Ok(serde_json::to_value(rows)?);
+                }
+                _ => {} // Fall through to events_local
+            }
+        }
+
+        // Fall back to events_local for kind-filtered queries or aggregates
         let mut conditions = Vec::new();
+
+        // Always exclude future dates (malformed or malicious events)
+        conditions.push("created_at <= now()".to_string());
 
         if let Some(kind) = kind {
             conditions.push(format!("kind = {}", kind));
@@ -296,11 +391,7 @@ pub async fn events(
             }
         }
 
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
 
         // Determine if we're grouping by time period
         match group_by.as_deref() {
@@ -1506,6 +1597,66 @@ pub struct PublishersQuery {
     pub days: Option<u32>,
     /// Number of publishers to return (default: 100, max: 1000).
     pub limit: Option<u32>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Relay Distribution (NIP-65)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Query parameters for relay distribution.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayDistributionQuery {
+    /// Number of relays to return (default: 100, max: 1000).
+    pub limit: Option<u32>,
+}
+
+/// Relay distribution row from NIP-65 relay lists.
+#[derive(Debug, Clone, Serialize, Deserialize, Row)]
+pub struct RelayDistributionRow {
+    /// Normalized relay URL.
+    pub relay_url: String,
+    /// Number of users listing this relay in their latest kind 10002 event.
+    pub user_count: u64,
+    /// Users listing this relay for reading (includes read+write).
+    pub read_count: u64,
+    /// Users listing this relay for writing (includes read+write).
+    pub write_count: u64,
+}
+
+/// `GET /api/v1/stats/relays/distribution`
+///
+/// Returns relay popularity distribution from NIP-65 relay lists (kind 10002).
+/// Only includes each user's latest relay list event.
+/// Cached for 10 minutes (data refreshes every 6 hours via MV).
+pub async fn relay_distribution(
+    State(state): State<AppState>,
+    Query(params): Query<RelayDistributionQuery>,
+) -> Result<Json<Vec<RelayDistributionRow>>, ApiError> {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let cache_key = format!("relay_distribution:limit={}", limit);
+
+    let result = get_or_compute(&state.cache, &cache_key, || async {
+        let rows: Vec<RelayDistributionRow> = state
+            .clickhouse
+            .query(&format!(
+                "SELECT
+                    relay_url,
+                    user_count,
+                    read_count,
+                    write_count
+                FROM relay_distribution FINAL
+                ORDER BY user_count DESC
+                LIMIT {}",
+                limit
+            ))
+            .fetch_all()
+            .await?;
+
+        Ok(rows)
+    })
+    .await?;
+
+    Ok(Json(result))
 }
 
 /// Publisher statistics.
