@@ -53,6 +53,10 @@
         reverse_proxy host.docker.internal:8080
     }
 
+    handle /docs {
+        reverse_proxy host.docker.internal:8080
+    }
+
     # =========================================================================
     # Root - Landing page or redirect
     # =========================================================================
