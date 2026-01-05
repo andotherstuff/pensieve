@@ -403,7 +403,7 @@ pub struct ActiveUsersCount {
 /// `GET /api/v1/stats/users/active`
 ///
 /// Returns current DAU/WAU/MAU summary (most recent values).
-/// Queries the small pre-aggregated summary tables directly.
+/// Queries the small pre-computed tables directly.
 /// Cached for 10 minutes.
 pub async fn active_users_summary(
     State(state): State<AppState>,
@@ -427,20 +427,19 @@ pub async fn active_users_summary(
     Ok(Json(result))
 }
 
-/// Fetch the most recent daily active users from the summary table.
+/// Fetch the most recent daily active users from the pre-computed table.
 async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
     state
         .clickhouse
         .query(
             "SELECT
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM daily_active_users_summary
+                active_users,
+                has_profile,
+                has_follows AS has_follows_list,
+                has_both AS has_profile_and_follows_list,
+                total_events
+            FROM active_users_daily FINAL
             WHERE date >= toDate('2020-11-07') AND date <= today()
-            GROUP BY date
             ORDER BY date DESC
             LIMIT 1",
         )
@@ -449,20 +448,19 @@ async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsers
         .map_err(ApiError::from)
 }
 
-/// Fetch the most recent weekly active users from the summary table.
+/// Fetch the most recent weekly active users from the pre-computed table.
 async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
     state
         .clickhouse
         .query(
             "SELECT
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM weekly_active_users_summary
+                active_users,
+                has_profile,
+                has_follows AS has_follows_list,
+                has_both AS has_profile_and_follows_list,
+                total_events
+            FROM active_users_weekly FINAL
             WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
-            GROUP BY week
             ORDER BY week DESC
             LIMIT 1",
         )
@@ -471,20 +469,19 @@ async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUser
         .map_err(ApiError::from)
 }
 
-/// Fetch the most recent monthly active users from the summary table.
+/// Fetch the most recent monthly active users from the pre-computed table.
 async fn fetch_latest_monthly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
     state
         .clickhouse
         .query(
             "SELECT
-                uniqMerge(active_users_state) AS active_users,
-                uniqMerge(has_profile_state) AS has_profile,
-                uniqMerge(has_follows_list_state) AS has_follows_list,
-                uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                sumMerge(total_events_state) AS total_events
-            FROM monthly_active_users_summary
+                active_users,
+                has_profile,
+                has_follows AS has_follows_list,
+                has_both AS has_profile_and_follows_list,
+                total_events
+            FROM active_users_monthly FINAL
             WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
-            GROUP BY month
             ORDER BY month DESC
             LIMIT 1",
         )
@@ -517,7 +514,7 @@ pub struct ActiveUsersRow {
 /// `GET /api/v1/stats/users/active/daily`
 ///
 /// Returns daily active users time series.
-/// Fetches from small pre-aggregated summary table (~1500 rows total).
+/// Fetches from small pre-computed table (~1500 rows total).
 /// Cached for 10 minutes.
 pub async fn active_users_daily(
     State(state): State<AppState>,
@@ -540,14 +537,13 @@ pub async fn active_users_daily(
             .query(
                 "SELECT
                     toString(date) AS period,
-                    uniqMerge(active_users_state) AS active_users,
-                    uniqMerge(has_profile_state) AS has_profile,
-                    uniqMerge(has_follows_list_state) AS has_follows_list,
-                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                    sumMerge(total_events_state) AS total_events
-                FROM daily_active_users_summary
+                    active_users,
+                    has_profile,
+                    has_follows AS has_follows_list,
+                    has_both AS has_profile_and_follows_list,
+                    total_events
+                FROM active_users_daily FINAL
                 WHERE date >= toDate('2020-11-07') AND date <= today()
-                GROUP BY date
                 ORDER BY date DESC",
             )
             .fetch_all()
@@ -570,7 +566,7 @@ pub async fn active_users_daily(
 /// `GET /api/v1/stats/users/active/weekly`
 ///
 /// Returns weekly active users time series.
-/// Fetches from small pre-aggregated summary table (~215 rows total).
+/// Fetches from small pre-computed table (~215 rows total).
 /// Cached for 10 minutes.
 pub async fn active_users_weekly(
     State(state): State<AppState>,
@@ -592,14 +588,13 @@ pub async fn active_users_weekly(
             .query(
                 "SELECT
                     toString(week) AS period,
-                    uniqMerge(active_users_state) AS active_users,
-                    uniqMerge(has_profile_state) AS has_profile,
-                    uniqMerge(has_follows_list_state) AS has_follows_list,
-                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                    sumMerge(total_events_state) AS total_events
-                FROM weekly_active_users_summary
+                    active_users,
+                    has_profile,
+                    has_follows AS has_follows_list,
+                    has_both AS has_profile_and_follows_list,
+                    total_events
+                FROM active_users_weekly FINAL
                 WHERE week >= toDate('2020-11-07') AND week <= toMonday(today())
-                GROUP BY week
                 ORDER BY week DESC",
             )
             .fetch_all()
@@ -622,7 +617,7 @@ pub async fn active_users_weekly(
 /// `GET /api/v1/stats/users/active/monthly`
 ///
 /// Returns monthly active users time series.
-/// Fetches from small pre-aggregated summary table (~50 rows total).
+/// Fetches from small pre-computed table (~50 rows total).
 /// Cached for 10 minutes.
 pub async fn active_users_monthly(
     State(state): State<AppState>,
@@ -644,14 +639,13 @@ pub async fn active_users_monthly(
             .query(
                 "SELECT
                     toString(month) AS period,
-                    uniqMerge(active_users_state) AS active_users,
-                    uniqMerge(has_profile_state) AS has_profile,
-                    uniqMerge(has_follows_list_state) AS has_follows_list,
-                    uniqMerge(has_profile_and_follows_list_state) AS has_profile_and_follows_list,
-                    sumMerge(total_events_state) AS total_events
-                FROM monthly_active_users_summary
+                    active_users,
+                    has_profile,
+                    has_follows AS has_follows_list,
+                    has_both AS has_profile_and_follows_list,
+                    total_events
+                FROM active_users_monthly FINAL
                 WHERE month >= toDate('2020-11-07') AND month <= toStartOfMonth(today())
-                GROUP BY month
                 ORDER BY month DESC",
             )
             .fetch_all()
@@ -915,7 +909,7 @@ pub struct NewUsersRow {
 /// `GET /api/v1/stats/users/new`
 ///
 /// Returns count of new pubkeys (first seen) per period.
-/// Requires the daily_new_users_summary table (migration 011).
+/// Requires the new_users_daily table (migration 013).
 /// Cached for 5 minutes.
 pub async fn new_users(
     State(state): State<AppState>,
@@ -959,7 +953,7 @@ pub async fn new_users(
                 "SELECT
                     toString({}) AS period,
                     sum(new_users) AS new_users
-                FROM daily_new_users
+                FROM new_users_daily FINAL
                 WHERE 1=1 {}
                 GROUP BY period
                 ORDER BY period DESC

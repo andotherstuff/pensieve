@@ -691,18 +691,23 @@ List all event kinds with counts.
     "kind": 1,
     "event_count": 45000000,
     "unique_pubkeys": 500000,
-    "first_seen": "2020-01-17T00:00:00Z",
-    "last_seen": "2024-12-22T15:30:00Z"
+    "first_seen": 1579219200,
+    "last_seen": 1735915800
   },
   {
     "kind": 7,
     "event_count": 32000000,
     "unique_pubkeys": 350000,
-    "first_seen": "2020-02-01T00:00:00Z",
-    "last_seen": "2024-12-22T15:29:00Z"
+    "first_seen": 1580515200,
+    "last_seen": 1735915740
   }
 ]
 ```
+
+| Field | Description |
+|-------|-------------|
+| `first_seen` | Unix timestamp (seconds) of the first event of this kind |
+| `last_seen` | Unix timestamp (seconds) of the most recent event of this kind |
 
 **Examples**
 
@@ -733,14 +738,19 @@ Detailed statistics for a specific event kind.
   "kind": 1,
   "event_count": 45000000,
   "unique_pubkeys": 500000,
-  "first_seen": "2020-01-17T00:00:00Z",
-  "last_seen": "2024-12-22T15:30:00Z",
+  "first_seen": 1579219200,
+  "last_seen": 1735915800,
   "avg_content_length": 142.5,
   "events_24h": 54000,
   "events_7d": 380000,
   "events_30d": 1650000
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `first_seen` | Unix timestamp (seconds) of the first event of this kind |
+| `last_seen` | Unix timestamp (seconds) of the most recent event of this kind |
 
 **Errors**
 
