@@ -196,9 +196,11 @@ async fn fetch_earliest_event(state: &AppState) -> u32 {
 }
 
 async fn fetch_latest_event(state: &AppState) -> u32 {
+    // Look back up to 7 days for the most recent event (in case ingestion is paused)
+    // Still excludes future timestamps
     state
         .clickhouse
-        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 1 HOUR AND created_at <= now()")
+        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY AND created_at <= now()")
         .fetch_one::<u32>()
         .await
         .unwrap_or(0)
