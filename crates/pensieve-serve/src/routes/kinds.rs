@@ -33,6 +33,7 @@ pub struct KindSummary {
 /// `GET /api/v1/kinds`
 ///
 /// Returns a list of event kinds with counts.
+/// Reads from pre-aggregated `kinds_stats_mv` (refreshed hourly with exact counts).
 /// Cached for 5 minutes.
 pub async fn list_kinds(
     State(state): State<AppState>,
@@ -60,17 +61,18 @@ pub async fn list_kinds(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        // Read from pre-aggregated MV (hourly refresh with uniqExact)
         let rows: Vec<KindSummary> = state
             .clickhouse
             .query(&format!(
                 "SELECT
                     kind,
-                    count() AS event_count,
-                    uniq(pubkey) AS unique_pubkeys,
-                    toUInt32(min(created_at)) AS first_seen,
-                    toUInt32(max(created_at)) AS last_seen
-                FROM events_local
-                GROUP BY kind
+                    event_count,
+                    unique_pubkeys,
+                    first_seen,
+                    last_seen
+                FROM kinds_stats_mv
+                FINAL
                 ORDER BY {}
                 LIMIT {}",
                 order_by, limit
@@ -139,7 +141,7 @@ pub async fn get_kind(
                 "SELECT
                     kind,
                     count() AS event_count,
-                    uniq(pubkey) AS unique_pubkeys,
+                    uniqExact(pubkey) AS unique_pubkeys,
                     toUInt32(min(created_at)) AS first_seen,
                     toUInt32(max(created_at)) AS last_seen,
                     avg(length(content)) AS avg_content_length
@@ -243,7 +245,7 @@ pub async fn kind_activity(
                 "SELECT
                     {} AS period,
                     count() AS event_count,
-                    uniq(pubkey) AS unique_pubkeys
+                    uniqExact(pubkey) AS unique_pubkeys
                 FROM events_local
                 WHERE kind = ?
                 GROUP BY period
