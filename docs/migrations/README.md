@@ -36,6 +36,9 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 010_fix_pubkey_first_seen_dates.sql | Filter invalid dates from new users view | No |
 | 011_new_users_summary.sql | Pre-aggregate new users for fast queries | **Yes** (1-5 min) |
 | 012_cohort_retention_summary.sql | Pre-aggregate cohort retention (auto-refreshes daily) | **Yes** (5-15 min) |
+| 013_schema_optimizations.sql | Replace slow AggregateFunction tables with pre-computed values | **Yes** (runs automatically) |
+| 014_relay_distribution.sql | Pre-aggregate NIP-65 relay distribution data | **Yes** (runs automatically) |
+| 015_kinds_stats.sql | Pre-aggregate event kind statistics | **Yes** (runs automatically) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).

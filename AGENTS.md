@@ -1,4 +1,4 @@
-# AGENTS.md
+# AGENTS.md (aka CLAUDE.md)
 
 This file provides context for AI coding agents working on the Pensieve codebase.
 

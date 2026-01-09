@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use chrono::NaiveDate;
 use clickhouse::Row;
-use pensieve_core::NOSTR_GENESIS_DATE_SQL;
+use pensieve_core::NOSTR_GENESIS_TIMESTAMP;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::get_or_compute;
@@ -183,24 +183,23 @@ async fn fetch_total_kinds(state: &AppState) -> u64 {
 }
 
 async fn fetch_earliest_event(state: &AppState) -> u32 {
-    // Use pubkey_first_seen view which filters by genesis date
-    state
+    // Uses events_by_time projection (sorted by created_at), reads first row - O(1)
+    let ts = state
         .clickhouse
-        .query(&format!(
-            "SELECT toUInt32(min(first_seen)) FROM pubkey_first_seen WHERE first_seen >= toDateTime('{}')",
-            NOSTR_GENESIS_DATE_SQL
-        ))
+        .query("SELECT toUInt32(created_at) FROM events_local ORDER BY created_at ASC LIMIT 1")
         .fetch_one::<u32>()
         .await
-        .unwrap_or(0)
+        .unwrap_or(0);
+    // Clamp to Nostr genesis date to exclude bogus pre-genesis timestamps
+    ts.max(NOSTR_GENESIS_TIMESTAMP)
 }
 
 async fn fetch_latest_event(state: &AppState) -> u32 {
-    // Look back up to 7 days for the most recent event (in case ingestion is paused)
-    // Still excludes future timestamps
+    // Uses events_by_time projection (sorted by created_at), reads last row - O(1)
+    // Excludes future timestamps
     state
         .clickhouse
-        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY AND created_at <= now()")
+        .query("SELECT toUInt32(created_at) FROM events_local WHERE created_at <= now() ORDER BY created_at DESC LIMIT 1")
         .fetch_one::<u32>()
         .await
         .unwrap_or(0)
