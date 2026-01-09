@@ -183,23 +183,20 @@ async fn fetch_total_kinds(state: &AppState) -> u64 {
 }
 
 async fn fetch_earliest_event(state: &AppState) -> u32 {
-    // Uses events_by_time projection (sorted by created_at), reads first row - O(1)
-    let ts = state
+    // Use min() aggregate with genesis date filter to exclude bogus pre-genesis timestamps
+    state
         .clickhouse
-        .query("SELECT toUInt32(created_at) FROM events_local ORDER BY created_at ASC LIMIT 1")
+        .query("SELECT toUInt32(min(created_at)) FROM events_local WHERE created_at >= '2020-01-01'")
         .fetch_one::<u32>()
         .await
-        .unwrap_or(0);
-    // Clamp to Nostr genesis date to exclude bogus pre-genesis timestamps
-    ts.max(NOSTR_GENESIS_TIMESTAMP)
+        .unwrap_or(NOSTR_GENESIS_TIMESTAMP)
 }
 
 async fn fetch_latest_event(state: &AppState) -> u32 {
-    // Uses events_by_time projection (sorted by created_at), reads last row - O(1)
-    // Excludes future timestamps
+    // Use max() aggregate, excluding future timestamps
     state
         .clickhouse
-        .query("SELECT toUInt32(created_at) FROM events_local WHERE created_at <= now() ORDER BY created_at DESC LIMIT 1")
+        .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now()")
         .fetch_one::<u32>()
         .await
         .unwrap_or(0)
