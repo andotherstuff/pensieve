@@ -183,13 +183,15 @@ async fn fetch_total_kinds(state: &AppState) -> u64 {
 }
 
 async fn fetch_earliest_event(state: &AppState) -> u32 {
-    // Use min() aggregate with genesis date filter to exclude bogus pre-genesis timestamps
-    state
+    // Use min() aggregate, clamp to Nostr genesis for correctness
+    let ts = state
         .clickhouse
-        .query("SELECT toUInt32(min(created_at)) FROM events_local WHERE created_at >= '2020-01-01'")
+        .query("SELECT toUInt32(min(created_at)) FROM events_local")
         .fetch_one::<u32>()
         .await
-        .unwrap_or(NOSTR_GENESIS_TIMESTAMP)
+        .unwrap_or(0);
+    // Return the later of: actual earliest event or Nostr genesis date
+    ts.max(NOSTR_GENESIS_TIMESTAMP)
 }
 
 async fn fetch_latest_event(state: &AppState) -> u32 {
