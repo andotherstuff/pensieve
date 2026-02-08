@@ -16,9 +16,15 @@
 //! URLs are rejected if they contain:
 //! - localhost or 127.0.0.1
 //! - Private IP ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+//! - CGNAT/shared address space (100.64-127.x.x)
+//! - Link-local IPv4 (169.254.x.x)
+//! - 0.0.0.0
+//! - IPv6 loopback (::1), link-local (fe80:), unique local (fc00::/fd00:),
+//!   IPv4-mapped (::ffff:)
 //! - .onion addresses (Tor) - unless `allow_onion` is set
 //! - .local addresses (mDNS)
 //! - "umbrel" (common home server misconfiguration)
+//! - Non-standard ports (only 80, 443, and common relay ports allowed)
 
 use nostr_sdk::RelayUrl;
 
@@ -129,6 +135,24 @@ pub fn normalize_relay_url_with_opts(url: &str, opts: &NormalizeOptions) -> Norm
     NormalizeResult::Ok(normalized)
 }
 
+/// Ports that are allowed for relay connections.
+///
+/// Only standard WebSocket ports and common relay ports are permitted.
+/// This prevents the ingester from looking like a port scanner to network
+/// monitoring systems.
+const ALLOWED_PORTS: &[u16] = &[
+    80,   // HTTP (ws://)
+    443,  // HTTPS (wss://) - default, usually omitted from URL
+    8080, // Common HTTP alt
+    8443, // Common HTTPS alt
+    8008, // Common relay port
+    8880, // Common alt
+    3000, // Dev/alt relay port
+    4848, // Some relays use this
+    7777, // Some relays use this
+    9735, // Some relays use this (Lightning-related)
+];
+
 /// Check if a URL matches any blocklist pattern.
 ///
 /// Returns `Some(reason)` if blocked, `None` if allowed.
@@ -139,6 +163,11 @@ fn check_blocklist(url: &str, opts: &NormalizeOptions) -> Option<String> {
     // Localhost
     if host == "localhost" || host.starts_with("localhost:") {
         return Some("localhost not allowed".to_string());
+    }
+
+    // 0.0.0.0 (unspecified address)
+    if host.starts_with("0.0.0.0") {
+        return Some("unspecified address (0.0.0.0) not allowed".to_string());
     }
 
     // Loopback IPv4
@@ -162,9 +191,38 @@ fn check_blocklist(url: &str, opts: &NormalizeOptions) -> Option<String> {
         return Some("private IP (172.16-31.x.x) not allowed".to_string());
     }
 
-    // IPv6 loopback and link-local
-    if host.starts_with("[::1]") || host.starts_with("[fe80:") {
-        return Some("IPv6 loopback/link-local not allowed".to_string());
+    // CGNAT / Shared address space (100.64.0.0 - 100.127.255.255, RFC 6598)
+    if host.starts_with("100.")
+        && let Some(second_octet) = host.split('.').nth(1)
+        && let Ok(n) = second_octet.parse::<u8>()
+        && (64..=127).contains(&n)
+    {
+        return Some("CGNAT/shared address (100.64-127.x.x) not allowed".to_string());
+    }
+
+    // Link-local IPv4 (169.254.0.0/16)
+    if host.starts_with("169.254.") {
+        return Some("link-local address (169.254.x.x) not allowed".to_string());
+    }
+
+    // IPv6 loopback
+    if host.starts_with("[::1]") {
+        return Some("IPv6 loopback (::1) not allowed".to_string());
+    }
+
+    // IPv6 link-local (fe80::/10)
+    if host.starts_with("[fe80:") {
+        return Some("IPv6 link-local (fe80::) not allowed".to_string());
+    }
+
+    // IPv6 unique local addresses (fc00::/7 = fc00:: through fdff::)
+    if host.starts_with("[fc") || host.starts_with("[fd") {
+        return Some("IPv6 unique local (fc00::/7) not allowed".to_string());
+    }
+
+    // IPv4-mapped IPv6 (::ffff:x.x.x.x) - could bypass IPv4 blocklist
+    if host.starts_with("[::ffff:") {
+        return Some("IPv4-mapped IPv6 (::ffff:) not allowed".to_string());
     }
 
     // .onion (Tor hidden services) - only block if not allowed
@@ -192,6 +250,16 @@ fn check_blocklist(url: &str, opts: &NormalizeOptions) -> Option<String> {
         return Some("host too short".to_string());
     }
 
+    // Port filtering: only allow standard and common relay ports.
+    // Non-standard ports make the ingester look like a port scanner.
+    // Note: .onion addresses skip port filtering (Tor relays often use odd ports).
+    if (!opts.allow_onion || !host.contains(".onion"))
+        && let Some(port) = extract_port(url)
+        && !ALLOWED_PORTS.contains(&port)
+    {
+        return Some(format!("non-standard port {} not allowed", port));
+    }
+
     None
 }
 
@@ -207,10 +275,138 @@ fn extract_host(url: &str) -> &str {
     without_scheme.split('/').next().unwrap_or(without_scheme)
 }
 
+/// Extract the port number from a websocket URL, if explicitly specified.
+///
+/// Returns `None` if no port is specified (uses default: 80 for ws, 443 for wss).
+fn extract_port(url: &str) -> Option<u16> {
+    let host = extract_host(url);
+
+    // Handle IPv6 addresses like [::1]:8080
+    if let Some(bracket_end) = host.rfind(']') {
+        // IPv6: look for port after the closing bracket
+        let after_bracket = &host[bracket_end + 1..];
+        if let Some(port_str) = after_bracket.strip_prefix(':') {
+            return port_str.parse().ok();
+        }
+        return None;
+    }
+
+    // IPv4 or hostname: look for last colon
+    if let Some(colon_pos) = host.rfind(':') {
+        let port_str = &host[colon_pos + 1..];
+        return port_str.parse().ok();
+    }
+
+    None
+}
+
 /// Check if a URL is a Tor .onion address.
 pub fn is_onion_url(url: &str) -> bool {
     let url = url.trim().to_lowercase();
     url.contains(".onion")
+}
+
+/// Check if an IP address is private, reserved, or otherwise not suitable
+/// for public relay connections.
+///
+/// This is used for post-DNS-resolution filtering to catch hostnames that
+/// resolve to private/internal addresses (SSRF protection).
+pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()                      // 127.0.0.0/8
+            || ipv4.is_unspecified()                 // 0.0.0.0
+            || ipv4.is_broadcast()                   // 255.255.255.255
+            || ipv4.is_link_local()                  // 169.254.0.0/16
+            || is_ipv4_private(*ipv4)                // 10/8, 172.16/12, 192.168/16
+            || is_ipv4_cgnat(*ipv4)                  // 100.64.0.0/10
+            || is_ipv4_documentation(*ipv4)          // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            || is_ipv4_benchmarking(*ipv4)           // 198.18.0.0/15
+            || ipv4.is_multicast()                   // 224.0.0.0/4
+            || is_ipv4_reserved(*ipv4) // 240.0.0.0/4 (except broadcast)
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()                       // ::1
+            || ipv6.is_unspecified()                  // ::
+            || ipv6.is_multicast()                    // ff00::/8
+            || is_ipv6_link_local(*ipv6)              // fe80::/10
+            || is_ipv6_unique_local(*ipv6)            // fc00::/7
+            || is_ipv6_ipv4_mapped(*ipv6)             // ::ffff:0:0/96
+            || is_ipv6_documentation(*ipv6) // 2001:db8::/32
+        }
+    }
+}
+
+// IPv4 helper functions
+
+fn is_ipv4_private(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 10.0.0.0/8
+    octets[0] == 10
+    // 172.16.0.0/12
+    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+    // 192.168.0.0/16
+    || (octets[0] == 192 && octets[1] == 168)
+}
+
+fn is_ipv4_cgnat(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_ipv4_documentation(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 192.0.2.0/24 (TEST-NET-1)
+    (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+    // 198.51.100.0/24 (TEST-NET-2)
+    || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+    // 203.0.113.0/24 (TEST-NET-3)
+    || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+}
+
+fn is_ipv4_benchmarking(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+    octets[0] == 198 && (18..=19).contains(&octets[1])
+}
+
+fn is_ipv4_reserved(ip: std::net::Ipv4Addr) -> bool {
+    // 240.0.0.0/4 (240.0.0.0 - 255.255.255.255, but not broadcast 255.255.255.255)
+    ip.octets()[0] >= 240
+}
+
+// IPv6 helper functions
+
+fn is_ipv6_link_local(ip: std::net::Ipv6Addr) -> bool {
+    // fe80::/10
+    let segments = ip.segments();
+    (segments[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_unique_local(ip: std::net::Ipv6Addr) -> bool {
+    // fc00::/7 (fc00:: through fdff::)
+    let segments = ip.segments();
+    (segments[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_ipv4_mapped(ip: std::net::Ipv6Addr) -> bool {
+    // ::ffff:0:0/96
+    let segments = ip.segments();
+    segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0xffff
+}
+
+fn is_ipv6_documentation(ip: std::net::Ipv6Addr) -> bool {
+    // 2001:db8::/32
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 /// Check if a URL is obviously invalid without full normalization.
@@ -231,14 +427,20 @@ pub fn is_obviously_invalid_with_opts(url: &str, opts: &NormalizeOptions) -> boo
         return true;
     }
 
-    // Check common blocklist patterns
+    // Check common blocklist patterns (fast string checks)
     if url.contains("localhost")
         || url.contains("127.0.0.1")
         || url.contains("192.168.")
         || url.contains("10.0.")
+        || url.contains("0.0.0.0")
+        || url.contains("169.254.")
         || url.contains(".local")
         || url.contains("umbrel")
         || url.contains("[::1]")
+        || url.contains("[fe80:")
+        || url.contains("[fc")
+        || url.contains("[fd")
+        || url.contains("[::ffff:")
     {
         return true;
     }
@@ -284,7 +486,7 @@ mod tests {
             normalize_relay_url("wss://relay.example.com:443/").ok(),
             Some("wss://relay.example.com".to_string())
         );
-        // Non-default ports should be preserved
+        // Allowed non-default ports should be preserved
         assert_eq!(
             normalize_relay_url("wss://relay.example.com:8080/").ok(),
             Some("wss://relay.example.com:8080".to_string())
@@ -320,6 +522,47 @@ mod tests {
     }
 
     #[test]
+    fn test_block_cgnat() {
+        assert!(matches!(
+            normalize_relay_url("wss://100.64.0.1:443"),
+            NormalizeResult::Blocked(_)
+        ));
+        assert!(matches!(
+            normalize_relay_url("wss://100.127.255.255:443"),
+            NormalizeResult::Blocked(_)
+        ));
+        // 100.63.x.x should NOT be blocked (not CGNAT)
+        assert!(normalize_relay_url("wss://100.63.0.1").is_ok());
+    }
+
+    #[test]
+    fn test_block_link_local_ipv4() {
+        assert!(matches!(
+            normalize_relay_url("wss://169.254.1.1:443"),
+            NormalizeResult::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_block_zero_address() {
+        assert!(matches!(
+            normalize_relay_url("wss://0.0.0.0:443"),
+            NormalizeResult::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_block_ipv6_unique_local() {
+        assert!(is_obviously_invalid("wss://[fc00::1]:443"));
+        assert!(is_obviously_invalid("wss://[fd12:3456::1]:443"));
+    }
+
+    #[test]
+    fn test_block_ipv4_mapped_ipv6() {
+        assert!(is_obviously_invalid("wss://[::ffff:192.168.1.1]:443"));
+    }
+
+    #[test]
     fn test_block_onion() {
         assert!(matches!(
             normalize_relay_url("wss://something.onion"),
@@ -333,6 +576,33 @@ mod tests {
             normalize_relay_url("wss://myserver.local"),
             NormalizeResult::Blocked(_)
         ));
+    }
+
+    #[test]
+    fn test_block_non_standard_ports() {
+        // Non-standard port should be blocked
+        assert!(matches!(
+            normalize_relay_url("wss://relay.example.com:31337"),
+            NormalizeResult::Blocked(_)
+        ));
+        assert!(matches!(
+            normalize_relay_url("wss://relay.example.com:12345"),
+            NormalizeResult::Blocked(_)
+        ));
+        assert!(matches!(
+            normalize_relay_url("ws://relay.example.com:1234"),
+            NormalizeResult::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn test_allow_standard_ports() {
+        // Standard and common relay ports should be allowed
+        assert!(normalize_relay_url("wss://relay.example.com").is_ok()); // default 443
+        assert!(normalize_relay_url("wss://relay.example.com:8080").is_ok());
+        assert!(normalize_relay_url("wss://relay.example.com:8443").is_ok());
+        assert!(normalize_relay_url("ws://relay.example.com:80").is_ok());
+        assert!(normalize_relay_url("ws://relay.example.com:3000").is_ok());
     }
 
     #[test]
@@ -361,6 +631,8 @@ mod tests {
         assert!(is_obviously_invalid("https://example.com"));
         assert!(is_obviously_invalid("wss://localhost:8080"));
         assert!(is_obviously_invalid("wss://192.168.1.1"));
+        assert!(is_obviously_invalid("wss://0.0.0.0"));
+        assert!(is_obviously_invalid("wss://169.254.1.1"));
         assert!(!is_obviously_invalid("wss://relay.damus.io"));
     }
 
@@ -398,5 +670,53 @@ mod tests {
 
         // Without, it should be invalid
         assert!(is_obviously_invalid("ws://relay.onion"));
+    }
+
+    #[test]
+    fn test_extract_port() {
+        assert_eq!(extract_port("wss://relay.example.com"), None);
+        assert_eq!(extract_port("wss://relay.example.com:8080"), Some(8080));
+        assert_eq!(extract_port("wss://relay.example.com:443"), Some(443));
+        assert_eq!(extract_port("ws://relay.example.com:80"), Some(80));
+        assert_eq!(
+            extract_port("wss://relay.example.com:8080/path"),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn test_is_private_ip() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // Private IPv4
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::BROADCAST)));
+
+        // CGNAT
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 255
+        ))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(100, 63, 0, 1))));
+
+        // Link-local
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+
+        // Public IPv4 should NOT be private
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+
+        // IPv6 private ranges
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+
+        // Public IPv6 should NOT be private
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2607, 0xf8b0, 0x4004, 0x800, 0, 0, 0, 0x200e
+        ))));
     }
 }

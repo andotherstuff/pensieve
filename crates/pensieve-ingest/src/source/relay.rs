@@ -20,6 +20,7 @@
 use super::{EventSource, SourceMetadata, SourceStats};
 use crate::pipeline::PackedEvent;
 use crate::relay::RelayManager;
+use crate::relay::connection_guard::{ConnectionGuard, ConnectionGuardConfig};
 use crate::{Error, Result};
 
 use chrono::DateTime;
@@ -126,6 +127,8 @@ pub struct RelaySource {
     relay_manager: Option<Arc<RelayManager>>,
     /// Connection start times for tracking uptime (relay_url -> connected_at).
     connection_times: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Connection guard for enforcing connection safety policies.
+    connection_guard: Arc<ConnectionGuard>,
 }
 
 /// Internal statistics for the relay source.
@@ -154,6 +157,11 @@ impl RelaySource {
     pub fn new(config: RelayConfig) -> Self {
         let known_relays: HashSet<String> = config.seed_relays.iter().cloned().collect();
 
+        let guard_config = ConnectionGuardConfig {
+            max_relays: config.max_relays,
+            ..Default::default()
+        };
+
         Self {
             config,
             known_relays: Arc::new(RwLock::new(known_relays)),
@@ -161,6 +169,7 @@ impl RelaySource {
             stats: Arc::new(RelayStats::default()),
             relay_manager: None,
             connection_times: Arc::new(RwLock::new(HashMap::new())),
+            connection_guard: Arc::new(ConnectionGuard::new(guard_config)),
         }
     }
 
@@ -172,6 +181,11 @@ impl RelaySource {
     pub fn with_manager(config: RelayConfig, relay_manager: Arc<RelayManager>) -> Self {
         let known_relays: HashSet<String> = config.seed_relays.iter().cloned().collect();
 
+        let guard_config = ConnectionGuardConfig {
+            max_relays: config.max_relays,
+            ..Default::default()
+        };
+
         Self {
             config,
             known_relays: Arc::new(RwLock::new(known_relays)),
@@ -179,6 +193,7 @@ impl RelaySource {
             stats: Arc::new(RelayStats::default()),
             relay_manager: Some(relay_manager),
             connection_times: Arc::new(RwLock::new(HashMap::new())),
+            connection_guard: Arc::new(ConnectionGuard::new(guard_config)),
         }
     }
 
@@ -223,7 +238,9 @@ impl RelaySource {
         }
     }
 
-    /// Record a disconnection from a relay.
+    /// Record a normal disconnection from a relay (e.g., optimization swap).
+    ///
+    /// This does NOT count as a failure.
     async fn record_disconnection(&self, relay_url: &str) {
         // Calculate connected duration
         let connected_seconds = {
@@ -237,6 +254,26 @@ impl RelaySource {
         // Record in relay manager
         if let Some(ref manager) = self.relay_manager {
             manager.record_disconnect(relay_url, connected_seconds);
+        }
+    }
+
+    /// Record a relay rejection (auth denied, whitelist, etc.).
+    ///
+    /// Unlike `record_disconnection`, this counts as a failure and will
+    /// eventually lead to the relay being blocked.
+    async fn record_rejection(&self, relay_url: &str) {
+        // Calculate connected duration
+        let connected_seconds = {
+            let mut times = self.connection_times.write().await;
+            times
+                .remove(relay_url)
+                .map(|start| start.elapsed().as_secs())
+                .unwrap_or(0)
+        };
+
+        // Record as rejection (counts as failure)
+        if let Some(ref manager) = self.relay_manager {
+            manager.record_rejection(relay_url, connected_seconds);
         }
     }
 
@@ -291,14 +328,20 @@ impl RelaySource {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        // Sync the connection guard's active count with reality
+        self.connection_guard
+            .set_active_connections(connected_count as usize);
+
         // Emit as Prometheus gauge - this is the ACTUAL WebSocket connection count
         metrics::gauge!("relay_connections_current").set(connected_count as f64);
+        metrics::gauge!("relay_unique_ips").set(self.connection_guard.unique_ips() as f64);
 
         if updates > 0 {
             tracing::debug!(
-                "Status reconciliation: {} connected, {} status updates",
+                "Status reconciliation: {} connected, {} status updates, {} unique IPs",
                 connected_count,
-                updates
+                updates,
+                self.connection_guard.unique_ips()
             );
         }
     }
@@ -357,21 +400,36 @@ impl RelaySource {
         }
 
         // Create client with signer for NIP-42 authentication
-        let client = Client::builder()
-            .signer(keys)
-            .opts(client_opts)
-            .build();
+        let client = Client::builder().signer(keys).opts(client_opts).build();
 
         // Enable automatic authentication (NIP-42)
         client.automatic_authentication(true);
 
-        // Add seed relays
+        // Pre-resolve seed relays through the connection guard (DNS + IP check)
+        // Seed relays bypass rate limiting but still get DNS/IP filtering
+        let mut valid_seeds = Vec::new();
         for relay_url in &self.config.seed_relays {
             // Register with manager if available
             if let Some(ref manager) = self.relay_manager
                 && let Err(e) = manager.register_relay(relay_url, crate::relay::RelayTier::Seed)
             {
                 tracing::warn!("Failed to register seed relay {}: {}", relay_url, e);
+            }
+
+            // Check DNS resolution for seed relays (skip rate limit check)
+            match self.connection_guard.check_and_resolve(relay_url).await {
+                Ok(()) => {
+                    valid_seeds.push(relay_url.clone());
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        "Seed relay {} rejected by connection guard: {}",
+                        relay_url,
+                        reason
+                    );
+                    self.record_connection_failure(relay_url);
+                    continue;
+                }
             }
 
             if let Err(e) = client.add_relay(relay_url).await {
@@ -388,13 +446,15 @@ impl RelaySource {
         // Wait a bit for connections to establish
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Record successful connections
+        // Record successful connections with the connection guard
         let relays = client.relays().await;
         let mut connected_count = 0usize;
         for (url, relay) in &relays {
             // Check if relay is actually connected
             if relay.status() == nostr_sdk::RelayStatus::Connected {
-                self.record_connection(&url.to_string()).await;
+                let url_str = url.to_string();
+                self.record_connection(&url_str).await;
+                self.connection_guard.record_connect(&url_str);
                 metrics::counter!("relay_connects_total", "reason" => "seed").increment(1);
                 connected_count += 1;
             }
@@ -571,8 +631,9 @@ impl RelaySource {
                                     notice_msg
                                 );
                                 let relay_url_str = relay_url.to_string();
-                                // Record disconnection before disconnecting
-                                self.record_disconnection(&relay_url_str).await;
+                                // Record as rejection (counts as failure, may lead to blocking)
+                                self.record_rejection(&relay_url_str).await;
+                                self.connection_guard.record_disconnect(&relay_url_str);
                                 metrics::counter!("relay_disconnects_total", "reason" => "rejection").increment(1);
                                 // Disconnect from this relay
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
@@ -604,8 +665,9 @@ impl RelaySource {
                                     closed_msg
                                 );
                                 let relay_url_str = relay_url.to_string();
-                                // Record disconnection before disconnecting
-                                self.record_disconnection(&relay_url_str).await;
+                                // Record as rejection (counts as failure, may lead to blocking)
+                                self.record_rejection(&relay_url_str).await;
+                                self.connection_guard.record_disconnect(&relay_url_str);
                                 metrics::counter!("relay_disconnects_total", "reason" => "rejection").increment(1);
                                 if let Err(e) = client.disconnect_relay(relay_url.clone()).await {
                                     tracing::debug!(
@@ -693,6 +755,7 @@ impl RelaySource {
         for url in &suggestions.to_disconnect {
             tracing::info!("Disconnecting low-scoring relay: {}", url);
             self.record_disconnection(url).await;
+            self.connection_guard.record_disconnect(url);
             counter!("relay_disconnects_total", "reason" => "optimization").increment(1);
 
             if let Ok(relay_url) = RelayUrl::parse(url) {
@@ -731,6 +794,12 @@ impl RelaySource {
     }
 
     /// Try to connect to a relay and subscribe it to the filter.
+    ///
+    /// The connection guard is checked first to enforce:
+    /// - Max relay connection cap
+    /// - Connection rate limiting
+    /// - DNS resolution filtering (reject private IPs)
+    /// - Per-IP connection deduplication
     async fn try_connect_relay(
         &self,
         client: &Client,
@@ -740,6 +809,23 @@ impl RelaySource {
     ) {
         use metrics::counter;
 
+        // Check connection guard BEFORE attempting connection
+        match self.connection_guard.check_and_resolve(url).await {
+            Ok(()) => {}
+            Err(rejection) => {
+                tracing::debug!(
+                    "Connection to {} blocked by guard: {} (reason: {})",
+                    url,
+                    rejection,
+                    reason
+                );
+                counter!("relay_guard_rejections_total", "reason" => reason).increment(1);
+                // Record the failure so the relay manager tracks it
+                self.record_connection_failure(url);
+                return;
+            }
+        }
+
         // Add to known set
         {
             let mut known = self.known_relays.write().await;
@@ -747,10 +833,23 @@ impl RelaySource {
         }
 
         // Add and connect
+        //
+        // IMPORTANT: connect_relay() returns Ok immediately -- it initiates
+        // the connection asynchronously. We must NOT record this as a success.
+        // Instead, we mark it as "connecting" and let reconcile_relay_status()
+        // determine the actual outcome at the next optimization cycle.
         match client.add_relay(url).await {
             Ok(_) => match client.connect_relay(url).await {
                 Ok(_) => {
-                    self.record_connection(url).await;
+                    // Track connection start time (for uptime calculation when it
+                    // eventually connects) and update the guard, but do NOT call
+                    // record_connection() -- that would reset consecutive_failures.
+                    // The reconciliation loop will confirm whether this actually connected.
+                    self.connection_times
+                        .write()
+                        .await
+                        .insert(url.to_string(), Instant::now());
+                    self.connection_guard.record_connect(url);
                     self.stats.relays_connected.fetch_add(1, Ordering::Relaxed);
                     counter!("relay_connects_total", "reason" => reason).increment(1);
 
@@ -764,6 +863,8 @@ impl RelaySource {
                     }
                 }
                 Err(e) => {
+                    // connect_relay() itself failed (not just the async handshake)
+                    // This is a definitive, synchronous failure.
                     tracing::warn!("Failed to connect to {}: {}", url, e);
                     self.record_connection_failure(url);
                     counter!("relay_connect_failures_total", "reason" => reason).increment(1);

@@ -127,10 +127,7 @@ pub fn router(state: AppState) -> Router {
         // Publishers
         .route("/stats/publishers", get(stats::publishers))
         // Relay distribution (NIP-65)
-        .route(
-            "/stats/relays/distribution",
-            get(stats::relay_distribution),
-        )
+        .route("/stats/relays/distribution", get(stats::relay_distribution))
         // Kinds
         .route("/kinds", get(kinds::list_kinds))
         .route("/kinds/{kind}", get(kinds::get_kind))

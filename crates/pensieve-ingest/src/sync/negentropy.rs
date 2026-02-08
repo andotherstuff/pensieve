@@ -105,9 +105,7 @@ impl SyncStateAdapter {
     /// Create a new adapter with an event capture channel.
     ///
     /// Returns the adapter and a receiver for captured events.
-    pub fn new(
-        sync_state: Arc<SyncStateDb>,
-    ) -> (Self, mpsc::UnboundedReceiver<Event>) {
+    pub fn new(sync_state: Arc<SyncStateDb>) -> (Self, mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
@@ -343,7 +341,10 @@ impl NegentropySyncer {
                 stats.relays_errored = self.config.relays.len();
             }
             Err(_) => {
-                tracing::warn!("Negentropy sync timed out after {:?}", self.config.protocol_timeout);
+                tracing::warn!(
+                    "Negentropy sync timed out after {:?}",
+                    self.config.protocol_timeout
+                );
                 stats.relays_errored = self.config.relays.len();
             }
         }
@@ -453,7 +454,10 @@ impl NegentropySyncer {
                             Err(e) => {
                                 // Event failed to process - do NOT record in sync state.
                                 // It will be re-fetched on the next sync cycle.
-                                tracing::debug!("Event handler error (will retry next sync): {}", e);
+                                tracing::debug!(
+                                    "Event handler error (will retry next sync): {}",
+                                    e
+                                );
                                 events_failed += 1;
                                 counter!("negentropy_events_failed_total").increment(1);
                             }
@@ -476,7 +480,8 @@ impl NegentropySyncer {
                     gauge!("negentropy_last_batch_total").set(total_events as f64);
                     gauge!("negentropy_last_batch_succeeded").set(events_succeeded as f64);
                     gauge!("negentropy_last_batch_failed").set(events_failed as f64);
-                    histogram!("negentropy_batch_process_duration_seconds").record(process_duration.as_secs_f64());
+                    histogram!("negentropy_batch_process_duration_seconds")
+                        .record(process_duration.as_secs_f64());
 
                     // Prune sync state entries older than the lookback window
                     // This bounds storage to approximately lookback_duration worth of events

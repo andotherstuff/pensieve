@@ -61,8 +61,8 @@ pub use source::{
 
 // Re-export relay manager types
 pub use relay::{
-    AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig, RelayStatus,
-    RelayTier,
+    AggregateRelayStats, ConnectionGuard, ConnectionGuardConfig, OptimizationSuggestions,
+    RelayManager, RelayManagerConfig, RelayStatus, RelayTier,
 };
 
 // Re-export sync types

@@ -44,5 +44,9 @@ const API_DOCS: &str = include_str!("../../README.md");
 /// Returns the API documentation as Markdown.
 /// No authentication required.
 pub async fn docs() -> Response {
-    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], API_DOCS).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        API_DOCS,
+    )
+        .into_response()
 }

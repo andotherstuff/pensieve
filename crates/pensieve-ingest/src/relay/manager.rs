@@ -322,7 +322,11 @@ impl RelayManager {
         }
     }
 
-    /// Record a disconnection and set status to idle.
+    /// Record a normal disconnection (e.g., optimization swap) and set status to idle.
+    ///
+    /// This does NOT count as a failure -- the relay was working fine, we're just
+    /// choosing to disconnect from it. Use [`record_rejection`] for relays that
+    /// rejected our connection or subscription.
     ///
     /// The URL is normalized before recording to ensure it matches the
     /// registered URL in the database.
@@ -360,10 +364,62 @@ impl RelayManager {
         }
     }
 
+    /// Record a relay rejection (auth denied, whitelist, paid, subscription closed).
+    ///
+    /// Unlike [`record_disconnect`], this counts as a failure and increments
+    /// `consecutive_failures`. Relays that consistently reject us will eventually
+    /// be blocked after reaching `block_after_failures`.
+    pub fn record_rejection(&self, relay_url: &str, connected_seconds: u64) {
+        // Normalize URL to match database entries
+        let normalized = match normalize_relay_url(relay_url) {
+            NormalizeResult::Ok(u) => u,
+            NormalizeResult::Invalid(_) | NormalizeResult::Blocked(_) => {
+                return;
+            }
+        };
+
+        self.maybe_flush_hour();
+
+        // Update in-memory accumulators
+        {
+            let mut accumulators = self.accumulators.lock();
+            let acc = accumulators.entry(normalized.clone()).or_default();
+            acc.disconnects += 1;
+            acc.connection_seconds += connected_seconds;
+        }
+
+        // Record as a connection failure (increments consecutive_failures, may block)
+        if let Err(e) = self.update_connection_status(&normalized, false) {
+            tracing::warn!(
+                "Failed to update connection status for rejected relay {}: {}",
+                normalized,
+                e
+            );
+        }
+    }
+
     /// Update relay status after connection attempt.
+    ///
+    /// If the relay is not registered in the database, it is auto-registered
+    /// as a discovered relay to ensure failures are tracked.
     fn update_connection_status(&self, relay_url: &str, success: bool) -> Result<()> {
         let conn = self.conn.lock();
         let now = Self::unix_now();
+
+        // Ensure the relay exists in the database (auto-register if missing).
+        // This prevents silent no-ops when recording failures for relays that
+        // were discovered but not yet formally registered.
+        conn.execute(
+            "INSERT OR IGNORE INTO relays (url, first_seen_at, tier, status)
+             VALUES (?, ?, ?, ?)",
+            rusqlite::params![
+                relay_url,
+                now,
+                RelayTier::Discovered.as_str(),
+                RelayStatus::Pending.as_str()
+            ],
+        )
+        .map_err(|e| Error::Database(e.to_string()))?;
 
         if success {
             conn.execute(
@@ -801,7 +857,7 @@ impl RelayManager {
             .prepare(
                 "SELECT r.url, COALESCE(s.score, 0) as score FROM relays r
                  LEFT JOIN relay_scores s ON r.url = s.relay_url
-                 WHERE r.status NOT IN ('blocked', 'active')
+                 WHERE r.status NOT IN ('blocked', 'active', 'failing')
                  ORDER BY score DESC
                  LIMIT 100",
             )
@@ -851,13 +907,13 @@ impl RelayManager {
 
             // Find relays that are:
             // 1. Not currently connected
-            // 2. Not blocked
+            // 2. Not blocked or failing
             // 3. Either never connected or last connected > 24h ago
             // Order randomly to avoid always picking the same ones
             let candidates: Vec<String> = conn
                 .prepare(
                     "SELECT r.url FROM relays r
-                     WHERE r.status NOT IN ('blocked', 'active')
+                     WHERE r.status NOT IN ('blocked', 'active', 'failing')
                        AND (r.last_connected_at IS NULL OR r.last_connected_at < ?)
                      ORDER BY RANDOM()
                      LIMIT ?",
@@ -1139,6 +1195,161 @@ mod tests {
         // Should be blocked now
         let relays = manager.get_relays_to_connect(10).unwrap();
         assert!(relays.is_empty());
+    }
+
+    #[test]
+    fn test_failure_counter_not_reset_by_reconciliation() {
+        // Regression test for Bug 3: consecutive_failures should accumulate
+        // across reconciliation cycles, not reset to 0.
+        let config = RelayManagerConfig {
+            block_after_failures: 3,
+            ..Default::default()
+        };
+
+        let manager = RelayManager::open_in_memory().unwrap();
+        let manager = RelayManager { config, ..manager };
+
+        manager
+            .register_relay("wss://dead.relay.com", RelayTier::Discovered)
+            .unwrap();
+
+        // Simulate: reconciliation detects relay is disconnected (was never really active)
+        // First cycle: relay was somehow marked active, now disconnected
+        {
+            let conn = manager.conn.lock();
+            conn.execute(
+                "UPDATE relays SET status = 'active' WHERE url = ?",
+                rusqlite::params!["wss://dead.relay.com"],
+            )
+            .unwrap();
+        }
+        // Reconcile: discovers it's disconnected -> failure +1
+        let updated = manager
+            .reconcile_status("wss://dead.relay.com", false)
+            .unwrap();
+        assert!(updated);
+
+        // Check failure count is 1
+        let failures: u32 = {
+            let conn = manager.conn.lock();
+            conn.query_row(
+                "SELECT consecutive_failures FROM relays WHERE url = ?",
+                rusqlite::params!["wss://dead.relay.com"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(failures, 1);
+
+        // Simulate second cycle: status is now 'failing', reconcile should NOT
+        // increment again (it only increments when transitioning from active)
+        let updated = manager
+            .reconcile_status("wss://dead.relay.com", false)
+            .unwrap();
+        assert!(!updated); // No update for already-failing relay
+
+        // Failure count should still be 1 (not 2)
+        let failures: u32 = {
+            let conn = manager.conn.lock();
+            conn.query_row(
+                "SELECT consecutive_failures FROM relays WHERE url = ?",
+                rusqlite::params!["wss://dead.relay.com"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn test_rejection_counts_as_failure() {
+        // Test that record_rejection increments consecutive_failures
+        let config = RelayManagerConfig {
+            block_after_failures: 3,
+            ..Default::default()
+        };
+
+        let manager = RelayManager::open_in_memory().unwrap();
+        let manager = RelayManager { config, ..manager };
+
+        manager
+            .register_relay("wss://paid.relay.com", RelayTier::Discovered)
+            .unwrap();
+
+        // First, mark as active (simulating a successful connection)
+        manager.record_connection_attempt("wss://paid.relay.com", true);
+
+        // Now reject 3 times
+        manager.record_rejection("wss://paid.relay.com", 10);
+        manager.record_rejection("wss://paid.relay.com", 10);
+        manager.record_rejection("wss://paid.relay.com", 10);
+
+        // Should be blocked
+        let relays = manager.get_relays_to_connect(10).unwrap();
+        assert!(relays.is_empty());
+    }
+
+    #[test]
+    fn test_unregistered_relay_auto_registered_on_failure() {
+        // Test that recording a failure for an unregistered relay auto-registers it
+        let manager = RelayManager::open_in_memory().unwrap();
+
+        // Record failure for relay that was never registered
+        manager.record_connection_attempt("wss://unknown.relay.com", false);
+
+        // Relay should now exist in the database with status 'failing'
+        let conn = manager.conn.lock();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM relays WHERE url = ?",
+                rusqlite::params!["wss://unknown.relay.com"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failing");
+
+        let failures: u32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM relays WHERE url = ?",
+                rusqlite::params!["wss://unknown.relay.com"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn test_failing_relays_excluded_from_exploration() {
+        let config = RelayManagerConfig {
+            exploration_slots: 5,
+            exploration_min_age_secs: 0, // Don't filter by age for test
+            ..Default::default()
+        };
+
+        let manager = RelayManager::open_in_memory().unwrap();
+        let manager = RelayManager { config, ..manager };
+
+        // Register a relay and mark it as failing
+        manager
+            .register_relay("wss://failing.relay.com", RelayTier::Discovered)
+            .unwrap();
+        manager.record_connection_attempt("wss://failing.relay.com", false);
+
+        // Register a healthy idle relay
+        manager
+            .register_relay("wss://healthy.relay.com", RelayTier::Discovered)
+            .unwrap();
+
+        // Get optimization suggestions with no currently connected relays
+        let suggestions = manager.get_optimization_suggestions(&[]).unwrap();
+
+        // The failing relay should NOT be in exploration candidates
+        assert!(
+            !suggestions
+                .exploration_relays
+                .contains(&"wss://failing.relay.com".to_string()),
+            "Failing relay should not be an exploration candidate"
+        );
     }
 
     #[test]
