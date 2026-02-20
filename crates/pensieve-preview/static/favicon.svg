@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<style>
+  text { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  @media (prefers-color-scheme: light) {
+    rect { fill: #fff; }
+    text { fill: #111; }
+  }
+  @media (prefers-color-scheme: dark) {
+    rect { fill: #0a0a0f; }
+    text { fill: #e5e5e5; }
+  }
+</style>
+<rect width="32" height="32" rx="6" fill="#fff"/>
+<text x="16" y="25" text-anchor="middle" font-size="26" font-weight="800" fill="#111">n</text>
+</svg>

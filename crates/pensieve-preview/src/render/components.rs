@@ -181,6 +181,7 @@ pub fn page_shell(
                 title { (title) }
                 meta name="description" content=(description);
                 link rel="canonical" href=(canonical_url);
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
 
                 // Open Graph
                 meta property="og:title" content=(og.title);

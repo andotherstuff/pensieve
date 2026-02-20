@@ -14,6 +14,7 @@ pub async fn home_page() -> impl IntoResponse {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "nstr.to — Nostr Event Previews" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 meta name="description" content="Fast, static preview pages for any Nostr event. Just add any npub, note, or nevent to the URL.";
                 meta property="og:title" content="nstr.to";
                 meta property="og:description" content="Fast, static preview pages for any Nostr event.";
