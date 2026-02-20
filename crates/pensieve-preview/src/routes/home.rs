@@ -60,7 +60,7 @@ pub async fn home_page() -> impl IntoResponse {
 
                     div class="home-try" {
                         p { "Try one:" }
-                        a href="/npub1gg0dd9mlypmk00ur047wnd5taw43hhmfj5sa03fh75dncd6uuajs97av9j" {
+                        a href="/npub1zuuajd7u3sx8xu92yav9jwxpr839cs0kc3q6t56vd5u9q033xmhsk6c2uc" {
                             "View a profile"
                         }
                         a href="/nevent1qqsqzh75xs5mkljtarlz82jk225vksu4m6wp355taepnwdphlhdfz6gnwh8jr" {
