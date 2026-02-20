@@ -58,15 +58,21 @@
     }
 
     # =========================================================================
-    # Root - Landing page or redirect
+    # Pensieve Preview - Static Nostr event preview pages
     # =========================================================================
+    # Access at: https://your-domain.com/{nip19_identifier}
+    # JSON API: https://your-domain.com/{nip19_identifier}.json
+    # Health: https://your-domain.com/health (shared with preview)
+    #
+    # The preview server runs as a native binary on the host (not in Docker).
+    # It handles all remaining routes (NIP-19 identifiers, robots.txt, llms.txt).
+
     handle / {
-        respond "Pensieve is running. Visit /grafana/ for dashboards." 200
+        reverse_proxy host.docker.internal:8081
     }
 
-    # Catch-all: 404
     handle {
-        respond "Not Found" 404
+        reverse_proxy host.docker.internal:8081
     }
 }
 

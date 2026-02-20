@@ -39,9 +39,16 @@ just precommit          # Runs fmt, clippy, test
 # Run binaries (debug mode)
 just run-ingest         # Live relay ingestion
 just run-serve          # Serve API (placeholder)
+just run-preview        # Preview server (static HTML event pages)
 just run-backfill-jsonl # JSONL backfill
 just run-backfill-proto # Protobuf backfill
 just run-relay-cleanup  # Normalize and dedupe relay database
+
+# Preview server testing
+just test-preview           # Run preview tests
+just test-preview-verbose   # Run with output
+just coverage-preview       # HTML coverage report (requires cargo-llvm-cov)
+just coverage-preview-summary  # Coverage summary
 
 # Local dev environment
 just dev-up             # Start Docker services (ClickHouse, Prometheus, Grafana)
@@ -71,6 +78,10 @@ pensieve/
 │   │       ├── pipeline/    # Core pipeline: dedupe.rs, segment.rs, clickhouse.rs
 │   │       ├── relay/       # Relay quality tracking and management
 │   │       └── source/      # Event sources: relay.rs, jsonl.rs, proto.rs
+│   ├── pensieve-preview/    # Static HTML preview pages for Nostr events
+│   │   └── src/
+│   │       ├── render/      # HTML renderers (note, profile, article, video, etc.)
+│   │       └── routes/      # HTTP routes (preview, JSON API, llms.txt, health)
 │   └── pensieve-serve/      # API server (placeholder)
 ├── docs/
 │   ├── clickhouse_self_hosted.sql  # Full ClickHouse schema
@@ -253,6 +264,7 @@ The production server runs at `~/pensieve`. The default branch is `master`.
 | ClickHouse, Grafana, Prometheus, Caddy | Docker Compose | `~/pensieve/pensieve-deploy/` |
 | `pensieve-ingest` | Native binary + systemd | `~/pensieve/target/release/` |
 | `pensieve-serve` | Native binary + systemd | `~/pensieve/target/release/` |
+| `pensieve-preview` | Native binary + systemd | `~/pensieve/target/release/` |
 
 ### Deployment Checklist
 
@@ -330,11 +342,13 @@ just ch-query "SELECT count() FROM events_local"
 # View logs
 journalctl -u pensieve-ingest -f      # Ingester logs
 journalctl -u pensieve-api -f         # API logs
+journalctl -u pensieve-preview -f     # Preview server logs
 journalctl -u 'pensieve*' -f          # All Pensieve logs
 
 # Restart services
 sudo systemctl restart pensieve-ingest
 sudo systemctl restart pensieve-api
+sudo systemctl restart pensieve-preview
 
 # Check status
 sudo systemctl status pensieve pensieve-api pensieve-ingest

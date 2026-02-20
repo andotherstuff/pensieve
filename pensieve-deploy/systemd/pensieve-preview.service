@@ -1,0 +1,38 @@
+[Unit]
+Description=Pensieve Preview Server
+Documentation=https://github.com/andotherstuff/pensieve
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=pensieve
+Group=pensieve
+WorkingDirectory=/home/pensieve/pensieve
+
+# Binary location (after cargo build --release)
+ExecStart=/home/pensieve/pensieve/target/release/pensieve-preview
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Environment file (for CLICKHOUSE_URL, PREVIEW_BASE_URL, etc.)
+EnvironmentFile=/home/pensieve/pensieve/pensieve-deploy/.env
+
+# Additional environment
+Environment=RUST_LOG=info,pensieve_preview=debug
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pensieve-preview
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
