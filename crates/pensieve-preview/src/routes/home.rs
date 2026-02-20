@@ -51,6 +51,12 @@ pub async fn home_page() -> impl IntoResponse {
                                 span class="home-label" { "Article" }
                                 code { "nstr.to/" span class="home-highlight" { "naddr1..." } }
                             }
+                        }
+                    }
+
+                    div class="home-agents" {
+                        p { "And for agents:" }
+                        div class="home-examples" {
                             div class="home-example" {
                                 span class="home-label" { "JSON" }
                                 code { "nstr.to/nevent1..." span class="home-highlight" { ".json" } }
@@ -94,6 +100,8 @@ const HOME_CSS: &str = r#"
 .home-label{font-size:.75rem;font-weight:600;color:var(--fg3);text-transform:uppercase;letter-spacing:.05em;width:52px;text-align:right;flex-shrink:0}
 .home-example code{font-family:var(--mono);font-size:.85rem;color:var(--fg2)}
 .home-highlight{color:var(--accent);font-weight:600}
+.home-agents{margin-top:1.75rem;width:100%;max-width:420px}
+.home-agents>p{font-size:.95rem;color:var(--fg2);margin-bottom:1rem}
 .home-try{margin-top:2rem;display:flex;flex-direction:column;align-items:center;gap:.75rem}
 .home-try p{font-size:.85rem;color:var(--fg3)}
 .home-try a{font-size:.9rem;color:var(--accent);text-decoration:none}
