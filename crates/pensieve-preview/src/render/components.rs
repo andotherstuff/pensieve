@@ -370,13 +370,13 @@ pub fn nostr_link(nostr_uri: &str) -> Markup {
             ("Snort", format!("https://snort.social/p/{nostr_uri}")),
             (
                 "Nostrudel",
-                format!("https://nostrudel.ninja/#/u/{nostr_uri}"),
+                format!("https://nostrudel.ninja/l/{nostr_uri}"),
             ),
             ("Iris", format!("https://iris.to/{nostr_uri}")),
-            ("Satellite", format!("https://satellite.earth/@{nostr_uri}")),
+            ("Jumble", format!("https://jumble.social/{nostr_uri}")),
+            ("YakiHonne", format!("https://yakihonne.com/{nostr_uri}")),
             ("Habla", format!("https://habla.news/p/{nostr_uri}")),
             ("njump", format!("https://njump.me/{nostr_uri}")),
-            ("nostr: link", format!("nostr:{nostr_uri}")),
         ]
     } else {
         vec![
@@ -385,16 +385,13 @@ pub fn nostr_link(nostr_uri: &str) -> Markup {
             ("Snort", format!("https://snort.social/e/{nostr_uri}")),
             (
                 "Nostrudel",
-                format!("https://nostrudel.ninja/#/n/{nostr_uri}"),
+                format!("https://nostrudel.ninja/l/{nostr_uri}"),
             ),
             ("Iris", format!("https://iris.to/{nostr_uri}")),
-            (
-                "Satellite",
-                format!("https://satellite.earth/thread/{nostr_uri}"),
-            ),
-            ("Habla", format!("https://habla.news/e/{nostr_uri}")),
+            ("Jumble", format!("https://jumble.social/{nostr_uri}")),
+            ("YakiHonne", format!("https://yakihonne.com/{nostr_uri}")),
+            ("Habla", format!("https://habla.news/{nostr_uri}")),
             ("njump", format!("https://njump.me/{nostr_uri}")),
-            ("nostr: link", format!("nostr:{nostr_uri}")),
         ]
     };
 
@@ -791,14 +788,18 @@ mod tests {
         let markup = nostr_link("nevent1abc123");
         let html = markup.into_string();
         // Should have client buttons linking to various clients
-        assert!(html.contains("nostr:nevent1abc123"));
         assert!(html.contains("Primal"));
         assert!(html.contains("Coracle"));
         assert!(html.contains("Snort"));
+        assert!(html.contains("Jumble"));
+        assert!(html.contains("YakiHonne"));
         assert!(html.contains("njump"));
         assert!(html.contains("clients-grid"));
-        // Event URLs should use /e/ pattern
+        // Event URLs should use /e/ pattern for Primal
         assert!(html.contains("primal.net/e/nevent1abc123"));
+        // Jumble and YakiHonne use direct path
+        assert!(html.contains("jumble.social/nevent1abc123"));
+        assert!(html.contains("yakihonne.com/nevent1abc123"));
     }
 
     #[test]
