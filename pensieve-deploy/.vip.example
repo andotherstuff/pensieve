@@ -1,0 +1,14 @@
+# VIP Pubkeys
+#
+# One pubkey per line. Supports hex (64 chars) and npub (bech32) formats.
+# Pages from these pubkeys get extended CDN cache TTLs.
+# Empty lines and lines starting with # are ignored.
+#
+# Copy to .vip and edit:
+#   cp .vip.example .vip
+
+# Example hex pubkey
+# 82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2
+
+# Example npub
+# npub1sg6plzptd64u62a878hep2kev3zah5gjcnrm4ggn8ky4rfu7dlhks42twg2

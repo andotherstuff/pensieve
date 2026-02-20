@@ -70,3 +70,6 @@ regex = "1"
 
 # Markdown rendering (for kind 30023 articles)
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+[dev-dependencies]
+tempfile = "3"

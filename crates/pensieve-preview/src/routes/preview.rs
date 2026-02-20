@@ -36,7 +36,7 @@ pub async fn preview_handler(
         tracing::debug!(identifier = %identifier, "cache hit");
         return Ok(build_response(
             &cached.html,
-            cache_headers(&state, identifier, true),
+            cache_headers(&state, identifier, None),
         ));
     }
 
@@ -44,6 +44,12 @@ pub async fn preview_handler(
 
     // Resolve the identifier
     let content = resolve::resolve(&state, identifier).await?;
+
+    // Extract the pubkey for VIP TTL decisions
+    let pubkey_hex = match &content {
+        resolve::ResolvedContent::Profile { pubkey_hex, .. } => Some(pubkey_hex.as_str()),
+        resolve::ResolvedContent::Event { event, .. } => Some(event.pubkey.as_str()),
+    };
 
     // Render the HTML page
     let markup = render::render_page(&state, &content).await?;
@@ -58,7 +64,7 @@ pub async fn preview_handler(
 
     Ok(build_response(
         &html_string,
-        cache_headers(&state, identifier, false),
+        cache_headers(&state, identifier, pubkey_hex),
     ))
 }
 
@@ -102,15 +108,12 @@ fn build_response(html: &str, cache_headers: HeaderMap) -> Response {
 ///
 /// TTL tiers:
 /// - VIP pubkeys: 24h s-maxage
-/// - Recent events (< 24h): 5min s-maxage
-/// - Medium events (1-30 days): 1h s-maxage
-/// - Old events (> 30 days): 6h s-maxage
 /// - Profiles: 30min s-maxage
-fn cache_headers(state: &AppState, identifier: &str, _is_cache_hit: bool) -> HeaderMap {
+/// - Events: 1h s-maxage
+fn cache_headers(state: &AppState, identifier: &str, pubkey_hex: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    // Determine TTL based on identifier type and VIP status
-    let (max_age, s_maxage, swr) = determine_ttl(state, identifier);
+    let (max_age, s_maxage, swr) = determine_ttl(state, identifier, pubkey_hex);
 
     let cache_value =
         format!("public, max-age={max_age}, s-maxage={s_maxage}, stale-while-revalidate={swr}");
@@ -125,19 +128,20 @@ fn cache_headers(state: &AppState, identifier: &str, _is_cache_hit: bool) -> Hea
 /// Determine TTL values (max-age, s-maxage, stale-while-revalidate) for an identifier.
 ///
 /// Returns (browser_ttl, cdn_ttl, stale_while_revalidate) in seconds.
-fn determine_ttl(_state: &AppState, identifier: &str) -> (u32, u32, u32) {
-    // Check if this is a profile-type identifier
+fn determine_ttl(state: &AppState, identifier: &str, pubkey_hex: Option<&str>) -> (u32, u32, u32) {
+    // Check if this pubkey is a VIP
+    let is_vip = pubkey_hex.is_some_and(|pk| state.config.vip_pubkeys.contains(pk));
+
+    if is_vip {
+        // VIP pubkeys get long CDN TTLs — their pages are hit frequently
+        return (60, 86400, 3600); // 1min browser, 24h CDN, 1h SWR
+    }
+
     let is_profile = identifier.starts_with("npub1") || identifier.starts_with("nprofile1");
 
     if is_profile {
-        // Check if it's a VIP pubkey
-        // For NIP-19 encoded identifiers, we'd need to decode to check.
-        // For simplicity, profiles get a moderate TTL; VIP logic can be
-        // refined once we track which pubkeys are VIPs at the response level.
-        return (60, 1800, 300); // 1min browser, 30min CDN, 5min SWR
+        (60, 1800, 300) // 1min browser, 30min CDN, 5min SWR
+    } else {
+        (60, 3600, 600) // 1min browser, 1h CDN, 10min SWR
     }
-
-    // For events, default to moderate TTL
-    // In the future, we can check event age and engagement here
-    (60, 3600, 600) // 1min browser, 1h CDN, 10min SWR
 }
