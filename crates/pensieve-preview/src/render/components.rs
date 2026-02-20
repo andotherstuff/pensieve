@@ -123,10 +123,13 @@ svg.icon{width:20px;height:20px;fill:currentColor;stroke:none;vertical-align:-3p
 .repost-header{font-size:.9rem;color:var(--fg3);padding:0 0 .75rem;display:flex;align-items:center;gap:.35rem}
 .repost-header svg.icon{width:16px;height:16px}
 
-.actions{margin-top:1.25rem;display:flex;justify-content:center}
-.nostr-link{display:inline-flex;align-items:center;gap:.5rem;padding:.55rem 1.1rem;background:var(--accent);color:#fff;border-radius:6px;font-size:.9rem;font-weight:500;text-decoration:none;transition:background .15s}
-.nostr-link:hover{background:var(--accent-hover);text-decoration:none}
-.nostr-link svg.icon{fill:#fff;width:16px;height:16px}
+.clients{margin-top:1.5rem}
+.clients-label{font-size:.8rem;color:var(--fg3);margin-bottom:.6rem;text-align:center}
+.clients-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem}
+.client-btn{display:flex;align-items:center;justify-content:center;gap:.35rem;padding:.45rem .5rem;border:1px solid var(--border);border-radius:6px;font-size:.78rem;font-weight:500;color:var(--fg2);text-decoration:none;transition:border-color .15s,color .15s;white-space:nowrap}
+.client-btn:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.client-btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.client-btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff}
 
 .footer{text-align:center;margin-top:1rem;padding-top:.75rem;font-size:.8rem;color:var(--fg3);letter-spacing:.01em;width:100%;max-width:680px;display:flex;align-items:center;justify-content:center;gap:.25rem}
 .footer a{color:var(--accent);text-decoration:none}
@@ -286,9 +289,6 @@ const ICON_REPOST: &str = r#"<svg class="icon" viewBox="0 0 256 256"><path d="M2
 /// Copy icon (Phosphor copy, fill)
 pub const ICON_COPY: &str = r#"<svg class="icon" viewBox="0 0 256 256"><path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32Zm-56,176H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"/></svg>"#;
 
-/// Arrow square out icon (Phosphor arrow-square-out, fill)
-const ICON_EXTERNAL: &str = r#"<svg class="icon" viewBox="0 0 256 256"><path d="M228,104a12,12,0,0,1-24,0V69l-59.51,59.51a12,12,0,0,1-17-17L187,52H152a12,12,0,0,1,0-24h64a12,12,0,0,1,12,12Zm-44,44a12,12,0,0,0-12,12v52H52V92h52a12,12,0,0,0,0-24H48A20,20,0,0,0,28,88V216a20,20,0,0,0,20,20H176a20,20,0,0,0,20-20V160A12,12,0,0,0,184,148Z"/></svg>"#;
-
 /// Lightning bolt icon (Phosphor lightning, fill)
 pub const ICON_LIGHTNING: &str = r#"<svg class="icon" viewBox="0 0 256 256"><path d="M213.85,125.46l-112,120a8,8,0,0,1-13.69-7l14.66-73.33L57.45,143.37a8,8,0,0,1-5.3-11.83l112-120a8,8,0,0,1,13.69,7L163.18,91.87l45.37,21.76A8,8,0,0,1,213.85,125.46Z"/></svg>"#;
 
@@ -352,12 +352,61 @@ fn format_sats(msats: u64) -> String {
     }
 }
 
-/// Render a "Open in Nostr" button on its own line.
+/// Render a grid of "Open in client" buttons.
+///
+/// The `nostr_uri` should be a bech32 identifier (npub, note, nevent, nprofile, naddr).
+/// Each client gets a button that links to the appropriate URL for that client.
 pub fn nostr_link(nostr_uri: &str) -> Markup {
+    // Determine if this is a profile or an event for URL pattern differences
+    let is_profile = nostr_uri.starts_with("npub") || nostr_uri.starts_with("nprofile");
+
+    // Client definitions: (name, url_pattern, is_web)
+    // Web clients use the identifier in the URL path
+    // Some clients use nostr: URI scheme
+    let clients: Vec<(&str, String)> = if is_profile {
+        vec![
+            ("Primal", format!("https://primal.net/p/{nostr_uri}")),
+            ("Coracle", format!("https://coracle.social/{nostr_uri}")),
+            ("Snort", format!("https://snort.social/p/{nostr_uri}")),
+            (
+                "Nostrudel",
+                format!("https://nostrudel.ninja/#/u/{nostr_uri}"),
+            ),
+            ("Iris", format!("https://iris.to/{nostr_uri}")),
+            ("Satellite", format!("https://satellite.earth/@{nostr_uri}")),
+            ("Habla", format!("https://habla.news/p/{nostr_uri}")),
+            ("njump", format!("https://njump.me/{nostr_uri}")),
+            ("nostr: link", format!("nostr:{nostr_uri}")),
+        ]
+    } else {
+        vec![
+            ("Primal", format!("https://primal.net/e/{nostr_uri}")),
+            ("Coracle", format!("https://coracle.social/{nostr_uri}")),
+            ("Snort", format!("https://snort.social/e/{nostr_uri}")),
+            (
+                "Nostrudel",
+                format!("https://nostrudel.ninja/#/n/{nostr_uri}"),
+            ),
+            ("Iris", format!("https://iris.to/{nostr_uri}")),
+            (
+                "Satellite",
+                format!("https://satellite.earth/thread/{nostr_uri}"),
+            ),
+            ("Habla", format!("https://habla.news/e/{nostr_uri}")),
+            ("njump", format!("https://njump.me/{nostr_uri}")),
+            ("nostr: link", format!("nostr:{nostr_uri}")),
+        ]
+    };
+
     html! {
-        div class="actions" {
-            a class="nostr-link" href=(format!("nostr:{nostr_uri}")) {
-                (PreEscaped(ICON_EXTERNAL)) " Open in Nostr"
+        div class="clients" {
+            div class="clients-label" { "Open in" }
+            div class="clients-grid" {
+                @for (name, url) in &clients {
+                    a class="client-btn" href=(url) target="_blank" rel="noopener" {
+                        (*name)
+                    }
+                }
             }
         }
     }
@@ -738,11 +787,27 @@ mod tests {
     // -- nostr_link() tests --
 
     #[test]
-    fn nostr_link_renders_href() {
+    fn nostr_link_renders_client_grid() {
         let markup = nostr_link("nevent1abc123");
         let html = markup.into_string();
+        // Should have client buttons linking to various clients
         assert!(html.contains("nostr:nevent1abc123"));
-        assert!(html.contains("Open in Nostr"));
+        assert!(html.contains("Primal"));
+        assert!(html.contains("Coracle"));
+        assert!(html.contains("Snort"));
+        assert!(html.contains("njump"));
+        assert!(html.contains("clients-grid"));
+        // Event URLs should use /e/ pattern
+        assert!(html.contains("primal.net/e/nevent1abc123"));
+    }
+
+    #[test]
+    fn nostr_link_profile_uses_profile_urls() {
+        let markup = nostr_link("npub1abc123");
+        let html = markup.into_string();
+        // Profile URLs should use /p/ pattern
+        assert!(html.contains("primal.net/p/npub1abc123"));
+        assert!(html.contains("snort.social/p/npub1abc123"));
     }
 
     // -- engagement_bar() tests --
