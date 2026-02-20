@@ -28,7 +28,8 @@ services:
       - caddy_config:/config
     environment:
       - DOMAIN=${DOMAIN:-localhost}
-    # Allow container to reach host services (API server runs on host)
+      - PREVIEW_DOMAIN=${PREVIEW_DOMAIN:-localhost:8081}
+    # Allow container to reach host services (API, preview run on host)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -147,12 +148,14 @@ services:
   # This provides better I/O performance and simpler debugging.
   #
   # See systemd/ directory for service files:
-  #   - pensieve-api.service    (API server on port 8080)
-  #   - pensieve-ingest.service (Ingester with metrics on port 9091)
+  #   - pensieve-api.service     (API server on port 8080)
+  #   - pensieve-ingest.service  (Ingester with metrics on port 9091)
+  #   - pensieve-preview.service (Preview server on port 8081)
   #
   # Start them with:
   #   sudo systemctl start pensieve-api
   #   sudo systemctl start pensieve-ingest
+  #   sudo systemctl start pensieve-preview
 
 volumes:
   clickhouse_logs:
