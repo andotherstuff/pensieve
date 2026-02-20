@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
-use maud::{Markup, html};
+use maud::{html, Markup};
 
 use super::components::{
-    OpenGraphData, author_header, engagement_bar, nostr_link, page_shell, truncate,
+    author_header, engagement_bar, nostr_link, page_shell, truncate, OpenGraphData,
 };
-use super::content::{QuotedEvent, render_content};
+use super::content::{render_content, QuotedEvent};
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 
 /// Render a text note preview page.
@@ -33,16 +33,14 @@ pub fn render(
     let description = truncate(&event.content, 200);
     let canonical = format!("{base_url}/{nevent}");
 
-    let og_image = author
-        .and_then(|a| a.picture.as_deref())
-        .filter(|u| super::components::is_safe_url(u));
+    let og_image_url = format!("{base_url}/og/{nevent}.png");
 
     let og = OpenGraphData {
         title: &title,
         description: &description,
         og_type: "article",
-        image: og_image,
-        twitter_card_type: "summary",
+        image: Some(&og_image_url),
+        twitter_card_type: "summary_large_image",
     };
 
     let body = html! {

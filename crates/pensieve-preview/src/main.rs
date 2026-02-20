@@ -48,6 +48,19 @@ async fn main() -> anyhow::Result<()> {
     // Create application state
     let state = AppState::new(config);
 
+    // Warm up ClickHouse connection pool before accepting requests.
+    // The clickhouse crate creates connections lazily, so the first user
+    // request would otherwise pay ~100-200ms for TCP setup + pool init.
+    match state
+        .clickhouse
+        .query("SELECT 1")
+        .fetch_one::<u8>()
+        .await
+    {
+        Ok(_) => tracing::info!("clickhouse connection warm-up complete"),
+        Err(e) => tracing::warn!(%e, "clickhouse warm-up failed (will retry on first request)"),
+    }
+
     // Build router with middleware
     let app = router(state)
         .layer(

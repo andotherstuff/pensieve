@@ -3,13 +3,13 @@
 //! Renders a user's profile page with banner, avatar, name, NIP-05,
 //! about text, and metadata links.
 
-use maud::{Markup, html};
+use maud::{html, Markup};
 
 use maud::PreEscaped;
 
 use super::components::{
-    self, ICON_COPY, OpenGraphData, is_safe_url, nostr_link, page_shell, truncate,
-    truncate_npub_display,
+    self, is_safe_url, nostr_link, page_shell, truncate, truncate_npub_display, OpenGraphData,
+    ICON_COPY,
 };
 use crate::query::ProfileMetadata;
 
@@ -32,14 +32,14 @@ pub fn render(
     };
     let canonical = format!("{base_url}/{npub}");
 
-    let og_image = metadata.picture.as_deref().filter(|u| is_safe_url(u));
+    let og_image_url = format!("{base_url}/og/{npub}.png");
 
     let og = OpenGraphData {
         title: &title,
         description: &description,
         og_type: "profile",
-        image: og_image,
-        twitter_card_type: "summary",
+        image: Some(&og_image_url),
+        twitter_card_type: "summary_large_image",
     };
 
     let initial = name

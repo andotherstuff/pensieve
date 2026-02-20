@@ -65,11 +65,20 @@ http-body-util = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hex_fmt = "0.3"
 
+# Async combinators
+futures = "0.3"
+
 # Content parsing
 regex = "1"
 
 # Markdown rendering (for kind 30023 articles)
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+# OG image generation
+resvg = "0.44"
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

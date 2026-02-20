@@ -3,11 +3,11 @@
 //! Renders video events with thumbnail, title, author info,
 //! and engagement counts.
 
-use maud::{Markup, html};
+use maud::{html, Markup};
 
 use super::components::{
-    OpenGraphData, author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell,
-    truncate,
+    author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell, truncate,
+    OpenGraphData,
 };
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 
@@ -40,17 +40,13 @@ pub fn render(
     }
     .filter(|u| is_safe_url(u));
 
-    let og_image = thumbnail.or_else(|| {
-        author
-            .and_then(|a| a.picture.as_deref())
-            .filter(|u| is_safe_url(u))
-    });
+    let og_image_url = format!("{base_url}/og/{nevent}.png");
 
     let og = OpenGraphData {
         title: &title,
         description: &description,
         og_type: "video.other",
-        image: og_image,
+        image: Some(&og_image_url),
         twitter_card_type: "summary_large_image",
     };
 

@@ -13,6 +13,7 @@ mod health;
 mod home;
 pub mod json;
 mod llms;
+mod og;
 mod preview;
 
 use axum::Router;
@@ -31,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/favicon.ico", get(favicon_svg))
         .route("/llms.txt", get(llms::llms_txt))
         .route("/llms-full.txt", get(llms::llms_full_txt))
+        .route("/og/{identifier}", get(og::og_image_handler))
         .route("/{identifier}", get(preview::preview_handler))
         .with_state(state)
 }

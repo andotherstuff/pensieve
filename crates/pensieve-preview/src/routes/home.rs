@@ -31,6 +31,32 @@ pub async fn home_page() -> impl IntoResponse {
                         "Fast, static preview pages for any Nostr event."
                     }
 
+                    form class="home-search" action="/" method="GET"
+                         onsubmit="return handleLookup(event)" {
+                        input class="home-input" type="text"
+                            name="q"
+                            placeholder="Paste an identifier"
+                            autocomplete="off"
+                            spellcheck="false"
+                            autofocus;
+                        button class="home-btn" type="submit" { "Look up" }
+                    }
+                    script { (PreEscaped(r#"
+var inp=document.querySelector('.home-input');
+inp.addEventListener('input',function(){
+  var v=this.value;
+  if(v.toLowerCase().startsWith('nostr:')){
+    this.value=v.slice(6);
+  }
+});
+function handleLookup(e){
+  e.preventDefault();
+  var v=inp.value.trim().replace(/\s+/g,'');
+  if(v)window.location.href='/'+encodeURIComponent(v);
+  return false;
+}
+"#)) }
+
                     div class="home-how" {
                         p {
                             "Add any Nostr identifier to the URL:"
@@ -94,6 +120,12 @@ const HOME_CSS: &str = r#"
 .home-title{font-size:3.5rem;font-weight:800;letter-spacing:-.04em;color:var(--fg)}
 .home-dot{color:var(--accent)}
 .home-tagline{font-size:1.15rem;color:var(--fg2);margin-top:.5rem;max-width:400px}
+.home-search{margin-top:2rem;width:100%;max-width:480px;display:flex;flex-direction:column;gap:.75rem}
+.home-input{width:100%;padding:1.1rem 1.25rem;font-family:var(--mono);font-size:1rem;color:var(--fg);background:var(--surface);border:1px solid var(--border);border-radius:10px;box-sizing:border-box;outline:none;transition:border-color .15s}
+.home-input::placeholder{color:var(--fg3)}
+.home-input:focus{border-color:var(--accent)}
+.home-btn{width:100%;padding:.85rem;font-size:.95rem;font-weight:600;color:#fff;background:var(--accent);border:none;border-radius:8px;cursor:pointer;transition:background .15s}
+.home-btn:hover{background:var(--accent-hover)}
 .home-how{margin-top:2.5rem;width:100%;max-width:420px}
 .home-how>p{font-size:.95rem;color:var(--fg2);margin-bottom:1rem}
 .home-examples{display:flex;flex-direction:column;gap:.5rem}

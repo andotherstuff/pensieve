@@ -178,12 +178,16 @@ pub async fn render_page(
 fn extract_referenced_pubkeys(content: &str, tags: &[Vec<String>]) -> Vec<String> {
     use nostr::nips::nip19::{FromBech32, Nip19};
     use std::collections::HashSet;
+    use std::sync::LazyLock;
+
+    static NOSTR_PUBKEY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"nostr:(npub1|nprofile1)[a-z0-9]+").unwrap()
+    });
 
     let mut pubkeys = HashSet::new();
 
     // Extract from nostr: URIs in content
-    let nostr_uri_re = regex::Regex::new(r"nostr:(npub1|nprofile1)[a-z0-9]+").unwrap();
-    for cap in nostr_uri_re.find_iter(content) {
+    for cap in NOSTR_PUBKEY_RE.find_iter(content) {
         let bech32 = cap.as_str().strip_prefix("nostr:").unwrap_or(cap.as_str());
         if let Ok(nip19) = Nip19::from_bech32(bech32) {
             match nip19 {
@@ -212,19 +216,62 @@ fn extract_referenced_pubkeys(content: &str, tags: &[Vec<String>]) -> Vec<String
 ///
 /// Only fetches events that exist in the database. This is depth-1 only —
 /// the content of quoted events is rendered as plain text, not recursively embedded.
+/// All quoted events are fetched in parallel for performance.
 async fn fetch_quoted_events(
     state: &crate::state::AppState,
     event_ids: &[String],
 ) -> Result<HashMap<String, content::QuotedEvent>, crate::error::PreviewError> {
-    let mut quoted = HashMap::new();
+    if event_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
 
-    for id in event_ids {
-        if let Ok(Some(row)) = query::fetch_event_by_id(&state.clickhouse, id).await {
-            let author_profile = query::fetch_profile(&state.clickhouse, &row.pubkey).await?;
-            let author_meta = author_profile.map(|p| ProfileMetadata::from_json(&p.content));
+    // Fetch all quoted events in parallel
+    let futures: Vec<_> = event_ids
+        .iter()
+        .map(|id| async {
+            let row = query::fetch_event_by_id(&state.clickhouse, id).await;
+            (id.clone(), row)
+        })
+        .collect();
 
-            quoted.insert(
-                id.clone(),
+    let results = futures::future::join_all(futures).await;
+
+    // For events that exist, fetch their author profiles in parallel
+    let found: Vec<_> = results
+        .into_iter()
+        .filter_map(|(id, result)| match result {
+            Ok(Some(row)) => Some((id, row)),
+            _ => None,
+        })
+        .collect();
+
+    let profile_futures: Vec<_> = found
+        .iter()
+        .map(|(id, row)| async {
+            let profile = query::fetch_profile(&state.clickhouse, &row.pubkey).await;
+            (id.clone(), profile)
+        })
+        .collect();
+
+    let profile_results = futures::future::join_all(profile_futures).await;
+
+    let profiles: HashMap<String, Option<ProfileMetadata>> = profile_results
+        .into_iter()
+        .map(|(id, result)| {
+            let meta = result
+                .ok()
+                .flatten()
+                .map(|p| ProfileMetadata::from_json(&p.content));
+            (id, meta)
+        })
+        .collect();
+
+    let quoted = found
+        .into_iter()
+        .map(|(id, row)| {
+            let author_meta = profiles.get(&id).cloned().flatten();
+            (
+                id,
                 content::QuotedEvent {
                     id: row.id,
                     pubkey: row.pubkey,
@@ -232,9 +279,9 @@ async fn fetch_quoted_events(
                     created_at: row.created_at,
                     author: author_meta,
                 },
-            );
-        }
-    }
+            )
+        })
+        .collect();
 
     Ok(quoted)
 }

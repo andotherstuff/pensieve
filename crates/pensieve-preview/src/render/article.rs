@@ -3,12 +3,12 @@
 //! Renders articles with title, author info, and full markdown content.
 //! Markdown is converted to HTML using pulldown-cmark.
 
-use maud::{Markup, PreEscaped, html};
-use pulldown_cmark::{Options, Parser, html as md_html};
+use maud::{html, Markup, PreEscaped};
+use pulldown_cmark::{html as md_html, Options, Parser};
 
 use super::components::{
-    OpenGraphData, author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell,
-    truncate,
+    author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell, truncate,
+    OpenGraphData,
 };
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 
@@ -54,22 +54,14 @@ pub fn render(
     };
     let canonical = format!("{base_url}/{nevent}");
 
-    let og_image = image.as_deref().filter(|u| is_safe_url(u)).or_else(|| {
-        author
-            .and_then(|a| a.picture.as_deref())
-            .filter(|u| is_safe_url(u))
-    });
+    let og_image_url = format!("{base_url}/og/{nevent}.png");
 
     let og = OpenGraphData {
         title: &title,
         description: &description,
         og_type: "article",
-        image: og_image,
-        twitter_card_type: if og_image.is_some() {
-            "summary_large_image"
-        } else {
-            "summary"
-        },
+        image: Some(&og_image_url),
+        twitter_card_type: "summary_large_image",
     };
 
     // Render markdown content to HTML

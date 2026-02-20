@@ -263,6 +263,57 @@ pub async fn fetch_engagement(
     })
 }
 
+/// Batch-fetch display names for a set of pubkeys.
+///
+/// Returns a map of pubkey (hex) -> display name. Pubkeys without
+/// a profile will not be included in the result.
+pub async fn fetch_display_names(
+    client: &Client,
+    pubkeys: &[String],
+) -> Result<std::collections::HashMap<String, String>, PreviewError> {
+    if pubkeys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    #[derive(Debug, Deserialize, clickhouse::Row)]
+    struct NameRow {
+        pubkey: String,
+        content: String,
+    }
+
+    // Build a query with IN clause for batch lookup
+    let placeholders: Vec<&str> = pubkeys.iter().map(|_| "?").collect();
+    let query_str = format!(
+        "SELECT pubkey, argMax(content, created_at) AS content \
+         FROM events_local \
+         WHERE pubkey IN ({}) AND kind = 0 \
+         GROUP BY pubkey",
+        placeholders.join(", ")
+    );
+
+    let mut query = client.query(&query_str);
+    for pk in pubkeys {
+        query = query.bind(pk);
+    }
+
+    let rows = query.fetch_all::<NameRow>().await?;
+
+    let names = rows
+        .into_iter()
+        .filter_map(|row| {
+            let meta = ProfileMetadata::from_json(&row.content);
+            let name = meta.display_name().to_string();
+            if name == "Anonymous" {
+                None
+            } else {
+                Some((row.pubkey, name))
+            }
+        })
+        .collect();
+
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,55 +431,4 @@ mod tests {
         assert_eq!(counts.zap_msats, 0);
         assert_eq!(counts.zap_count, 0);
     }
-}
-
-/// Batch-fetch display names for a set of pubkeys.
-///
-/// Returns a map of pubkey (hex) -> display name. Pubkeys without
-/// a profile will not be included in the result.
-pub async fn fetch_display_names(
-    client: &Client,
-    pubkeys: &[String],
-) -> Result<std::collections::HashMap<String, String>, PreviewError> {
-    if pubkeys.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    #[derive(Debug, Deserialize, clickhouse::Row)]
-    struct NameRow {
-        pubkey: String,
-        content: String,
-    }
-
-    // Build a query with IN clause for batch lookup
-    let placeholders: Vec<&str> = pubkeys.iter().map(|_| "?").collect();
-    let query_str = format!(
-        "SELECT pubkey, argMax(content, created_at) AS content \
-         FROM events_local \
-         WHERE pubkey IN ({}) AND kind = 0 \
-         GROUP BY pubkey",
-        placeholders.join(", ")
-    );
-
-    let mut query = client.query(&query_str);
-    for pk in pubkeys {
-        query = query.bind(pk);
-    }
-
-    let rows = query.fetch_all::<NameRow>().await?;
-
-    let names = rows
-        .into_iter()
-        .filter_map(|row| {
-            let meta = ProfileMetadata::from_json(&row.content);
-            let name = meta.display_name().to_string();
-            if name == "Anonymous" {
-                None
-            } else {
-                Some((row.pubkey, name))
-            }
-        })
-        .collect();
-
-    Ok(names)
 }
