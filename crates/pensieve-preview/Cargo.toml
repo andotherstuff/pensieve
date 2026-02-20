@@ -1,0 +1,72 @@
+[package]
+name = "pensieve-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "Static HTML preview pages for Nostr events"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Internal crates
+pensieve-core = { path = "../pensieve-core" }
+
+# Async runtime
+tokio.workspace = true
+
+# HTTP server
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# ClickHouse
+clickhouse.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Nostr (NIP-19 decoding)
+nostr.workspace = true
+
+# Observability
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
+
+# HTML templating (compile-time)
+maud = { version = "0.27", features = ["axum"] }
+
+# ETag computation
+http-body-util = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+hex_fmt = "0.3"
+
+# Content parsing
+regex = "1"
+
+# Markdown rendering (for kind 30023 articles)
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

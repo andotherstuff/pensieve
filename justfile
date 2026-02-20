@@ -52,7 +52,7 @@ build-release:
 # Build and show binary sizes
 build-release-sizes: build-release
     @echo "\nBinary sizes:"
-    @ls -lh target/release/pensieve-ingest target/release/pensieve-serve target/release/backfill-jsonl target/release/backfill-proto 2>/dev/null || true
+    @ls -lh target/release/pensieve-ingest target/release/pensieve-serve target/release/pensieve-preview target/release/backfill-jsonl target/release/backfill-proto 2>/dev/null || true
 
 # Clean build artifacts
 clean:
@@ -81,6 +81,26 @@ run-backfill-jsonl *ARGS:
 # Run the proto backfill tool (debug)
 run-backfill-proto *ARGS:
     cargo run --bin backfill-proto -- {{ARGS}}
+
+# Run the preview server (debug)
+run-preview *ARGS:
+    cargo run --bin pensieve-preview -- {{ARGS}}
+
+# Test the preview crate
+test-preview:
+    cargo test -p pensieve-preview --lib -- --nocapture
+
+# Test the preview crate (verbose)
+test-preview-verbose:
+    cargo test -p pensieve-preview -- --nocapture
+
+# Test coverage for the preview crate (requires cargo-llvm-cov)
+coverage-preview:
+    cargo llvm-cov --lib -p pensieve-preview --html --open
+
+# Test coverage summary for the preview crate
+coverage-preview-summary:
+    cargo llvm-cov --lib -p pensieve-preview
 
 # Run the relay cleanup tool
 run-relay-cleanup *ARGS:
