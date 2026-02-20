@@ -66,15 +66,16 @@ impl IntoResponse for PreviewError {
                 head {
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
-                    title { (title) " - Nostr Preview" }
+                    title { (title) " — nstr.to" }
                     meta name="robots" content="noindex";
+                    link rel="icon" type="image/svg+xml" href="/favicon.svg";
                     style { (maud::PreEscaped(crate::render::components::ERROR_CSS)) }
                 }
                 body {
                     main class="error-page" {
                         h1 { (title) }
                         p { (message) }
-                        a href="/" { "Back to home" }
+                        a href="/" { "Back to nstr.to" }
                     }
                 }
             }

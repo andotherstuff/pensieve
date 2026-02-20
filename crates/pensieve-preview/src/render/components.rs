@@ -145,15 +145,16 @@ svg.icon{width:20px;height:20px;fill:currentColor;stroke:none;vertical-align:-3p
 /// Inline CSS for error pages.
 pub const ERROR_CSS: &str = r#"
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#fafafa;color:#1a1a2e;padding:1rem}
-.error-page{text-align:center;max-width:400px}
-.error-page h1{font-size:1.5rem;margin-bottom:.75rem}
-.error-page p{color:#666;margin-bottom:1rem;line-height:1.5}
-.error-page a{color:#6c5ce7}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;background:#fafafa;color:#111;padding:1.5rem 1rem}
+.error-page{text-align:center;max-width:480px}
+.error-page h1{font-size:2rem;font-weight:800;letter-spacing:-.02em;margin-bottom:.75rem}
+.error-page p{color:#555;margin-bottom:1.25rem;line-height:1.6;font-size:.95rem;word-break:break-all}
+.error-page a{color:#9900CC;text-decoration:none;font-weight:500;font-size:.95rem}
+.error-page a:hover{text-decoration:underline}
 @media(prefers-color-scheme:dark){
-body{background:#0f0f17;color:#e0e0e8}
-.error-page p{color:#aaa}
-.error-page a{color:#a29bfe}
+body{background:#0a0a0f;color:#e5e5e5}
+.error-page p{color:#a0a0a0}
+.error-page a{color:#d946ef}
 }
 "#;
 
