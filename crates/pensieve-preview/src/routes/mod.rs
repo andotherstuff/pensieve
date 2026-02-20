@@ -2,15 +2,16 @@
 //!
 //! ## Routes
 //!
+//! - `GET /` - Home page
 //! - `GET /health` - Health check (JSON)
 //! - `GET /robots.txt` - Crawler instructions
 //! - `GET /llms.txt` - LLM agent description
 //! - `GET /llms-full.txt` - LLM agent full documentation
-//! - `GET /{identifier}.json` - Raw event data as JSON
-//! - `GET /{identifier}` - Preview page for any NIP-19 identifier or hex ID
+//! - `GET /{identifier}` - Preview page (or .json for API)
 
 mod health;
-mod json;
+mod home;
+pub mod json;
 mod llms;
 mod preview;
 
@@ -23,6 +24,7 @@ use crate::state::AppState;
 /// Build the complete preview service router.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(home::home_page))
         .route("/health", get(health::health_check))
         .route("/robots.txt", get(robots_txt))
         .route("/llms.txt", get(llms::llms_txt))
