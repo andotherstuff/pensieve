@@ -21,9 +21,11 @@
 
 use std::future::Future;
 use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
 use moka::future::Cache;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 
@@ -31,7 +33,9 @@ use crate::error::ApiError;
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1000;
 
 /// Default TTL for cached entries.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_TTL: Duration = ttl::AGGREGATES;
+
+type InFlightMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 /// Cached response with metadata.
 #[derive(Clone, Debug)]
@@ -40,10 +44,16 @@ pub struct CachedEntry {
     pub json: String,
     /// When this entry was cached.
     pub cached_at: chrono::DateTime<chrono::Utc>,
+    /// When this cache entry expires.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Type alias for the response cache.
 pub type ResponseCache = Cache<String, CachedEntry>;
+
+/// Per-key in-flight locks to prevent cache stampedes.
+static IN_FLIGHT: std::sync::LazyLock<InFlightMap> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// Create a new response cache with default settings.
 pub fn new_cache() -> ResponseCache {
@@ -85,40 +95,92 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, ApiError>>,
 {
-    // Check cache first
-    if let Some(entry) = cache.get(key).await {
-        match serde_json::from_str(&entry.json) {
-            Ok(value) => {
-                tracing::debug!(key = %key, cached_at = %entry.cached_at, "cache hit");
-                return Ok(value);
-            }
-            Err(e) => {
-                // Corrupted cache entry - log and continue to recompute
-                tracing::warn!(key = %key, error = %e, "failed to deserialize cached entry");
-            }
-        }
+    get_or_compute_with_ttl(cache, key, DEFAULT_TTL, compute).await
+}
+
+/// Get a cached value or compute and cache it with per-entry TTL.
+pub async fn get_or_compute_with_ttl<T, F, Fut>(
+    cache: &ResponseCache,
+    key: &str,
+    ttl: Duration,
+    compute: F,
+) -> Result<T, ApiError>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, ApiError>>,
+{
+    if let Some(value) = try_get_cached(cache, key).await? {
+        return Ok(value);
     }
 
-    // Cache miss - compute the value
-    tracing::debug!(key = %key, "cache miss, computing");
+    let key_lock = {
+        let mut map = IN_FLIGHT.lock().await;
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+
+    let _guard = key_lock.lock().await;
+
+    if let Some(value) = try_get_cached(cache, key).await? {
+        return Ok(value);
+    }
+
+    tracing::debug!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
     let value = compute().await?;
 
-    // Serialize and cache the result
     match serde_json::to_string(&value) {
         Ok(json) => {
+            let now = chrono::Utc::now();
+            let expires_at = now
+                + chrono::Duration::from_std(ttl)
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
             let entry = CachedEntry {
                 json,
-                cached_at: chrono::Utc::now(),
+                cached_at: now,
+                expires_at,
             };
             cache.insert(key.to_string(), entry).await;
         }
         Err(e) => {
-            // Failed to serialize - log but still return the value
             tracing::warn!(key = %key, error = %e, "failed to serialize for cache");
         }
     }
 
     Ok(value)
+}
+
+async fn try_get_cached<T>(cache: &ResponseCache, key: &str) -> Result<Option<T>, ApiError>
+where
+    T: DeserializeOwned,
+{
+    if let Some(entry) = cache.get(key).await {
+        if chrono::Utc::now() > entry.expires_at {
+            cache.invalidate(key).await;
+            tracing::debug!(key = %key, expired_at = %entry.expires_at, "cache expired");
+            return Ok(None);
+        }
+
+        return match serde_json::from_str(&entry.json) {
+            Ok(value) => {
+                tracing::debug!(
+                    key = %key,
+                    cached_at = %entry.cached_at,
+                    expires_at = %entry.expires_at,
+                    "cache hit"
+                );
+                Ok(Some(value))
+            }
+            Err(e) => {
+                cache.invalidate(key).await;
+                tracing::warn!(key = %key, error = %e, "failed to deserialize cached entry");
+                Ok(None)
+            }
+        };
+    }
+
+    Ok(None)
 }
 
 /// Common TTL values for different endpoint types.
