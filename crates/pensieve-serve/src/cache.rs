@@ -203,6 +203,8 @@ pub mod ttl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_cache_hit() {
@@ -237,5 +239,112 @@ mod tests {
 
         assert_eq!(result1, 1);
         assert_eq!(result2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_entry_expires_and_recomputes() {
+        let cache = new_cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        let second: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let third: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(third, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cache_miss_is_coalesced_per_key() {
+        let cache = new_cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let calls = Arc::clone(&calls);
+            let start = Arc::clone(&start);
+
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                get_or_compute_with_ttl(
+                    &cache,
+                    "coalesced_key",
+                    Duration::from_secs(1),
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Ok::<u64, ApiError>(99)
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let value = handle.await.unwrap().unwrap();
+            assert_eq!(value, 99);
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_cached_json_recomputes_and_replaces_entry() {
+        let cache = new_cache();
+        cache
+            .insert(
+                "bad_json".to_string(),
+                CachedEntry {
+                    json: "not-json".to_string(),
+                    cached_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+                },
+            )
+            .await;
+
+        let value: i32 = get_or_compute(&cache, "bad_json", || async { Ok(7) })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+
+        let entry = cache.get("bad_json").await.unwrap();
+        assert_eq!(entry.json, "7");
     }
 }
