@@ -7,7 +7,7 @@ use clickhouse::Row;
 use pensieve_core::NOSTR_GENESIS_TIMESTAMP;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::get_or_compute;
+use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -1088,7 +1088,7 @@ pub struct HourlyActivityRow {
 /// `GET /api/v1/stats/activity/hourly`
 ///
 /// Returns event activity grouped by hour of day (0-23) to show usage patterns.
-/// Cached for 5 minutes.
+/// Cached for 10 minutes.
 pub async fn hourly_activity(
     State(state): State<AppState>,
     Query(params): Query<HourlyActivityQuery>,
@@ -1102,7 +1102,7 @@ pub async fn hourly_activity(
         kind.map(|k| k.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),
@@ -1479,7 +1479,7 @@ pub async fn engagement(
     let days = params.days.unwrap_or(30);
     let cache_key = format!("engagement:days={}", days);
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
         // Calculate all metrics from events_local consistently.
         // A reply is a kind=1 event that has at least one e-tag (references another event).
         let row: EngagementRow = state

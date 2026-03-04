@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::get_or_compute;
+use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -207,7 +207,7 @@ pub struct KindTimeSeriesRow {
 /// `GET /api/v1/kinds/{kind}/activity`
 ///
 /// Returns activity time series for a specific kind.
-/// Cached for 5 minutes.
+/// Cached for 10 minutes.
 pub async fn kind_activity(
     State(state): State<AppState>,
     Path(kind): Path<u16>,
@@ -238,7 +238,7 @@ pub async fn kind_activity(
         limit
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
         let rows: Vec<KindTimeSeriesRow> = state
             .clickhouse
             .query(&format!(

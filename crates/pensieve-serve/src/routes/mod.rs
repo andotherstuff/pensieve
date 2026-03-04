@@ -154,6 +154,7 @@ pub fn router(state: AppState) -> Router {
 /// TTLs are set per-endpoint based on how frequently the data changes:
 /// - `/stats/events/latest`: 10 seconds (changes frequently)
 /// - `/stats/events/total`, `/stats/pubkeys/total`: 5 minutes
+/// - `/stats/activity/hourly`, `/stats/engagement`, `/kinds/{kind}/activity`: 10 minutes
 /// - `/stats/kinds/total`, `/stats/events/earliest`: 1 hour (stable data)
 /// - Other endpoints: 60 seconds default
 ///
@@ -174,16 +175,7 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
     }
 
     // Determine TTL based on endpoint path (paths are relative to /api/v1 nest)
-    let (max_age, stale_while_revalidate) = match path.as_str() {
-        // Latest event changes frequently - short TTL
-        "/api/v1/stats/events/latest" => (10, 30),
-        // Total counts - moderate TTL (5 minutes)
-        "/api/v1/stats/events/total" | "/api/v1/stats/pubkeys/total" => (300, 600),
-        // Stable data - long TTL (1 hour)
-        "/api/v1/stats/kinds/total" | "/api/v1/stats/events/earliest" => (3600, 7200),
-        // Default for all other endpoints (1 minute)
-        _ => (60, 300),
-    };
+    let (max_age, stale_while_revalidate) = cache_policy_for_path(&path);
 
     let cache_value =
         format!("public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}");
@@ -242,4 +234,85 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
         .insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
 
     response
+}
+
+fn cache_policy_for_path(path: &str) -> (u32, u32) {
+    if path == "/api/v1/stats/events/latest" {
+        // Latest event changes frequently - short TTL
+        (10, 30)
+    } else if path == "/api/v1/stats/events/total" || path == "/api/v1/stats/pubkeys/total" {
+        // Total counts - moderate TTL (5 minutes)
+        (300, 600)
+    } else if path == "/api/v1/stats/activity/hourly"
+        || path == "/api/v1/stats/engagement"
+        || (path.starts_with("/api/v1/kinds/") && path.ends_with("/activity"))
+    {
+        // Time series endpoints - 10 minutes
+        (600, 1800)
+    } else if path == "/api/v1/stats/kinds/total" || path == "/api/v1/stats/events/earliest" {
+        // Stable data - long TTL (1 hour)
+        (3600, 7200)
+    } else {
+        // Default for all other endpoints (1 minute)
+        (60, 300)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_policy_for_path;
+
+    #[test]
+    fn cache_policy_uses_realtime_for_latest_event() {
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/events/latest"),
+            (10, 30)
+        );
+    }
+
+    #[test]
+    fn cache_policy_uses_aggregate_ttl_for_totals() {
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/events/total"),
+            (300, 600)
+        );
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/pubkeys/total"),
+            (300, 600)
+        );
+    }
+
+    #[test]
+    fn cache_policy_uses_timeseries_ttl_for_hot_paths() {
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/activity/hourly"),
+            (600, 1800)
+        );
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/engagement"),
+            (600, 1800)
+        );
+        assert_eq!(
+            cache_policy_for_path("/api/v1/kinds/1/activity"),
+            (600, 1800)
+        );
+    }
+
+    #[test]
+    fn cache_policy_uses_stable_ttl_for_stable_paths() {
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/kinds/total"),
+            (3600, 7200)
+        );
+        assert_eq!(
+            cache_policy_for_path("/api/v1/stats/events/earliest"),
+            (3600, 7200)
+        );
+    }
+
+    #[test]
+    fn cache_policy_falls_back_to_default_for_other_paths() {
+        assert_eq!(cache_policy_for_path("/api/v1/stats/throughput"), (60, 300));
+        assert_eq!(cache_policy_for_path("/api/v1/kinds/1"), (60, 300));
+    }
 }

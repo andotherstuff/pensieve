@@ -21,9 +21,11 @@
 
 use std::future::Future;
 use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 
 use moka::future::Cache;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 
@@ -31,7 +33,9 @@ use crate::error::ApiError;
 pub const DEFAULT_CACHE_CAPACITY: u64 = 1000;
 
 /// Default TTL for cached entries.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_TTL: Duration = ttl::AGGREGATES;
+
+type InFlightMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 /// Cached response with metadata.
 #[derive(Clone, Debug)]
@@ -40,10 +44,16 @@ pub struct CachedEntry {
     pub json: String,
     /// When this entry was cached.
     pub cached_at: chrono::DateTime<chrono::Utc>,
+    /// When this cache entry expires.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Type alias for the response cache.
 pub type ResponseCache = Cache<String, CachedEntry>;
+
+/// Per-key in-flight locks to prevent cache stampedes.
+static IN_FLIGHT: std::sync::LazyLock<InFlightMap> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// Create a new response cache with default settings.
 pub fn new_cache() -> ResponseCache {
@@ -85,40 +95,92 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, ApiError>>,
 {
-    // Check cache first
-    if let Some(entry) = cache.get(key).await {
-        match serde_json::from_str(&entry.json) {
-            Ok(value) => {
-                tracing::debug!(key = %key, cached_at = %entry.cached_at, "cache hit");
-                return Ok(value);
-            }
-            Err(e) => {
-                // Corrupted cache entry - log and continue to recompute
-                tracing::warn!(key = %key, error = %e, "failed to deserialize cached entry");
-            }
-        }
+    get_or_compute_with_ttl(cache, key, DEFAULT_TTL, compute).await
+}
+
+/// Get a cached value or compute and cache it with per-entry TTL.
+pub async fn get_or_compute_with_ttl<T, F, Fut>(
+    cache: &ResponseCache,
+    key: &str,
+    ttl: Duration,
+    compute: F,
+) -> Result<T, ApiError>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, ApiError>>,
+{
+    if let Some(value) = try_get_cached(cache, key).await? {
+        return Ok(value);
     }
 
-    // Cache miss - compute the value
-    tracing::debug!(key = %key, "cache miss, computing");
+    let key_lock = {
+        let mut map = IN_FLIGHT.lock().await;
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+
+    let _guard = key_lock.lock().await;
+
+    if let Some(value) = try_get_cached(cache, key).await? {
+        return Ok(value);
+    }
+
+    tracing::debug!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
     let value = compute().await?;
 
-    // Serialize and cache the result
     match serde_json::to_string(&value) {
         Ok(json) => {
+            let now = chrono::Utc::now();
+            let expires_at = now
+                + chrono::Duration::from_std(ttl)
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
             let entry = CachedEntry {
                 json,
-                cached_at: chrono::Utc::now(),
+                cached_at: now,
+                expires_at,
             };
             cache.insert(key.to_string(), entry).await;
         }
         Err(e) => {
-            // Failed to serialize - log but still return the value
             tracing::warn!(key = %key, error = %e, "failed to serialize for cache");
         }
     }
 
     Ok(value)
+}
+
+async fn try_get_cached<T>(cache: &ResponseCache, key: &str) -> Result<Option<T>, ApiError>
+where
+    T: DeserializeOwned,
+{
+    if let Some(entry) = cache.get(key).await {
+        if chrono::Utc::now() > entry.expires_at {
+            cache.invalidate(key).await;
+            tracing::debug!(key = %key, expired_at = %entry.expires_at, "cache expired");
+            return Ok(None);
+        }
+
+        return match serde_json::from_str(&entry.json) {
+            Ok(value) => {
+                tracing::debug!(
+                    key = %key,
+                    cached_at = %entry.cached_at,
+                    expires_at = %entry.expires_at,
+                    "cache hit"
+                );
+                Ok(Some(value))
+            }
+            Err(e) => {
+                cache.invalidate(key).await;
+                tracing::warn!(key = %key, error = %e, "failed to deserialize cached entry");
+                Ok(None)
+            }
+        };
+    }
+
+    Ok(None)
 }
 
 /// Common TTL values for different endpoint types.
@@ -141,6 +203,8 @@ pub mod ttl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn test_cache_hit() {
@@ -175,5 +239,112 @@ mod tests {
 
         assert_eq!(result1, 1);
         assert_eq!(result2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_entry_expires_and_recomputes() {
+        let cache = new_cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        let second: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let third: usize =
+            get_or_compute_with_ttl(&cache, "expiring_key", Duration::from_millis(25), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(third, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cache_miss_is_coalesced_per_key() {
+        let cache = new_cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let calls = Arc::clone(&calls);
+            let start = Arc::clone(&start);
+
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                get_or_compute_with_ttl(
+                    &cache,
+                    "coalesced_key",
+                    Duration::from_secs(1),
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Ok::<u64, ApiError>(99)
+                    },
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let value = handle.await.unwrap().unwrap();
+            assert_eq!(value, 99);
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_cached_json_recomputes_and_replaces_entry() {
+        let cache = new_cache();
+        cache
+            .insert(
+                "bad_json".to_string(),
+                CachedEntry {
+                    json: "not-json".to_string(),
+                    cached_at: chrono::Utc::now(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+                },
+            )
+            .await;
+
+        let value: i32 = get_or_compute(&cache, "bad_json", || async { Ok(7) })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+
+        let entry = cache.get("bad_json").await.unwrap();
+        assert_eq!(entry.json, "7");
     }
 }

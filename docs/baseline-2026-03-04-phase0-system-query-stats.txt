@@ -1,0 +1,136 @@
+-> % uptime
+ 20:13:31 up 13 days,  2:22,  1 user,  load average: 18.65, 28.80, 32.06
+
+ -> % top -bn1 | rg -i "cpu|mem|load"
+top - 20:15:20 up 13 days,  2:24,  1 user,  load average: 3.25, 20.27, 28.63
+%Cpu(s):  0.4 us,  1.1 sy,  0.0 ni, 98.5 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem : 128737.2 total,  34118.4 free,   8069.4 used,  87781.5 buff/cache
+MiB Swap:  16384.0 total,  15914.5 free,    469.5 used. 120667.8 avail Mem
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+     23 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/0
+     24 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/1
+     30 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/2
+     36 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/3
+     42 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/4
+     48 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/5
+     54 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/6
+     60 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/7
+     66 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/8
+     72 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/9
+     78 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/10
+     84 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/11
+     90 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/12
+     97 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/13
+    103 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/14
+    109 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/15
+    115 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/16
+    121 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/17
+    127 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/18
+    133 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/19
+    139 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/20
+    145 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/21
+    151 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/22
+    157 root      20   0       0      0      0 S   0.0   0.0   0:00.00 cpuhp/23
+
+-> % ps -Ao pid,pcpu,pmem,comm | sort -k2 -nr | head -n 20
+   1715  338  1.2 clickhouse-serv
+1460928  300  0.0 ps
+   1462 35.3  2.5 pensieve-ingest
+1460422  0.3  0.0 zsh
+   1221  0.2  0.4 openclaw-gatewa
+  91470  0.1  0.0 caddy
+   1909  0.1  0.1 grafana
+    PID %CPU %MEM COMMAND
+     99  0.0  0.0 migration/13
+     98  0.0  0.0 idle_inject/13
+     97  0.0  0.0 cpuhp/13
+     96  0.0  0.0 rcu_exp_par_gp_kthread_worker/2
+     95  0.0  0.0 kworker/12:0H-events_highpri
+     93  0.0  0.0 ksoftirqd/12
+    921  0.0  0.0 xfsaild/sda1
+     92  0.0  0.0 migration/12
+    920  0.0  0.0 kworker/R-xfs-cil/sda1
+    919  0.0  0.0 kworker/R-xfs-log/sda1
+    918  0.0  0.0 xfsaild/dm-2
+    917  0.0  0.0 kworker/R-xfs-cil/dm-2
+
+-> % just ch-query "SELECT normalized_query_hash, count() AS runs, round(sum(query_duration_ms)/1000,2) AS total_sec, sum(read_rows) AS read_rows, sum(read_bytes) AS read_bytes, any(query) AS sample_query FROM system.query_log WHERE event_time >= now() - INTERVAL 1 HOUR AND type='QueryFinish' AND query_kind='Select' GROUP BY normalized_query_hash ORDER BY total_sec DESC LIMIT 30"
+11654791322635434381    371     6795.12 24978202086     1973277964794   SELECT\n                    toString(toDate(created_at)) AS period,\n                    count() AS event_count,\n                    uniqExact(pubkey) AS unique_pubkeys\n                FROM events_local\n                WHERE kind = 31234\n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 30 FORMAT RowBinary\n
+10419523767095314656    38      771.98  4507806444      864044020927    SELECT\n                    countIf(kind = 1) AS total_notes,\n                    countIf(kind = 1 AND arrayExists(t -> t[1] = \'e\', tags)) AS total_replies,\n                    countIf(kind = 7) AS total_reactions\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 30 DAY FORMAT RowBinary\n
+3790641301814883286     39      454.65  1620936825      124812135525    SELECT\n                    toHour(created_at) AS hour,\n                    count() AS event_count,\n                    uniq(pubkey) AS unique_pubkeys,\n                    toFloat64(count()) / 7 AS avg_per_day\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                \n                GROUP BY hour\n                ORDER BY hour ASC FORMAT RowBinary\n
+9276024051640404961     195     380.46  359518703       28401977537     SELECT\n                    toHour(created_at) AS hour,\n                    count() AS event_count,\n                    uniq(pubkey) AS unique_pubkeys,\n                    toFloat64(count()) / 7 AS avg_per_day\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                AND kind = 0\n                GROUP BY hour\n                ORDER BY hour ASC FORMAT RowBinary\n
+118032033596033906      102     125.73  669309414       58964255210     SELECT\n                            count() AS total_zaps,\n                            toUInt64(sum(amount_msats) / 1000) AS total_sats,\n                            uniq(sender_pubkey) AS unique_senders,\n                            uniq(recipient_pubkey) AS unique_recipients,\n                            avg(amount_msats) / 1000 AS avg_zap_sats\n                        FROM zap_amounts_data\n                        WHERE created_at >= now() - INTERVAL 10000 DAY\n                            AND amount_msats > 0 FORMAT RowBinary\n
+5587487901541895399     15      31.54   15104492340     60417969360     SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now() FORMAT RowBinary\n
+5086184713570275030     33      29.57   3914948018      23489688108     SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY FORMAT RowBinary\n
+18439395168556161       33      28.07   649623843       2981575476      WITH\n                total_zaps AS (SELECT count() AS cnt FROM zap_amounts_data WHERE created_at >= now() - INTERVAL 30 DAY AND amount_msats > 0),\n                total_amount AS (SELECT sum(amount_msats) / 1000 AS sats FROM zap_amounts_data WHERE created_at >= now() - INTERVAL 30 DAY AND amount_msats > 0)\n            SELECT\n                multiIf(\n                    amount_msats / 1000 <= 10, \'1-10 sats\',\n                    amount_msats / 1000 <= 21, \'11-21 sats\',\n                    amount_msats / 1000 <= 50, \'22-50 sats\',\n                    amount_msats / 1000 <= 100, \'51-100 sats\',\n                    amount_msats / 1000 <= 250, \'101-250 sats\',\n                    amount_msats / 1000 <= 500, \'251-500 sats\',\n                    amount_msats / 1000 <= 750, \'501-750 sats\',\n                    amount_msats / 1000 <= 1000, \'751-1K sats\',\n                    amount_msats / 1000 <= 2500, \'1K-2.5K sats\',\n                    amount_msats / 1000 <= 5000, \'2.5K-5K sats\',\n                    amount_msats / 1000 <= 7500, \'5K-7.5K sats\',\n                    amount_msats / 1000 <= 10000, \'7.5K-10K sats\',\n                    amount_msats / 1000 <= 25000, \'10K-25K sats\',\n                    amount_msats / 1000 <= 50000, \'25K-50K sats\',\n                    amount_msats / 1000 <= 75000, \'50K-75K sats\',\n                    amount_msats / 1000 <= 100000, \'75K-100K sats\',\n                    \'100K+ sats\'\n                ) AS bucket,\n                multiIf(\n                    amount_msats / 1000 <= 10, toUInt64(1),\n                    amount_msats / 1000 <= 21, toUInt64(11),\n                    amount_msats / 1000 <= 50, toUInt64(22),\n                    amount_msats / 1000 <= 100, toUInt64(51),\n                    amount_msats / 1000 <= 250, toUInt64(101),\n                    amount_msats / 1000 <= 500, toUInt64(251),\n                    amount_msats / 1000 <= 750, toUInt64(501),\n                    amount_msats / 1000 <= 1000, toUInt64(751),\n                    amount_msats / 1000 <= 2500, toUInt64(1001),\n                    amount_msats / 1000 <= 5000, toUInt64(2501),\n                    amount_msats / 1000 <= 7500, toUInt64(5001),\n                    amount_msats / 1000 <= 10000, toUInt64(7501),\n                    amount_msats / 1000 <= 25000, toUInt64(10001),\n                    amount_msats / 1000 <= 50000, toUInt64(25001),\n                    amount_msats / 1000 <= 75000, toUInt64(50001),\n                    amount_msats / 1000 <= 100000, toUInt64(75001),\n                    toUInt64(100001)\n                ) AS min_sats,\n                multiIf(\n                    amount_msats / 1000 <= 10, toUInt64(10),\n                    amount_msats / 1000 <= 21, toUInt64(21),\n                    amount_msats / 1000 <= 50, toUInt64(50),\n                    amount_msats / 1000 <= 100, toUInt64(100),\n                    amount_msats / 1000 <= 250, toUInt64(250),\n                    amount_msats / 1000 <= 500, toUInt64(500),\n                    amount_msats / 1000 <= 750, toUInt64(750),\n                    amount_msats / 1000 <= 1000, toUInt64(1000),\n                    amount_msats / 1000 <= 2500, toUInt64(2500),\n                    amount_msats / 1000 <= 5000, toUInt64(5000),\n                    amount_msats / 1000 <= 7500, toUInt64(7500),\n                    amount_msats / 1000 <= 10000, toUInt64(10000),\n                    amount_msats / 1000 <= 25000, toUInt64(25000),\n                    amount_msats / 1000 <= 50000, toUInt64(50000),\n                    amount_msats / 1000 <= 75000, toUInt64(75000),\n                    amount_msats / 1000 <= 100000, toUInt64(100000),\n                    toUInt64(999999999)\n                ) AS max_sats,\n                count() AS count,\n                toUInt64(sum(amount_msats) / 1000) AS total_sats,\n                ifNull(round(100.0 * count() / nullIf((SELECT cnt FROM total_zaps), 0), 2), 0.0) AS pct_count,\n                ifNull(round(100.0 * (sum(amount_msats) / 1000) / nullIf((SELECT sats FROM total_amount), 0), 2), 0.0) AS pct_sats\n            FROM zap_amounts_data\n            WHERE created_at >= now() - INTERVAL 30 DAY\n                AND amount_msats > 0\n            GROUP BY bucket, min_sats, max_sats\n            ORDER BY min_sats ASC FORMAT RowBinary\n
+1114448571384004621     15      23.61   15104492340     60417969360     SELECT toUInt32(min(created_at)) FROM events_local FORMAT RowBinary\n
+13289044087073907965    31      19.16   203417567       2782995147      SELECT\n                            toString(toDate(created_at)) AS period,\n                            count() AS total_zaps,\n                            toUInt64(sum(amount_msats) / 1000) AS total_sats,\n                            uniq(sender_pubkey) AS unique_senders,\n                            uniq(recipient_pubkey) AS unique_recipients,\n                            avg(amount_msats) / 1000 AS avg_zap_sats\n                        FROM zap_amounts_data\n                        WHERE created_at >= now() - INTERVAL 31 DAY\n                            AND amount_msats > 0\n                        GROUP BY period\n                        ORDER BY period DESC\n                        LIMIT 31 FORMAT RowBinary\n
+2564648462734419375     15      15.82   82791525        6540530475      SELECT\n                            toString(date) AS period,\n                            sum(event_count) AS count,\n                            count() AS unique_pubkeys\n                        FROM daily_user_stats FINAL\n                        WHERE date <= today() AND date >= today() - INTERVAL 30 DAY\n                        GROUP BY date\n                        ORDER BY date DESC\n                        LIMIT 100 FORMAT RowBinary\n
+3604967190190707920     30      10.59   1246863138      4987452552      SELECT\n                    toFloat64(count()) / 168.0 AS events_per_hour,\n                    count() AS total_events_7d\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                 FORMAT RowBinary\n
+10520284516429986368    1       4.09    13349052        11176530047     SELECT sum(z.amount_msats) AS total_msats, count() AS zap_count FROM events_local e INNER JOIN zap_amounts_data z ON e.id = z.event_id WHERE e.kind = 9735 AND arrayExists(t -> t[1] = \'e\' AND t[2] = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\', e.tags) FORMAT RowBinary\n
+347203161627827813      25      1.08    57975   3642825 SELECT\n                    relay_url,\n                    user_count,\n                    read_count,\n                    write_count\n                FROM relay_distribution FINAL\n                ORDER BY user_count DESC\n                LIMIT 50 FORMAT RowBinary\n
+6540054426884992050     28      0.97    144872  3766672 SELECT\n                    kind,\n                    event_count,\n                    unique_pubkeys,\n                    first_seen,\n                    last_seen\n                FROM kinds_stats_mv\n                FINAL\n                ORDER BY event_count DESC\n                LIMIT 50 FORMAT RowBinary\n
+12330852686229131964    27      0.9     42606   596484  SELECT\n                    toString(date) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 92 FORMAT RowBinary\n
+15095586062519484435    25      0.68    39450   552300  SELECT\n                    toString(toMonday(date)) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 26 FORMAT RowBinary\n
+15697554845390390711    27      0.64    49653   595836  SELECT\n                    cohort,\n                    activity_period,\n                    active_count\n                FROM cohort_retention_monthly_view\n                WHERE cohort >= toString(today() - INTERVAL 12 MONTH)\n                ORDER BY cohort, activity_period FORMAT RowBinary\n
+6490933866431901680     25      0.54    39450   552300  SELECT\n                    toString(toStartOfMonth(date)) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 24 FORMAT RowBinary\n
+3342636814104852807     26      0.52    236054  2832648 SELECT\n                    cohort,\n                    activity_period,\n                    active_count\n                FROM cohort_retention_weekly_view\n                WHERE cohort >= toString(today() - INTERVAL 12 WEEK)\n                ORDER BY cohort, activity_period FORMAT RowBinary\n
+15722048748544463130    119     0.33    119     119     SELECT 1
+14519820189927402864    24      0.32    744     34224   SELECT\n                    toString(date) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_daily FINAL\n                WHERE date >= toDate(\'2020-11-07\') AND date <= today()\n                ORDER BY date DESC FORMAT RowBinary\n
+77027013118436854       2       0.3     364058  200631054       SELECT pubkey, argMax(id, created_at) AS event_id, argMax(content, created_at) AS content FROM events_local WHERE pubkey = \'9c775480547b02bc8c391dbb6d06bebba764366a5064711501ef99c954476b11\' AND kind = 0 GROUP BY pubkey LIMIT 1 FORMAT RowBinary\n
+4112649621582514533     26      0.28    338     15548   SELECT\n                    toString(month) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_monthly FINAL\n                WHERE month >= toDate(\'2020-11-07\') AND month <= toStartOfMonth(today())\n                ORDER BY month DESC FORMAT RowBinary\n
+9584647282082648437     26      0.26    702     32292   SELECT\n                    toString(week) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_weekly FINAL\n                WHERE week >= toDate(\'2020-11-07\') AND week <= toMonday(today())\n                ORDER BY week DESC FORMAT RowBinary\n
+16541278353412335871    25      0.2     25      400     SELECT count() FROM pubkey_first_seen_data FORMAT RowBinary\n
+3085499941042308638     15      0.13    405     17820   SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = \'events_local\' AND active FORMAT RowBinary\n
+7423691896936334502     2       0.03    350471  31440504        SELECT id, pubkey, created_at, kind, content, tags, d_tag, title, thumbnail, video_url FROM events_local WHERE id = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\' LIMIT 1 FORMAT RowBinary\n
+8570619532331437304     1       0.01    64303   4761612 SELECT sum(comment_count) AS count FROM comment_counts WHERE target_event_id = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\' FORMAT RowBinary\n
+14391776268478721631    1       0.01    78255   5778430 SELECT sum(reaction_count) AS count FROM reaction_counts WHERE target_event_id = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\' FORMAT RowBinary\n
+
+-> % just ch-query "SELECT round(sum(query_duration_ms)/1000,2) AS total_sec, count() AS runs, any(query) AS sample_query FROM system.query_log WHERE event_time >= now() - INTERVAL 1 HOUR AND type='QueryFinish' AND (query ILIKE '%events_local%' OR query ILIKE '%uniqExact%' OR query ILIKE '%arrayExists%' OR query ILIKE '%FINAL%') GROUP BY normalizeQuery(query) ORDER BY total_sec DESC LIMIT 30"
+6795.12 371     SELECT\n                    toString(toDate(created_at)) AS period,\n                    count() AS event_count,\n                    uniqExact(pubkey) AS unique_pubkeys\n                FROM events_local\n                WHERE kind = 31234\n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 30 FORMAT RowBinary\n
+771.98  38      SELECT\n                    countIf(kind = 1) AS total_notes,\n                    countIf(kind = 1 AND arrayExists(t -> t[1] = \'e\', tags)) AS total_replies,\n                    countIf(kind = 7) AS total_reactions\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 30 DAY FORMAT RowBinary\n
+454.65  39      SELECT\n                    toHour(created_at) AS hour,\n                    count() AS event_count,\n                    uniq(pubkey) AS unique_pubkeys,\n                    toFloat64(count()) / 7 AS avg_per_day\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                \n                GROUP BY hour\n                ORDER BY hour ASC FORMAT RowBinary\n
+371.64  194     SELECT\n                    toHour(created_at) AS hour,\n                    count() AS event_count,\n                    uniq(pubkey) AS unique_pubkeys,\n                    toFloat64(count()) / 7 AS avg_per_day\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                AND kind = 0\n                GROUP BY hour\n                ORDER BY hour ASC FORMAT RowBinary\n
+31.54   15      SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now() FORMAT RowBinary\n
+28.34   33      SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY FORMAT RowBinary\n
+19.8    14      SELECT toUInt32(min(created_at)) FROM events_local FORMAT RowBinary\n
+14.23   15      SELECT\n                            toString(date) AS period,\n                            sum(event_count) AS count,\n                            count() AS unique_pubkeys\n                        FROM daily_user_stats FINAL\n                        WHERE date <= today() AND date >= today() - INTERVAL 30 DAY\n                        GROUP BY date\n                        ORDER BY date DESC\n                        LIMIT 100 FORMAT RowBinary\n
+10.16   30      SELECT\n                    toFloat64(count()) / 168.0 AS events_per_hour,\n                    count() AS total_events_7d\n                FROM events_local\n                WHERE created_at >= now() - INTERVAL 7 DAY\n                 FORMAT RowBinary\n
+4.09    1       SELECT sum(z.amount_msats) AS total_msats, count() AS zap_count FROM events_local e INNER JOIN zap_amounts_data z ON e.id = z.event_id WHERE e.kind = 9735 AND arrayExists(t -> t[1] = \'e\' AND t[2] = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\', e.tags) FORMAT RowBinary\n
+1.07    25      SELECT\n                    relay_url,\n                    user_count,\n                    read_count,\n                    write_count\n                FROM relay_distribution FINAL\n                ORDER BY user_count DESC\n                LIMIT 50 FORMAT RowBinary\n
+0.94    28      SELECT\n                    kind,\n                    event_count,\n                    unique_pubkeys,\n                    first_seen,\n                    last_seen\n                FROM kinds_stats_mv\n                FINAL\n                ORDER BY event_count DESC\n                LIMIT 50 FORMAT RowBinary\n
+0.92    27      SELECT\n                    toString(date) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 92 FORMAT RowBinary\n
+0.61    25      SELECT\n                    toString(toMonday(date)) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 26 FORMAT RowBinary\n
+0.49    25      SELECT\n                    toString(toStartOfMonth(date)) AS period,\n                    sum(new_users) AS new_users\n                FROM new_users_daily FINAL\n                WHERE 1=1 \n                GROUP BY period\n                ORDER BY period DESC\n                LIMIT 24 FORMAT RowBinary\n
+0.31    24      SELECT\n                    toString(date) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_daily FINAL\n                WHERE date >= toDate(\'2020-11-07\') AND date <= today()\n                ORDER BY date DESC FORMAT RowBinary\n
+0.3     2       SELECT pubkey, argMax(id, created_at) AS event_id, argMax(content, created_at) AS content FROM events_local WHERE pubkey = \'9c775480547b02bc8c391dbb6d06bebba764366a5064711501ef99c954476b11\' AND kind = 0 GROUP BY pubkey LIMIT 1 FORMAT RowBinary\n
+0.27    26      SELECT\n                    toString(month) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_monthly FINAL\n                WHERE month >= toDate(\'2020-11-07\') AND month <= toStartOfMonth(today())\n                ORDER BY month DESC FORMAT RowBinary\n
+0.24    26      SELECT\n                    toString(week) AS period,\n                    active_users,\n                    has_profile,\n                    has_follows AS has_follows_list,\n                    has_both AS has_profile_and_follows_list,\n                    total_events\n                FROM active_users_weekly FINAL\n                WHERE week >= toDate(\'2020-11-07\') AND week <= toMonday(today())\n                ORDER BY week DESC FORMAT RowBinary\n
+0.12    15      SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = \'events_local\' AND active FORMAT RowBinary\n
+0.03    2       SELECT id, pubkey, created_at, kind, content, tags, d_tag, title, thumbnail, video_url FROM events_local WHERE id = \'771628f66446fd5e67af0790999e78dddfe52a8af4eabbb89ecec4d5f84a10f8\' LIMIT 1 FORMAT RowBinary\n
+
+-> % just ch-query "SELECT view, status, last_refresh_time, next_refresh_time FROM system.view_refreshes WHERE database = currentDatabase() ORDER BY view"
+active_users_daily_mv   Scheduled       2026-03-04 19:00:00     2026-03-04 20:00:00
+active_users_monthly_mv Scheduled       2026-03-04 00:00:04     2026-03-05 00:00:00
+active_users_weekly_mv  Scheduled       2026-03-04 12:00:10     2026-03-05 00:00:00
+cohort_retention_monthly_mv     Scheduled       2026-03-04 03:15:20     2026-03-05 03:15:00
+cohort_retention_weekly_mv      Scheduled       2026-03-04 03:00:35     2026-03-05 03:00:00
+kinds_stats_mv  Scheduled       2026-03-04 19:00:25     2026-03-04 20:00:00
+new_users_daily_mv      Scheduled       2026-03-04 12:00:22     2026-03-05 00:00:00
+relay_distribution_mv   Scheduled       2026-03-04 18:00:09     2026-03-05 00:00:00
+
+-> % curl -s -o /dev/null -w "kinds_activity %{time_total}s\n" "http://localhost:8080/api/v1/kinds/1/activity?group_by=day&limit=30"
+kinds_activity 0.000711s
+
+-> % curl -s -o /dev/null -w "engagement %{time_total}s\n" "http://localhost:8080/api/v1/stats/engagement?days=30"
+engagement 0.004893s
+
+-> % curl -s -o /dev/null -w "hourly_activity %{time_total}s\n" "http://localhost:8080/api/v1/stats/activity/hourly?days=30"
+hourly_activity 0.000453s
+
+-> %  curl -sI "http://localhost:8080/api/v1/stats/engagement?days=30" | rg -i "cache-control|etag|age"
+"No output"
+
+-> % curl -sI "http://localhost:8080/api/v1/kinds/1/activity?group_by=day&limit=30" | rg -i "cache-control|etag|age"
+"No output"
+
