@@ -5,6 +5,9 @@
 # Run during normal traffic for 30-60 minutes.
 # Save output to timestamped files for before/after comparison.
 # =============================================================================
+# Re-exec with bash if invoked as sh (arrays require bash)
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+
 set -u
 
 if command -v rg >/dev/null 2>&1; then
