@@ -56,6 +56,14 @@ just dev-down           # Stop Docker services
 just dev-logs           # View Docker logs
 ```
 
+### Agent Commit Requirement
+
+For AI agents making code changes:
+
+- `just precommit` is the mandatory final verification step.
+- Run `just precommit` after all edits are complete and immediately before creating a commit.
+- Do not create a commit if `just precommit` fails.
+
 ### ClickHouse Commands
 
 ```bash
@@ -439,4 +447,3 @@ See `pensieve-local/README.md` for detailed local setup instructions.
 ## License
 
 PolyForm Noncommercial License 1.0.0 - see `LICENSE` file.
-
