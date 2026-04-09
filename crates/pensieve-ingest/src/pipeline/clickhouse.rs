@@ -17,6 +17,7 @@
 //! any partially-indexed segment.
 
 use super::segment::SealedSegment;
+use crate::logging::compact_error;
 use crate::{Error, Result};
 use clickhouse::{Client, Row};
 use crossbeam_channel::Receiver;
@@ -236,7 +237,7 @@ impl ClickHouseIndexer {
             match Self::parse_notepack(&data) {
                 Ok(row) => events.push(row),
                 Err(e) => {
-                    tracing::warn!("Failed to parse event: {}", e);
+                    tracing::warn!(error = %compact_error(&e), "failed to parse archived event for clickhouse");
                     // Continue with next event
                 }
             }

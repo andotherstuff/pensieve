@@ -21,7 +21,7 @@ RestartSec=5
 EnvironmentFile=/home/pensieve/pensieve/pensieve-deploy/.env
 
 # Additional environment
-Environment=RUST_LOG=info,pensieve_preview=debug
+Environment=RUST_LOG=info
 
 # Logging
 StandardOutput=journal

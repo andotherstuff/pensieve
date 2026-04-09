@@ -3,12 +3,12 @@
 //! Renders articles with title, author info, and full markdown content.
 //! Markdown is converted to HTML using pulldown-cmark.
 
-use maud::{html, Markup, PreEscaped};
-use pulldown_cmark::{html as md_html, Options, Parser};
+use maud::{Markup, PreEscaped, html};
+use pulldown_cmark::{Options, Parser, html as md_html};
 
 use super::components::{
-    author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell, truncate,
-    OpenGraphData,
+    OpenGraphData, author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell,
+    truncate,
 };
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 

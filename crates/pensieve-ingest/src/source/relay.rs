@@ -18,6 +18,7 @@
 //! periodically optimizes which relays are connected based on quality scores.
 
 use super::{EventSource, SourceMetadata, SourceStats};
+use crate::logging::{compact_error, compact_notice};
 use crate::pipeline::PackedEvent;
 use crate::relay::RelayManager;
 use crate::relay::connection_guard::{ConnectionGuard, ConnectionGuardConfig};
@@ -373,7 +374,7 @@ impl RelaySource {
         // This allows us to authenticate with relays that require it
         // We don't use this key for signing events, just for relay auth
         let keys = Keys::generate();
-        tracing::info!(
+        tracing::debug!(
             "Generated ephemeral keypair for relay auth: {}",
             keys.public_key()
                 .to_bech32()
@@ -413,7 +414,11 @@ impl RelaySource {
             if let Some(ref manager) = self.relay_manager
                 && let Err(e) = manager.register_relay(relay_url, crate::relay::RelayTier::Seed)
             {
-                tracing::warn!("Failed to register seed relay {}: {}", relay_url, e);
+                tracing::warn!(
+                    relay_url = %relay_url,
+                    error = %compact_error(&e),
+                    "failed to register seed relay"
+                );
             }
 
             // Check DNS resolution for seed relays (skip rate limit check)
@@ -433,7 +438,11 @@ impl RelaySource {
             }
 
             if let Err(e) = client.add_relay(relay_url).await {
-                tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                tracing::warn!(
+                    relay_url = %relay_url,
+                    error = %compact_error(&e),
+                    "failed to add relay"
+                );
                 self.record_connection_failure(relay_url);
             } else {
                 tracing::debug!("Added relay: {}", relay_url);
@@ -486,7 +495,7 @@ impl RelaySource {
 
         // Subscribe
         let output = client.subscribe((*filter).clone(), None).await?;
-        tracing::info!("Subscribed with ID: {:?}", output.val);
+        tracing::debug!("Subscribed with ID: {:?}", output.val);
 
         // Get notification receiver
         let mut notifications = client.notifications();
@@ -538,7 +547,7 @@ impl RelaySource {
                 Ok(Ok(n)) => n,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     // All senders dropped - channel is truly closed
-                    tracing::info!("Notification channel closed");
+                    tracing::debug!("Notification channel closed");
                     break;
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(count))) => {
@@ -594,18 +603,27 @@ impl RelaySource {
                     match handler(relay_url_str, &event) {
                         Ok(true) => {} // Continue
                         Ok(false) => {
-                            tracing::info!("Handler signaled stop");
+                            tracing::debug!("Handler signaled stop");
                             break;
                         }
                         Err(e) => {
-                            tracing::error!("Handler error: {}", e);
+                            tracing::error!(
+                                relay_url = %relay_url,
+                                event_id = %event.id,
+                                kind = event.kind.as_u16(),
+                                pubkey = %event.pubkey,
+                                tag_count = event.tags.len(),
+                                content_len = event.content.len(),
+                                error = %compact_error(&e),
+                                "relay event handler failed"
+                            );
                             break;
                         }
                     }
 
                     // Progress logging
                     if event_count.is_multiple_of(progress_interval) {
-                        tracing::info!(
+                        tracing::debug!(
                             "Received {} events, {} relays connected",
                             event_count,
                             self.stats.relays_connected.load(Ordering::Relaxed)
@@ -626,9 +644,9 @@ impl RelaySource {
                                 || msg_lower.contains("not allowed")
                             {
                                 tracing::warn!(
-                                    "Relay {} rejected access: {}. Disconnecting.",
-                                    relay_url,
-                                    notice_msg
+                                    relay_url = %relay_url,
+                                    notice = %compact_notice(&notice_msg),
+                                    "relay rejected access; disconnecting"
                                 );
                                 let relay_url_str = relay_url.to_string();
                                 // Record as rejection (counts as failure, may lead to blocking)
@@ -645,7 +663,11 @@ impl RelaySource {
                                 }
                                 self.stats.relays_connected.fetch_sub(1, Ordering::Relaxed);
                             } else {
-                                tracing::debug!("Relay {} notice: {}", relay_url, notice_msg);
+                                tracing::debug!(
+                                    relay_url = %relay_url,
+                                    notice = %compact_notice(&notice_msg),
+                                    "relay notice"
+                                );
                             }
                         }
                         RelayMessage::Closed {
@@ -659,10 +681,10 @@ impl RelaySource {
                                 || msg_lower.contains("not allowed")
                             {
                                 tracing::warn!(
-                                    "Relay {} closed subscription {}: {}. Disconnecting.",
-                                    relay_url,
-                                    subscription_id,
-                                    closed_msg
+                                    relay_url = %relay_url,
+                                    subscription_id = %subscription_id,
+                                    message = %compact_notice(&closed_msg),
+                                    "relay closed restricted subscription; disconnecting"
                                 );
                                 let relay_url_str = relay_url.to_string();
                                 // Record as rejection (counts as failure, may lead to blocking)
@@ -684,7 +706,7 @@ impl RelaySource {
                 }
 
                 RelayPoolNotification::Shutdown => {
-                    tracing::info!("Relay pool shutdown notification received");
+                    tracing::debug!("Relay pool shutdown notification received");
                     break;
                 }
             }
@@ -709,7 +731,7 @@ impl RelaySource {
 
         // First, recompute scores
         if let Err(e) = manager.recompute_scores() {
-            tracing::warn!("Failed to recompute relay scores: {}", e);
+            tracing::warn!(error = %compact_error(&e), "failed to recompute relay scores");
             return;
         }
 
@@ -729,7 +751,7 @@ impl RelaySource {
         let suggestions = match manager.get_optimization_suggestions(&connected_relays) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Failed to get optimization suggestions: {}", e);
+                tracing::warn!(error = %compact_error(&e), "failed to get relay optimization suggestions");
                 return;
             }
         };
@@ -753,14 +775,18 @@ impl RelaySource {
 
         // Disconnect low-scoring relays
         for url in &suggestions.to_disconnect {
-            tracing::info!("Disconnecting low-scoring relay: {}", url);
+            tracing::debug!("Disconnecting low-scoring relay: {}", url);
             self.record_disconnection(url).await;
             self.connection_guard.record_disconnect(url);
             counter!("relay_disconnects_total", "reason" => "optimization").increment(1);
 
             if let Ok(relay_url) = RelayUrl::parse(url) {
                 if let Err(e) = client.disconnect_relay(relay_url).await {
-                    tracing::warn!("Failed to disconnect {}: {}", url, e);
+                    tracing::warn!(
+                        relay_url = %url,
+                        error = %compact_error(&e),
+                        "failed to disconnect relay"
+                    );
                 } else {
                     self.stats.relays_connected.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -769,13 +795,13 @@ impl RelaySource {
 
         // Connect higher-scoring relays (swaps)
         for url in &suggestions.to_connect {
-            tracing::info!("Connecting higher-scoring relay: {}", url);
+            tracing::debug!("Connecting higher-scoring relay: {}", url);
             self.try_connect_relay(client, filter, url, "swap").await;
         }
 
         // Connect exploration relays (untested/stale relays)
         for url in &suggestions.exploration_relays {
-            tracing::info!("Exploring untested relay: {}", url);
+            tracing::debug!("Exploring untested relay: {}", url);
             counter!("relay_exploration_attempts_total").increment(1);
             self.try_connect_relay(client, filter, url, "exploration")
                 .await;
@@ -859,13 +885,22 @@ impl RelaySource {
                             .subscribe_to(vec![relay_url], (**filter).clone(), None)
                             .await
                     {
-                        tracing::warn!("Failed to subscribe new relay {}: {}", url, e);
+                        tracing::warn!(
+                            relay_url = %url,
+                            error = %compact_error(&e),
+                            "failed to subscribe new relay"
+                        );
                     }
                 }
                 Err(e) => {
                     // connect_relay() itself failed (not just the async handshake)
                     // This is a definitive, synchronous failure.
-                    tracing::warn!("Failed to connect to {}: {}", url, e);
+                    tracing::warn!(
+                        relay_url = %url,
+                        reason = reason,
+                        error = %compact_error(&e),
+                        "failed to connect relay"
+                    );
                     self.record_connection_failure(url);
                     counter!("relay_connect_failures_total", "reason" => reason).increment(1);
                 }
@@ -985,7 +1020,15 @@ impl EventSource for RelaySource {
             match pack_nostr_event(event) {
                 Ok(packed) => handler(packed),
                 Err(e) => {
-                    tracing::debug!("Failed to pack event: {}", e);
+                    tracing::debug!(
+                        event_id = %event.id,
+                        kind = event.kind.as_u16(),
+                        pubkey = %event.pubkey,
+                        tag_count = event.tags.len(),
+                        content_len = event.content.len(),
+                        error = %compact_error(&e),
+                        "failed to pack relay event"
+                    );
                     Ok(true) // Continue on pack errors
                 }
             }

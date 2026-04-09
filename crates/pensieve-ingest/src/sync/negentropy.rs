@@ -20,6 +20,7 @@
 
 use super::SyncStateDb;
 use crate::Result;
+use crate::logging::compact_error;
 use metrics::{counter, gauge, histogram};
 use nostr_sdk::prelude::*;
 use std::fmt::Debug;
@@ -258,7 +259,7 @@ impl NegentropySyncer {
         // Mark sync as in progress
         gauge!("negentropy_sync_in_progress").set(1.0);
 
-        tracing::info!(
+        tracing::debug!(
             "Starting negentropy sync with {} relays, lookback {}s",
             self.config.relays.len(),
             self.config.lookback.as_secs()
@@ -304,7 +305,11 @@ impl NegentropySyncer {
         // Add trusted relays
         for relay_url in &self.config.relays {
             if let Err(e) = client.add_relay(relay_url).await {
-                tracing::warn!("Failed to add negentropy relay {}: {}", relay_url, e);
+                tracing::warn!(
+                    relay_url = %relay_url,
+                    error = %compact_error(&e),
+                    "failed to add negentropy relay"
+                );
                 stats.relays_errored += 1;
             }
         }
@@ -331,13 +336,13 @@ impl NegentropySyncer {
                 stats.events_discovered = output.received.len();
                 stats.relays_responded = self.config.relays.len() - stats.relays_errored;
 
-                tracing::info!(
+                tracing::debug!(
                     "Negentropy reconciliation complete: {} events discovered",
                     stats.events_discovered
                 );
             }
             Ok(Err(e)) => {
-                tracing::warn!("Negentropy sync failed: {}", e);
+                tracing::warn!(error = %compact_error(&e), "negentropy sync failed");
                 stats.relays_errored = self.config.relays.len();
             }
             Err(_) => {
@@ -358,7 +363,7 @@ impl NegentropySyncer {
         // Wait for collector to finish receiving all events
         // The channel will close when the adapter is dropped
         if let Err(e) = collector_handle.await {
-            tracing::warn!("Event collector task failed: {}", e);
+            tracing::warn!(error = %compact_error(&e), "event collector task failed");
         }
 
         // Get collected events
@@ -369,7 +374,7 @@ impl NegentropySyncer {
         stats.events_received = discovered_events.len();
         stats.duration = start.elapsed();
 
-        tracing::info!(
+        tracing::debug!(
             "Negentropy sync captured {} events in {:?}",
             stats.events_received,
             stats.duration
@@ -442,12 +447,18 @@ impl NegentropySyncer {
                                     .sync_state
                                     .record(event.id.as_bytes(), event.created_at.as_secs())
                                 {
-                                    tracing::warn!("Failed to record event in sync state: {}", e);
+                                    tracing::warn!(
+                                        event_id = %event.id,
+                                        kind = event.kind.as_u16(),
+                                        pubkey = %event.pubkey,
+                                        error = %compact_error(&e),
+                                        "failed to record negentropy event in sync state"
+                                    );
                                 }
                                 events_succeeded += 1;
                             }
                             Ok(false) => {
-                                tracing::info!("Event handler signaled stop");
+                                tracing::debug!("Event handler signaled stop");
                                 self.running.store(false, Ordering::SeqCst);
                                 break;
                             }
@@ -455,8 +466,13 @@ impl NegentropySyncer {
                                 // Event failed to process - do NOT record in sync state.
                                 // It will be re-fetched on the next sync cycle.
                                 tracing::debug!(
-                                    "Event handler error (will retry next sync): {}",
-                                    e
+                                    event_id = %event.id,
+                                    kind = event.kind.as_u16(),
+                                    pubkey = %event.pubkey,
+                                    tag_count = event.tags.len(),
+                                    content_len = event.content.len(),
+                                    error = %compact_error(&e),
+                                    "negentropy event handler failed; will retry next sync"
                                 );
                                 events_failed += 1;
                                 counter!("negentropy_events_failed_total").increment(1);
@@ -467,7 +483,7 @@ impl NegentropySyncer {
                     let process_duration = process_start.elapsed();
 
                     // Log batch summary
-                    tracing::info!(
+                    tracing::debug!(
                         "Negentropy batch processed: {} events → {} succeeded, {} failed in {:?}",
                         total_events,
                         events_succeeded,
@@ -497,7 +513,7 @@ impl NegentropySyncer {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to prune sync state: {}", e);
+                            tracing::warn!(error = %compact_error(&e), "failed to prune sync state");
                         }
                     }
 
@@ -507,7 +523,7 @@ impl NegentropySyncer {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Negentropy sync cycle failed: {}", e);
+                    tracing::error!(error = %compact_error(&e), "negentropy sync cycle failed");
                     counter!("negentropy_sync_errors_total").increment(1);
                 }
             }

@@ -39,6 +39,7 @@
 //! and ClickHouse is a derived index.
 
 pub mod error;
+pub mod logging;
 pub mod pipeline;
 pub mod relay;
 pub mod source;

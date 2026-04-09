@@ -46,7 +46,7 @@ Or with all options:
 ```bash
 PENSIEVE_API_TOKENS=dev-token \
 CLICKHOUSE_URL=http://localhost:8123 \
-RUST_LOG=info,pensieve_serve=debug \
+RUST_LOG=info \
 cargo run --bin pensieve-serve
 ```
 
@@ -89,6 +89,10 @@ mkdir -p ./data/dedupe ./data/segments
   --metrics-port 9091 \
   --score-interval-secs 60
 ```
+
+For live tuning, add `--verbose-ops` to emit periodic throughput and checkpoint
+progress at INFO without turning on broader debug logging.
+
 
 ## Grafana Dashboards
 

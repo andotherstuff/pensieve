@@ -35,6 +35,7 @@ use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, NegentropySyncConfig, NegentropySyncer,
     RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
+    logging::compact_error,
     pack_nostr_event,
     relay::normalize_relay_url,
     seed_from_clickhouse,
@@ -78,7 +79,7 @@ fn load_seeds_from_file(path: &std::path::Path) -> Result<Vec<String>> {
         if let Some(normalized) = normalize_relay_url(line).ok() {
             seeds.push(normalized);
         } else {
-            tracing::warn!("Skipping invalid/blocked relay URL in seed file: {}", line);
+            tracing::warn!(seed_entry = %line, "skipping invalid or blocked relay URL from seed file");
         }
     }
     Ok(seeds)
@@ -137,6 +138,13 @@ struct Args {
     /// Metrics HTTP server port (0 to disable)
     #[arg(long, default_value = "9091")]
     metrics_port: u16,
+
+    /// Emit periodic operational progress lines at INFO instead of DEBUG.
+    ///
+    /// This is useful for live tuning when you want throughput/checkpoint
+    /// progress without broadly increasing log verbosity via RUST_LOG.
+    #[arg(long)]
+    verbose_ops: bool,
 
     /// SQLite database path for relay quality tracking
     #[arg(long, default_value = "./data/relay-stats.db")]
@@ -225,11 +233,7 @@ async fn main() -> Result<()> {
 
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("info".parse().unwrap())
-                .add_directive("pensieve_ingest=debug".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
@@ -389,40 +393,28 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    if args.tor_proxy.is_some() {
-        tracing::info!("Tor proxy enabled - .onion relays will be routed through proxy");
+    if let Some(proxy_addr) = args.tor_proxy {
+        tracing::info!(tor_proxy = %proxy_addr, "tor proxy enabled for .onion relays");
     }
 
-    tracing::info!("Configuration:");
-    tracing::info!("  RocksDB: {}", args.rocksdb_path.display());
-    tracing::info!("  Relay DB: {}", args.relay_db_path.display());
-    tracing::info!("  Output: {}", args.output_dir.display());
+    let catchup = match relay_config.since_timestamp {
+        Some(ts) => format!("since {ts}"),
+        None => "disabled".to_string(),
+    };
     tracing::info!(
-        "  ClickHouse: {}",
-        args.clickhouse_url.as_deref().unwrap_or("disabled")
-    );
-    tracing::info!("  Seed relays: {}", relay_config.seed_relays.len());
-    tracing::info!("  Discovery: {}", relay_config.discovery_enabled);
-    tracing::info!("  Max relays: {}", relay_config.max_relays);
-    tracing::info!(
-        "  Optimization interval: {}s",
-        relay_config.optimization_interval.as_secs()
-    );
-    tracing::info!(
-        "  Catch-up: {}",
-        match relay_config.since_timestamp {
-            Some(ts) => format!("enabled (since {}) - WARNING: may reduce throughput", ts),
-            None => "disabled (default)".to_string(),
-        }
-    );
-    tracing::info!("  Checkpoint interval: {}s", args.checkpoint_interval_secs);
-    tracing::info!(
-        "  Negentropy sync: {}",
-        if args.negentropy {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        rocksdb_path = %args.rocksdb_path.display(),
+        relay_db_path = %args.relay_db_path.display(),
+        output_dir = %args.output_dir.display(),
+        clickhouse = %args.clickhouse_url.as_deref().unwrap_or("disabled"),
+        seed_relays = relay_config.seed_relays.len(),
+        discovery = relay_config.discovery_enabled,
+        max_relays = relay_config.max_relays,
+        optimization_interval_secs = relay_config.optimization_interval.as_secs(),
+        catchup = %catchup,
+        checkpoint_interval_secs = args.checkpoint_interval_secs,
+        verbose_ops = args.verbose_ops,
+        negentropy = args.negentropy,
+        "ingest configuration"
     );
 
     // Initialize negentropy sync (if enabled)
@@ -523,14 +515,12 @@ async fn main() -> Result<()> {
         };
 
         tracing::info!(
-            "  Negentropy interval: {}s",
-            negentropy_config.interval.as_secs()
+            relay_count = negentropy_config.relays.len(),
+            interval_secs = negentropy_config.interval.as_secs(),
+            lookback_days = args.negentropy_lookback_days,
+            "negentropy configuration"
         );
-        tracing::info!(
-            "  Negentropy lookback: {} days",
-            args.negentropy_lookback_days
-        );
-        tracing::info!("  Negentropy relays: {:?}", negentropy_config.relays);
+        tracing::debug!(relays = ?negentropy_config.relays, "negentropy relays");
 
         Some(Arc::new(NegentropySyncer::new(
             negentropy_config,
@@ -606,6 +596,7 @@ async fn main() -> Result<()> {
     let rate_events_received = Arc::clone(&events_received);
     let rate_events_processed = Arc::clone(&events_processed);
     let rate_events_deduplicated = Arc::clone(&events_deduplicated);
+    let rate_verbose_ops = args.verbose_ops;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.tick().await; // Skip first immediate tick
@@ -658,13 +649,23 @@ async fn main() -> Result<()> {
 
             // Log throughput periodically (every 5 seconds)
             if curr_received > 0 {
-                tracing::debug!(
-                    "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
-                    received_rate,
-                    processed_rate,
-                    deduplicated_rate,
-                    dedupe_ratio * 100.0
-                );
+                if rate_verbose_ops {
+                    tracing::info!(
+                        "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
+                        received_rate,
+                        processed_rate,
+                        deduplicated_rate,
+                        dedupe_ratio * 100.0
+                    );
+                } else {
+                    tracing::debug!(
+                        "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
+                        received_rate,
+                        processed_rate,
+                        deduplicated_rate,
+                        dedupe_ratio * 100.0
+                    );
+                }
             }
         }
 
@@ -676,6 +677,7 @@ async fn main() -> Result<()> {
     let checkpoint_relay_manager = Arc::clone(&relay_manager);
     let checkpoint_max_created_at = Arc::clone(&max_created_at);
     let checkpoint_interval = args.checkpoint_interval_secs;
+    let checkpoint_verbose_ops = args.verbose_ops;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(checkpoint_interval));
         interval.tick().await; // Skip first immediate tick
@@ -691,9 +693,13 @@ async fn main() -> Result<()> {
             let max_ts = checkpoint_max_created_at.load(Ordering::Relaxed);
             if max_ts > 0 {
                 if let Err(e) = checkpoint_relay_manager.update_last_archived_timestamp(max_ts) {
-                    tracing::warn!("Failed to update checkpoint: {}", e);
+                    tracing::warn!(error = %compact_error(&e), "failed to update checkpoint");
                 } else {
-                    tracing::debug!("Updated checkpoint to {}", max_ts);
+                    if checkpoint_verbose_ops {
+                        tracing::info!(checkpoint = max_ts, "updated checkpoint");
+                    } else {
+                        tracing::debug!(checkpoint = max_ts, "updated checkpoint");
+                    }
                     gauge!("ingest_checkpoint_timestamp").set(max_ts as f64);
                 }
             }
@@ -731,7 +737,15 @@ async fn main() -> Result<()> {
                     let is_novel = match negentropy_dedupe.check_and_mark_pending(event_id) {
                         Ok(novel) => novel,
                         Err(e) => {
-                            tracing::warn!("Negentropy dedupe check error: {}", e);
+                            tracing::warn!(
+                                event_id = %event.id,
+                                kind = event.kind.as_u16(),
+                                pubkey = %event.pubkey,
+                                tag_count = event.tags.len(),
+                                content_len = event.content.len(),
+                                error = %compact_error(&e),
+                                "negentropy dedupe check failed"
+                            );
                             false
                         }
                     };
@@ -741,16 +755,33 @@ async fn main() -> Result<()> {
                         let packed = match pack_nostr_event(event) {
                             Ok(p) => p,
                             Err(e) => {
-                                tracing::debug!("Failed to pack negentropy event: {}", e);
+                                let error = compact_error(&e);
+                                tracing::debug!(
+                                    event_id = %event.id,
+                                    kind = event.kind.as_u16(),
+                                    pubkey = %event.pubkey,
+                                    tag_count = event.tags.len(),
+                                    content_len = event.content.len(),
+                                    error = %error,
+                                    "failed to pack negentropy event"
+                                );
                                 // Return error so event is NOT recorded in sync state
                                 // and will be re-fetched on next sync cycle
-                                return Err(pensieve_ingest::Error::Notepack(e.to_string()));
+                                return Err(pensieve_ingest::Error::Notepack(error));
                             }
                         };
 
                         // Write to segment - must succeed for event to be recorded in sync state
                         if let Err(e) = negentropy_segment_writer.write(packed) {
-                            tracing::error!("Failed to write negentropy event: {}", e);
+                            tracing::error!(
+                                event_id = %event.id,
+                                kind = event.kind.as_u16(),
+                                pubkey = %event.pubkey,
+                                tag_count = event.tags.len(),
+                                content_len = event.content.len(),
+                                error = %compact_error(&e),
+                                "failed to write negentropy event"
+                            );
                             // Return error so event is NOT recorded in sync state
                             // and will be re-fetched on next sync cycle
                             return Err(e);
@@ -777,7 +808,7 @@ async fn main() -> Result<()> {
                 })
                 .await
             {
-                tracing::error!("Negentropy sync task failed: {}", e);
+                tracing::error!(error = %compact_error(&e), "negentropy sync task failed");
             }
 
             tracing::debug!("Negentropy sync task stopped");
@@ -808,7 +839,16 @@ async fn main() -> Result<()> {
             let is_novel = match dedupe.check_and_mark_pending(event_id) {
                 Ok(novel) => novel,
                 Err(e) => {
-                    tracing::warn!("Dedupe check error: {}", e);
+                    tracing::warn!(
+                        relay_url = %relay_url,
+                        event_id = %event.id,
+                        kind = event.kind.as_u16(),
+                        pubkey = %event.pubkey,
+                        tag_count = event.tags.len(),
+                        content_len = event.content.len(),
+                        error = %compact_error(&e),
+                        "dedupe check failed for live event"
+                    );
                     false // Treat as duplicate on error
                 }
             };
@@ -822,7 +862,16 @@ async fn main() -> Result<()> {
                     Ok(packed) => {
                         // Write to segment
                         if let Err(e) = segment_writer.write(packed) {
-                            tracing::error!("Failed to write event: {}", e);
+                            tracing::error!(
+                                relay_url = %relay_url,
+                                event_id = %event.id,
+                                kind = event.kind.as_u16(),
+                                pubkey = %event.pubkey,
+                                tag_count = event.tags.len(),
+                                content_len = event.content.len(),
+                                error = %compact_error(&e),
+                                "failed to write live event"
+                            );
                             // Continue processing despite write errors
                         } else {
                             handler_events_processed.fetch_add(1, Ordering::Relaxed);
@@ -842,7 +891,16 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("Failed to pack event: {}", e);
+                        tracing::debug!(
+                            relay_url = %relay_url,
+                            event_id = %event.id,
+                            kind = event.kind.as_u16(),
+                            pubkey = %event.pubkey,
+                            tag_count = event.tags.len(),
+                            content_len = event.content.len(),
+                            error = %compact_error(&e),
+                            "failed to pack live event"
+                        );
                     }
                 }
             } else {
@@ -875,7 +933,7 @@ async fn main() -> Result<()> {
     // Flush negentropy sync state
     if let Some(ref syncer) = negentropy_syncer {
         if let Err(e) = syncer.sync_state().flush() {
-            tracing::warn!("Failed to flush negentropy sync state: {}", e);
+            tracing::warn!(error = %compact_error(&e), "failed to flush negentropy sync state");
         } else {
             tracing::info!(
                 "Negentropy sync state flushed: ~{} items",
@@ -901,7 +959,7 @@ async fn main() -> Result<()> {
 
     // Flush relay manager stats
     if let Err(e) = relay_manager.flush() {
-        tracing::warn!("Failed to flush relay stats: {}", e);
+        tracing::warn!(error = %compact_error(&e), "failed to flush relay stats");
     }
 
     // Save final checkpoint
@@ -909,7 +967,7 @@ async fn main() -> Result<()> {
     if final_checkpoint > 0 {
         match relay_manager.update_last_archived_timestamp(final_checkpoint) {
             Ok(()) => tracing::info!("Saved final checkpoint: {}", final_checkpoint),
-            Err(e) => tracing::warn!("Failed to save final checkpoint: {}", e),
+            Err(e) => tracing::warn!(error = %compact_error(&e), "failed to save final checkpoint"),
         }
     }
 

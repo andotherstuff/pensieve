@@ -16,6 +16,9 @@ WorkingDirectory=/home/pensieve/pensieve
 #
 # Negentropy sync (NIP-77) enabled - periodically reconciles with trusted relays
 # to discover events missed during normal streaming
+#
+# Add --verbose-ops to ExecStart when you want periodic throughput/checkpoint
+# progress at INFO without raising RUST_LOG for everything else.
 ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
     --import-discovered-json /home/pensieve/pensieve/data/relays/relay_discovery_results.json \
@@ -36,7 +39,7 @@ Restart=always
 RestartSec=10
 
 # Environment
-Environment=RUST_LOG=info,pensieve_ingest=debug
+Environment=RUST_LOG=info
 
 # Logging
 StandardOutput=journal

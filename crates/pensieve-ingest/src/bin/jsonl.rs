@@ -33,6 +33,7 @@ use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, SealedSegment, SegmentConfig, SegmentWriter,
+    logging::compact_error,
     source::{EventSource, JsonlConfig, JsonlSource},
 };
 use serde::{Deserialize, Serialize};
@@ -163,7 +164,7 @@ impl Progress {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
@@ -322,7 +323,12 @@ async fn index_segments_mode(
                 );
             }
             Err(e) => {
-                tracing::error!("Failed to index segment {}: {}", segment_num, e);
+                tracing::error!(
+                    segment_number = segment_num,
+                    path = %segment_path.display(),
+                    error = %compact_error(&e),
+                    "failed to index segment"
+                );
                 errors += 1;
                 // Continue with next segment
             }
@@ -579,7 +585,11 @@ fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
                 // Mark as completed and save progress
                 progress.mark_completed(&file_path_str);
                 if let Err(e) = progress.save(&progress_file) {
-                    tracing::warn!("Failed to save progress: {}", e);
+                    tracing::warn!(
+                        path = %progress_file.display(),
+                        error = %compact_error(&e),
+                        "failed to save jsonl backfill progress"
+                    );
                 }
 
                 // Update metrics after each file (calculate adjusted valid_events on the fly)
@@ -592,7 +602,11 @@ fn process(args: &Args, input: &Path, output: &Path) -> Result<Stats> {
                 record_metrics(&metrics_stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                tracing::error!("Error processing {}: {}", file_path.display(), e);
+                tracing::error!(
+                    path = %file_path.display(),
+                    error = %compact_error(&e),
+                    "error processing jsonl file"
+                );
                 if !args.continue_on_error {
                     return Err(e.into());
                 }

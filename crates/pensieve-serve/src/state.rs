@@ -127,11 +127,11 @@ impl AppState {
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             ) {
                 Ok(conn) => {
-                    tracing::info!("Relay database connected (immutable): {:?}", path);
+                    tracing::info!(path = %path.display(), "relay database connected (immutable)");
                     Some(Arc::new(Mutex::new(conn)))
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to open relay database {:?}: {}", path, e);
+                    tracing::warn!(path = %path.display(), error = %e, "failed to open relay database");
                     None
                 }
             }

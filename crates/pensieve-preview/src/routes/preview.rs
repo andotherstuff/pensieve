@@ -33,14 +33,14 @@ pub async fn preview_handler(
 
     // Check in-process cache
     if let Some(cached) = state.cache.get(identifier).await {
-        tracing::debug!(identifier = %identifier, "cache hit");
+        tracing::trace!(identifier = %identifier, "cache hit");
         return Ok(build_response(
             &cached.html,
             cache_headers(&state, identifier, None),
         ));
     }
 
-    tracing::debug!(identifier = %identifier, "cache miss, resolving");
+    tracing::trace!(identifier = %identifier, "cache miss, resolving");
 
     // Resolve the identifier
     let content = resolve::resolve(&state, identifier).await?;

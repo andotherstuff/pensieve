@@ -3,13 +3,13 @@
 //! Renders a user's profile page with banner, avatar, name, NIP-05,
 //! about text, and metadata links.
 
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use maud::PreEscaped;
 
 use super::components::{
-    self, is_safe_url, nostr_link, page_shell, truncate, truncate_npub_display, OpenGraphData,
-    ICON_COPY,
+    self, ICON_COPY, OpenGraphData, is_safe_url, nostr_link, page_shell, truncate,
+    truncate_npub_display,
 };
 use crate::query::ProfileMetadata;
 

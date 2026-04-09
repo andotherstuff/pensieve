@@ -56,12 +56,7 @@ impl IntoResponse for ApiError {
                 )
             }
             Self::Database(err) => {
-                // Include the full error details for debugging
-                tracing::error!(
-                    error = %err,
-                    error_debug = ?err,
-                    "database error"
-                );
+                tracing::error!(error = %err, "database error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "database_error",

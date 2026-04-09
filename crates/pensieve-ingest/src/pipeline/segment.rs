@@ -21,6 +21,7 @@
 //! 3. Notify ClickHouse indexer via callback
 //! 4. Start a new segment
 
+use crate::logging::compact_error;
 use crate::{Error, Result};
 
 use chrono::{DateTime, Utc};
@@ -375,7 +376,11 @@ impl SegmentWriter {
                     Ok(compressed_bytes) => {
                         // Remove the uncompressed file
                         if let Err(e) = fs::remove_file(&path) {
-                            tracing::warn!("Failed to remove uncompressed segment: {}", e);
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %compact_error(&e),
+                                "failed to remove uncompressed segment"
+                            );
                         }
 
                         tracing::info!(
@@ -399,18 +404,23 @@ impl SegmentWriter {
                                 ..sealed_for_notify
                             };
                             if let Err(e) = sender.send(compressed_sealed) {
-                                tracing::warn!("Failed to send sealed segment notification: {}", e);
+                                tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Failed to compress segment {}: {}", segment_number, e);
+                        tracing::error!(
+                            segment_number,
+                            path = %path.display(),
+                            error = %compact_error(&e),
+                            "failed to compress segment"
+                        );
                         // Still notify indexer with uncompressed segment on error
                         total_compressed_bytes.fetch_add(size_bytes, Ordering::Relaxed);
                         if let Some(sender) = sender
                             && let Err(e) = sender.send(sealed_for_notify)
                         {
-                            tracing::warn!("Failed to send sealed segment notification: {}", e);
+                            tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
                         }
                     }
                 }
@@ -432,7 +442,7 @@ impl SegmentWriter {
             if let Some(sender) = &self.sealed_sender
                 && let Err(e) = sender.send(sealed.clone())
             {
-                tracing::warn!("Failed to send sealed segment notification: {}", e);
+                tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
             }
         }
 
@@ -495,7 +505,7 @@ impl Drop for SegmentWriter {
     fn drop(&mut self) {
         // Seal any remaining segment on drop
         if let Err(e) = self.seal() {
-            tracing::warn!("Error sealing segment on drop: {}", e);
+            tracing::warn!(error = %compact_error(&e), "error sealing segment on drop");
         }
     }
 }

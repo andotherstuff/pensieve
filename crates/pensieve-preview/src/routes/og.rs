@@ -39,11 +39,11 @@ pub async fn og_image_handler(
 
     // Check OG image cache
     if let Some(cached) = state.og_cache.get(identifier).await {
-        tracing::debug!(identifier = %identifier, "og image cache hit");
+        tracing::trace!(identifier = %identifier, "og image cache hit");
         return Ok(png_response(&cached));
     }
 
-    tracing::debug!(identifier = %identifier, "og image cache miss, generating");
+    tracing::trace!(identifier = %identifier, "og image cache miss, generating");
 
     // Resolve the identifier to get the avatar URL
     let avatar_url = match resolve::resolve(&state, identifier).await {
@@ -86,9 +86,7 @@ fn png_response(png_bytes: &[u8]) -> Response {
 /// Extract the avatar URL from resolved content.
 fn extract_avatar_url(content: &resolve::ResolvedContent) -> Option<String> {
     match content {
-        resolve::ResolvedContent::Profile { metadata, .. } => {
-            metadata.picture.clone()
-        }
+        resolve::ResolvedContent::Profile { metadata, .. } => metadata.picture.clone(),
         resolve::ResolvedContent::Event { author, .. } => {
             author.as_ref().and_then(|a| a.picture.clone())
         }
@@ -182,7 +180,11 @@ fn generate_og_image(avatar_bytes: Option<&[u8]>) -> Result<Vec<u8>, PreviewErro
     let mut pixmap = resvg::tiny_skia::Pixmap::new(OG_WIDTH, OG_HEIGHT)
         .ok_or_else(|| PreviewError::Internal(anyhow::anyhow!("failed to create pixmap")))?;
 
-    resvg::render(&tree, resvg::tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
 
     // Encode as PNG
     let png_data = pixmap
