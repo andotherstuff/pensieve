@@ -21,11 +21,6 @@ scrape_configs:
   # ═══════════════════════════════════════════════════════════════════════════
   # ClickHouse metrics
   # ═══════════════════════════════════════════════════════════════════════════
-  - job_name: 'clickhouse'
-    static_configs:
-      - targets: ['clickhouse:8123']
-    metrics_path: '/metrics'
-
   # ═══════════════════════════════════════════════════════════════════════════
   # Pensieve Ingester (native binary on host via systemd)
   # Metrics exposed on port 9091
@@ -36,9 +31,22 @@ scrape_configs:
       - targets: ['host.docker.internal:9091']
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # ClickHouse built-in Prometheus metrics
+  # Metrics exposed on port 9363 inside the Docker network
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['pensieve-clickhouse:9363']
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Node Exporter (host machine metrics)
+  # Metrics exposed on port 9100
+  # ═══════════════════════════════════════════════════════════════════════════
+  - job_name: 'node'
+    static_configs:
+      - targets: ['host.docker.internal:9100']
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # Pensieve Backfill (native binary on host, when running)
   # Metrics exposed on port 9092
   # ═══════════════════════════════════════════════════════════════════════════
-  - job_name: 'backfill'
-    static_configs:
-      - targets: ['host.docker.internal:9092']

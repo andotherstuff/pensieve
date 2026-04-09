@@ -84,6 +84,18 @@
     <keep_alive_timeout>3</keep_alive_timeout>
 
     <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!-- Prometheus Metrics -->
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+    </prometheus>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
     <!-- User Profile Settings (query-level settings) -->
     <!-- ═══════════════════════════════════════════════════════════════════ -->
 

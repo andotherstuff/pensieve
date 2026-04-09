@@ -27,3 +27,6 @@ data/
 # Debug files
 *.pdb
 
+# Local host marker
+.vip
+
