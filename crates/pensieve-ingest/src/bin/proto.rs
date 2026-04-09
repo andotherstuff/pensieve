@@ -810,14 +810,13 @@ fn process_file_impl(
                 break;
             }
             Err(e) => {
-                let error = compact_error(&e);
-                tracing::warn!(error = %error, "protobuf decode failed");
+                tracing::warn!(error = %compact_error(&e), "protobuf decode failed");
                 stats.invalid_events += 1;
                 stats.proto_errors += 1;
                 if args.continue_on_error {
                     break;
                 } else {
-                    bail!("Protobuf decode error: {}", error);
+                    bail!("Protobuf decode error: {}", e);
                 }
             }
         };
@@ -834,7 +833,6 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    let error = compact_error(&e);
                     tracing::warn!(
                         event_id = %proto_event.id,
                         kind = proto_event.kind,
@@ -842,7 +840,7 @@ fn process_file_impl(
                         tag_count = proto_event.tags.len(),
                         content_len = proto_event.content.len(),
                         payload_bytes = proto_bytes,
-                        error = %error,
+                        error = %compact_error(&e),
                         "protobuf event failed notepack encoding"
                     );
                     stats.invalid_events += 1;
@@ -850,7 +848,7 @@ fn process_file_impl(
                     if args.continue_on_error {
                         continue;
                     } else {
-                        bail!("Notepack encoding error: {}", error);
+                        bail!("Notepack encoding error: {}", e);
                     }
                 }
             }
@@ -862,7 +860,6 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    let error = compact_error(&e);
                     tracing::warn!(
                         event_id = %proto_event.id,
                         kind = proto_event.kind,
@@ -870,7 +867,7 @@ fn process_file_impl(
                         tag_count = proto_event.tags.len(),
                         content_len = proto_event.content.len(),
                         payload_bytes = proto_bytes,
-                        error = %error,
+                        error = %compact_error(&e),
                         "protobuf event validation failed"
                     );
                     stats.invalid_events += 1;
@@ -878,7 +875,7 @@ fn process_file_impl(
                     if args.continue_on_error {
                         continue;
                     } else {
-                        bail!("Validation error: {}", error);
+                        bail!("Validation error: {}", e);
                     }
                 }
             }

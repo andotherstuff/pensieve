@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         let metrics_handle = init_metrics();
         start_metrics_server(args.metrics_port, metrics_handle).await?;
         gauge!("ingestion_running").set(1.0);
-        tracing::info!("Metrics server listening on port {}", args.metrics_port);
+        tracing::info!(port = args.metrics_port, "metrics server listening");
     }
 
     // Set up graceful shutdown
@@ -277,30 +277,30 @@ async fn main() -> Result<()> {
     // Load seed relays (tier=seed, protected from eviction)
     // Priority: CLI args > seed file > hardcoded defaults
     let seed_relays = if let Some(relays) = args.seed_relays.clone() {
-        tracing::info!("Using {} seed relays from CLI arguments", relays.len());
+        tracing::info!(
+            relay_count = relays.len(),
+            "using seed relays from CLI arguments"
+        );
         relays
     } else if args.seed_file.exists() {
         match load_seeds_from_file(&args.seed_file) {
             Ok(relays) if !relays.is_empty() => {
                 tracing::info!(
-                    "Loaded {} seed relays from file: {}",
-                    relays.len(),
-                    args.seed_file.display()
+                    relay_count = relays.len(),
+                    path = %args.seed_file.display(),
+                    "loaded seed relays from file"
                 );
                 relays
             }
             Ok(_) => {
-                tracing::warn!(
-                    "Seed file {} is empty, using defaults",
-                    args.seed_file.display()
-                );
+                tracing::warn!(path = %args.seed_file.display(), "seed file is empty, using defaults");
                 default_seed_relays()
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load seed file {}: {}. Using defaults.",
-                    args.seed_file.display(),
-                    e
+                    path = %args.seed_file.display(),
+                    error = %compact_error(&e),
+                    "failed to load seed file, using defaults"
                 );
                 default_seed_relays()
             }
@@ -312,23 +312,28 @@ async fn main() -> Result<()> {
 
     // Register seeds with tier=seed (protected, score floor 0.5)
     relay_manager.register_seed_relays(&seed_relays)?;
-    tracing::info!("Registered {} seed relays (tier=seed)", seed_relays.len());
+    tracing::info!(
+        relay_count = seed_relays.len(),
+        tier = "seed",
+        "registered seed relays"
+    );
 
     // Import discovered relays from JSON if provided (tier=discovered, can be swapped)
     if let Some(json_path) = &args.import_discovered_json {
         match relay_manager.import_from_json(json_path) {
             Ok(count) => {
                 tracing::info!(
-                    "Imported {} discovered relays from JSON: {} (tier=discovered)",
-                    count,
-                    json_path.display()
+                    relay_count = count,
+                    path = %json_path.display(),
+                    tier = "discovered",
+                    "imported discovered relays from JSON"
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to import discovered relays from {}: {}",
-                    json_path.display(),
-                    e
+                    path = %json_path.display(),
+                    error = %compact_error(&e),
+                    "failed to import discovered relays from JSON"
                 );
             }
         }
@@ -350,19 +355,19 @@ async fn main() -> Result<()> {
                 let clamped = checkpoint.min(now_secs);
                 if clamped < checkpoint {
                     tracing::warn!(
-                        "Checkpoint {} was in the future, clamped to current time {}",
-                        checkpoint,
-                        clamped
+                        checkpoint = checkpoint,
+                        clamped = clamped,
+                        "checkpoint was in the future and was clamped"
                     );
                 }
 
                 // Apply buffer to handle clock skew and relay propagation delay
                 let buffered = clamped.saturating_sub(args.catchup_buffer_secs);
                 tracing::info!(
-                    "Loaded checkpoint: {} (buffered to {} with {}s buffer)",
-                    clamped,
-                    buffered,
-                    args.catchup_buffer_secs
+                    checkpoint = clamped,
+                    buffered_checkpoint = buffered,
+                    buffer_secs = args.catchup_buffer_secs,
+                    "loaded checkpoint"
                 );
                 Some(buffered)
             }
@@ -374,8 +379,8 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load checkpoint: {} - starting without catch-up",
-                    e
+                    error = %compact_error(&e),
+                    "failed to load checkpoint, starting without catch-up"
                 );
                 None
             }
@@ -422,32 +427,32 @@ async fn main() -> Result<()> {
         // Load trusted relays for negentropy sync
         let negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
             tracing::info!(
-                "Using {} negentropy relays from CLI arguments",
-                relays.len()
+                relay_count = relays.len(),
+                "using negentropy relays from CLI arguments"
             );
             relays.clone()
         } else if let Some(ref file_path) = args.negentropy_relays_file {
             match load_seeds_from_file(file_path) {
                 Ok(relays) if !relays.is_empty() => {
                     tracing::info!(
-                        "Loaded {} negentropy relays from file: {}",
-                        relays.len(),
-                        file_path.display()
+                        relay_count = relays.len(),
+                        path = %file_path.display(),
+                        "loaded negentropy relays from file"
                     );
                     relays
                 }
                 Ok(_) => {
                     tracing::warn!(
-                        "Negentropy relays file {} is empty, using defaults",
-                        file_path.display()
+                        path = %file_path.display(),
+                        "negentropy relays file is empty, using defaults"
                     );
                     NegentropySyncConfig::default().relays
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to load negentropy relays file {}: {}. Using defaults.",
-                        file_path.display(),
-                        e
+                        path = %file_path.display(),
+                        error = %compact_error(&e),
+                        "failed to load negentropy relays file, using defaults"
                     );
                     NegentropySyncConfig::default().relays
                 }
@@ -468,16 +473,16 @@ async fn main() -> Result<()> {
         )?);
 
         tracing::info!(
-            "Negentropy sync state opened: ~{} items",
-            sync_state.approximate_count().unwrap_or(0)
+            approximate_items = sync_state.approximate_count().unwrap_or(0),
+            "negentropy sync state opened"
         );
 
         // Seed from ClickHouse if sync state is empty and ClickHouse is available
         if sync_state.is_empty().unwrap_or(true) {
             if let Some(ref ch_url) = args.clickhouse_url {
                 tracing::info!(
-                    "Sync state is empty, seeding from ClickHouse (lookback: {} days)",
-                    args.negentropy_lookback_days
+                    lookback_days = args.negentropy_lookback_days,
+                    "sync state is empty, seeding from ClickHouse"
                 );
                 match seed_from_clickhouse(
                     &sync_state,
@@ -488,13 +493,12 @@ async fn main() -> Result<()> {
                 .await
                 {
                     Ok(count) => {
-                        tracing::info!("Seeded {} events into sync state from ClickHouse", count);
+                        tracing::info!(event_count = count, "seeded sync state from ClickHouse");
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to seed sync state from ClickHouse: {}. \
-                             First negentropy sync may request more events than necessary.",
-                            e
+                            error = %compact_error(&e),
+                            "failed to seed sync state from ClickHouse; first negentropy sync may request more events than necessary"
                         );
                     }
                 }
@@ -596,7 +600,7 @@ async fn main() -> Result<()> {
     let rate_events_received = Arc::clone(&events_received);
     let rate_events_processed = Arc::clone(&events_processed);
     let rate_events_deduplicated = Arc::clone(&events_deduplicated);
-    let rate_verbose_ops = args.verbose_ops;
+    let verbose_ops = args.verbose_ops;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.tick().await; // Skip first immediate tick
@@ -649,21 +653,21 @@ async fn main() -> Result<()> {
 
             // Log throughput periodically (every 5 seconds)
             if curr_received > 0 {
-                if rate_verbose_ops {
+                if verbose_ops {
                     tracing::info!(
-                        "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
-                        received_rate,
-                        processed_rate,
-                        deduplicated_rate,
-                        dedupe_ratio * 100.0
+                        received_per_sec = received_rate,
+                        processed_per_sec = processed_rate,
+                        deduplicated_per_sec = deduplicated_rate,
+                        duplicate_pct = dedupe_ratio * 100.0,
+                        "throughput"
                     );
                 } else {
                     tracing::debug!(
-                        "Throughput: {:.0} received/s, {:.0} processed/s, {:.0} deduped/s ({:.1}% duplicates)",
-                        received_rate,
-                        processed_rate,
-                        deduplicated_rate,
-                        dedupe_ratio * 100.0
+                        received_per_sec = received_rate,
+                        processed_per_sec = processed_rate,
+                        deduplicated_per_sec = deduplicated_rate,
+                        duplicate_pct = dedupe_ratio * 100.0,
+                        "throughput"
                     );
                 }
             }
@@ -677,7 +681,6 @@ async fn main() -> Result<()> {
     let checkpoint_relay_manager = Arc::clone(&relay_manager);
     let checkpoint_max_created_at = Arc::clone(&max_created_at);
     let checkpoint_interval = args.checkpoint_interval_secs;
-    let checkpoint_verbose_ops = args.verbose_ops;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(checkpoint_interval));
         interval.tick().await; // Skip first immediate tick
@@ -695,7 +698,7 @@ async fn main() -> Result<()> {
                 if let Err(e) = checkpoint_relay_manager.update_last_archived_timestamp(max_ts) {
                     tracing::warn!(error = %compact_error(&e), "failed to update checkpoint");
                 } else {
-                    if checkpoint_verbose_ops {
+                    if verbose_ops {
                         tracing::info!(checkpoint = max_ts, "updated checkpoint");
                     } else {
                         tracing::debug!(checkpoint = max_ts, "updated checkpoint");
@@ -755,19 +758,18 @@ async fn main() -> Result<()> {
                         let packed = match pack_nostr_event(event) {
                             Ok(p) => p,
                             Err(e) => {
-                                let error = compact_error(&e);
                                 tracing::debug!(
                                     event_id = %event.id,
                                     kind = event.kind.as_u16(),
                                     pubkey = %event.pubkey,
                                     tag_count = event.tags.len(),
                                     content_len = event.content.len(),
-                                    error = %error,
+                                    error = %compact_error(&e),
                                     "failed to pack negentropy event"
                                 );
                                 // Return error so event is NOT recorded in sync state
                                 // and will be re-fetched on next sync cycle
-                                return Err(pensieve_ingest::Error::Notepack(error));
+                                return Err(pensieve_ingest::Error::Notepack(e.to_string()));
                             }
                         };
 
@@ -936,8 +938,8 @@ async fn main() -> Result<()> {
             tracing::warn!(error = %compact_error(&e), "failed to flush negentropy sync state");
         } else {
             tracing::info!(
-                "Negentropy sync state flushed: ~{} items",
-                syncer.sync_state().approximate_count().unwrap_or(0)
+                approximate_items = syncer.sync_state().approximate_count().unwrap_or(0),
+                "negentropy sync state flushed"
             );
         }
     }
@@ -945,9 +947,9 @@ async fn main() -> Result<()> {
     // Seal final segment
     if let Some(sealed) = segment_writer.seal()? {
         tracing::info!(
-            "Sealed final segment {}: {} events",
-            sealed.segment_number,
-            sealed.event_count
+            segment_number = sealed.segment_number,
+            event_count = sealed.event_count,
+            "sealed final segment"
         );
 
         // Mark as archived
@@ -966,7 +968,7 @@ async fn main() -> Result<()> {
     let final_checkpoint = max_created_at.load(Ordering::Relaxed);
     if final_checkpoint > 0 {
         match relay_manager.update_last_archived_timestamp(final_checkpoint) {
-            Ok(()) => tracing::info!("Saved final checkpoint: {}", final_checkpoint),
+            Ok(()) => tracing::info!(checkpoint = final_checkpoint, "saved final checkpoint"),
             Err(e) => tracing::warn!(error = %compact_error(&e), "failed to save final checkpoint"),
         }
     }
@@ -976,7 +978,7 @@ async fn main() -> Result<()> {
         tracing::info!("Waiting for ClickHouse indexer to finish...");
         drop(segment_writer);
         if let Err(e) = handle.join() {
-            tracing::warn!("ClickHouse indexer thread panicked: {:?}", e);
+            tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
         }
     }
 
@@ -992,29 +994,24 @@ async fn main() -> Result<()> {
     let final_deduplicated = events_deduplicated.load(Ordering::Relaxed);
 
     // Print summary
-    tracing::info!("═══════════════════════════════════════════════════════");
-    tracing::info!("SHUTDOWN COMPLETE");
-    tracing::info!("═══════════════════════════════════════════════════════");
-    tracing::info!("Events received:      {}", final_received);
-    tracing::info!("Events processed:     {}", final_processed);
-    tracing::info!("Events deduplicated:  {}", final_deduplicated);
     tracing::info!(
-        "Relays connected:     {}",
-        stats.source_metadata.relays_connected.unwrap_or(0)
-    );
-    tracing::info!(
-        "Relays discovered:    {}",
-        stats.source_metadata.relays_discovered.unwrap_or(0)
+        events_received = final_received,
+        events_processed = final_processed,
+        events_deduplicated = final_deduplicated,
+        relays_connected = stats.source_metadata.relays_connected.unwrap_or(0),
+        relays_discovered = stats.source_metadata.relays_discovered.unwrap_or(0),
+        "shutdown complete"
     );
     if let Some(rs) = relay_stats {
-        tracing::info!("───────────────────────────────────────────────────────");
-        tracing::info!("Relay Manager Stats:");
-        tracing::info!("  Total relays tracked:  {}", rs.total_relays);
-        tracing::info!("  Active relays:         {}", rs.active_relays);
-        tracing::info!("  Blocked relays:        {}", rs.blocked_relays);
-        tracing::info!("  Seed relays:           {}", rs.seed_relays);
-        tracing::info!("  Discovered relays:     {}", rs.discovered_relays);
-        tracing::info!("  Avg quality score:     {:.3}", rs.avg_score);
+        tracing::info!(
+            total_relays = rs.total_relays,
+            active_relays = rs.active_relays,
+            blocked_relays = rs.blocked_relays,
+            seed_relays = rs.seed_relays,
+            discovered_relays = rs.discovered_relays,
+            avg_quality_score = rs.avg_score,
+            "relay manager summary"
+        );
     }
 
     Ok(())
@@ -1030,7 +1027,7 @@ type PipelineComponents = (
 /// Initialize pipeline components.
 fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index
-    tracing::info!("Opening dedupe index at {}", args.rocksdb_path.display());
+    tracing::info!(path = %args.rocksdb_path.display(), "opening dedupe index");
     let dedupe = Arc::new(
         DedupeIndex::open(&args.rocksdb_path)
             .with_context(|| format!("Failed to open dedupe index at {:?}", args.rocksdb_path))?,
@@ -1038,8 +1035,8 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
 
     let dedupe_stats = dedupe.stats();
     tracing::info!(
-        "Dedupe index opened: ~{} keys",
-        dedupe_stats.approximate_keys
+        approximate_keys = dedupe_stats.approximate_keys,
+        "dedupe index opened"
     );
 
     // Set up ClickHouse channel (optional)
@@ -1059,10 +1056,10 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     };
 
     tracing::info!(
-        "Segment writer: output={}, max_size={}, compress={}",
-        args.output_dir.display(),
-        args.segment_size,
-        !args.no_compress
+        output_dir = %args.output_dir.display(),
+        max_segment_size = args.segment_size,
+        compress = !args.no_compress,
+        "segment writer configured"
     );
 
     let segment_writer = Arc::new(
@@ -1073,7 +1070,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize ClickHouse indexer (optional)
     let indexer_handle =
         if let (Some(ch_url), Some(receiver)) = (&args.clickhouse_url, sealed_receiver) {
-            tracing::info!("Starting ClickHouse indexer for {}", ch_url);
+            tracing::info!(url = %ch_url, "starting ClickHouse indexer");
             let ch_config = ClickHouseConfig {
                 url: ch_url.clone(),
                 database: args.clickhouse_db.clone(),

@@ -149,7 +149,6 @@ impl JsonlSource {
                 match serde_json::from_str::<NoteBuf>(&line) {
                     Ok(note) => {
                         if let Err(e) = pack_note_into(&note, &mut pack_buf) {
-                            let error = compact_error(&e);
                             tracing::warn!(
                                 line = line_num + 1,
                                 payload_bytes = line.len(),
@@ -157,7 +156,7 @@ impl JsonlSource {
                                 kind = note.kind,
                                 tag_count = note.tags.len(),
                                 content_len = note.content.len(),
-                                error = %error,
+                                error = %compact_error(&e),
                                 "notepack encoding failed"
                             );
                             stats.invalid_events += 1;
@@ -165,18 +164,17 @@ impl JsonlSource {
                             if self.config.continue_on_error {
                                 continue;
                             } else {
-                                return Err(Error::Notepack(error));
+                                return Err(Error::Notepack(e.to_string()));
                             }
                         }
                         // Parse event ID from the note
                         hex_to_bytes32(&note.id)?
                     }
                     Err(e) => {
-                        let error = compact_error(&e);
                         tracing::warn!(
                             line = line_num + 1,
                             payload_bytes = line.len(),
-                            error = %error,
+                            error = %compact_error(&e),
                             "json parse error"
                         );
                         stats.invalid_events += 1;
@@ -184,7 +182,7 @@ impl JsonlSource {
                         if self.config.continue_on_error {
                             continue;
                         } else {
-                            return Err(Error::Json(error));
+                            return Err(Error::Json(e.to_string()));
                         }
                     }
                 }
@@ -208,11 +206,10 @@ impl JsonlSource {
                         id_bytes
                     }
                     Err(e) => {
-                        let error = compact_error(&e);
                         tracing::warn!(
                             line = line_num + 1,
                             payload_bytes = line.len(),
-                            error = %error,
+                            error = %compact_error(&e),
                             "event validation failed"
                         );
                         stats.invalid_events += 1;
@@ -220,7 +217,7 @@ impl JsonlSource {
                         if self.config.continue_on_error {
                             continue;
                         } else {
-                            return Err(Error::Validation(error));
+                            return Err(Error::Validation(e.to_string()));
                         }
                     }
                 }

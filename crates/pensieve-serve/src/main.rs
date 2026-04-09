@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
                     tracing::span!(
-                        Level::DEBUG,
+                        Level::INFO,
                         "http_request",
                         method = %request.method(),
                         path = %request.uri().path(),

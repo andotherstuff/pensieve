@@ -10,7 +10,7 @@ const DEFAULT_LOG_VALUE_LIMIT: usize = 240;
 const NOTICE_LOG_VALUE_LIMIT: usize = 160;
 
 /// Compact an external/log-derived string into a single-line value.
-pub fn compact_log_value(value: &str) -> String {
+pub(crate) fn compact_log_value(value: &str) -> String {
     compact_log_value_with_limit(value, DEFAULT_LOG_VALUE_LIMIT)
 }
 

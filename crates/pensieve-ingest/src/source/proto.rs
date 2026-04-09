@@ -142,14 +142,13 @@ impl ProtoSource {
                     break;
                 }
                 Err(e) => {
-                    let error = compact_error(&e);
-                    tracing::warn!(error = %error, "protobuf decode failed");
+                    tracing::warn!(error = %compact_error(&e), "protobuf decode failed");
                     stats.invalid_events += 1;
                     stats.proto_errors += 1;
                     if self.config.continue_on_error {
                         break;
                     } else {
-                        return Err(Error::Protobuf(error));
+                        return Err(Error::Protobuf(e.to_string()));
                     }
                 }
             };
@@ -163,7 +162,6 @@ impl ProtoSource {
                 match proto_to_notepack_unvalidated(&proto_event, &mut pack_buf) {
                     Ok(_) => hex_to_bytes32(&proto_event.id)?,
                     Err(e) => {
-                        let error = compact_error(&e);
                         tracing::warn!(
                             event_id = %proto_event.id,
                             kind = proto_event.kind,
@@ -171,7 +169,7 @@ impl ProtoSource {
                             tag_count = proto_event.tags.len(),
                             content_len = proto_event.content.len(),
                             payload_bytes = proto_bytes,
-                            error = %error,
+                            error = %compact_error(&e),
                             "protobuf event failed notepack encoding"
                         );
                         stats.invalid_events += 1;
@@ -179,7 +177,7 @@ impl ProtoSource {
                         if self.config.continue_on_error {
                             continue;
                         } else {
-                            return Err(Error::Notepack(error));
+                            return Err(Error::Notepack(e.to_string()));
                         }
                     }
                 }
@@ -191,7 +189,6 @@ impl ProtoSource {
                         id_bytes
                     }
                     Err(e) => {
-                        let error = compact_error(&e);
                         tracing::warn!(
                             event_id = %proto_event.id,
                             kind = proto_event.kind,
@@ -199,7 +196,7 @@ impl ProtoSource {
                             tag_count = proto_event.tags.len(),
                             content_len = proto_event.content.len(),
                             payload_bytes = proto_bytes,
-                            error = %error,
+                            error = %compact_error(&e),
                             "protobuf event validation failed"
                         );
                         stats.invalid_events += 1;
@@ -207,7 +204,7 @@ impl ProtoSource {
                         if self.config.continue_on_error {
                             continue;
                         } else {
-                            return Err(Error::Validation(error));
+                            return Err(Error::Validation(e.to_string()));
                         }
                     }
                 }
