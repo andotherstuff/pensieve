@@ -127,7 +127,7 @@ where
         return Ok(value);
     }
 
-    tracing::debug!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
+    tracing::trace!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
     let value = compute().await?;
 
     match serde_json::to_string(&value) {
@@ -158,13 +158,13 @@ where
     if let Some(entry) = cache.get(key).await {
         if chrono::Utc::now() > entry.expires_at {
             cache.invalidate(key).await;
-            tracing::debug!(key = %key, expired_at = %entry.expires_at, "cache expired");
+            tracing::trace!(key = %key, expired_at = %entry.expires_at, "cache expired");
             return Ok(None);
         }
 
         return match serde_json::from_str(&entry.json) {
             Ok(value) => {
-                tracing::debug!(
+                tracing::trace!(
                     key = %key,
                     cached_at = %entry.cached_at,
                     expires_at = %entry.expires_at,

@@ -6,7 +6,7 @@
 use axum::http::Request;
 use clap::Parser;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -51,15 +51,19 @@ async fn main() -> anyhow::Result<()> {
     // Build router with middleware
     let app = router(state)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
-                tracing::span!(
-                    Level::INFO,
-                    "http_request",
-                    method = %request.method(),
-                    path = %request.uri().path(),
-                    query = request.uri().query().unwrap_or("")
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| {
+                    tracing::span!(
+                        Level::INFO,
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        query = request.uri().query().unwrap_or("")
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
         )
         .layer(
             CorsLayer::new()

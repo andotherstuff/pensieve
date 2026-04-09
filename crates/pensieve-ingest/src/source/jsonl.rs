@@ -5,6 +5,7 @@
 //! ready for the ingestion pipeline.
 
 use super::{EventSource, SourceMetadata, SourceStats};
+use crate::logging::compact_error;
 use crate::pipeline::PackedEvent;
 use crate::{Error, Result};
 use notepack::{NoteBuf, pack_note_into};
@@ -121,7 +122,11 @@ impl JsonlSource {
             let line = match line_result {
                 Ok(l) => l,
                 Err(e) => {
-                    tracing::warn!("Line {}: I/O error: {}", line_num + 1, e);
+                    tracing::warn!(
+                        line = line_num + 1,
+                        error = %compact_error(&e),
+                        "jsonl input read failed"
+                    );
                     stats.invalid_events += 1;
                     stats.json_errors += 1;
                     if self.config.continue_on_error {
@@ -144,7 +149,16 @@ impl JsonlSource {
                 match serde_json::from_str::<NoteBuf>(&line) {
                     Ok(note) => {
                         if let Err(e) = pack_note_into(&note, &mut pack_buf) {
-                            tracing::warn!("Line {}: Notepack encoding error: {}", line_num + 1, e);
+                            tracing::warn!(
+                                line = line_num + 1,
+                                payload_bytes = line.len(),
+                                note_id = %note.id,
+                                kind = note.kind,
+                                tag_count = note.tags.len(),
+                                content_len = note.content.len(),
+                                error = %compact_error(&e),
+                                "notepack encoding failed"
+                            );
                             stats.invalid_events += 1;
                             stats.notepack_errors += 1;
                             if self.config.continue_on_error {
@@ -157,7 +171,12 @@ impl JsonlSource {
                         hex_to_bytes32(&note.id)?
                     }
                     Err(e) => {
-                        tracing::warn!("Line {}: JSON parse error: {}", line_num + 1, e);
+                        tracing::warn!(
+                            line = line_num + 1,
+                            payload_bytes = line.len(),
+                            error = %compact_error(&e),
+                            "json parse error"
+                        );
                         stats.invalid_events += 1;
                         stats.json_errors += 1;
                         if self.config.continue_on_error {
@@ -187,7 +206,12 @@ impl JsonlSource {
                         id_bytes
                     }
                     Err(e) => {
-                        tracing::warn!("Line {}: Validation error: {}", line_num + 1, e);
+                        tracing::warn!(
+                            line = line_num + 1,
+                            payload_bytes = line.len(),
+                            error = %compact_error(&e),
+                            "event validation failed"
+                        );
                         stats.invalid_events += 1;
                         stats.validation_errors += 1;
                         if self.config.continue_on_error {
@@ -210,12 +234,12 @@ impl JsonlSource {
             match handler(packed_event) {
                 Ok(true) => {} // Continue
                 Ok(false) => {
-                    tracing::info!("Handler signaled stop");
+                    tracing::debug!("Handler signaled stop");
                     return Ok(false);
                 }
                 Err(e) => {
                     if self.config.continue_on_error {
-                        tracing::warn!("Handler error: {}", e);
+                        tracing::warn!(error = %compact_error(&e), "handler error");
                     } else {
                         return Err(e);
                     }
@@ -276,7 +300,11 @@ impl EventSource for JsonlSource {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!("Error processing {}: {}", file_path.display(), e);
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        error = %compact_error(&e),
+                        "error processing jsonl file"
+                    );
                     if !self.config.continue_on_error {
                         return Err(e);
                     }

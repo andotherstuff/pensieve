@@ -44,7 +44,7 @@ use pensieve_core::{
 };
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, SealedSegment, SegmentConfig,
-    SegmentWriter,
+    SegmentWriter, logging::compact_error,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -189,7 +189,7 @@ impl Progress {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let args = Args::parse();
@@ -399,7 +399,11 @@ async fn process_s3(args: &Args) -> Result<Stats> {
                 stats.compressed_proto_bytes += size;
             }
             Err(e) => {
-                tracing::error!("Failed to download {}: {}", key, e);
+                tracing::error!(
+                    object_key = %key,
+                    error = %compact_error(&e),
+                    "failed to download s3 object"
+                );
                 if args.continue_on_error {
                     continue;
                 } else {
@@ -424,14 +428,22 @@ async fn process_s3(args: &Args) -> Result<Stats> {
                 // Mark as completed and save progress
                 progress.mark_completed(key);
                 if let Err(e) = progress.save(&progress_file) {
-                    tracing::warn!("Failed to save progress: {}", e);
+                    tracing::warn!(
+                        path = %progress_file.display(),
+                        error = %compact_error(&e),
+                        "failed to save proto backfill progress"
+                    );
                 }
 
                 // Update metrics after each file
                 record_metrics(&stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                tracing::error!("Error processing {}: {}", key, e);
+                tracing::error!(
+                    object_key = %key,
+                    error = %compact_error(&e),
+                    "error processing s3 protobuf object"
+                );
                 if !args.continue_on_error {
                     // Clean up temp file before returning
                     let _ = fs::remove_file(&temp_path);
@@ -442,7 +454,11 @@ async fn process_s3(args: &Args) -> Result<Stats> {
 
         // Delete temp file
         if let Err(e) = fs::remove_file(&temp_path) {
-            tracing::warn!("Failed to delete temp file {}: {}", temp_path.display(), e);
+            tracing::warn!(
+                path = %temp_path.display(),
+                error = %compact_error(&e),
+                "failed to delete temp protobuf file"
+            );
         }
     }
 
@@ -601,7 +617,11 @@ fn process_local(args: &Args) -> Result<Stats> {
                 record_metrics(&stats, process_start.elapsed().as_secs_f64());
             }
             Err(e) => {
-                tracing::warn!("Error processing {}: {}", file_path.display(), e);
+                tracing::warn!(
+                    path = %file_path.display(),
+                    error = %compact_error(&e),
+                    "error processing protobuf file"
+                );
                 if !args.continue_on_error {
                     return Err(e);
                 }
@@ -790,7 +810,7 @@ fn process_file_impl(
                 break;
             }
             Err(e) => {
-                tracing::warn!("Protobuf decode error: {}", e);
+                tracing::warn!(error = %compact_error(&e), "protobuf decode failed");
                 stats.invalid_events += 1;
                 stats.proto_errors += 1;
                 if args.continue_on_error {
@@ -813,7 +833,16 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    tracing::warn!("Notepack encoding error: {}", e);
+                    tracing::warn!(
+                        event_id = %proto_event.id,
+                        kind = proto_event.kind,
+                        pubkey = %proto_event.pubkey,
+                        tag_count = proto_event.tags.len(),
+                        content_len = proto_event.content.len(),
+                        payload_bytes = proto_bytes,
+                        error = %compact_error(&e),
+                        "protobuf event failed notepack encoding"
+                    );
                     stats.invalid_events += 1;
                     stats.proto_errors += 1;
                     if args.continue_on_error {
@@ -831,7 +860,16 @@ fn process_file_impl(
                     (id_bytes, len)
                 }
                 Err(e) => {
-                    tracing::warn!("Validation error: {}", e);
+                    tracing::warn!(
+                        event_id = %proto_event.id,
+                        kind = proto_event.kind,
+                        pubkey = %proto_event.pubkey,
+                        tag_count = proto_event.tags.len(),
+                        content_len = proto_event.content.len(),
+                        payload_bytes = proto_bytes,
+                        error = %compact_error(&e),
+                        "protobuf event validation failed"
+                    );
                     stats.invalid_events += 1;
                     stats.validation_errors += 1;
                     if args.continue_on_error {

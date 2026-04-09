@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rocksdb::{DB, DBWithThreadMode, MultiThreaded, Options, WriteBatch};
 use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "repair-dedupe")]
@@ -47,7 +48,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
 
     let args = Args::parse();
 

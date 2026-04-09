@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use super::components::{
-    author_header, engagement_bar, nostr_link, page_shell, truncate, truncate_key, OpenGraphData,
+    OpenGraphData, author_header, engagement_bar, nostr_link, page_shell, truncate, truncate_key,
 };
-use super::content::{render_content, QuotedEvent};
+use super::content::{QuotedEvent, render_content};
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 
 /// Render a repost preview page.

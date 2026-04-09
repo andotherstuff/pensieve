@@ -3,11 +3,11 @@
 //! Renders video events with thumbnail, title, author info,
 //! and engagement counts.
 
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use super::components::{
-    author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell, truncate,
-    OpenGraphData,
+    OpenGraphData, author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell,
+    truncate,
 };
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 

@@ -5,6 +5,7 @@
 //! ready for the ingestion pipeline.
 
 use super::{EventSource, SourceMetadata, SourceStats};
+use crate::logging::compact_error;
 use crate::pipeline::PackedEvent;
 use crate::{Error, Result};
 use flate2::read::GzDecoder;
@@ -141,7 +142,7 @@ impl ProtoSource {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!("Protobuf decode error: {}", e);
+                    tracing::warn!(error = %compact_error(&e), "protobuf decode failed");
                     stats.invalid_events += 1;
                     stats.proto_errors += 1;
                     if self.config.continue_on_error {
@@ -161,7 +162,16 @@ impl ProtoSource {
                 match proto_to_notepack_unvalidated(&proto_event, &mut pack_buf) {
                     Ok(_) => hex_to_bytes32(&proto_event.id)?,
                     Err(e) => {
-                        tracing::warn!("Notepack encoding error: {}", e);
+                        tracing::warn!(
+                            event_id = %proto_event.id,
+                            kind = proto_event.kind,
+                            pubkey = %proto_event.pubkey,
+                            tag_count = proto_event.tags.len(),
+                            content_len = proto_event.content.len(),
+                            payload_bytes = proto_bytes,
+                            error = %compact_error(&e),
+                            "protobuf event failed notepack encoding"
+                        );
                         stats.invalid_events += 1;
                         stats.proto_errors += 1;
                         if self.config.continue_on_error {
@@ -179,7 +189,16 @@ impl ProtoSource {
                         id_bytes
                     }
                     Err(e) => {
-                        tracing::warn!("Validation error: {}", e);
+                        tracing::warn!(
+                            event_id = %proto_event.id,
+                            kind = proto_event.kind,
+                            pubkey = %proto_event.pubkey,
+                            tag_count = proto_event.tags.len(),
+                            content_len = proto_event.content.len(),
+                            payload_bytes = proto_bytes,
+                            error = %compact_error(&e),
+                            "protobuf event validation failed"
+                        );
                         stats.invalid_events += 1;
                         stats.validation_errors += 1;
                         if self.config.continue_on_error {
@@ -202,12 +221,12 @@ impl ProtoSource {
             match handler(packed_event) {
                 Ok(true) => {} // Continue
                 Ok(false) => {
-                    tracing::info!("Handler signaled stop");
+                    tracing::debug!("Handler signaled stop");
                     return Ok(false);
                 }
                 Err(e) => {
                     if self.config.continue_on_error {
-                        tracing::warn!("Handler error: {}", e);
+                        tracing::warn!(error = %compact_error(&e), "handler error");
                     } else {
                         return Err(e);
                     }
@@ -265,7 +284,11 @@ impl EventSource for ProtoSource {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!("Error processing {}: {}", file_path.display(), e);
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        error = %compact_error(&e),
+                        "error processing protobuf file"
+                    );
                     if !self.config.continue_on_error {
                         return Err(e);
                     }

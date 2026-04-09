@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use super::schema::{self, RelayStatus, RelayTier};
 use super::scoring::{self, RelayStatsForScoring};
 use super::url::{NormalizeResult, normalize_relay_url};
+use crate::logging::compact_error;
 use crate::{Error, Result};
 
 /// Configuration for the relay manager.
@@ -360,7 +361,11 @@ impl RelayManager {
                 RelayStatus::Active.as_str()
             ],
         ) {
-            tracing::error!("Failed to update relay status on disconnect: {}", e);
+            tracing::error!(
+                relay_url = %normalized,
+                error = %compact_error(&e),
+                "failed to update relay status on disconnect"
+            );
         }
     }
 
@@ -391,9 +396,9 @@ impl RelayManager {
         // Record as a connection failure (increments consecutive_failures, may block)
         if let Err(e) = self.update_connection_status(&normalized, false) {
             tracing::warn!(
-                "Failed to update connection status for rejected relay {}: {}",
-                normalized,
-                e
+                relay_url = %normalized,
+                error = %compact_error(&e),
+                "failed to update connection status for rejected relay"
             );
         }
     }
@@ -576,7 +581,7 @@ impl RelayManager {
 
             // Flush to database
             if let Err(e) = self.flush_accumulators(old_hour) {
-                tracing::error!("Failed to flush hour stats: {}", e);
+                tracing::error!(error = %compact_error(&e), "failed to flush hourly relay stats");
             }
         }
     }

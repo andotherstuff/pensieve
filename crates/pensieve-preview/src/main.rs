@@ -6,7 +6,7 @@
 use axum::http::Request;
 use clap::Parser;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -51,12 +51,7 @@ async fn main() -> anyhow::Result<()> {
     // Warm up ClickHouse connection pool before accepting requests.
     // The clickhouse crate creates connections lazily, so the first user
     // request would otherwise pay ~100-200ms for TCP setup + pool init.
-    match state
-        .clickhouse
-        .query("SELECT 1")
-        .fetch_one::<u8>()
-        .await
-    {
+    match state.clickhouse.query("SELECT 1").fetch_one::<u8>().await {
         Ok(_) => tracing::info!("clickhouse connection warm-up complete"),
         Err(e) => tracing::warn!(%e, "clickhouse warm-up failed (will retry on first request)"),
     }
@@ -64,14 +59,18 @@ async fn main() -> anyhow::Result<()> {
     // Build router with middleware
     let app = router(state)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
-                tracing::span!(
-                    Level::INFO,
-                    "http_request",
-                    method = %request.method(),
-                    path = %request.uri().path(),
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| {
+                    tracing::span!(
+                        Level::INFO,
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
         )
         .layer(
             CorsLayer::new()

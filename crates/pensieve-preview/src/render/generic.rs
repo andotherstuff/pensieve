@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use super::components::{
-    author_header, engagement_bar, kind_badge, nostr_link, page_shell, truncate, OpenGraphData,
+    OpenGraphData, author_header, engagement_bar, kind_badge, nostr_link, page_shell, truncate,
 };
-use super::content::{render_content, QuotedEvent};
+use super::content::{QuotedEvent, render_content};
 use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 
 /// Render a generic event preview page.

@@ -180,9 +180,8 @@ fn extract_referenced_pubkeys(content: &str, tags: &[Vec<String>]) -> Vec<String
     use std::collections::HashSet;
     use std::sync::LazyLock;
 
-    static NOSTR_PUBKEY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"nostr:(npub1|nprofile1)[a-z0-9]+").unwrap()
-    });
+    static NOSTR_PUBKEY_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"nostr:(npub1|nprofile1)[a-z0-9]+").unwrap());
 
     let mut pubkeys = HashSet::new();
 
