@@ -20,8 +20,9 @@ RestartSec=5
 # Environment file (for CLICKHOUSE_URL, PREVIEW_BASE_URL, etc.)
 EnvironmentFile=/home/pensieve/pensieve/pensieve-deploy/.env
 
-# Additional environment
-Environment=RUST_LOG=info
+# Logging: the binary defaults to info with noisy upstream crates suppressed.
+# To override:  systemctl edit pensieve-preview  →  Environment=RUST_LOG=debug
+# Environment=RUST_LOG=info
 
 # Logging
 StandardOutput=journal

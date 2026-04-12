@@ -187,9 +187,12 @@ impl Progress {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Initialize tracing (suppress noisy upstream crates by default)
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,nostr_relay_pool=off,nostr_sdk=warn".into()),
+        )
         .init();
 
     let args = Args::parse();
