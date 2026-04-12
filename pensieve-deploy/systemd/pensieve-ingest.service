@@ -38,8 +38,9 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
 Restart=always
 RestartSec=10
 
-# Environment
-Environment=RUST_LOG=info
+# Logging: the binary defaults to info with noisy upstream crates suppressed.
+# To override:  systemctl edit pensieve-ingest  →  Environment=RUST_LOG=debug
+# Environment=RUST_LOG=info
 
 # Logging
 StandardOutput=journal

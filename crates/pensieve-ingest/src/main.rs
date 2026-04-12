@@ -232,8 +232,20 @@ async fn main() -> Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     // Initialize tracing
+    //
+    // Suppress noisy upstream crates completely by default:
+    // - nostr_relay_pool: dumps full event payloads (thousands of tags) in ERROR
+    //   messages, negentropy progress spam at INFO, connection chatter at INFO.
+    //   We handle all relay error/status reporting ourselves with compact_error().
+    // - nostr_sdk: internal client chatter
+    //
+    // Override with RUST_LOG for debugging (e.g. RUST_LOG=debug or
+    // RUST_LOG=info,nostr_relay_pool=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,nostr_relay_pool=off,nostr_sdk=warn".into()),
+        )
         .init();
 
     let args = Args::parse();
