@@ -1,0 +1,105 @@
+name: CI
+
+# Mirrors `just precommit` (fmt + clippy + test) and shards the test suite across
+# multiple runners with cargo-nextest.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel superseded runs for the same ref (e.g. new pushes to a PR).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Same as `just fmt-check`.
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The `rocksdb` crate builds librocksdb-sys via bindgen, which needs libclang.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      # Same as `just clippy`.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (shard ${{ matrix.partition }}/3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # Split the suite across runners; nextest assigns each test to one shard.
+      - run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/3
+
+  doctest:
+    name: doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: doctest
+      # nextest does not run doctests, so cover them separately.
+      - run: cargo test --workspace --doc
+
+  # Single required status check that aggregates the matrix + other jobs, so branch
+  # protection only needs to require "CI success".
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [fmt, clippy, test, doctest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          if echo '${{ join(needs.*.result, ',') }}' | grep -qE 'failure|cancelled'; then
+            echo "One or more CI jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs passed."
