@@ -70,17 +70,26 @@ pub async fn json_handler_inner(
             engagement,
             ..
         } => {
-            // Build mentions_metadata: fetch full profiles for all p-tagged pubkeys
-            let mentioned_pubkeys: Vec<String> = event
+            // Build mentions_metadata: resolve p-tagged pubkeys' profiles.
+            // Cap the count and batch into a single query so a malicious event
+            // with thousands of `p` tags can't trigger an N+1 query amplification.
+            const MAX_MENTIONS: usize = 50;
+            let mut mentioned_pubkeys: Vec<String> = event
                 .tags
                 .iter()
                 .filter(|t| t.len() >= 2 && t[0] == "p" && t[1].len() == 64)
                 .map(|t| t[1].clone())
                 .collect();
+            mentioned_pubkeys.sort();
+            mentioned_pubkeys.dedup();
+            mentioned_pubkeys.truncate(MAX_MENTIONS);
 
+            let profiles = query::fetch_profiles(&state.clickhouse, &mentioned_pubkeys)
+                .await
+                .unwrap_or_default();
             let mut mentions_map = serde_json::Map::new();
             for pk in &mentioned_pubkeys {
-                if let Ok(Some(profile_row)) = query::fetch_profile(&state.clickhouse, pk).await {
+                if let Some(profile_row) = profiles.get(pk) {
                     let meta = ProfileMetadata::from_json(&profile_row.content);
                     mentions_map.insert(
                         pk.clone(),
