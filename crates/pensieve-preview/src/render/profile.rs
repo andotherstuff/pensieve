@@ -55,7 +55,7 @@ pub fn render(
             div class="profile-banner-fallback" {
                 @if let Some(banner_url) = metadata.banner.as_deref() {
                     @if is_safe_url(banner_url) {
-                        img class="profile-banner" src=(banner_url) alt="" loading="lazy" onerror="this.style.display='none'";
+                        img class="profile-banner" src=(banner_url) alt="" loading="lazy" data-hide-on-error="1";
                     }
                 }
             }
@@ -66,7 +66,7 @@ pub fn render(
                     (initial.as_str())
                     @if let Some(pic_url) = metadata.picture.as_deref() {
                         @if is_safe_url(pic_url) {
-                            img src=(pic_url) alt=(name) loading="lazy" onerror="this.style.display='none'";
+                            img src=(pic_url) alt=(name) loading="lazy" data-hide-on-error="1";
                         }
                     }
                 }
@@ -81,7 +81,7 @@ pub fn render(
 
                 div class="author-npub" {
                     span class="author-npub-text" title=(npub) { (truncate_npub_display(npub)) }
-                    button class="copy-btn" onclick=(format!("navigator.clipboard.writeText('{}').then(()=>{{this.innerHTML='Copied!';setTimeout(()=>this.innerHTML='{}',1500)}})", npub, ICON_COPY.replace('"', "&quot;"))) title="Copy npub" {
+                    button class="copy-btn" data-copy=(npub) title="Copy npub" {
                         (PreEscaped(ICON_COPY))
                     }
                 }

@@ -168,7 +168,7 @@ pub fn render_content(
         }
 
         // Lightbox overlay (hidden by default, activated by JS)
-        div class="lightbox-overlay" id="lightbox" onclick="this.classList.remove('active')" {
+        div class="lightbox-overlay" id="lightbox" {
             img id="lightbox-img" src="" alt="";
         }
     }
@@ -184,7 +184,7 @@ fn render_image_grid(urls: &[String]) -> Markup {
     html! {
         div class=(grid_class) {
             @for (i, url) in urls.iter().take(display_count).enumerate() {
-                div class="media-item" onclick=(format!("document.getElementById('lightbox-img').src='{}';document.getElementById('lightbox').classList.add('active')", url)) {
+                div class="media-item" data-full=(url) {
                     img src=(url) alt="" loading="lazy";
                     // Show +N overlay on the last visible image if there are more
                     @if overflow > 0 && i == display_count - 1 {
@@ -422,7 +422,7 @@ fn render_quote_card(quoted: &QuotedEvent, base_url: &str) -> Markup {
                     (initial.as_str())
                     @if let Some(pic_url) = author_pic {
                         @if is_safe_url(pic_url) {
-                            img src=(pic_url) alt="" loading="lazy" onerror="this.style.display='none'";
+                            img src=(pic_url) alt="" loading="lazy" data-hide-on-error="1";
                         }
                     }
                 }
