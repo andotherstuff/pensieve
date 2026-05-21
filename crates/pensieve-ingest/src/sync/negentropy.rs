@@ -53,9 +53,16 @@ pub struct NegentropySyncConfig {
 impl Default for NegentropySyncConfig {
     fn default() -> Self {
         Self {
-            // Only Damus confirmed to support NIP-77
+            // Relays confirmed to support NIP-77:
+            //   - relay.damus.io
+            //   - relay.divine.video
+            //   - nos.lol
             // Primal does NOT support NIP-77 (connects but ignores NEG-OPEN)
-            relays: vec!["wss://relay.damus.io".to_string()],
+            relays: vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.divine.video".to_string(),
+                "wss://nos.lol".to_string(),
+            ],
             interval: Duration::from_secs(1800), // 30 minutes
             lookback: Duration::from_secs(14 * 24 * 3600), // 14 days
             protocol_timeout: Duration::from_secs(900), // 15 min for full sync
@@ -643,7 +650,14 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = NegentropySyncConfig::default();
-        assert_eq!(config.relays.len(), 1);
+        assert_eq!(
+            config.relays,
+            vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.divine.video".to_string(),
+                "wss://nos.lol".to_string(),
+            ]
+        );
         assert_eq!(config.interval, Duration::from_secs(1800));
         assert_eq!(config.lookback, Duration::from_secs(14 * 24 * 3600));
     }

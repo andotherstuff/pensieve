@@ -91,13 +91,15 @@ impl Default for RelayConfig {
         Self {
             seed_relays: vec![
                 "wss://relay.damus.io".to_string(),
-                "wss://relay.nostr.band".to_string(),
                 "wss://nos.lol".to_string(),
                 "wss://relay.snort.social".to_string(),
                 "wss://purplepag.es".to_string(),
                 "wss://relay.primal.net".to_string(),
                 "wss://nostr.wine".to_string(),
                 "wss://relay.nostr.bg".to_string(),
+                "wss://relay.divine.video".to_string(),
+                "wss://relay.momostr.pink".to_string(),
+                "wss://relay.ditto.pub".to_string(),
             ],
             discovery_enabled: true,
             max_relays: 30,

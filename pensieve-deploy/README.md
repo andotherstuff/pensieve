@@ -658,6 +658,7 @@ Add `.onion` relay addresses to your seed file:
 wss://relay.damus.io
 wss://nos.lol
 wss://relay.primal.net
+wss://relay.divine.video
 
 # Tor relays (routed through proxy)
 # Note: .onion relays use ws:// not wss:// (Tor provides encryption)

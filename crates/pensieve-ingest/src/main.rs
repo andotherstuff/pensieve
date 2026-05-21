@@ -51,13 +51,15 @@ use tracing_subscriber::EnvFilter;
 fn default_seed_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
-        "wss://relay.nostr.band".to_string(),
         "wss://nos.lol".to_string(),
         "wss://relay.snort.social".to_string(),
         "wss://purplepag.es".to_string(),
         "wss://relay.primal.net".to_string(),
         "wss://nostr.wine".to_string(),
         "wss://relay.nostr.bg".to_string(),
+        "wss://relay.divine.video".to_string(),
+        "wss://relay.momostr.pink".to_string(),
+        "wss://relay.ditto.pub".to_string(),
     ]
 }
 
@@ -212,7 +214,7 @@ struct Args {
 
     /// Path to negentropy trusted relays file (one URL per line, # for comments).
     ///
-    /// If not specified, uses default trusted relays (relay.damus.io, relay.primal.net).
+    /// If not specified, uses default trusted relays (relay.damus.io, relay.divine.video, nos.lol).
     /// Only relays that support NIP-77 should be listed.
     #[arg(long)]
     negentropy_relays_file: Option<PathBuf>,
