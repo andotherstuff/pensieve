@@ -543,6 +543,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(NegentropySyncer::new(
             negentropy_config,
             sync_state,
+            Some(Arc::clone(&dedupe)),
         )))
     } else {
         None
@@ -958,16 +959,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Seal final segment
+    // Seal final segment. Its events are marked archived inside seal() now (the
+    // writer holds a dedupe reference), so we don't mark them again here.
     if let Some(sealed) = segment_writer.seal()? {
         tracing::info!(
             segment_number = sealed.segment_number,
             event_count = sealed.event_count,
             "sealed final segment"
         );
-
-        // Mark as archived
-        dedupe.mark_archived(sealed.event_ids.iter())?;
     }
 
     // Flush dedupe
@@ -1077,7 +1076,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     );
 
     let segment_writer = Arc::new(
-        SegmentWriter::new(segment_config, sealed_sender)
+        SegmentWriter::new(segment_config, sealed_sender, Some(Arc::clone(&dedupe)))
             .with_context(|| "Failed to create segment writer")?,
     );
 

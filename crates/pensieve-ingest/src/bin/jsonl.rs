@@ -708,7 +708,8 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
     };
-    let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender)?);
+    // Backfill marks archived itself (see below), so the writer gets no dedupe ref.
+    let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender, None)?);
 
     // Initialize ClickHouse indexer (optional)
     let indexer_handle =

@@ -35,6 +35,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use super::dedupe::DedupeIndex;
+
 /// Configuration for the segment writer.
 #[derive(Debug, Clone)]
 pub struct SegmentConfig {
@@ -167,6 +169,11 @@ pub struct SegmentWriter {
     /// Wrapped in Arc for sharing with background compression threads.
     total_compressed_bytes: Arc<AtomicUsize>,
     sealed_sender: Option<Sender<SealedSegment>>,
+    /// Optional dedupe index. When present, every sealed segment's events are
+    /// marked durably `Archived` here (after the segment file is fsync'd), which is
+    /// what makes mid-stream seals crash-safe. Backfill binaries pass `None` and
+    /// mark archived themselves.
+    dedupe: Option<Arc<DedupeIndex>>,
 }
 
 impl SegmentWriter {
@@ -176,9 +183,12 @@ impl SegmentWriter {
     ///
     /// * `config` - Configuration for the writer
     /// * `sealed_sender` - Optional channel to send sealed segment notifications
+    /// * `dedupe` - Optional dedupe index; when set, each sealed segment's events
+    ///   are durably marked `Archived` after the file is fsync'd
     pub fn new(
         config: SegmentConfig,
         sealed_sender: Option<Sender<SealedSegment>>,
+        dedupe: Option<Arc<DedupeIndex>>,
     ) -> Result<Self> {
         // Create output directory if it doesn't exist
         fs::create_dir_all(&config.output_dir)?;
@@ -201,6 +211,7 @@ impl SegmentWriter {
             total_bytes: AtomicUsize::new(0),
             total_compressed_bytes: Arc::new(AtomicUsize::new(0)),
             sealed_sender,
+            dedupe,
         })
     }
 
@@ -330,24 +341,39 @@ impl SegmentWriter {
     /// for marking as archived). The ClickHouse notification is sent after
     /// compression completes (from the background thread).
     pub fn seal(&self) -> Result<Option<SealedSegment>> {
-        let mut current = self.current.lock();
+        let segment = {
+            let mut current = self.current.lock();
+            match current.take() {
+                Some(s) => s,
+                None => return Ok(None),
+            }
+        }; // release the `current` lock before durable I/O and dedupe writes
 
-        let segment = match current.take() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        // Flush and close the writer
         let CurrentSegment {
-            mut writer,
+            writer,
             path,
             event_count,
             size_bytes,
             event_ids,
         } = segment;
 
-        writer.flush()?;
-        drop(writer);
+        // Flush the buffer and fsync so the segment bytes are durable on disk
+        // BEFORE we record its events as archived. Otherwise a machine crash could
+        // leave events marked `Archived` (hence never re-fetched) while their bytes
+        // were still only in the OS page cache.
+        let file = writer
+            .into_inner()
+            .map_err(|e| Error::Segment(format!("failed to flush segment on seal: {e}")))?;
+        file.sync_all()?;
+        drop(file);
+
+        // Record the segment's events as durably archived (and clear their in-flight
+        // markers). Doing this on EVERY seal — not just the final one — is what makes
+        // mid-stream sealed events durable; a crash before this point leaves them
+        // re-fetchable rather than silently lost.
+        if let Some(dedupe) = &self.dedupe {
+            dedupe.mark_archived(event_ids.iter())?;
+        }
 
         let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
         let sealed_at = Utc::now();
@@ -555,7 +581,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = SegmentWriter::new(config, None).unwrap();
+        let writer = SegmentWriter::new(config, None, None).unwrap();
         writer.write(test_event(1)).unwrap();
 
         let stats = writer.stats();
@@ -572,7 +598,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = SegmentWriter::new(config, None).unwrap();
+        let writer = SegmentWriter::new(config, None, None).unwrap();
 
         // Write enough events to trigger seal
         for i in 0..20 {
@@ -592,7 +618,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = SegmentWriter::new(config, None).unwrap();
+        let writer = SegmentWriter::new(config, None, None).unwrap();
         writer.write(test_event(1)).unwrap();
         writer.seal().unwrap();
 
@@ -610,7 +636,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = SegmentWriter::new(config, None).unwrap();
+        let writer = SegmentWriter::new(config, None, None).unwrap();
         writer.write(test_event(1)).unwrap();
         writer.seal().unwrap();
 
@@ -646,7 +672,7 @@ mod tests {
         };
 
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let writer = SegmentWriter::new(config, Some(sender)).unwrap();
+        let writer = SegmentWriter::new(config, Some(sender), None).unwrap();
 
         writer.write(test_event(1)).unwrap();
         writer.seal().unwrap();
