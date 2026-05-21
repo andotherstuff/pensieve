@@ -4,7 +4,7 @@
 //! Markdown is converted to HTML using pulldown-cmark.
 
 use maud::{Markup, PreEscaped, html};
-use pulldown_cmark::{Options, Parser, html as md_html};
+use pulldown_cmark::{Event, Options, Parser, html as md_html};
 
 use super::components::{
     OpenGraphData, author_header, engagement_bar, is_safe_url, kind_badge, nostr_link, page_shell,
@@ -99,8 +99,11 @@ pub fn render(
 /// Render markdown text to sanitized HTML.
 ///
 /// Uses pulldown-cmark with common extensions (tables, footnotes, strikethrough,
-/// task lists). The output is safe because pulldown-cmark parses markdown structure
-/// and generates its own HTML — it does not pass through raw HTML tags by default.
+/// task lists). Article content is attacker-controlled (it comes from untrusted
+/// relays), and pulldown-cmark passes raw/inline HTML through verbatim by default,
+/// so we filter out every `Event::Html`/`Event::InlineHtml` event. Only the HTML
+/// that pulldown-cmark generates itself from markdown structure is emitted, which
+/// prevents `<script>` and other markup injection.
 fn render_markdown(markdown: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -109,7 +112,9 @@ fn render_markdown(markdown: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
-    let parser = Parser::new_ext(markdown, options);
+    // Drop raw and inline HTML so untrusted article content cannot inject markup.
+    let parser = Parser::new_ext(markdown, options)
+        .filter(|event| !matches!(event, Event::Html(_) | Event::InlineHtml(_)));
     let mut html_output = String::with_capacity(markdown.len() * 2);
     md_html::push_html(&mut html_output, parser);
     html_output
@@ -234,11 +239,15 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_raw_html_passed_through() {
-        // pulldown-cmark passes raw HTML through by default (no ENABLE_HTML option disabled)
-        // The CSP header on the page prevents script execution
+    fn render_markdown_strips_raw_html() {
+        // Raw/inline HTML is filtered out so untrusted article content can't inject markup.
         let result = render_markdown("<script>alert('xss')</script>");
-        assert!(result.contains("<script>"));
+        assert!(!result.contains("<script>"));
+        assert!(!result.contains("</script>"));
+        // A benign inline tag is dropped too.
+        let bold = render_markdown("hello <b>world</b>");
+        assert!(!bold.contains("<b>"));
+        assert!(bold.contains("world"));
     }
 
     // -- extract_tag_value() tests --

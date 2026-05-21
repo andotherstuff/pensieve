@@ -22,18 +22,41 @@ use notepack::{NoteBinary, NoteBuf}; // Required for Event::from_json()
 /// - Event ID doesn't match computed hash
 /// - Signature is invalid
 pub fn validate_event(event_json: &str) -> Result<nostr::Event> {
-    // The nostr crate's Event::from_json validates ID and signature automatically
+    // IMPORTANT: nostr's `Event::from_json` only DESERIALIZES — it does not verify
+    // the ID hash or signature — so we must verify explicitly. Without this a
+    // tampered event would pass validation and be written to the canonical archive.
     let event = nostr::Event::from_json(event_json)?;
+    verify_event_crypto(&event)?;
     Ok(event)
+}
+
+/// Verify a deserialized event's ID hash and Schnorr signature.
+///
+/// `nostr::Event::from_json` does NOT check these, so every validation entry
+/// point that accepts untrusted input must call this before trusting the event.
+pub(crate) fn verify_event_crypto(event: &nostr::Event) -> Result<()> {
+    if !event.verify_id() {
+        return Err(crate::error::Error::InvalidEventId {
+            computed: "recomputed id differs".to_string(),
+            expected: event.id.to_hex(),
+        });
+    }
+    if !event.verify_signature() {
+        return Err(crate::error::Error::InvalidSignature(
+            "signature verification failed".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates a NoteBuf event's ID and signature by converting through nostr crate.
 ///
 /// This is useful when you have a NoteBuf from notepack and want to validate it.
 pub fn validate_notebuf(note: &NoteBuf) -> Result<()> {
-    // Convert NoteBuf to JSON, then parse with nostr crate for validation
+    // Convert NoteBuf to JSON, then parse AND verify with the nostr crate.
     let json = serde_json::to_string(note)?;
-    let _event = nostr::Event::from_json(&json)?;
+    let event = nostr::Event::from_json(&json)?;
+    verify_event_crypto(&event)?;
     Ok(())
 }
 
@@ -304,6 +327,33 @@ mod tests {
                 // Error during parsing is also acceptable
             }
         }
+    }
+
+    #[test]
+    fn test_validate_event_strictly_rejects_tampered_signature() {
+        // Strict guard for the invariant the live + negentropy ingest paths rely
+        // on: the nostr crate verifies signatures during deserialization, so
+        // validate_event() (used by the JSONL backfill) must REJECT a bad signature
+        // outright rather than return an unverified event. If a future nostr
+        // version stopped verifying, this test fails loudly.
+        let event = make_test_event("strict sig test", Kind::TextNote, vec![]);
+        let mut json: serde_json::Value = serde_json::to_value(&event).unwrap();
+        json["sig"] = serde_json::Value::String("a".repeat(128));
+        assert!(
+            validate_event(&json.to_string()).is_err(),
+            "validate_event must reject a tampered signature"
+        );
+    }
+
+    #[test]
+    fn test_validate_event_strictly_rejects_tampered_id() {
+        let event = make_test_event("strict id test", Kind::TextNote, vec![]);
+        let mut json: serde_json::Value = serde_json::to_value(&event).unwrap();
+        json["id"] = serde_json::Value::String("a".repeat(64));
+        assert!(
+            validate_event(&json.to_string()).is_err(),
+            "validate_event must reject a tampered id"
+        );
     }
 
     // =========================================================================

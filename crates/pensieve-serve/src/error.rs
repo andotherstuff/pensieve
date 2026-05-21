@@ -60,7 +60,8 @@ impl IntoResponse for ApiError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "database_error",
-                    Some(format!("Database error: {}", err)),
+                    // Do not leak SQL/schema internals to clients; full detail is logged above.
+                    Some("A database error occurred".to_string()),
                 )
             }
             Self::Serialization(err) => {

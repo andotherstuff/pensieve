@@ -26,9 +26,11 @@
 //!
 //! # Security
 //!
-//! - All dynamic content is HTML-escaped by maud
+//! - User-controlled text is HTML-escaped by maud; article markdown is rendered
+//!   with raw/inline HTML stripped
 //! - URLs are validated (HTTPS/HTTP only) before use in attributes
-//! - Strict Content-Security-Policy: no JavaScript execution
+//! - Strict Content-Security-Policy: scripts only from same-origin `/app.js`,
+//!   with no inline scripts or event handlers
 //! - X-Frame-Options: DENY prevents clickjacking
 
 pub mod config;

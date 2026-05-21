@@ -21,6 +21,7 @@
 use super::SyncStateDb;
 use crate::Result;
 use crate::logging::compact_error;
+use crate::pipeline::{DedupeIndex, EventStatus};
 use metrics::{counter, gauge, histogram};
 use nostr_sdk::prelude::*;
 use std::fmt::Debug;
@@ -53,9 +54,16 @@ pub struct NegentropySyncConfig {
 impl Default for NegentropySyncConfig {
     fn default() -> Self {
         Self {
-            // Only Damus confirmed to support NIP-77
+            // Relays confirmed to support NIP-77:
+            //   - relay.damus.io
+            //   - relay.divine.video
+            //   - nos.lol
             // Primal does NOT support NIP-77 (connects but ignores NEG-OPEN)
-            relays: vec!["wss://relay.damus.io".to_string()],
+            relays: vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.divine.video".to_string(),
+                "wss://nos.lol".to_string(),
+            ],
             interval: Duration::from_secs(1800), // 30 minutes
             lookback: Duration::from_secs(14 * 24 * 3600), // 14 days
             protocol_timeout: Duration::from_secs(900), // 15 min for full sync
@@ -218,15 +226,28 @@ pub struct NegentropySyncer {
     config: NegentropySyncConfig,
     sync_state: Arc<SyncStateDb>,
     running: Arc<AtomicBool>,
+    /// Optional dedupe index, used to confirm an event is DURABLY archived before
+    /// advancing sync-state. Without this gate, sync-state could record an event
+    /// that was only written to an unsealed segment; a crash would then drop it
+    /// from the archive *and* stop negentropy from ever re-fetching it (H4).
+    dedupe: Option<Arc<DedupeIndex>>,
 }
 
 impl NegentropySyncer {
     /// Create a new negentropy syncer.
-    pub fn new(config: NegentropySyncConfig, sync_state: Arc<SyncStateDb>) -> Self {
+    ///
+    /// `dedupe` should be the shared dedupe index so sync-state is only advanced
+    /// for events that are durably archived. Pass `None` only in tests.
+    pub fn new(
+        config: NegentropySyncConfig,
+        sync_state: Arc<SyncStateDb>,
+        dedupe: Option<Arc<DedupeIndex>>,
+    ) -> Self {
         Self {
             config,
             sync_state,
             running: Arc::new(AtomicBool::new(false)),
+            dedupe,
         }
     }
 
@@ -441,21 +462,35 @@ impl NegentropySyncer {
                     for event in events {
                         match event_handler(&event) {
                             Ok(true) => {
-                                // Event processed successfully, NOW record in sync state.
-                                // This ensures we only record events that were actually archived.
-                                if let Err(e) = self
-                                    .sync_state
-                                    .record(event.id.as_bytes(), event.created_at.as_secs())
-                                {
-                                    tracing::warn!(
-                                        event_id = %event.id,
-                                        kind = event.kind.as_u16(),
-                                        pubkey = %event.pubkey,
-                                        error = %compact_error(&e),
-                                        "failed to record negentropy event in sync state"
-                                    );
+                                // Only advance sync-state once the event is DURABLY
+                                // archived (its segment sealed + fsync'd). Recording an
+                                // event that is merely in-flight would let a crash drop
+                                // it from the archive while sync-state still claims we
+                                // have it — negentropy would then never re-fetch it (H4).
+                                // Not-yet-durable events are simply re-evaluated on the
+                                // next cycle and recorded once their segment seals.
+                                let durable = match &self.dedupe {
+                                    Some(dedupe) => matches!(
+                                        dedupe.get_status(event.id.as_bytes()),
+                                        Ok(Some(EventStatus::Archived))
+                                    ),
+                                    None => true,
+                                };
+                                if durable {
+                                    if let Err(e) = self
+                                        .sync_state
+                                        .record(event.id.as_bytes(), event.created_at.as_secs())
+                                    {
+                                        tracing::warn!(
+                                            event_id = %event.id,
+                                            kind = event.kind.as_u16(),
+                                            pubkey = %event.pubkey,
+                                            error = %compact_error(&e),
+                                            "failed to record negentropy event in sync state"
+                                        );
+                                    }
+                                    events_succeeded += 1;
                                 }
-                                events_succeeded += 1;
                             }
                             Ok(false) => {
                                 tracing::debug!("Event handler signaled stop");
@@ -643,7 +678,14 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = NegentropySyncConfig::default();
-        assert_eq!(config.relays.len(), 1);
+        assert_eq!(
+            config.relays,
+            vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://relay.divine.video".to_string(),
+                "wss://nos.lol".to_string(),
+            ]
+        );
         assert_eq!(config.interval, Duration::from_secs(1800));
         assert_eq!(config.lookback, Duration::from_secs(14 * 24 * 3600));
     }

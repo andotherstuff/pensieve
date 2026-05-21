@@ -20,6 +20,7 @@
 use crate::Result;
 use parking_lot::Mutex;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,7 +28,10 @@ use std::sync::Arc;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventStatus {
-    /// Event is being processed (written to segment but not yet sealed).
+    /// Legacy on-disk status written by older builds. New builds track in-flight
+    /// events in memory and only ever persist `Archived`; this variant is kept so
+    /// that existing databases (which contain `Pending` values) still read as
+    /// "already seen".
     Pending = 1,
     /// Event has been archived (segment sealed and uploaded).
     Archived = 2,
@@ -54,12 +58,20 @@ impl EventStatus {
 /// when multiple sources concurrently attempt to claim the same event ID.
 pub struct DedupeIndex {
     db: Arc<DBWithThreadMode<MultiThreaded>>,
-    /// Mutex for atomic check-and-mark operations.
+    /// In-flight event IDs: claimed (written to the current, unsealed segment) but
+    /// not yet durably archived. Tracked in memory ONLY — never persisted.
     ///
-    /// This ensures that when multiple sources (e.g., live ingestion and negentropy
-    /// sync) concurrently process the same event, only one "wins" and marks it pending.
-    /// Without this, a race between check and put could allow duplicates.
-    write_lock: Mutex<()>,
+    /// This is deliberate for crash-safety. On a crash, the unsealed segment's
+    /// buffered bytes are lost; because these markers live only in memory, they are
+    /// lost too, so the affected events are simply "not seen" on the next start and
+    /// get re-fetched (by live ingestion and negentropy), then de-duplicated
+    /// downstream by ClickHouse's ReplacingMergeTree. Only durably-sealed events are
+    /// written to disk as `Archived`, and that on-disk state is what actually
+    /// suppresses re-fetching.
+    ///
+    /// The mutex also serializes check-and-mark so two sources (live and negentropy)
+    /// cannot both claim the same novel event ID.
+    pending: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl DedupeIndex {
@@ -110,7 +122,7 @@ impl DedupeIndex {
 
         Ok(Self {
             db: Arc::new(db),
-            write_lock: Mutex::new(()),
+            pending: Mutex::new(HashSet::new()),
         })
     }
 
@@ -139,6 +151,10 @@ impl DedupeIndex {
     /// This is optimized for the common case where events are new.
     /// Uses bloom filters for fast rejection of seen events.
     pub fn is_new(&self, event_id: &[u8; 32]) -> Result<bool> {
+        // An event is "not new" if it's either durably on disk or currently in-flight.
+        if self.pending.lock().contains(event_id) {
+            return Ok(false);
+        }
         Ok(self.get_status(event_id)?.is_none())
     }
 
@@ -154,16 +170,18 @@ impl DedupeIndex {
     pub fn check_and_mark_pending(&self, event_id: &[u8; 32]) -> Result<bool> {
         // Hold the lock for the entire check-and-mark operation to prevent races.
         // Without this, two sources could both see "not exists" and both write.
-        let _guard = self.write_lock.lock();
+        let mut pending = self.pending.lock();
 
-        // Check if it exists (uses bloom filter for fast path)
+        // Already durably recorded on disk? (`Archived`, or a legacy `Pending`
+        // value from an older build — both mean "we already have this".)
         if self.get_status(event_id)?.is_some() {
             return Ok(false);
         }
 
-        // Mark as pending
-        self.db.put(event_id, [EventStatus::Pending.to_byte()])?;
-        Ok(true)
+        // Claim it in-flight. This is in memory only and becomes a durable
+        // `Archived` entry when the segment is sealed (see `mark_archived`).
+        // `insert` returns false if another source already claimed it this run.
+        Ok(pending.insert(*event_id))
     }
 
     /// Mark multiple events as archived (batch operation).
@@ -178,18 +196,25 @@ impl DedupeIndex {
         I: Iterator<Item = &'a [u8; 32]>,
     {
         let mut batch = WriteBatch::default();
-        let mut count = 0usize;
+        let mut archived: Vec<[u8; 32]> = Vec::new();
 
         for event_id in event_ids {
             batch.put(event_id, [EventStatus::Archived.to_byte()]);
-            count += 1;
+            archived.push(*event_id);
         }
 
-        if count > 0 {
+        if !archived.is_empty() {
             let mut write_opts = WriteOptions::default();
-            write_opts.set_sync(true); // Ensure durability
+            write_opts.set_sync(true); // Durable before we drop the in-flight markers
             self.db.write_opt(batch, &write_opts)?;
-            tracing::debug!("Marked {} events as archived", count);
+
+            // Now that the IDs are durably `Archived`, remove them from the
+            // in-flight set so the in-memory set only ever holds unsealed events.
+            let mut pending = self.pending.lock();
+            for id in &archived {
+                pending.remove(id);
+            }
+            tracing::debug!("Marked {} events as archived", archived.len());
         }
 
         Ok(())
@@ -259,8 +284,10 @@ mod tests {
         // Different ID should return true
         assert!(index.check_and_mark_pending(&id2).unwrap());
 
-        // Check status
-        assert_eq!(index.get_status(&id1).unwrap(), Some(EventStatus::Pending));
+        // In-flight events are tracked in memory (not persisted), so they read as
+        // "not new" but have no on-disk status until the segment is sealed.
+        assert!(!index.is_new(&id1).unwrap());
+        assert_eq!(index.get_status(&id1).unwrap(), None);
     }
 
     #[test]
@@ -293,5 +320,33 @@ mod tests {
         assert!(index.is_new(&id1).unwrap());
         index.check_and_mark_pending(&id1).unwrap();
         assert!(!index.is_new(&id1).unwrap());
+    }
+
+    #[test]
+    fn test_pending_not_persisted_but_archived_is() {
+        let tmp = TempDir::new().unwrap();
+        let id1 = test_event_id(1);
+        let id2 = test_event_id(2);
+
+        {
+            let index = DedupeIndex::open(tmp.path()).unwrap();
+            // Claim both in-flight, then durably archive only id1.
+            assert!(index.check_and_mark_pending(&id1).unwrap());
+            assert!(index.check_and_mark_pending(&id2).unwrap());
+            index.mark_archived([&id1].into_iter()).unwrap();
+        }
+
+        // Re-opening simulates a restart: in-memory in-flight state is gone, so an
+        // unsealed event (id2) becomes re-fetchable while an archived one (id1)
+        // stays suppressed. This is the crash-safety guarantee.
+        let index = DedupeIndex::open(tmp.path()).unwrap();
+        assert!(
+            !index.is_new(&id1).unwrap(),
+            "archived event must stay seen"
+        );
+        assert!(
+            index.is_new(&id2).unwrap(),
+            "unsealed event must be re-fetchable after restart"
+        );
     }
 }

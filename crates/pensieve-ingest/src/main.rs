@@ -51,13 +51,15 @@ use tracing_subscriber::EnvFilter;
 fn default_seed_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
-        "wss://relay.nostr.band".to_string(),
         "wss://nos.lol".to_string(),
         "wss://relay.snort.social".to_string(),
         "wss://purplepag.es".to_string(),
         "wss://relay.primal.net".to_string(),
         "wss://nostr.wine".to_string(),
         "wss://relay.nostr.bg".to_string(),
+        "wss://relay.divine.video".to_string(),
+        "wss://relay.momostr.pink".to_string(),
+        "wss://relay.ditto.pub".to_string(),
     ]
 }
 
@@ -212,7 +214,7 @@ struct Args {
 
     /// Path to negentropy trusted relays file (one URL per line, # for comments).
     ///
-    /// If not specified, uses default trusted relays (relay.damus.io, relay.primal.net).
+    /// If not specified, uses default trusted relays (relay.damus.io, relay.divine.video, nos.lol).
     /// Only relays that support NIP-77 should be listed.
     #[arg(long)]
     negentropy_relays_file: Option<PathBuf>,
@@ -541,6 +543,7 @@ async fn main() -> Result<()> {
         Some(Arc::new(NegentropySyncer::new(
             negentropy_config,
             sync_state,
+            Some(Arc::clone(&dedupe)),
         )))
     } else {
         None
@@ -761,7 +764,9 @@ async fn main() -> Result<()> {
                                 error = %compact_error(&e),
                                 "negentropy dedupe check failed"
                             );
-                            false
+                            // Treat as novel on a transient dedupe error rather than
+                            // dropping a possibly-new event; ClickHouse de-dups by id.
+                            true
                         }
                     };
 
@@ -863,7 +868,10 @@ async fn main() -> Result<()> {
                         error = %compact_error(&e),
                         "dedupe check failed for live event"
                     );
-                    false // Treat as duplicate on error
+                    // Treat as novel on a (rare, transient) dedupe error: writing a
+                    // possible duplicate is safe (ClickHouse de-dups by id), whereas
+                    // dropping it would silently lose a potentially-new event.
+                    true
                 }
             };
 
@@ -956,16 +964,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Seal final segment
+    // Seal final segment. Its events are marked archived inside seal() now (the
+    // writer holds a dedupe reference), so we don't mark them again here.
     if let Some(sealed) = segment_writer.seal()? {
         tracing::info!(
             segment_number = sealed.segment_number,
             event_count = sealed.event_count,
             "sealed final segment"
         );
-
-        // Mark as archived
-        dedupe.mark_archived(sealed.event_ids.iter())?;
     }
 
     // Flush dedupe
@@ -1075,7 +1081,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     );
 
     let segment_writer = Arc::new(
-        SegmentWriter::new(segment_config, sealed_sender)
+        SegmentWriter::new(segment_config, sealed_sender, Some(Arc::clone(&dedupe)))
             .with_context(|| "Failed to create segment writer")?,
     );
 
@@ -1088,6 +1094,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
                 database: args.clickhouse_db.clone(),
                 table: "events_local".to_string(),
                 batch_size: 10000,
+                reindex_queue_path: Some(args.output_dir.join(".clickhouse_reindex_queue")),
             };
             let indexer = ClickHouseIndexer::new(ch_config)
                 .with_context(|| "Failed to create ClickHouse indexer")?;

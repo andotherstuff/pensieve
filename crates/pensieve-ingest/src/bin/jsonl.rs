@@ -290,6 +290,7 @@ async fn index_segments_mode(
         database: clickhouse_db.to_string(),
         table: "events_local".to_string(),
         batch_size: 10000,
+        reindex_queue_path: None,
     };
     let indexer = ClickHouseIndexer::new(ch_config)?;
 
@@ -708,7 +709,8 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
     };
-    let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender)?);
+    // Backfill marks archived itself (see below), so the writer gets no dedupe ref.
+    let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender, None)?);
 
     // Initialize ClickHouse indexer (optional)
     let indexer_handle =
@@ -719,6 +721,7 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
                 database: args.clickhouse_db.clone(),
                 table: "events_local".to_string(),
                 batch_size: 10000,
+                reindex_queue_path: None,
             };
             let indexer = ClickHouseIndexer::new(ch_config)?;
             Some(indexer.start(receiver))

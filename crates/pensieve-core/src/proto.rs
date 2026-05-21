@@ -29,10 +29,11 @@ pub use nostr_proto::{EventBatch, ProtoEvent, Tag};
 /// - Event ID doesn't match computed hash
 /// - Signature is invalid
 pub fn validate_proto_event(proto: &ProtoEvent) -> Result<nostr::Event> {
-    // Convert ProtoEvent to JSON for validation via nostr crate
-    // This is the most reliable path since nostr crate validates everything
+    // Convert ProtoEvent to JSON, then parse AND verify. `from_json` only
+    // deserializes, so the ID hash + signature must be checked explicitly.
     let json = proto_to_json(proto)?;
     let event = nostr::Event::from_json(&json)?;
+    crate::event::verify_event_crypto(&event)?;
     Ok(event)
 }
 
@@ -411,5 +412,54 @@ mod tests {
 
         let result = validate_proto_event(&proto);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_proto_event_rejects_tampered_signature() {
+        use nostr::{EventBuilder, Keys, Kind};
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "proto sig test")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let mut proto = ProtoEvent {
+            id: event.id.to_hex(),
+            pubkey: event.pubkey.to_hex(),
+            created_at: event.created_at.as_secs() as i64,
+            kind: event.kind.as_u16() as i32,
+            tags: vec![],
+            content: event.content.clone(),
+            sig: event.sig.to_string(),
+        };
+        // The untampered event validates...
+        assert!(validate_proto_event(&proto).is_ok());
+        // ...but a tampered signature must be rejected (proto backfill path).
+        proto.sig = "a".repeat(128);
+        assert!(
+            validate_proto_event(&proto).is_err(),
+            "tampered-signature proto event must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_proto_event_rejects_tampered_id() {
+        use nostr::{EventBuilder, Keys, Kind};
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "proto id test")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let mut proto = ProtoEvent {
+            id: event.id.to_hex(),
+            pubkey: event.pubkey.to_hex(),
+            created_at: event.created_at.as_secs() as i64,
+            kind: event.kind.as_u16() as i32,
+            tags: vec![],
+            content: event.content.clone(),
+            sig: event.sig.to_string(),
+        };
+        proto.id = "a".repeat(64);
+        assert!(
+            validate_proto_event(&proto).is_err(),
+            "tampered-id proto event must be rejected"
+        );
     }
 }

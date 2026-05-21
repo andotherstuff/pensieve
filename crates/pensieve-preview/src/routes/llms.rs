@@ -137,7 +137,7 @@ and tag specifications — useful for understanding event content and structure.
 - Engagement counts are approximate (based on ingested data)
 - Zap amounts are in millisatoshis (divide by 1000 for sats)
 - HTML pages include Open Graph and Twitter Card meta tags
-- All dynamic content is HTML-escaped for XSS protection
+- User-controlled text is HTML-escaped and article markdown is rendered with raw HTML stripped, for XSS protection
 
 ## Links
 

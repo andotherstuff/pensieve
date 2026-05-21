@@ -160,9 +160,10 @@ body{background:#0a0a0f;color:#e5e5e5}
 
 /// Content-Security-Policy header value.
 ///
-/// Allows inline styles and a small inline script for copy-to-clipboard.
-/// No external scripts, no iframes, only HTTPS images.
-pub const CSP_HEADER: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; form-action 'none'; frame-ancestors 'none'";
+/// Scripts are served same-origin from `/app.js`; there are no inline scripts or
+/// inline event handlers, so `script-src` is locked to `'self'`. Inline styles
+/// are still allowed. No iframes; images limited to HTTPS and data URIs.
+pub const CSP_HEADER: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; img-src https: data:; connect-src 'self'; form-action 'none'; frame-ancestors 'none'";
 
 /// Render the full HTML page shell with `<head>`, OG tags, and body content.
 pub fn page_shell(
@@ -207,6 +208,7 @@ pub fn page_shell(
                 // these pages in search results initially.
 
                 style { (PreEscaped(PAGE_CSS)) }
+                script src="/app.js" defer {}
             }
             body {
                 main { (body_content) }
@@ -255,7 +257,7 @@ pub fn author_header(metadata: Option<&ProfileMetadata>, npub: &str, base_url: &
                 (initial.as_str())
                 @if let Some(pic_url) = picture {
                     @if is_safe_url(pic_url) {
-                        img src=(pic_url) alt=(name) loading="lazy" onerror="this.style.display='none'";
+                        img src=(pic_url) alt=(name) loading="lazy" data-hide-on-error="1";
                     }
                 }
             }
@@ -268,7 +270,7 @@ pub fn author_header(metadata: Option<&ProfileMetadata>, npub: &str, base_url: &
                 }
                 div class="author-npub" {
                     span class="author-npub-text" title=(npub) { (truncated_npub) }
-                    button class="copy-btn" onclick=(format!("navigator.clipboard.writeText('{}').then(()=>{{this.innerHTML='Copied!';setTimeout(()=>this.innerHTML='{}',1500)}})", npub, ICON_COPY.replace('"', "&quot;"))) title="Copy npub" {
+                    button class="copy-btn" data-copy=(npub) title="Copy npub" {
                         (PreEscaped(ICON_COPY))
                     }
                 }

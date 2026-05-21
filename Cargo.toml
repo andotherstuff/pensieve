@@ -57,7 +57,7 @@ notepack = { git = "https://github.com/erskingardner/notepack" }
 # HTTP server
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 
 # Observability
 tracing = "0.1"

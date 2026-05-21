@@ -144,6 +144,37 @@ pub async fn fetch_profile(
     Ok(result)
 }
 
+/// Batch-fetch full profiles (kind 0) for a set of pubkeys in a single query.
+///
+/// Returns a map of pubkey (hex) -> [`ProfileRow`]. Pubkeys without a profile
+/// are omitted. Used to resolve mentioned pubkeys without an N+1 query.
+pub async fn fetch_profiles(
+    client: &Client,
+    pubkeys: &[String],
+) -> Result<std::collections::HashMap<String, ProfileRow>, PreviewError> {
+    if pubkeys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<&str> = pubkeys.iter().map(|_| "?").collect();
+    let query_str = format!(
+        "SELECT pubkey, argMax(id, created_at) AS event_id, \
+         argMax(content, created_at) AS content \
+         FROM events_local \
+         WHERE pubkey IN ({}) AND kind = 0 \
+         GROUP BY pubkey",
+        placeholders.join(", ")
+    );
+
+    let mut query = client.query(&query_str);
+    for pk in pubkeys {
+        query = query.bind(pk);
+    }
+
+    let rows = query.fetch_all::<ProfileRow>().await?;
+    Ok(rows.into_iter().map(|r| (r.pubkey.clone(), r)).collect())
+}
+
 /// Fetch a replaceable event by (kind, pubkey, d_tag).
 ///
 /// Used for addressable events like NIP-23 articles (kind 30023),

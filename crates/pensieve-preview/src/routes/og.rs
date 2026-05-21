@@ -96,9 +96,38 @@ fn extract_avatar_url(content: &resolve::ResolvedContent) -> Option<String> {
 /// Fetch an avatar image from a URL, with a timeout.
 ///
 /// Returns the raw image bytes, or `None` if the fetch fails.
+///
+/// SSRF guard: the `picture` URL is attacker-controlled (it comes from a Nostr
+/// profile event), so before fetching we require an `http(s)` scheme, resolve the
+/// host and reject any address that is not globally routable (loopback, private,
+/// link-local/metadata, CGNAT, etc.), and disable redirect following so a public
+/// URL cannot bounce to an internal one. (A determined attacker could still race
+/// DNS between our resolution and reqwest's; pinning the resolved IP would close
+/// that, but redirect-disable + resolve-check covers the practical cases.)
 async fn fetch_avatar(url: &str) -> Option<Vec<u8>> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+
+    // Resolve the host and ensure every resolved address is globally routable.
+    let mut resolved_any = false;
+    for addr in tokio::net::lookup_host((host, port)).await.ok()? {
+        resolved_any = true;
+        if !is_global_ip(addr.ip()) {
+            tracing::debug!(%host, ip = %addr.ip(), "blocked avatar fetch to non-global address");
+            return None;
+        }
+    }
+    if !resolved_any {
+        return None;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
 
@@ -115,6 +144,39 @@ async fn fetch_avatar(url: &str) -> Option<Vec<u8>> {
     }
 
     Some(bytes.to_vec())
+}
+
+/// Whether an IP address is globally routable (i.e. safe to fetch from).
+///
+/// Conservatively rejects loopback, private, link-local (incl. 169.254.169.254
+/// cloud metadata), CGNAT, documentation, unspecified, and IPv6 ULA/link-local.
+fn is_global_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_global_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be judged by its IPv4 value.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_global_v4(v4);
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00   // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
+        }
+    }
+}
+
+/// IPv4 global-routability check.
+fn is_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    !(v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || o[0] == 0
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)) // CGNAT 100.64.0.0/10
 }
 
 /// Font family string for SVG text (sans single quotes that confuse `format!`).

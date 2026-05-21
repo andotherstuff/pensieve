@@ -21,6 +21,7 @@ pub async fn home_page() -> impl IntoResponse {
                 meta property="og:type" content="website";
                 style { (PreEscaped(PAGE_CSS)) }
                 style { (PreEscaped(HOME_CSS)) }
+                script src="/app.js" defer {}
             }
             body {
                 main class="home" {
@@ -31,8 +32,7 @@ pub async fn home_page() -> impl IntoResponse {
                         "Fast, static preview pages for any Nostr event."
                     }
 
-                    form class="home-search" action="/" method="GET"
-                         onsubmit="return handleLookup(event)" {
+                    form class="home-search" action="/" method="GET" {
                         input class="home-input" type="text"
                             name="q"
                             placeholder="Paste an identifier"
@@ -41,22 +41,6 @@ pub async fn home_page() -> impl IntoResponse {
                             autofocus;
                         button class="home-btn" type="submit" { "Look up" }
                     }
-                    script { (PreEscaped(r#"
-var inp=document.querySelector('.home-input');
-inp.addEventListener('input',function(){
-  var v=this.value;
-  if(v.toLowerCase().startsWith('nostr:')){
-    this.value=v.slice(6);
-  }
-});
-function handleLookup(e){
-  e.preventDefault();
-  var v=inp.value.trim().replace(/\s+/g,'');
-  if(v)window.location.href='/'+encodeURIComponent(v);
-  return false;
-}
-"#)) }
-
                     div class="home-how" {
                         p {
                             "Add any Nostr identifier to the URL:"
