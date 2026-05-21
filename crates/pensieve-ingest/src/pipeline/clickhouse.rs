@@ -229,6 +229,18 @@ impl ClickHouseIndexer {
 
             let len = u32::from_le_bytes(len_buf) as usize;
 
+            // Guard against a torn/corrupt frame (e.g. a crash mid-write that left a
+            // partial length prefix): a single packed event is never this large, so
+            // treat an absurd length as end-of-data instead of allocating gigabytes.
+            const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+            if len > MAX_EVENT_BYTES {
+                tracing::warn!(
+                    len,
+                    "segment frame length exceeds sane maximum; stopping read (likely torn segment)"
+                );
+                break;
+            }
+
             // Read notepack bytes
             let mut data = vec![0u8; len];
             reader.read_exact(&mut data)?;

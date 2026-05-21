@@ -764,7 +764,9 @@ async fn main() -> Result<()> {
                                 error = %compact_error(&e),
                                 "negentropy dedupe check failed"
                             );
-                            false
+                            // Treat as novel on a transient dedupe error rather than
+                            // dropping a possibly-new event; ClickHouse de-dups by id.
+                            true
                         }
                     };
 
@@ -866,7 +868,10 @@ async fn main() -> Result<()> {
                         error = %compact_error(&e),
                         "dedupe check failed for live event"
                     );
-                    false // Treat as duplicate on error
+                    // Treat as novel on a (rare, transient) dedupe error: writing a
+                    // possible duplicate is safe (ClickHouse de-dups by id), whereas
+                    // dropping it would silently lose a potentially-new event.
+                    true
                 }
             };
 

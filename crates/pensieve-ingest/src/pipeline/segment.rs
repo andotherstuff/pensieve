@@ -409,13 +409,19 @@ impl SegmentWriter {
                             );
                         }
 
+                        // Guard against divide-by-zero on an empty/forced seal.
+                        let ratio_pct = if size_bytes > 0 {
+                            (compressed_bytes as f64 / size_bytes as f64) * 100.0
+                        } else {
+                            0.0
+                        };
                         tracing::info!(
                             "Sealed segment {}: {} events, {} bytes -> {} bytes ({:.1}%) at {}",
                             segment_number,
                             event_count,
                             size_bytes,
                             compressed_bytes,
-                            (compressed_bytes as f64 / size_bytes as f64) * 100.0,
+                            ratio_pct,
                             gz_path.display()
                         );
 
