@@ -124,6 +124,10 @@ doc-open:
 
 # Start local dev services (ClickHouse, etc.)
 dev-up:
+    # Ensure relay-stats.db exists as a file before Docker mounts it,
+    # otherwise Docker creates it as a root-owned directory.
+    mkdir -p data
+    touch data/relay-stats.db
     docker compose -f pensieve-local/docker-compose.yml up -d
 
 # Stop local dev services
