@@ -23,6 +23,7 @@ Thumbs.db
 
 # Local data directories (RocksDB, archive segments, etc.)
 data/
+segments/
 
 # Local code-review artifacts
 reviews/

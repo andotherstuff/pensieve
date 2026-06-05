@@ -171,6 +171,15 @@ Import events from length-delimited protobuf files. Supports local files or S3 w
 | `--temp-dir` | system | Temp directory for S3 downloads |
 | `--metrics-port` | `9091` | Prometheus metrics port |
 
+## Prerequisites
+
+- **Rust** ≥ 1.90 (edition 2024) — `rustup update stable`
+- **protoc** (Protocol Buffers compiler) — required by the `pensieve-core` build script
+  - Debian/Ubuntu: `sudo apt-get install protobuf-compiler`
+  - macOS: `brew install protobuf`
+- **just** — task runner for all dev commands (`cargo install just`)
+- **Docker + Docker Compose** — for local infrastructure (ClickHouse, Prometheus, Grafana)
+
 ## Quick Start
 
 ```bash

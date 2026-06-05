@@ -10,17 +10,15 @@ Local Docker environment for developing and testing Pensieve.
 ## Quick Start
 
 ```bash
-# From this directory
-cd pensieve-local
-
-# Start all services
-docker compose up -d
+# From the repo root — ensures data/relay-stats.db exists as a file before
+# Docker mounts it (otherwise Docker creates it as a root-owned directory)
+just dev-up
 
 # Check status
-docker compose ps
+cd pensieve-local && docker compose ps
 
 # View logs
-docker compose logs -f
+just dev-logs
 ```
 
 ## Services
