@@ -119,26 +119,6 @@ doc-open:
     cargo doc --workspace --no-deps --open
 
 # ============================================================================
-# Docker / Deployment
-# ============================================================================
-
-# Start local dev services (ClickHouse, etc.)
-dev-up:
-    docker compose -f pensieve-local/docker-compose.yml up -d
-
-# Stop local dev services
-dev-down:
-    docker compose -f pensieve-local/docker-compose.yml down
-
-# View local dev service logs
-dev-logs:
-    docker compose -f pensieve-local/docker-compose.yml logs -f
-
-# Restart local Grafana
-dev-grafana-restart:
-    docker compose -f pensieve-local/docker-compose.yml restart grafana
-
-# ============================================================================
 # Production Deployment
 # ============================================================================
 

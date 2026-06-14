@@ -188,6 +188,21 @@ fn register_common_metrics() {
         "Ratio of duplicate events (0.0-1.0, higher = more duplicates)"
     );
 
+    // Reference-coverage: of the events referenced by ingested events (via e/q
+    // tags), how many do we already hold? coverage = present / referenced.
+    describe_counter!(
+        "ingest_reference_coverage_sampled_events_total",
+        "Ingested events inspected by reference-coverage sampling"
+    );
+    describe_counter!(
+        "ingest_reference_coverage_referenced_total",
+        "Event ids referenced via e/q tags by sampled events"
+    );
+    describe_counter!(
+        "ingest_reference_coverage_present_total",
+        "Referenced event ids present in the dedupe index (coverage = present/referenced)"
+    );
+
     // =========================================================================
     // Relay Manager Metrics
     // =========================================================================

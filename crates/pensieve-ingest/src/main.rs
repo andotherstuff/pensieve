@@ -33,8 +33,9 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, NegentropySyncConfig, NegentropySyncer,
-    RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
+    ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
+    NegentropySyncer, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
+    SegmentWriter, SyncStateDb,
     logging::compact_error,
     pack_nostr_event,
     relay::normalize_relay_url,
@@ -224,6 +225,19 @@ struct Args {
     /// Overrides --negentropy-relays-file if specified.
     #[arg(long, value_delimiter = ',')]
     negentropy_relays: Option<Vec<String>>,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Coverage instrumentation
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Reference-coverage sampling rate (0.0-1.0).
+    ///
+    /// For this fraction of ingested events, the daemon checks each event id
+    /// referenced via `e`/`q` tags against the dedupe index and records the
+    /// `ingest_reference_coverage_*` metrics. Coverage = present/referenced is the
+    /// north-star signal for how complete our view of the global event set is.
+    /// Sampling is deterministic on the event id; set to 0.0 to disable.
+    #[arg(long, default_value = "0.1")]
+    coverage_sample_rate: f64,
 }
 
 #[tokio::main]
@@ -839,6 +853,17 @@ async fn main() -> Result<()> {
     // Run the ingestion loop
     tracing::info!("Starting live ingestion...");
 
+    // Reference-coverage sampler: of the events that ingested events reference
+    // (via e/q tags), how many do we already hold? Cheap and sampled; feeds the
+    // ingest_reference_coverage_* metrics. 0.0 disables it.
+    let coverage = CoverageSampler::new(Arc::clone(&dedupe), args.coverage_sample_rate);
+    if coverage.is_enabled() {
+        tracing::info!(
+            sample_rate = args.coverage_sample_rate,
+            "reference-coverage sampling enabled"
+        );
+    }
+
     let stats = relay_source
         .run_async(|relay_url: String, event: &nostr_sdk::Event| {
             // Check if we should stop
@@ -877,6 +902,10 @@ async fn main() -> Result<()> {
 
             // Record event for relay quality tracking
             handler_relay_manager.record_event(&relay_url, is_novel);
+
+            // Reference-coverage sampling (sampled + cheap): does our archive
+            // already contain the events this one references?
+            coverage.observe(event);
 
             if is_novel {
                 // New event - NOW pack it (only for novel events)

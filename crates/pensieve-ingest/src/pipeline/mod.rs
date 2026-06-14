@@ -18,10 +18,12 @@
 //! and ClickHouse is a derived index.
 
 mod clickhouse;
+mod coverage;
 mod dedupe;
 mod segment;
 
 pub use clickhouse::{ClickHouseConfig, ClickHouseIndexer, EventRow, IndexerStats};
+pub use coverage::CoverageSampler;
 pub use dedupe::{DedupeIndex, DedupeStats, EventStatus};
 pub use segment::{
     PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter, pack_nostr_event,
