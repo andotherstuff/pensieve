@@ -242,6 +242,15 @@ sqlite3 ./data/relay-stats.db "
 "
 ```
 
+## Configuration
+
+Environment variables are documented in two example files at the repo root:
+
+| File | Use | Copy to |
+|------|-----|---------|
+| [`env.local.example`](env.local.example) | Local native dev (`just run-serve` / `just run-ingest`) | `.env` (repo root) |
+| [`env.production.example`](env.production.example) | Production Docker + systemd stack | `pensieve-deploy/.env` |
+
 ## Deployment
 
 See [`pensieve-deploy/README.md`](pensieve-deploy/README.md) for production setup with Docker, ClickHouse, Prometheus, and Grafana.

@@ -119,7 +119,8 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Datasources/dashboards are configured directly on the running instance
+      # (repo-managed Grafana provisioning was removed during the migration).
       # Mount relay database for SQLite datasource (read-only)
       - /data/relay-stats.db:/var/lib/grafana/relay-stats.db:ro
     environment:

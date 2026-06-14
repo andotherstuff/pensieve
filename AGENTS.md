@@ -49,11 +49,6 @@ just test-preview           # Run preview tests
 just test-preview-verbose   # Run with output
 just coverage-preview       # HTML coverage report (requires cargo-llvm-cov)
 just coverage-preview-summary  # Coverage summary
-
-# Local dev environment
-just dev-up             # Start Docker services (ClickHouse, Prometheus, Grafana)
-just dev-down           # Stop Docker services
-just dev-logs           # View Docker logs
 ```
 
 ### Agent Commit Requirement
@@ -95,7 +90,6 @@ pensieve/
 │   ├── clickhouse_self_hosted.sql  # Full ClickHouse schema
 │   ├── migrations/                  # Incremental schema migrations
 │   └── ingestion_pipeline.md        # Architecture decisions
-├── pensieve-local/          # Local dev Docker Compose + Grafana dashboards
 ├── pensieve-deploy/         # Production deployment configs
 ├── data/                    # Local data directories (gitignored)
 │   ├── dedupe/              # RocksDB dedupe index
@@ -413,30 +407,22 @@ sudo systemctl start pensieve-ingest
 
 ## Local Development
 
-For local development, use Docker for infrastructure and run Rust binaries natively:
+> **Note:** The bundled local Docker stack (`pensieve-local/`) was removed during the
+> lakehouse migration and will be replaced when the new stack (Parquet + DuckDB +
+> Postgres) lands. For now, run the Rust binaries natively against a ClickHouse you
+> provide.
 
 ```bash
-# Start infrastructure (ClickHouse, Prometheus, Grafana)
-just dev-up
+# Copy and edit local env (see env.local.example for all variables)
+cp env.local.example .env
 
-# Run API server
+# Run API server (needs a reachable ClickHouse)
 export PENSIEVE_API_TOKENS=dev-token
 just run-serve
 
-# Run ingester (separate terminal)
-just run-ingest
-
-# Access services
-# - ClickHouse: http://localhost:8123/play
-# - Grafana: http://localhost:3000 (admin/admin)
-# - Prometheus: http://localhost:9090
-# - API: http://localhost:8080
-
-# Stop infrastructure
-just dev-down
+# Run ingester in a separate terminal (configured via CLI flags)
+just run-ingest -- --help
 ```
-
-See `pensieve-local/README.md` for detailed local setup instructions.
 
 ## Security Notes
 

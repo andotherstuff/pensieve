@@ -133,7 +133,7 @@ echo "pensieve ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pensieve
 su - pensieve
 git clone https://github.com/andotherstuff/pensieve.git
 cd ~/pensieve/pensieve-deploy
-cp env.example .env
+cp ../env.production.example .env
 # Edit .env with your settings
 nano .env
 ```
@@ -358,7 +358,7 @@ All services are exposed through Caddy reverse proxy:
 
 **Grafana Login**: `admin` / `admin` (or value of `GRAFANA_PASSWORD` in `.env`)
 
-**API Authentication**: Set `PENSIEVE_API_TOKENS` in `.env` (see `env.example`).
+**API Authentication**: Set `PENSIEVE_API_TOKENS` in `.env` (see `../env.production.example`).
 
 The API runs as a native binary with its own systemd service:
 
