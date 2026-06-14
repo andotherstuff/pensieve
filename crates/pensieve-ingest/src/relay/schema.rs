@@ -123,7 +123,8 @@ fn create_tables(conn: &Connection) -> Result<()> {
 
         -- NIP-66 relay catalog (one row per relay + reporting monitor)
         CREATE TABLE IF NOT EXISTS relay_catalog (
-            relay_url TEXT NOT NULL,
+            relay_id TEXT NOT NULL,
+            relay_id_kind TEXT NOT NULL,
             monitor_pubkey TEXT NOT NULL,
             network TEXT,
             supported_nips TEXT,
@@ -134,9 +135,9 @@ fn create_tables(conn: &Connection) -> Result<()> {
             geohash TEXT,
             observed_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            PRIMARY KEY (relay_url, monitor_pubkey)
+            PRIMARY KEY (relay_id, monitor_pubkey)
         );
-        CREATE INDEX IF NOT EXISTS idx_relay_catalog_url ON relay_catalog(relay_url);
+        CREATE INDEX IF NOT EXISTS idx_relay_catalog_relay_id ON relay_catalog(relay_id);
         "#,
     )?;
 
@@ -176,7 +177,8 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS relay_catalog (
-            relay_url TEXT NOT NULL,
+            relay_id TEXT NOT NULL,
+            relay_id_kind TEXT NOT NULL,
             monitor_pubkey TEXT NOT NULL,
             network TEXT,
             supported_nips TEXT,
@@ -187,9 +189,9 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
             geohash TEXT,
             observed_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            PRIMARY KEY (relay_url, monitor_pubkey)
+            PRIMARY KEY (relay_id, monitor_pubkey)
         );
-        CREATE INDEX IF NOT EXISTS idx_relay_catalog_url ON relay_catalog(relay_url);
+        CREATE INDEX IF NOT EXISTS idx_relay_catalog_relay_id ON relay_catalog(relay_id);
         "#,
     )?;
     Ok(())

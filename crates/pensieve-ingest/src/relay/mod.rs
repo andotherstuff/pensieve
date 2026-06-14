@@ -51,7 +51,7 @@ mod scoring;
 pub mod url;
 
 pub use catalog::{
-    KIND_RELAY_DISCOVERY, KIND_RELAY_MONITOR, RelayCatalogEntry, parse_relay_discovery,
+    KIND_RELAY_DISCOVERY, KIND_RELAY_MONITOR, RelayCatalogEntry, RelayId, parse_relay_discovery,
 };
 pub use connection_guard::{ConnectionGuard, ConnectionGuardConfig, RejectionReason};
 pub use manager::{AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig};

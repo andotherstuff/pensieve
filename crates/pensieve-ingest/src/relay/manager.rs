@@ -187,18 +187,23 @@ impl RelayManager {
     /// Upsert a NIP-66 relay catalog entry (one row per relay + reporting monitor).
     ///
     /// Older observations never overwrite newer ones for the same (relay, monitor).
+    /// `supported_nips`/`requirements` are stored comma-joined for now; a child
+    /// table or JSON would age better once we add exact NIP-match queries.
     pub fn record_catalog_entry(&self, entry: &super::catalog::RelayCatalogEntry) -> Result<()> {
         let now = Self::unix_now();
+        let relay_id = entry.relay_id.as_str();
+        let relay_id_kind = entry.relay_id.kind();
         let supported_nips = entry.supported_nips.join(",");
         let requirements = entry.requirements.join(",");
         let conn = self.conn.lock();
 
         conn.execute(
             "INSERT INTO relay_catalog
-                (relay_url, monitor_pubkey, network, supported_nips, requirements,
-                 rtt_open, rtt_read, rtt_write, geohash, observed_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(relay_url, monitor_pubkey) DO UPDATE SET
+                (relay_id, relay_id_kind, monitor_pubkey, network, supported_nips,
+                 requirements, rtt_open, rtt_read, rtt_write, geohash, observed_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(relay_id, monitor_pubkey) DO UPDATE SET
+                relay_id_kind = excluded.relay_id_kind,
                 network = excluded.network,
                 supported_nips = excluded.supported_nips,
                 requirements = excluded.requirements,
@@ -210,7 +215,8 @@ impl RelayManager {
                 updated_at = excluded.updated_at
              WHERE excluded.observed_at >= relay_catalog.observed_at",
             rusqlite::params![
-                entry.relay_url,
+                relay_id,
+                relay_id_kind,
                 entry.monitor_pubkey,
                 entry.network,
                 supported_nips,
