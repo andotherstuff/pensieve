@@ -81,7 +81,14 @@ pulling this change, or services break. On the box, after `git pull`:
    ```bash
    sudo systemctl restart pensieve-api pensieve-preview pensieve-ingest
    ```
-5. **Verify**, then delete the leftover `~/pensieve/pensieve-deploy/.env`.
+5. **Verify the cutover preserved live state**, then delete the leftover
+   `~/pensieve/pensieve-deploy/.env`:
+   ```bash
+   docker network ls | grep pensieve-deploy_default   # reused, NOT recreated
+   docker exec pensieve-clickhouse clickhouse-client \
+     --query "SHOW CREATE TABLE system.query_log"     # shows the 7-day TTL
+   systemctl status pensieve pensieve-api pensieve-preview pensieve-ingest
+   ```
 
 ## Grafana
 

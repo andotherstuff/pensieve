@@ -162,3 +162,15 @@ volumes:
   grafana_data:
   caddy_data:
   caddy_config:
+
+networks:
+  # Carried forward from the pre-rename deploy so the cutover reuses the existing
+  # network instead of recreating it: the running containers are on this network,
+  # and the br-pensieve bridge name may be referenced by host firewall rules.
+  # Renaming would force a recreation — do that deliberately, not as a side effect
+  # of the ops/ directory move.
+  default:
+    name: pensieve-deploy_default
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-pensieve
