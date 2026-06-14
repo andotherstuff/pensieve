@@ -203,6 +203,16 @@ fn register_common_metrics() {
         "Referenced event ids present in the dedupe index (coverage = present/referenced)"
     );
 
+    // NIP-66 relay catalog.
+    describe_counter!(
+        "ingest_nip66_relay_discovery_total",
+        "NIP-66 relay discovery (kind 30166) events recorded into the relay catalog"
+    );
+    describe_counter!(
+        "ingest_nip66_relay_discovery_errors_total",
+        "NIP-66 relay discovery events that failed to record into the catalog"
+    );
+
     // =========================================================================
     // Relay Manager Metrics
     // =========================================================================

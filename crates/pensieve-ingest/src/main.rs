@@ -37,7 +37,7 @@ use pensieve_ingest::{
     NegentropySyncer, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
     SegmentWriter, SyncStateDb,
     logging::compact_error,
-    pack_nostr_event,
+    pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
     seed_from_clickhouse,
     source::{RelayConfig, RelaySource},
@@ -86,6 +86,24 @@ fn load_seeds_from_file(path: &std::path::Path) -> Result<Vec<String>> {
         }
     }
     Ok(seeds)
+}
+
+/// Record a NIP-66 relay-discovery event into the catalog. Shared by all
+/// ingestion paths; a no-op for non-30166 events. Call only for accepted
+/// (archived) events so catalog contents track the archive, not arrival path.
+fn record_relay_discovery(manager: &RelayManager, event: &nostr_sdk::Event) {
+    if let Some(entry) = parse_relay_discovery(event) {
+        match manager.record_catalog_entry(&entry) {
+            Ok(()) => counter!("ingest_nip66_relay_discovery_total").increment(1),
+            Err(e) => {
+                counter!("ingest_nip66_relay_discovery_errors_total").increment(1);
+                tracing::debug!(
+                    error = %compact_error(&e),
+                    "failed to record relay catalog entry"
+                );
+            }
+        }
+    }
 }
 
 /// Pensieve live ingestion daemon.
@@ -749,6 +767,7 @@ async fn main() -> Result<()> {
         let negentropy_events_processed = Arc::clone(&events_processed);
         let negentropy_events_deduplicated = Arc::clone(&events_deduplicated);
         let negentropy_max_created_at = Arc::clone(&max_created_at);
+        let negentropy_relay_manager = Arc::clone(&relay_manager);
 
         Some(tokio::spawn(async move {
             tracing::info!("Starting negentropy sync task...");
@@ -832,6 +851,9 @@ async fn main() -> Result<()> {
                         negentropy_max_created_at.fetch_max(clamped_ts, Ordering::Relaxed);
 
                         counter!("negentropy_events_written_total").increment(1);
+
+                        // NIP-66: record relay-discovery events we just archived.
+                        record_relay_discovery(&negentropy_relay_manager, event);
                     } else {
                         negentropy_events_deduplicated.fetch_add(1, Ordering::Relaxed);
                         counter!("negentropy_events_deduplicated_total").increment(1);
@@ -939,6 +961,9 @@ async fn main() -> Result<()> {
                                 .as_secs();
                             let clamped_ts = event_ts.min(now);
                             handler_max_created_at.fetch_max(clamped_ts, Ordering::Relaxed);
+
+                            // NIP-66: record relay-discovery events we just archived.
+                            record_relay_discovery(&handler_relay_manager, event);
                         }
                     }
                     Err(e) => {
