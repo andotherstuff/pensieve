@@ -6,7 +6,7 @@
 use rusqlite::{Connection, Result};
 
 /// Current schema version. Increment when making breaking changes.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Initialize the database schema.
 ///
@@ -120,6 +120,23 @@ fn create_tables(conn: &Connection) -> Result<()> {
             value INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
+
+        -- NIP-66 relay catalog (one row per relay + reporting monitor)
+        CREATE TABLE IF NOT EXISTS relay_catalog (
+            relay_url TEXT NOT NULL,
+            monitor_pubkey TEXT NOT NULL,
+            network TEXT,
+            supported_nips TEXT,
+            requirements TEXT,
+            rtt_open INTEGER,
+            rtt_read INTEGER,
+            rtt_write INTEGER,
+            geohash TEXT,
+            observed_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (relay_url, monitor_pubkey)
+        );
+        CREATE INDEX IF NOT EXISTS idx_relay_catalog_url ON relay_catalog(relay_url);
         "#,
     )?;
 
@@ -131,6 +148,9 @@ fn migrate(conn: &Connection, from: i32, to: i32) -> Result<()> {
     for version in from..to {
         if version == 1 {
             migrate_v1_to_v2(conn)?;
+        }
+        if version == 2 {
+            migrate_v2_to_v3(conn)?;
         }
     }
     set_schema_version(conn, to)?;
@@ -146,6 +166,30 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
             value INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Migrate from v2 to v3: add the NIP-66 relay_catalog table.
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS relay_catalog (
+            relay_url TEXT NOT NULL,
+            monitor_pubkey TEXT NOT NULL,
+            network TEXT,
+            supported_nips TEXT,
+            requirements TEXT,
+            rtt_open INTEGER,
+            rtt_read INTEGER,
+            rtt_write INTEGER,
+            geohash TEXT,
+            observed_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (relay_url, monitor_pubkey)
+        );
+        CREATE INDEX IF NOT EXISTS idx_relay_catalog_url ON relay_catalog(relay_url);
         "#,
     )?;
     Ok(())
@@ -247,6 +291,7 @@ mod tests {
         assert!(tables.contains(&"relay_stats_hourly".to_string()));
         assert!(tables.contains(&"relay_stats_daily".to_string()));
         assert!(tables.contains(&"relay_scores".to_string()));
+        assert!(tables.contains(&"relay_catalog".to_string()));
     }
 
     #[test]

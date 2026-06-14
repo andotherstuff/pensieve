@@ -37,7 +37,7 @@ use pensieve_ingest::{
     NegentropySyncer, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
     SegmentWriter, SyncStateDb,
     logging::compact_error,
-    pack_nostr_event,
+    pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
     seed_from_clickhouse,
     source::{RelayConfig, RelaySource},
@@ -906,6 +906,18 @@ async fn main() -> Result<()> {
             // Reference-coverage sampling (sampled + cheap): does our archive
             // already contain the events this one references?
             coverage.observe(event);
+
+            // NIP-66: relay-discovery (kind 30166) events feed the relay catalog.
+            // parse_relay_discovery returns None for every other kind.
+            if let Some(entry) = parse_relay_discovery(event) {
+                if let Err(e) = handler_relay_manager.record_catalog_entry(&entry) {
+                    tracing::debug!(
+                        error = %compact_error(&e),
+                        "failed to record relay catalog entry"
+                    );
+                }
+                counter!("ingest_nip66_relay_discovery_total").increment(1);
+            }
 
             if is_novel {
                 // New event - NOW pack it (only for novel events)

@@ -43,12 +43,16 @@
 //! let (disconnect, connect) = manager.get_optimization_suggestions(&connected_urls)?;
 //! ```
 
+mod catalog;
 pub mod connection_guard;
 mod manager;
 mod schema;
 mod scoring;
 pub mod url;
 
+pub use catalog::{
+    KIND_RELAY_DISCOVERY, KIND_RELAY_MONITOR, RelayCatalogEntry, parse_relay_discovery,
+};
 pub use connection_guard::{ConnectionGuard, ConnectionGuardConfig, RejectionReason};
 pub use manager::{AggregateRelayStats, OptimizationSuggestions, RelayManager, RelayManagerConfig};
 pub use schema::{RelayStatus, RelayTier};

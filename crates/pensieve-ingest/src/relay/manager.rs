@@ -184,6 +184,50 @@ impl RelayManager {
         Ok(())
     }
 
+    /// Upsert a NIP-66 relay catalog entry (one row per relay + reporting monitor).
+    ///
+    /// Older observations never overwrite newer ones for the same (relay, monitor).
+    pub fn record_catalog_entry(&self, entry: &super::catalog::RelayCatalogEntry) -> Result<()> {
+        let now = Self::unix_now();
+        let supported_nips = entry.supported_nips.join(",");
+        let requirements = entry.requirements.join(",");
+        let conn = self.conn.lock();
+
+        conn.execute(
+            "INSERT INTO relay_catalog
+                (relay_url, monitor_pubkey, network, supported_nips, requirements,
+                 rtt_open, rtt_read, rtt_write, geohash, observed_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(relay_url, monitor_pubkey) DO UPDATE SET
+                network = excluded.network,
+                supported_nips = excluded.supported_nips,
+                requirements = excluded.requirements,
+                rtt_open = excluded.rtt_open,
+                rtt_read = excluded.rtt_read,
+                rtt_write = excluded.rtt_write,
+                geohash = excluded.geohash,
+                observed_at = excluded.observed_at,
+                updated_at = excluded.updated_at
+             WHERE excluded.observed_at >= relay_catalog.observed_at",
+            rusqlite::params![
+                entry.relay_url,
+                entry.monitor_pubkey,
+                entry.network,
+                supported_nips,
+                requirements,
+                entry.rtt_open,
+                entry.rtt_read,
+                entry.rtt_write,
+                entry.geohash,
+                entry.observed_at as i64,
+                now,
+            ],
+        )
+        .map_err(|e| Error::Database(format!("Failed to record catalog entry: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Import relays from a JSON discovery results file.
     ///
     /// Expected format: JSON object with `functioning_relays` array of URL strings.
