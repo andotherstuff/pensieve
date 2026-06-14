@@ -10,10 +10,10 @@ User=pensieve
 Group=pensieve
 
 # Run the sync script
-ExecStart=/home/pensieve/pensieve/pensieve-deploy/scripts/sync-archive.sh
+ExecStart=/home/pensieve/pensieve/ops/scripts/sync-archive.sh
 
 # Environment
-EnvironmentFile=-/home/pensieve/pensieve/pensieve-deploy/.env
+EnvironmentFile=-/etc/pensieve/pensieve.env
 
 # Logging
 StandardOutput=journal

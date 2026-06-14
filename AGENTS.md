@@ -90,7 +90,7 @@ pensieve/
 │   ├── clickhouse_self_hosted.sql  # Full ClickHouse schema
 │   ├── migrations/                  # Incremental schema migrations
 │   └── ingestion_pipeline.md        # Architecture decisions
-├── pensieve-deploy/         # Production deployment configs
+├── ops/                     # Production ops: compose, systemd units, scripts, RUNBOOK
 ├── data/                    # Local data directories (gitignored)
 │   ├── dedupe/              # RocksDB dedupe index
 │   ├── relays/              # Relay discovery data
@@ -258,12 +258,15 @@ just ch-tables
 ## Production Deployment
 
 The production server runs at `~/pensieve`. The default branch is `master`.
+Operational config lives in `ops/` (compose, systemd units, scripts); secrets live
+outside the repo at `/etc/pensieve/pensieve.env`. See [`ops/RUNBOOK.md`](ops/RUNBOOK.md)
+for the authoritative deploy/cutover procedure — the summary below is a quick reference.
 
 ### Architecture
 
 | Component | Runs As | Location |
 |-----------|---------|----------|
-| ClickHouse, Grafana, Prometheus, Caddy | Docker Compose | `~/pensieve/pensieve-deploy/` |
+| ClickHouse, Grafana, Prometheus, Caddy | Docker Compose | `~/pensieve/ops/production/` |
 | `pensieve-ingest` | Native binary + systemd | `~/pensieve/target/release/` |
 | `pensieve-serve` | Native binary + systemd | `~/pensieve/target/release/` |
 | `pensieve-preview` | Native binary + systemd | `~/pensieve/target/release/` |
@@ -356,14 +359,14 @@ sudo systemctl restart pensieve-preview
 sudo systemctl status pensieve pensieve-api pensieve-ingest
 
 # Docker infrastructure
-cd ~/pensieve/pensieve-deploy
+cd ~/pensieve/ops/production
 docker compose logs -f clickhouse
 docker compose logs -f grafana
 ```
 
 ### Environment Variables
 
-Key environment variables for `pensieve-serve` (set in systemd service or `.env`):
+Key environment variables for `pensieve-serve` (set in `/etc/pensieve/pensieve.env`, read via the systemd `EnvironmentFile`):
 
 | Variable | Required | Description |
 |----------|----------|-------------|

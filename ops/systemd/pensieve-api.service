@@ -1,5 +1,5 @@
 [Unit]
-Description=Pensieve Preview Server
+Description=Pensieve API Server
 Documentation=https://github.com/andotherstuff/pensieve
 After=network.target docker.service
 Wants=docker.service
@@ -11,23 +11,23 @@ Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve
 
 # Binary location (after cargo build --release)
-ExecStart=/home/pensieve/pensieve/target/release/pensieve-preview
+ExecStart=/home/pensieve/pensieve/target/release/pensieve-serve
 
 # Restart policy
 Restart=always
 RestartSec=5
 
-# Environment file (for CLICKHOUSE_URL, PREVIEW_BASE_URL, etc.)
-EnvironmentFile=/home/pensieve/pensieve/pensieve-deploy/.env
+# Environment file (for PENSIEVE_API_TOKENS, CLICKHOUSE_URL, etc.)
+EnvironmentFile=/etc/pensieve/pensieve.env
 
 # Logging: the binary defaults to info with noisy upstream crates suppressed.
-# To override:  systemctl edit pensieve-preview  →  Environment=RUST_LOG=debug
+# To override:  systemctl edit pensieve-api  →  Environment=RUST_LOG=debug
 # Environment=RUST_LOG=info
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=pensieve-preview
+SyslogIdentifier=pensieve-api
 
 # Security hardening
 NoNewPrivileges=true
@@ -37,3 +37,4 @@ PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
+
