@@ -43,7 +43,7 @@ Pensieve is an **archive-first** Nostr indexer. It stores canonical events in a 
 | `pensieve-core` | ✅ Event validation, notepack encoding, metrics |
 | `pensieve-ingest` | ✅ Live relay ingestion + backfill binaries + relay quality tracking |
 | `pensieve-serve` | 🚧 Placeholder |
-| Deployment | ✅ Docker + systemd setup in `pensieve-deploy/` |
+| Deployment | ✅ Docker + systemd setup in `ops/` |
 
 ## Ingestion Modes
 
@@ -249,11 +249,11 @@ Environment variables are documented in two example files at the repo root:
 | File | Use | Copy to |
 |------|-----|---------|
 | [`env.local.example`](env.local.example) | Local native dev (`just run-serve` / `just run-ingest`) | `.env` (repo root) |
-| [`env.production.example`](env.production.example) | Production Docker + systemd stack | `pensieve-deploy/.env` |
+| [`env.production.example`](env.production.example) | Production Docker + systemd stack | `/etc/pensieve/pensieve.env` |
 
 ## Deployment
 
-See [`pensieve-deploy/README.md`](pensieve-deploy/README.md) for production setup with Docker, ClickHouse, Prometheus, and Grafana.
+See [`ops/RUNBOOK.md`](ops/RUNBOOK.md) for production setup and the deploy/cutover procedure.
 
 ## Documentation
 

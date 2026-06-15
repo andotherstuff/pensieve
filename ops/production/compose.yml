@@ -59,8 +59,8 @@ services:
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
       # Users config (for grafana read-only user)
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
-      # Schema initialization
-      - ../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Schema initialization (repo docs/, two levels up from ops/production/)
+      - ../../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       - CLICKHOUSE_DB=nostr
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
@@ -129,10 +129,8 @@ services:
       # Configure for reverse proxy at /grafana/
       - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
-      # Install plugins on startup
+      # Install plugins on startup (datasources are configured on the running instance)
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,frser-sqlite-datasource
-      # ClickHouse datasource password (for provisioning)
-      - CLICKHOUSE_GRAFANA_PASSWORD=${CLICKHOUSE_GRAFANA_PASSWORD:-changeme}
     depends_on:
       - prometheus
       - clickhouse
@@ -164,3 +162,15 @@ volumes:
   grafana_data:
   caddy_data:
   caddy_config:
+
+networks:
+  # Carried forward from the pre-rename deploy so the cutover reuses the existing
+  # network instead of recreating it: the running containers are on this network,
+  # and the br-pensieve bridge name may be referenced by host firewall rules.
+  # Renaming would force a recreation — do that deliberately, not as a side effect
+  # of the ops/ directory move.
+  default:
+    name: pensieve-deploy_default
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-pensieve

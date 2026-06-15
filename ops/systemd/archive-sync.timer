@@ -1,6 +1,6 @@
 [Unit]
 Description=Periodic archive sync to Storage Box
-Documentation=https://github.com/yourname/pensieve
+Documentation=https://github.com/andotherstuff/pensieve
 
 [Timer]
 # Run every hour

@@ -33,3 +33,7 @@ reviews/
 # Local host marker
 .vip
 
+# Docker Compose local overrides
+compose.override.yml
+docker-compose.override.yml
+

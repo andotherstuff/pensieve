@@ -160,7 +160,7 @@ prod-restart: prod-ingest-restart prod-api-restart
 
 # Restart production Grafana
 prod-grafana-restart:
-    cd ~/pensieve/pensieve-deploy && docker compose restart grafana
+    cd ~/pensieve/ops/production && docker compose --env-file /etc/pensieve/pensieve.env restart grafana
 
 # Show status of all Pensieve services
 prod-status:
