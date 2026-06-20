@@ -212,6 +212,18 @@ fn register_common_metrics() {
         "ingest_nip66_relay_discovery_errors_total",
         "NIP-66 relay discovery events that failed to record into the catalog"
     );
+    describe_gauge!(
+        "ingest_nip66_catalog_relays",
+        "Distinct relays known in the NIP-66 catalog"
+    );
+    describe_gauge!(
+        "ingest_nip66_catalog_nip77_relays",
+        "Distinct URL relays in the catalog advertising NIP-77 (negentropy-capable)"
+    );
+    describe_gauge!(
+        "ingest_nip66_catalog_monitors",
+        "Distinct NIP-66 monitors reporting into the catalog"
+    );
 
     // =========================================================================
     // Relay Manager Metrics
