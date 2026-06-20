@@ -38,6 +38,10 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
 Restart=always
 RestartSec=10
 
+# Open-file limit: the ingester holds many concurrent relay sockets; the systemd
+# default caused "Too many open files" (notably during shutdown).
+LimitNOFILE=524288
+
 # Logging: the binary defaults to info with noisy upstream crates suppressed.
 # To override:  systemctl edit pensieve-ingest  →  Environment=RUST_LOG=debug
 # Environment=RUST_LOG=info

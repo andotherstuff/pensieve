@@ -12,8 +12,10 @@ WorkingDirectory=/home/pensieve/pensieve/ops/production
 
 # Start docker compose (ClickHouse, Grafana, Prometheus, Caddy).
 # --env-file points at the production secrets, which live outside the repo tree.
-ExecStart=/usr/bin/docker compose --env-file /etc/pensieve/pensieve.env up
-ExecStop=/usr/bin/docker compose --env-file /etc/pensieve/pensieve.env down
+# --project-name pins the project to pensieve-deploy (also set via `name:` in
+# compose.yml) so the ops/ rename does not orphan the existing volumes/network.
+ExecStart=/usr/bin/docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up
+ExecStop=/usr/bin/docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env down
 
 # Restart policy
 Restart=always
