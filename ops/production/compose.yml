@@ -11,6 +11,13 @@
 # Start Rust services:   sudo systemctl start pensieve-api pensieve-ingest
 # Stop Rust services:    sudo systemctl stop pensieve-api pensieve-ingest
 
+# Pin the Compose project name so every invocation (systemd, justfile, manual)
+# uses the same project/volumes/network regardless of the directory name. Without
+# this, Compose infers the project from the directory (ops/production -> "production"),
+# which orphans the existing pensieve-deploy_* volumes and conflicts on container
+# names. Kept in sync with --project-name in ops/systemd/pensieve.service.
+name: pensieve-deploy
+
 services:
   # ═══════════════════════════════════════════════════════════════════════════
   # Caddy - Reverse Proxy with Auto-HTTPS
