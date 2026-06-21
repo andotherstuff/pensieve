@@ -263,6 +263,15 @@ struct Args {
     #[arg(long, default_value = "16")]
     negentropy_max_targets: usize,
 
+    /// Minimum distinct monitors that must report NIP-77 for a catalog relay to be
+    /// used as a negentropy target (quorum; guards against a single bad monitor).
+    #[arg(long, default_value = "2")]
+    negentropy_target_min_monitors: usize,
+
+    /// Max age (days) of a monitor observation for it to count toward target selection.
+    #[arg(long, default_value = "7")]
+    negentropy_target_max_age_days: u64,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Coverage instrumentation
     // ─────────────────────────────────────────────────────────────────────────
@@ -508,7 +517,7 @@ async fn main() -> Result<()> {
     // Initialize negentropy sync (if enabled)
     let negentropy_syncer = if args.negentropy {
         // Load trusted relays for negentropy sync
-        let mut negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
+        let negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
             tracing::info!(
                 relay_count = relays.len(),
                 "using negentropy relays from CLI arguments"
@@ -544,35 +553,6 @@ async fn main() -> Result<()> {
             tracing::info!("Using default negentropy relays");
             NegentropySyncConfig::default().relays
         };
-
-        // Augment with NIP-77 relays from the NIP-66 catalog (deduped, capped).
-        // Catalog relays advertise NIP-77, so non-supporting relays (e.g. Primal)
-        // are naturally excluded. The catalog persists in relay-stats.db, so it is
-        // populated across restarts.
-        if !args.no_negentropy_catalog_targets {
-            match relay_manager.catalog_negentropy_targets(args.negentropy_max_targets) {
-                Ok(catalog_targets) => {
-                    let before = negentropy_relays.len();
-                    for t in catalog_targets {
-                        if !negentropy_relays.contains(&t) {
-                            negentropy_relays.push(t);
-                        }
-                    }
-                    let added = negentropy_relays.len() - before;
-                    if added > 0 {
-                        tracing::info!(
-                            added,
-                            total = negentropy_relays.len(),
-                            "added NIP-77 negentropy targets from catalog"
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    error = %compact_error(&e),
-                    "failed to load catalog negentropy targets"
-                ),
-            }
-        }
 
         // Open sync state database
         let sync_state = Arc::new(SyncStateDb::open(&args.negentropy_db_path).with_context(
@@ -636,14 +616,24 @@ async fn main() -> Result<()> {
             lookback_days = args.negentropy_lookback_days,
             "negentropy configuration"
         );
-        tracing::debug!(relays = ?negentropy_config.relays, "negentropy relays");
-        gauge!("ingest_negentropy_targets").set(negentropy_config.relays.len() as f64);
+        tracing::debug!(relays = ?negentropy_config.relays, "negentropy base relays");
 
-        Some(Arc::new(NegentropySyncer::new(
-            negentropy_config,
-            sync_state,
-            Some(Arc::clone(&dedupe)),
-        )))
+        // Catalog targets are resolved per sync cycle (not once at startup) so the
+        // target set follows catalog growth. Quorum + recency gating lives in
+        // catalog_negentropy_targets so a single bad monitor can't inject a target.
+        let mut syncer =
+            NegentropySyncer::new(negentropy_config, sync_state, Some(Arc::clone(&dedupe)));
+        if !args.no_negentropy_catalog_targets {
+            let rm = Arc::clone(&relay_manager);
+            let cap = args.negentropy_max_targets;
+            let min_monitors = args.negentropy_target_min_monitors;
+            let max_age = args.negentropy_target_max_age_days as i64 * 86400;
+            syncer = syncer.with_target_provider(Arc::new(move || {
+                rm.catalog_negentropy_targets(cap, min_monitors, max_age)
+                    .unwrap_or_default()
+            }));
+        }
+        Some(Arc::new(syncer))
     } else {
         None
     };
