@@ -221,6 +221,10 @@ impl NostrDatabase for SyncStateAdapter {
     }
 }
 
+/// A source of additional reconciliation targets, re-queried each sync cycle
+/// (e.g. NIP-77 relays from the NIP-66 catalog).
+pub type TargetProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Negentropy syncer for periodic reconciliation with trusted relays.
 pub struct NegentropySyncer {
     config: NegentropySyncConfig,
@@ -231,6 +235,8 @@ pub struct NegentropySyncer {
     /// that was only written to an unsealed segment; a crash would then drop it
     /// from the archive *and* stop negentropy from ever re-fetching it (H4).
     dedupe: Option<Arc<DedupeIndex>>,
+    /// Dynamic reconciliation targets, merged with `config.relays` each cycle.
+    target_provider: Option<TargetProvider>,
 }
 
 impl NegentropySyncer {
@@ -248,7 +254,30 @@ impl NegentropySyncer {
             sync_state,
             running: Arc::new(AtomicBool::new(false)),
             dedupe,
+            target_provider: None,
         }
+    }
+
+    /// Provide a dynamic source of additional reconciliation targets, re-queried
+    /// each sync cycle and merged (deduped) with the configured base relays.
+    pub fn with_target_provider(mut self, provider: TargetProvider) -> Self {
+        self.target_provider = Some(provider);
+        self
+    }
+
+    /// Effective relay set for a cycle: configured base relays plus any dynamic
+    /// targets, deduped. Recomputed each cycle so catalog growth is followed
+    /// without a restart.
+    fn effective_relays(&self) -> Vec<String> {
+        let mut relays = self.config.relays.clone();
+        if let Some(provider) = &self.target_provider {
+            for t in provider() {
+                if !relays.contains(&t) {
+                    relays.push(t);
+                }
+            }
+        }
+        relays
     }
 
     /// Check if the syncer is currently running.
@@ -277,12 +306,17 @@ impl NegentropySyncer {
         let start = Instant::now();
         let mut stats = SyncStats::default();
 
+        // Resolve targets fresh each cycle: configured base + dynamic catalog targets,
+        // so catalog growth is followed without a restart.
+        let relays = self.effective_relays();
+        gauge!("ingest_negentropy_targets").set(relays.len() as f64);
+
         // Mark sync as in progress
         gauge!("negentropy_sync_in_progress").set(1.0);
 
         tracing::debug!(
             "Starting negentropy sync with {} relays, lookback {}s",
-            self.config.relays.len(),
+            relays.len(),
             self.config.lookback.as_secs()
         );
 
@@ -324,7 +358,7 @@ impl NegentropySyncer {
             .build();
 
         // Add trusted relays
-        for relay_url in &self.config.relays {
+        for relay_url in &relays {
             if let Err(e) = client.add_relay(relay_url).await {
                 tracing::warn!(
                     relay_url = %relay_url,
@@ -355,7 +389,7 @@ impl NegentropySyncer {
         match sync_result {
             Ok(Ok(output)) => {
                 stats.events_discovered = output.received.len();
-                stats.relays_responded = self.config.relays.len() - stats.relays_errored;
+                stats.relays_responded = relays.len() - stats.relays_errored;
 
                 tracing::debug!(
                     "Negentropy reconciliation complete: {} events discovered",
@@ -364,14 +398,14 @@ impl NegentropySyncer {
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %compact_error(&e), "negentropy sync failed");
-                stats.relays_errored = self.config.relays.len();
+                stats.relays_errored = relays.len();
             }
             Err(_) => {
                 tracing::warn!(
                     "Negentropy sync timed out after {:?}",
                     self.config.protocol_timeout
                 );
-                stats.relays_errored = self.config.relays.len();
+                stats.relays_errored = relays.len();
             }
         }
 

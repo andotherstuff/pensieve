@@ -147,7 +147,7 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
       **Aggregate across multiple monitors** — NIP-66 risk mitigation says never trust a
       single monitor (misconfig/malice); use quorum / web-of-trust.
       These are ordinary Nostr events, so they flow through normal ingest + archive too.
-- [ ] **Dynamic negentropy targeting.** Choose reconciliation targets from catalog `N`
+- [x] **Dynamic negentropy targeting.** Choose reconciliation targets from catalog `N`
       tags advertising NIP-77; retire the hardcoded list; drop Primal.
 - [ ] **Windowed REQ backfill collector.** Paginate by `since`/`until` time slices walking
       backward — the completeness fallback for relays that don't support NIP-77.
@@ -248,7 +248,7 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 ## 8. Status tracker
 
 - **P0 Foundation** — in progress (disk relief done; object-storage bucket / verify harness / backups pending)
-- **P1 Collection & coverage** — in progress (reference-coverage ✅, NIP-66 catalog first slice ✅, catalog-coverage metrics ✅; dynamic negentropy targeting + windowed backfill pending)
+- **P1 Collection & coverage** — in progress (reference-coverage ✅, NIP-66 catalog ✅, catalog-coverage metrics ✅, dynamic negentropy targeting ✅; windowed REQ backfill pending)
 - **P2 Parquet archive** — not started
 - **P3 New analytics** — not started
 - **P4 Reader cutover** — not started

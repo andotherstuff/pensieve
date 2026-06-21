@@ -252,6 +252,27 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     negentropy_relays: Option<Vec<String>>,
 
+    /// Disable augmenting negentropy targets with NIP-77 relays from the catalog.
+    ///
+    /// By default, URL relays in the NIP-66 catalog that advertise NIP-77 are
+    /// added (deduped, capped by --negentropy-max-targets) to the configured
+    /// targets, so reconciliation follows discovered support automatically.
+    #[arg(long)]
+    no_negentropy_catalog_targets: bool,
+
+    /// Max NIP-77 relays to pull from the catalog as negentropy targets.
+    #[arg(long, default_value = "16")]
+    negentropy_max_targets: usize,
+
+    /// Minimum distinct monitors that must report NIP-77 for a catalog relay to be
+    /// used as a negentropy target (quorum; guards against a single bad monitor).
+    #[arg(long, default_value = "2")]
+    negentropy_target_min_monitors: usize,
+
+    /// Max age (days) of a monitor observation for it to count toward target selection.
+    #[arg(long, default_value = "7")]
+    negentropy_target_max_age_days: u64,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Coverage instrumentation
     // ─────────────────────────────────────────────────────────────────────────
@@ -597,13 +618,24 @@ async fn main() -> Result<()> {
             lookback_days = args.negentropy_lookback_days,
             "negentropy configuration"
         );
-        tracing::debug!(relays = ?negentropy_config.relays, "negentropy relays");
+        tracing::debug!(relays = ?negentropy_config.relays, "negentropy base relays");
 
-        Some(Arc::new(NegentropySyncer::new(
-            negentropy_config,
-            sync_state,
-            Some(Arc::clone(&dedupe)),
-        )))
+        // Catalog targets are resolved per sync cycle (not once at startup) so the
+        // target set follows catalog growth. Quorum + recency gating lives in
+        // catalog_negentropy_targets so a single bad monitor can't inject a target.
+        let mut syncer =
+            NegentropySyncer::new(negentropy_config, sync_state, Some(Arc::clone(&dedupe)));
+        if !args.no_negentropy_catalog_targets {
+            let rm = Arc::clone(&relay_manager);
+            let cap = args.negentropy_max_targets;
+            let min_monitors = args.negentropy_target_min_monitors;
+            let max_age = args.negentropy_target_max_age_days as i64 * 86400;
+            syncer = syncer.with_target_provider(Arc::new(move || {
+                rm.catalog_negentropy_targets(cap, min_monitors, max_age)
+                    .unwrap_or_default()
+            }));
+        }
+        Some(Arc::new(syncer))
     } else {
         None
     };

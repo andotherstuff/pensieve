@@ -224,6 +224,10 @@ fn register_common_metrics() {
         "ingest_nip66_catalog_monitors",
         "Distinct NIP-66 monitors reporting into the catalog"
     );
+    describe_gauge!(
+        "ingest_negentropy_targets",
+        "Relays used as negentropy reconciliation targets (configured + catalog NIP-77)"
+    );
 
     // =========================================================================
     // Relay Manager Metrics
