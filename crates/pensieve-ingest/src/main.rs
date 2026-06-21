@@ -251,6 +251,18 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     negentropy_relays: Option<Vec<String>>,
 
+    /// Disable augmenting negentropy targets with NIP-77 relays from the catalog.
+    ///
+    /// By default, URL relays in the NIP-66 catalog that advertise NIP-77 are
+    /// added (deduped, capped by --negentropy-max-targets) to the configured
+    /// targets, so reconciliation follows discovered support automatically.
+    #[arg(long)]
+    no_negentropy_catalog_targets: bool,
+
+    /// Max NIP-77 relays to pull from the catalog as negentropy targets.
+    #[arg(long, default_value = "16")]
+    negentropy_max_targets: usize,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Coverage instrumentation
     // ─────────────────────────────────────────────────────────────────────────
@@ -496,7 +508,7 @@ async fn main() -> Result<()> {
     // Initialize negentropy sync (if enabled)
     let negentropy_syncer = if args.negentropy {
         // Load trusted relays for negentropy sync
-        let negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
+        let mut negentropy_relays = if let Some(ref relays) = args.negentropy_relays {
             tracing::info!(
                 relay_count = relays.len(),
                 "using negentropy relays from CLI arguments"
@@ -532,6 +544,35 @@ async fn main() -> Result<()> {
             tracing::info!("Using default negentropy relays");
             NegentropySyncConfig::default().relays
         };
+
+        // Augment with NIP-77 relays from the NIP-66 catalog (deduped, capped).
+        // Catalog relays advertise NIP-77, so non-supporting relays (e.g. Primal)
+        // are naturally excluded. The catalog persists in relay-stats.db, so it is
+        // populated across restarts.
+        if !args.no_negentropy_catalog_targets {
+            match relay_manager.catalog_negentropy_targets(args.negentropy_max_targets) {
+                Ok(catalog_targets) => {
+                    let before = negentropy_relays.len();
+                    for t in catalog_targets {
+                        if !negentropy_relays.contains(&t) {
+                            negentropy_relays.push(t);
+                        }
+                    }
+                    let added = negentropy_relays.len() - before;
+                    if added > 0 {
+                        tracing::info!(
+                            added,
+                            total = negentropy_relays.len(),
+                            "added NIP-77 negentropy targets from catalog"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %compact_error(&e),
+                    "failed to load catalog negentropy targets"
+                ),
+            }
+        }
 
         // Open sync state database
         let sync_state = Arc::new(SyncStateDb::open(&args.negentropy_db_path).with_context(
@@ -596,6 +637,7 @@ async fn main() -> Result<()> {
             "negentropy configuration"
         );
         tracing::debug!(relays = ?negentropy_config.relays, "negentropy relays");
+        gauge!("ingest_negentropy_targets").set(negentropy_config.relays.len() as f64);
 
         Some(Arc::new(NegentropySyncer::new(
             negentropy_config,

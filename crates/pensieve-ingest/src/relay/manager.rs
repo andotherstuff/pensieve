@@ -270,6 +270,34 @@ impl RelayManager {
         Ok((known as u64, nip77_url as u64, monitors as u64))
     }
 
+    /// URL relays from the catalog that advertise NIP-77 (negentropy), best RTT
+    /// first, capped at `limit`. Relays requiring payment are excluded. Used to
+    /// pick negentropy reconciliation targets dynamically — relays that don't
+    /// support NIP-77 (e.g. Primal) are naturally absent.
+    pub fn catalog_negentropy_targets(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT relay_id FROM relay_catalog
+                 WHERE relay_id_kind = 'url'
+                   AND (',' || supported_nips || ',') LIKE '%,77,%'
+                   AND (',' || requirements || ',') NOT LIKE '%,payment,%'
+                 GROUP BY relay_id
+                 ORDER BY (MIN(rtt_open) IS NULL), MIN(rtt_open) ASC
+                 LIMIT ?",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let urls: Vec<String> = stmt
+            .query_map([limit as i64], |row| row.get(0))
+            .map_err(|e| Error::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(urls)
+    }
+
     /// Import relays from a JSON discovery results file.
     ///
     /// Expected format: JSON object with `functioning_relays` array of URL strings.
@@ -1241,6 +1269,72 @@ mod tests {
         let relays = manager.get_relays_to_connect(10).unwrap();
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0], "wss://relay.example.com");
+    }
+
+    #[test]
+    fn test_catalog_negentropy_targets() {
+        use crate::relay::{RelayCatalogEntry, RelayId};
+
+        let manager = RelayManager::open_in_memory().unwrap();
+        let entry =
+            |id: RelayId, nips: &[&str], reqs: &[&str], rtt: Option<u32>| RelayCatalogEntry {
+                relay_id: id,
+                monitor_pubkey: "mon".to_string(),
+                network: Some("clearnet".to_string()),
+                supported_nips: nips.iter().map(|s| s.to_string()).collect(),
+                requirements: reqs.iter().map(|s| s.to_string()).collect(),
+                rtt_open: rtt,
+                rtt_read: None,
+                rtt_write: None,
+                geohash: None,
+                observed_at: 1_700_000_000,
+            };
+
+        manager
+            .record_catalog_entry(&entry(
+                RelayId::Url("wss://fast.example".into()),
+                &["1", "77"],
+                &["!payment"],
+                Some(50),
+            ))
+            .unwrap();
+        manager
+            .record_catalog_entry(&entry(
+                RelayId::Url("wss://slow.example".into()),
+                &["77"],
+                &[],
+                Some(500),
+            ))
+            .unwrap();
+        // Excluded: payment required, no NIP-77, and a non-URL (pubkey) id.
+        manager
+            .record_catalog_entry(&entry(
+                RelayId::Url("wss://paid.example".into()),
+                &["77"],
+                &["payment"],
+                Some(10),
+            ))
+            .unwrap();
+        manager
+            .record_catalog_entry(&entry(
+                RelayId::Url("wss://plain.example".into()),
+                &["1"],
+                &[],
+                Some(20),
+            ))
+            .unwrap();
+        manager
+            .record_catalog_entry(&entry(
+                RelayId::Pubkey("a".repeat(64)),
+                &["77"],
+                &[],
+                Some(5),
+            ))
+            .unwrap();
+
+        // Only NIP-77 URL relays, payment excluded, fastest RTT first.
+        let targets = manager.catalog_negentropy_targets(10).unwrap();
+        assert_eq!(targets, vec!["wss://fast.example", "wss://slow.example"]);
     }
 
     #[test]
