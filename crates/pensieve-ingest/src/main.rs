@@ -151,9 +151,10 @@ struct Args {
     /// Relays that carry NIP-66 monitor data (kind 30166/10166), comma-separated.
     ///
     /// Registered as seed-tier (always-connect) so the relay catalog reliably
-    /// fills. Point at a NIP-66 monitor's relay(s), e.g. nostr.watch.
-    #[arg(long, value_delimiter = ',')]
-    nip66_monitor_relays: Option<Vec<String>>,
+    /// fills. Defaults to nostr.watch's monitor relay (verified to publish the
+    /// NIP-66 kinds); override with your own comma-separated list.
+    #[arg(long, value_delimiter = ',', default_value = "wss://relay.nostr.watch")]
+    nip66_monitor_relays: Vec<String>,
 
     /// Disable relay discovery via NIP-65
     #[arg(long)]
@@ -364,21 +365,22 @@ async fn main() -> Result<()> {
     };
 
     // NIP-66 monitor relays: always-connect (seed tier) so the relay catalog fills.
-    if let Some(monitors) = args.nip66_monitor_relays.clone() {
-        let mut added = 0usize;
-        for m in monitors {
-            let Some(normalized) = normalize_relay_url(&m).ok() else {
-                tracing::warn!(relay = %m, "skipping invalid NIP-66 monitor relay");
-                continue;
-            };
-            if !seed_relays.contains(&normalized) {
-                seed_relays.push(normalized);
-                added += 1;
-            }
+    let mut monitor_added = 0usize;
+    for m in &args.nip66_monitor_relays {
+        let Some(normalized) = normalize_relay_url(m).ok() else {
+            tracing::warn!(relay = %m, "skipping invalid NIP-66 monitor relay");
+            continue;
+        };
+        if !seed_relays.contains(&normalized) {
+            seed_relays.push(normalized);
+            monitor_added += 1;
         }
-        if added > 0 {
-            tracing::info!(count = added, "added NIP-66 monitor relays (seed tier)");
-        }
+    }
+    if monitor_added > 0 {
+        tracing::info!(
+            count = monitor_added,
+            "added NIP-66 monitor relays (seed tier)"
+        );
     }
 
     // Register seeds with tier=seed (protected, score floor 0.5)
