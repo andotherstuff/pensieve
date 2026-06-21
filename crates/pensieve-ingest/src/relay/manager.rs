@@ -234,6 +234,42 @@ impl RelayManager {
         Ok(())
     }
 
+    /// Catalog-coverage counts for metrics: `(known, nip77_url, monitors)`.
+    ///
+    /// `known` = distinct relay ids in the catalog; `nip77_url` = distinct URL relays
+    /// advertising NIP-77 (negentropy-capable); `monitors` = distinct reporting monitors.
+    pub fn catalog_stats(&self) -> Result<(u64, u64, u64)> {
+        let conn = self.conn.lock();
+
+        let known: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT relay_id) FROM relay_catalog",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // supported_nips is comma-joined; wrap in commas for an exact membership match.
+        let nip77_url: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT relay_id) FROM relay_catalog \
+                 WHERE relay_id_kind = 'url' AND (',' || supported_nips || ',') LIKE '%,77,%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let monitors: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT monitor_pubkey) FROM relay_catalog",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        Ok((known as u64, nip77_url as u64, monitors as u64))
+    }
+
     /// Import relays from a JSON discovery results file.
     ///
     /// Expected format: JSON object with `functioning_relays` array of URL strings.

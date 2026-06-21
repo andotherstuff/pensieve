@@ -134,12 +134,12 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
 
 ### P1 — Collection & coverage  *(Track A; additive; priority)*
 
-- [ ] **Coverage instrumentation first.** Two metrics on existing Grafana, measured at a
+- [x] **Coverage instrumentation.** Two metrics on existing Grafana, measured at a
       baseline before anything changes:
   - *Reference-coverage:* sample event ids referenced in `e`/`a`/`q` tags of events we
     have, check RocksDB membership → `have / referenced` %.
   - *Catalog-coverage:* `connected / reconciled / known` relays (known = from NIP-66).
-- [ ] **NIP-66 catalog consumer.** Subscribe to kind **10166** (monitor announcements →
+- [x] **NIP-66 catalog consumer (first slice).** Subscribe to kind **10166** (monitor announcements →
       discover monitors + frequency) and kind **30166** (relay discovery) from a trusted
       monitor set (nostr.watch primary). Persist a `relay_catalog`:
       URL (`d`), supported NIPs (`N`), network (`n`), RTT (`rtt-*`), requirements (`R`),
@@ -247,12 +247,15 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
 ## 8. Status tracker
 
-- **P0 Foundation** — in progress (disk relief done; bucket/harness/backups pending)
-- **P1 Collection & coverage** — not started (next up)
+- **P0 Foundation** — in progress (disk relief done; object-storage bucket / verify harness / backups pending)
+- **P1 Collection & coverage** — in progress (reference-coverage ✅, NIP-66 catalog first slice ✅, catalog-coverage metrics ✅; dynamic negentropy targeting + windowed backfill pending)
 - **P2 Parquet archive** — not started
 - **P3 New analytics** — not started
 - **P4 Reader cutover** — not started
 - **P5 Retire & reclaim** — not started
+
+Also done (operational, not a plan phase): `pensieve-deploy/` → `ops/` restructure with
+secrets in `/etc/pensieve/pensieve.env`; production box cut over to the new layout.
 
 ---
 

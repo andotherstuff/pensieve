@@ -148,6 +148,13 @@ struct Args {
     #[arg(long)]
     import_discovered_json: Option<PathBuf>,
 
+    /// Relays that carry NIP-66 monitor data (kind 30166/10166), comma-separated.
+    ///
+    /// Registered as seed-tier (always-connect) so the relay catalog reliably
+    /// fills. Point at a NIP-66 monitor's relay(s), e.g. nostr.watch.
+    #[arg(long, value_delimiter = ',')]
+    nip66_monitor_relays: Option<Vec<String>>,
+
     /// Disable relay discovery via NIP-65
     #[arg(long)]
     no_discovery: bool,
@@ -322,7 +329,7 @@ async fn main() -> Result<()> {
 
     // Load seed relays (tier=seed, protected from eviction)
     // Priority: CLI args > seed file > hardcoded defaults
-    let seed_relays = if let Some(relays) = args.seed_relays.clone() {
+    let mut seed_relays = if let Some(relays) = args.seed_relays.clone() {
         tracing::info!(
             relay_count = relays.len(),
             "using seed relays from CLI arguments"
@@ -355,6 +362,24 @@ async fn main() -> Result<()> {
         tracing::info!("Using default seed relays (no seed file found)");
         default_seed_relays()
     };
+
+    // NIP-66 monitor relays: always-connect (seed tier) so the relay catalog fills.
+    if let Some(monitors) = args.nip66_monitor_relays.clone() {
+        let mut added = 0usize;
+        for m in monitors {
+            let Some(normalized) = normalize_relay_url(&m).ok() else {
+                tracing::warn!(relay = %m, "skipping invalid NIP-66 monitor relay");
+                continue;
+            };
+            if !seed_relays.contains(&normalized) {
+                seed_relays.push(normalized);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            tracing::info!(count = added, "added NIP-66 monitor relays (seed tier)");
+        }
+    }
 
     // Register seeds with tier=seed (protected, score floor 0.5)
     relay_manager.register_seed_relays(&seed_relays)?;
@@ -619,6 +644,13 @@ async fn main() -> Result<()> {
                 gauge!("relay_manager_events_novel_1h").set(agg_stats.events_novel_1h as f64);
                 gauge!("relay_manager_events_duplicate_1h")
                     .set(agg_stats.events_duplicate_1h as f64);
+            }
+
+            // NIP-66 catalog coverage: known relays vs NIP-77-capable vs monitors.
+            if let Ok((known, nip77, monitors)) = metrics_relay_manager.catalog_stats() {
+                gauge!("ingest_nip66_catalog_relays").set(known as f64);
+                gauge!("ingest_nip66_catalog_nip77_relays").set(nip77 as f64);
+                gauge!("ingest_nip66_catalog_monitors").set(monitors as f64);
             }
         }
 
