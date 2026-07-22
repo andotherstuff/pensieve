@@ -62,18 +62,80 @@ Key design points:
 - **Source of truth = Parquet on object storage.** Open, columnar, universally readable,
   self-verifying (recompute event id + check schnorr sig). Daily files,
   **partitioned by ingest date, immutable, never rewritten.** `created_at` is preserved
-  in-row (research queries on `created_at` scan more files — accepted trade-off for an
-  append-only archive).
+  in-row; each day seals as a **fresh/late pair** so file-level `created_at` stats stay
+  tight even as Track A backfills old events (see P2). Schema + footer metadata follow
+  the TSM event-archives spec — locked in §3 **before** any file is written.
 - **Object storage:** **Hetzner Object Storage** (S3-compatible, ~€5/TB-mo, 1 TB egress
   included; same provider as compute). NB: Hetzner **Storage Box ≠ S3** (SFTP/SMB/WebDAV
   only). Cloudflare R2 (zero egress) only if we publish a high-traffic public dataset.
 - **Distinct/rolling metrics** (WAU/MAU/retention/total-unique) use **mergeable HLL
-  sketches**, not stored integer counts, so "completed days + today" composes.
-  ~2% error vs. today's `uniqExact` (tolerance to confirm — see §6).
+  sketches** (Apache DataSketches end-to-end — see P3), not stored integer counts, so
+  "completed days + today" composes. ~2% error vs. today's `uniqExact` (tolerance to
+  confirm — see §7).
 - **Success metric changed: throughput → coverage** (fraction of the global event set
   captured). Measured continuously (§ Track A).
 
-## 3. Migration philosophy
+## 3. Archive format — locked before P2
+
+Every Parquet file we write — from the first `backfill-parquet` output onward — uses the
+core schema and footer metadata of the **TSM `event-archives` spec** (draft;
+`gitworkshop.dev/manime@nostr4.social/tsm` → `event-archives.md`). Matching its column
+names/types costs nothing, and binary-vs-hex is, per the spec itself, the one
+interoperability decision that is expensive to reverse — so it is locked here, before
+the one-time backfill runs.
+
+### Core columns (names and types fixed when present)
+
+| column | Parquet type | notes |
+|---|---|---|
+| `id` | `fixed_len_byte_array(32)` | raw bytes, **not hex**; the anchor |
+| `pubkey` | `fixed_len_byte_array(32)` | raw bytes; dictionary-encodes |
+| `created_at` | `int64` | unix seconds; in-file sort key |
+| `kind` | `int32` | dictionary-encodes |
+| `tags` | `list<list<string>>` | element + inner order preserved exactly |
+| `content` | `binary` (STRING) | zstd |
+| `sig` | `fixed_len_byte_array(64)` | raw bytes; incompressible |
+
+Plus archiving-metadata columns: `seen_at` (`int64`), `relays` (`list<string>`),
+`verified` (`boolean` — always true for us; id + sig verified at ingest).
+**No `raw_json` column needed:** validation recomputes the id from parsed fields
+(`pensieve-core/src/event.rs`), so non-canonical events are rejected at ingest and
+everything archived reproduces canonically by construction.
+
+### Footer metadata (every file)
+
+All six REQUIRED keys: `nostr.nip` (`tsm/event-archives/1`), `nostr.filter` (`{}` for
+internal files), `nostr.count`, `nostr.created_at.min`, `nostr.created_at.max`,
+`nostr.generator`. Plus `nostr.commitment` — the sorted-id merkle root (spec
+Appendix 3), computed at seal time. It doubles as a per-file integrity manifest for the
+§6 verification sweep and is the diff primitive for any future peer healing.
+
+### Canonical vs. published — layering, not choosing
+
+The spec's membership rule (archive scope defined by in-event fields, never by producer
+receive time) pulls against our ingest-date partitioning. Resolution: **layer, don't
+choose.**
+
+- **Canonical (internal):** ingest-date daily files, immutable, never rewritten,
+  `nostr.filter: {}`. Technically conforming (contents ⊆ scope) and optimized for the
+  live system's verification + crash-safety story. This is the source of truth.
+- **Published (optional, later):** a periodic DuckDB compaction re-materializes history
+  into `created_at`-windowed, commitment-bearing archives linked by `nostr.prev`
+  supersession chains — the interoperable public dataset. Publishing is a *derived
+  job*, never the canonical store.
+
+Policy questions to settle **before the first published file** (they do not block P2):
+
+- **kind-5 deletions:** internally we keep everything; the publication answer is a
+  separate legal/ethical decision the spec explicitly punts on.
+- **Ephemeral kinds (20000–29999):** the live firehose captures them, but the spec
+  default-excludes them from archives — include only with explicit declaration.
+
+Upside if the spec gains adoption: conforming peer archives become a new bulk-import
+collector (file-level negentropy via commitment-root diff) and a third coverage metric
+alongside reference- and catalog-coverage.
+
+## 4. Migration philosophy
 
 The system is live; relays don't retain forever, so **a gap in ingestion is permanent
 data loss.** We split the work by risk:
@@ -90,7 +152,7 @@ data loss.** We split the work by risk:
 1. **Ingest never stops.** New paths are added beside old ones; nothing is removed until
    its replacement is proven in production.
 2. **Nothing is deleted on cutover.** Superseded data is archived cold and kept for a
-   defined retention (§6) as belt-and-suspenders.
+   defined retention (§7) as belt-and-suspenders.
 3. **The crash-safety contract changes last.** notepack keeps driving dedup /
    `mark_archived` until Parquet is fully proven. Changing *when* an event is considered
    durable is the single riskiest change — it happens once, deliberately, in P5.
@@ -115,7 +177,7 @@ Tracks A and B run in parallel; they converge only at P5.
 
 ---
 
-## 4. Phases
+## 5. Phases
 
 ### P0 — Foundation & breathing room  *(low risk)*
 
@@ -163,11 +225,27 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
       *notepack still drives dedup and crash-safety.* Use a per-day table/file and drop it
       after seal — never a daily multi-million-row `DELETE` (bloats SQLite without VACUUM).
 - [ ] **Midnight seal job (00:05):** for *yesterday*, `DuckDB COPY` from
-      `sqlite_scan('hot.db', ...)` → `YYYY-MM-DD.parquet` (zstd, `ORDER BY created_at`,
-      row-group 100k) → verify → upload to object storage → **only then** drop the day.
-- [ ] **`backfill-parquet` binary:** read existing notepack segments → one Parquet file
-      per ingestion day over all history (partition by approximate ingest date from
-      segment mtime; `created_at` preserved in-row). Run once.
+      `sqlite_scan('hot.db', ...)` → **two files** (schema per §3; zstd,
+      `ORDER BY created_at`, row-group 100k): `YYYY-MM-DD.fresh.parquet` (`created_at`
+      within ±2 days of ingest) and `YYYY-MM-DD.late.parquet` (backfill stragglers) →
+      verify → upload to object storage → **only then** drop the day.
+      *Why the split:* Track A's whole purpose is pulling old events on new days, which
+      would otherwise widen every daily file's `created_at` range. The in-file sort
+      already gives row-group pruning; the split preserves **file-level** pruning too,
+      for one extra `COPY`.
+- [ ] **hot.db continuous replication** (Litestream to the same bucket, or hourly
+      partial-Parquet flushes consolidated at seal). Nice-to-have in P2, a **hard
+      precondition for P5**: post-contract-change, a lost hot.db is not just a lost
+      copy — RocksDB has already marked those events, so negentropy will never
+      re-fetch them (silent, permanent loss). NB Litestream config is per-database;
+      per-day hot.db *files* need a wrapper, or use one db with per-day tables.
+- [ ] **`backfill-parquet` binary:** read existing notepack segments → Parquet over all
+      history, partitioned by **`created_at`, not ingest date** — the segment-mtime
+      "ingest date" is approximate anyway, and `created_at` partitioning is what
+      research scans want. Clamp: `created_at` outside `[2020-11, ingest + 24h]` goes
+      to a quarantine file so adversarial timestamps can't mint pathological
+      partitions. Run once. (Deliberate mixed regime — history by `created_at`,
+      go-forward daily files by ingest date; both conform per §3.)
 - [ ] **Verification (automated):** per-day row counts vs notepack/ClickHouse; sample N
       events/day, recompute id + verify sig + confirm byte-identical reconstruction;
       kind/pubkey distribution spot-checks.
@@ -179,11 +257,16 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
 
 - [ ] Stand up **Postgres** rollup store.
 - [ ] **DuckDB batch jobs** reproducing all 32 endpoints' metrics from Parquet.
-      **HLL sketches** for distinct/rolling metrics. "Today so far" from hot SQLite +
-      live sketches.
+      Distinct/rolling metrics use **Apache DataSketches HLL end-to-end**: DuckDB's
+      built-in `approx_count_distinct` exposes no mergeable sketch state, and
+      `postgresql-hll`'s binary format is **incompatible** with DataSketches — so it's
+      the DataSketches DuckDB extension paired with `datasketches-postgresql`.
+      (Simpler alternative: merge sketches entirely in the batch job and store plain
+      integers per rollup window in Postgres; then only "today so far" needs a live
+      merge.) "Today so far" from hot SQLite + live sketches.
 - [ ] **Verification harness:** diff each endpoint old (ClickHouse) vs new (Postgres)
       across parameter ranges — additive metrics **exact**, distinct metrics within the
-      agreed tolerance (§6).
+      agreed tolerance (§7).
 
 **Gate:** all endpoints match within tolerance for a sustained window (≈1–2 weeks).
 **Rollback:** new stack is shadow; readers still on ClickHouse.
@@ -193,7 +276,7 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
 - [ ] Point `pensieve-serve` + Grafana at Postgres rollups.
 - [ ] **Keep ClickHouse running, read-only, as instant fallback.**
 
-**Gate:** stable through grace period (§6), no correctness issues.
+**Gate:** stable through grace period (§7), no correctness issues.
 **Rollback:** flip readers back to ClickHouse (still alive).
 
 ### P5 — Retire & reclaim  *(only after sustained proof)*
@@ -201,8 +284,11 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
 - [ ] Stop writing notepack; Parquet becomes the sole go-forward source of truth.
       **Crash-safety contract changes here:** `mark_archived` now keys off the durable
       hot-SQLite write (`synchronous=FULL`) or the verified seal. Done last, deliberately.
+      **Precondition:** hot.db replication (P2) live and tested — `synchronous=FULL`
+      survives a crash, not a disk, and a lost hot day is unrecoverable because the
+      dedupe index already claims it.
 - [ ] Archive existing notepack segments **cold** to object storage; do **not** delete for
-      the retention window (§6).
+      the retention window (§7).
 - [ ] Decommission ClickHouse → reclaim ~2.6 TiB NVMe. Drop the preview server.
 
 **Gate:** fully on the new stack for a sustained period before anything old is deleted.
@@ -210,7 +296,7 @@ Make aggressive collection safe *before* doing it, and lay the rails for Track B
 
 ---
 
-## 5. Verification
+## 6. Verification
 
 The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
@@ -222,7 +308,7 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
   through the shadow window.
 - **Coverage (P1):** before/after each collector change; the metric must move.
 
-## 6. Parameters to lock
+## 7. Parameters to lock
 
 | Parameter | Default | Notes |
 |---|---|---|
@@ -231,8 +317,12 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 | P4 fallback-kept window | ≈2–4 weeks | ClickHouse stays read-only |
 | notepack cold retention | 6–12 months | After P5, before any deletion |
 | Tracks A & B | parallel | A now; B's P2 once P0 lands |
+| Fresh/late seal threshold | ±2 days | `created_at` vs ingest date; beyond → `.late` file |
+| Sketch stack | DataSketches | One format end-to-end (DuckDB ⇄ Postgres); never mix with `postgresql-hll` |
+| hot.db replication RPO | minutes | Litestream or hourly flush; hard precondition for P5 |
+| Backfill `created_at` clamp | `[2020-11, ingest+24h]` | Outliers → quarantine file |
 
-## 7. Risk register
+## 8. Risk register
 
 | Risk | Mitigation |
 |---|---|
@@ -243,9 +333,10 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 | Crash-safety/durability mismatch | Defer contract change to P5; notepack drives dedup until then |
 | Collection outpaces old-stack disk | P0 tiering/relief; monitor NVMe through Track A |
 | Bad NIP-66 monitor (misconfig/malice) | Aggregate multiple monitors; quorum / web-of-trust |
-| `created_at` query performance | Partition by ingest date, append-only; `created_at` in-row; documented trade-off |
+| `created_at` query performance | Fresh/late seal split keeps file-level stats tight; in-file `created_at` sort; history partitioned by `created_at` |
+| Post-P5 hot.db loss (disk/box, not crash) | Continuous replication (RPO minutes); without it the dedupe index converts the loss into silent, permanent, unrecoverable-from-network loss |
 
-## 8. Status tracker
+## 9. Status tracker
 
 - **P0 Foundation** — in progress (disk relief done; object-storage bucket / verify harness / backups pending)
 - **P1 Collection & coverage** — in progress (reference-coverage ✅, NIP-66 catalog ✅, catalog-coverage metrics ✅, dynamic negentropy targeting ✅; windowed REQ backfill pending)
@@ -262,4 +353,6 @@ secrets in `/etc/pensieve/pensieve.env`; production box cut over to the new layo
 ## Related
 - Target-architecture design notes (the *what*)
 - `docs/ingestion_pipeline.md` — current pipeline architecture
+- TSM `event-archives` spec (§3 schema source) — `gitworkshop.dev/manime@nostr4.social/tsm`,
+  clone: `https://relay.ngit.dev/npub1manlnflyzyjhgh970t8mmngrdytcp3jrmaa66u846ggg7t20cgqqvyn9tn/tsm.git`
 - Open questions: negentropy strategy, relay-discovery strategy (tracked separately)
