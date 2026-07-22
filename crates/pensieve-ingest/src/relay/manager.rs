@@ -270,6 +270,54 @@ impl RelayManager {
         Ok((known as u64, nip77_url as u64, monitors as u64))
     }
 
+    /// URL relays from the catalog that are safe negentropy reconciliation targets:
+    /// NIP-77 advertised by at least `min_monitors` distinct monitors observed within
+    /// `max_age_secs`, with no recent monitor reporting a `payment` requirement. Best
+    /// RTT first, capped at `limit`.
+    ///
+    /// The quorum + recency gate matters because 30166 events are recorded from the
+    /// whole firehose, not a trusted monitor set — NIP-66 warns that a single monitor
+    /// may be erroneous or malicious, so one source must not be able to inject a sync
+    /// target. The payment check is an aggregate (HAVING), so a relay is rejected if
+    /// *any* recent monitor reports payment, not merely filtered row-by-row.
+    pub fn catalog_negentropy_targets(
+        &self,
+        limit: usize,
+        min_monitors: usize,
+        max_age_secs: i64,
+    ) -> Result<Vec<String>> {
+        let cutoff = Self::unix_now() - max_age_secs;
+        let conn = self.conn.lock();
+
+        // One row per (relay_id, monitor_pubkey), so each recent row is a distinct
+        // monitor's vote: quorum = enough monitors assert NIP-77, and reject the
+        // relay if any recent monitor reports a payment requirement.
+        let mut stmt = conn
+            .prepare(
+                "SELECT relay_id FROM relay_catalog
+                 WHERE relay_id_kind = 'url' AND observed_at >= ?1
+                 GROUP BY relay_id
+                 HAVING SUM(CASE WHEN (',' || supported_nips || ',') LIKE '%,77,%'
+                                 THEN 1 ELSE 0 END) >= ?2
+                    AND SUM(CASE WHEN (',' || requirements || ',') LIKE '%,payment,%'
+                                 THEN 1 ELSE 0 END) = 0
+                 ORDER BY (MIN(rtt_open) IS NULL), MIN(rtt_open) ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| Error::Database(e.to_string()))?;
+
+        let urls: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![cutoff, min_monitors as i64, limit as i64],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(urls)
+    }
+
     /// Import relays from a JSON discovery results file.
     ///
     /// Expected format: JSON object with `functioning_relays` array of URL strings.
@@ -1241,6 +1289,89 @@ mod tests {
         let relays = manager.get_relays_to_connect(10).unwrap();
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0], "wss://relay.example.com");
+    }
+
+    #[test]
+    fn test_catalog_negentropy_targets() {
+        use crate::relay::{RelayCatalogEntry, RelayId};
+
+        let manager = RelayManager::open_in_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let rec = |url: &str,
+                   monitor: &str,
+                   nips: &[&str],
+                   reqs: &[&str],
+                   rtt: Option<u32>,
+                   observed: u64| {
+            manager
+                .record_catalog_entry(&RelayCatalogEntry {
+                    relay_id: RelayId::Url(url.to_string()),
+                    monitor_pubkey: monitor.to_string(),
+                    network: Some("clearnet".to_string()),
+                    supported_nips: nips.iter().map(|s| s.to_string()).collect(),
+                    requirements: reqs.iter().map(|s| s.to_string()).collect(),
+                    rtt_open: rtt,
+                    rtt_read: None,
+                    rtt_write: None,
+                    geohash: None,
+                    observed_at: observed,
+                })
+                .unwrap();
+        };
+
+        // Quorum (2 monitors), recent, no payment → selected (fastest RTT sorts first).
+        rec(
+            "wss://quorum.example",
+            "mon_a",
+            &["1", "77"],
+            &[],
+            Some(40),
+            now,
+        );
+        rec("wss://quorum.example", "mon_b", &["77"], &[], Some(40), now);
+        // Two NIP-77 monitors but a third reports payment → rejected (HAVING any-payment).
+        rec("wss://paid.example", "mon_a", &["77"], &[], Some(10), now);
+        rec("wss://paid.example", "mon_b", &["77"], &[], Some(10), now);
+        rec(
+            "wss://paid.example",
+            "mon_c",
+            &["77"],
+            &["payment"],
+            Some(10),
+            now,
+        );
+        // Only one monitor asserts NIP-77 → below quorum.
+        rec("wss://single.example", "mon_a", &["77"], &[], Some(5), now);
+        // Two monitors but both stale → excluded by recency.
+        rec(
+            "wss://stale.example",
+            "mon_a",
+            &["77"],
+            &[],
+            Some(5),
+            now - 30 * 86400,
+        );
+        rec(
+            "wss://stale.example",
+            "mon_b",
+            &["77"],
+            &[],
+            Some(5),
+            now - 30 * 86400,
+        );
+        // No NIP-77 → excluded.
+        rec("wss://plain.example", "mon_a", &["1"], &[], Some(5), now);
+        rec("wss://plain.example", "mon_b", &["1"], &[], Some(5), now);
+
+        // Quorum >= 2 distinct monitors, observed within 7 days.
+        let targets = manager
+            .catalog_negentropy_targets(10, 2, 7 * 86400)
+            .unwrap();
+        assert_eq!(targets, vec!["wss://quorum.example"]);
     }
 
     #[test]
