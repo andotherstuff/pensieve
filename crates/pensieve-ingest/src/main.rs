@@ -34,14 +34,16 @@ use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
-    NegentropySyncer, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
-    SegmentWriter, SyncStateDb,
+    NegentropySyncer, ParquetShadowConfig, ParquetShadowPublisher, RelayManager,
+    RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
     logging::compact_error,
     pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
     seed_from_clickhouse,
     source::{RelayConfig, RelaySource},
+    start_parquet_shadow,
 };
+use pensieve_lake::{CampaignConfig, S3PublisherConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -135,6 +137,64 @@ struct Args {
     /// Disable gzip compression of output segments
     #[arg(long)]
     no_compress: bool,
+
+    /// Publish sealed notepack segments to an immutable local Parquet shadow lake.
+    #[arg(long, conflicts_with = "parquet_shadow_s3_bucket")]
+    parquet_shadow_lake_dir: Option<PathBuf>,
+
+    /// Publish sealed notepack segments to this S3-compatible Parquet shadow bucket.
+    #[arg(long, conflicts_with = "parquet_shadow_lake_dir")]
+    parquet_shadow_s3_bucket: Option<String>,
+
+    /// AWS region override for the Parquet shadow S3 target.
+    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    parquet_shadow_s3_region: Option<String>,
+
+    /// Endpoint URL for an S3-compatible Parquet shadow target.
+    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    parquet_shadow_s3_endpoint_url: Option<String>,
+
+    /// Use path-style bucket addressing for the Parquet shadow S3 target.
+    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    parquet_shadow_s3_force_path_style: bool,
+
+    /// SQLite publication journal for the Parquet shadow.
+    ///
+    /// Defaults to <output-dir>/.parquet-shadow/inventory.sqlite.
+    #[arg(long)]
+    parquet_shadow_state_db: Option<PathBuf>,
+
+    /// Durable local staging directory for the Parquet shadow.
+    ///
+    /// Defaults to <output-dir>/.parquet-shadow/staging.
+    #[arg(long)]
+    parquet_shadow_staging_dir: Option<PathBuf>,
+
+    /// Immutable object-key prefix used by the Parquet shadow.
+    #[arg(long, default_value = "nostr/v1")]
+    parquet_shadow_object_prefix: String,
+
+    /// Target represented bytes per live Parquet object.
+    #[arg(long, default_value_t = pensieve_lake::DEFAULT_TARGET_UNCOMPRESSED_BYTES)]
+    parquet_shadow_target_uncompressed_bytes: usize,
+
+    /// Maximum accepted notepack frame size in the Parquet shadow.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    parquet_shadow_max_event_bytes: usize,
+
+    /// Maximum age of an open live batch while the Parquet shadow is enabled.
+    ///
+    /// The timer force-seals the authoritative notepack segment; the resulting
+    /// sealed file is then the durable Parquet work unit. Zero disables the timer.
+    #[arg(long, default_value = "300")]
+    parquet_shadow_max_batch_age_secs: u64,
+
+    /// Do not replay already sealed notepack files when the shadow starts.
+    ///
+    /// Replay is safe and idempotent through the inventory, and is enabled by
+    /// default so a process crash cannot lose an in-memory notification.
+    #[arg(long)]
+    no_parquet_shadow_replay: bool,
 
     /// Initial seed relay URLs (comma-separated, overrides seed file)
     #[arg(long, value_delimiter = ',')]
@@ -334,7 +394,9 @@ async fn main() -> Result<()> {
     .context("Failed to set Ctrl+C handler")?;
 
     // Initialize pipeline components
-    let (segment_writer, dedupe, indexer_handle) = init_pipeline(&args)?;
+    let (segment_writer, dedupe, indexer_handle, parquet_shadow_handle) = init_pipeline(&args)?;
+    let parquet_batch_timer =
+        start_parquet_batch_timer(&args, Arc::clone(&segment_writer), Arc::clone(&running));
 
     // Initialize relay manager for quality tracking
     let relay_manager_config = RelayManagerConfig {
@@ -1084,6 +1146,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(handle) = parquet_batch_timer {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // Seal final segment. Its events are marked archived inside seal() now (the
     // writer holds a dedupe reference), so we don't mark them again here.
     if let Some(sealed) = segment_writer.seal()? {
@@ -1111,12 +1178,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Dropping the writer closes downstream channels after any background
+    // compression threads finish sending their final notifications.
+    drop(segment_writer);
+
     // Wait for ClickHouse indexer if running
     if let Some(handle) = indexer_handle {
         tracing::info!("Waiting for ClickHouse indexer to finish...");
-        drop(segment_writer);
         if let Err(e) = handle.join() {
             tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
+        }
+    }
+    if let Some(handle) = parquet_shadow_handle {
+        tracing::info!("Waiting for Parquet shadow worker to finish...");
+        if let Err(error) = handle.join() {
+            tracing::warn!(panic = ?error, "Parquet shadow worker thread panicked");
         }
     }
 
@@ -1155,10 +1231,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Pipeline components: (segment writer, dedupe index, optional ClickHouse indexer handle).
+/// Live archive pipeline and optional derived sink handles.
 type PipelineComponents = (
     Arc<SegmentWriter>,
     Arc<DedupeIndex>,
+    Option<std::thread::JoinHandle<()>>,
     Option<std::thread::JoinHandle<()>>,
 );
 
@@ -1177,12 +1254,24 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         "dedupe index opened"
     );
 
+    let mut sealed_senders = Vec::new();
+
     // Set up ClickHouse channel (optional)
-    let (sealed_sender, sealed_receiver) = if args.clickhouse_url.is_some() {
+    let sealed_receiver = if args.clickhouse_url.is_some() {
         let (tx, rx) = crossbeam_channel::unbounded::<SealedSegment>();
-        (Some(tx), Some(rx))
+        sealed_senders.push(tx);
+        Some(rx)
     } else {
-        (None, None)
+        None
+    };
+
+    // Set up the derived Parquet shadow channel (optional).
+    let parquet_shadow_receiver = if parquet_shadow_enabled(args) {
+        let (tx, rx) = crossbeam_channel::unbounded::<SealedSegment>();
+        sealed_senders.push(tx);
+        Some(rx)
+    } else {
+        None
     };
 
     // Initialize segment writer
@@ -1201,7 +1290,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     );
 
     let segment_writer = Arc::new(
-        SegmentWriter::new(segment_config, sealed_sender, Some(Arc::clone(&dedupe)))
+        SegmentWriter::new_with_senders(segment_config, sealed_senders, Some(Arc::clone(&dedupe)))
             .with_context(|| "Failed to create segment writer")?,
     );
 
@@ -1223,5 +1312,107 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
             None
         };
 
-    Ok((segment_writer, dedupe, indexer_handle))
+    let parquet_shadow_handle = if let Some(receiver) = parquet_shadow_receiver {
+        let config = parquet_shadow_config(args)?;
+        tracing::info!(
+            state_db = %config.state_db.display(),
+            staging_dir = %config.campaign.staging_dir.display(),
+            replay_existing = config.replay_dir.is_some(),
+            "starting Parquet shadow worker"
+        );
+        Some(
+            start_parquet_shadow(config, receiver)
+                .with_context(|| "Failed to start Parquet shadow worker")?,
+        )
+    } else {
+        None
+    };
+
+    Ok((
+        segment_writer,
+        dedupe,
+        indexer_handle,
+        parquet_shadow_handle,
+    ))
+}
+
+fn parquet_shadow_enabled(args: &Args) -> bool {
+    args.parquet_shadow_lake_dir.is_some() || args.parquet_shadow_s3_bucket.is_some()
+}
+
+fn parquet_shadow_config(args: &Args) -> Result<ParquetShadowConfig> {
+    if args.parquet_shadow_target_uncompressed_bytes == 0 {
+        anyhow::bail!("--parquet-shadow-target-uncompressed-bytes must be greater than zero");
+    }
+    if args.parquet_shadow_max_event_bytes == 0 {
+        anyhow::bail!("--parquet-shadow-max-event-bytes must be greater than zero");
+    }
+
+    let control_dir = args.output_dir.join(".parquet-shadow");
+    let state_db = args
+        .parquet_shadow_state_db
+        .clone()
+        .unwrap_or_else(|| control_dir.join("inventory.sqlite"));
+    let staging_dir = args
+        .parquet_shadow_staging_dir
+        .clone()
+        .unwrap_or_else(|| control_dir.join("staging"));
+    let publisher = match (
+        &args.parquet_shadow_lake_dir,
+        &args.parquet_shadow_s3_bucket,
+    ) {
+        (Some(root), None) => ParquetShadowPublisher::Local { root: root.clone() },
+        (None, Some(bucket)) => ParquetShadowPublisher::S3(S3PublisherConfig {
+            bucket: bucket.clone(),
+            region: args.parquet_shadow_s3_region.clone(),
+            endpoint_url: args.parquet_shadow_s3_endpoint_url.clone(),
+            force_path_style: args.parquet_shadow_s3_force_path_style,
+        }),
+        _ => anyhow::bail!("exactly one Parquet shadow publication target is required"),
+    };
+
+    Ok(ParquetShadowConfig {
+        state_db,
+        campaign: CampaignConfig {
+            staging_dir,
+            object_prefix: args.parquet_shadow_object_prefix.clone(),
+            target_uncompressed_bytes: args.parquet_shadow_target_uncompressed_bytes,
+            max_event_bytes: args.parquet_shadow_max_event_bytes,
+        },
+        publisher,
+        replay_dir: (!args.no_parquet_shadow_replay).then(|| args.output_dir.clone()),
+    })
+}
+
+fn start_parquet_batch_timer(
+    args: &Args,
+    segment_writer: Arc<SegmentWriter>,
+    running: Arc<AtomicBool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !parquet_shadow_enabled(args) || args.parquet_shadow_max_batch_age_secs == 0 {
+        return None;
+    }
+    let interval = Duration::from_secs(args.parquet_shadow_max_batch_age_secs);
+    Some(tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + interval;
+        let mut timer = tokio::time::interval_at(start, interval);
+        while running.load(Ordering::SeqCst) {
+            timer.tick().await;
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            match segment_writer.seal() {
+                Ok(Some(sealed)) => tracing::info!(
+                    segment_number = sealed.segment_number,
+                    event_count = sealed.event_count,
+                    "force-sealed live batch at Parquet shadow maximum age"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::error!(
+                    error = %compact_error(&error),
+                    "failed to force-seal live batch for Parquet shadow"
+                ),
+            }
+        }
+    }))
 }

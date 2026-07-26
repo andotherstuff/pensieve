@@ -1,0 +1,30 @@
+[package]
+name = "pensieve-parquet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+clap = { version = "4.4", features = ["derive"] }
+flate2 = "1.0"
+hex.workspace = true
+nostr.workspace = true
+notepack.workspace = true
+parquet.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+
+[dev-dependencies]
+bytes = "1"
+serde_json.workspace = true

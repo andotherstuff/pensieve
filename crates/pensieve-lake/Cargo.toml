@@ -1,0 +1,31 @@
+[package]
+name = "pensieve-lake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+clap = { version = "4.4", features = ["derive"] }
+hex.workspace = true
+pensieve-parquet = { path = "../pensieve-parquet" }
+rusqlite.workspace = true
+sha2.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+flate2 = "1.0"
+nostr.workspace = true
+notepack.workspace = true

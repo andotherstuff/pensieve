@@ -1,12 +1,15 @@
 # Canonical Nostr Parquet Archive Format
 
-*Status: draft design*
-*Last updated: 2026-07-23*
+*Status: accepted V1 specification*
+*Accepted: 2026-07-26*
+*Last updated: 2026-07-26*
 
 This document defines the canonical Parquet representation of Nostr events and
 the operational model for using those files as a durable, queryable data lake.
-It is the working archive-format design for Pensieve's lakehouse
-migration.
+It is the accepted archive-format specification for Pensieve's lakehouse
+migration. Incompatible logical or physical changes require a new archive
+format version; operational tuning within the explicitly non-normative areas
+does not.
 
 The format is intentionally narrow:
 
@@ -190,7 +193,8 @@ hatch for events whose ID or signature does not validate.
 
 An event ID commits to `pubkey`, `created_at`, `kind`, `tags`, and `content`, but
 not to `sig`. More than one BIP-340 signature may validly authenticate the same
-event ID.
+event ID because BIP-340 permits different nonce-generation inputs and is not a
+unique-signature scheme.
 
 Within a file:
 
@@ -466,6 +470,7 @@ A file is a conforming V1 canonical event archive when:
 ## 13. References
 
 - [NIP-01: Basic protocol flow description](https://github.com/nostr-protocol/nips/blob/master/01.md)
+- [BIP-340: Schnorr signatures for secp256k1](https://bips.dev/340/)
 - [Apache Parquet file format](https://parquet.apache.org/docs/file-format/)
 - [Apache Parquet logical types](https://parquet.apache.org/docs/file-format/types/logicaltypes/)
 - [Apache Parquet implementation status](https://parquet.apache.org/docs/file-format/implementationstatus/)

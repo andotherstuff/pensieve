@@ -41,7 +41,9 @@ Pensieve is an **archive-first** Nostr indexer. It stores canonical events in a 
 | Component | Status |
 |-----------|--------|
 | `pensieve-core` | ✅ Event validation, notepack encoding, metrics |
-| `pensieve-ingest` | ✅ Live relay ingestion + backfill binaries + relay quality tracking |
+| `pensieve-ingest` | ✅ Live relay ingestion + optional inventoried Parquet shadow sink |
+| `pensieve-parquet` | 🚧 Accepted V1 writer, strict validator, fixtures, and notepack converter prototype |
+| `pensieve-lake` | 🚧 Resumable notepack campaign, SQLite inventory, and immutable local/S3 publication |
 | `pensieve-serve` | 🚧 Placeholder |
 | Deployment | ✅ Docker + systemd setup in `ops/` |
 
@@ -74,6 +76,7 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 - Auto-discovers relays via NIP-65 (kind:10002 events)
 - Disconnects from paid/whitelist relays that reject auth
 - **Relay quality tracking** (SQLite) with scoring and optimization
+- Optional Parquet shadow publication from durably sealed notepack work units
 - Graceful shutdown on Ctrl+C
 
 **Options:**

@@ -34,11 +34,17 @@ clickhouse = { version = "0.13", features = ["lz4", "chrono", "native-tls"] }
 # Storage
 rocksdb = "0.23"
 
+# Parquet archive
+arrow-array = "59.1"
+arrow-schema = "59.1"
+parquet = { version = "59.1", default-features = false, features = ["arrow", "zstd"] }
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
 # Encoding
 hex = "0.4"
+sha2 = "0.10"
 
 # AWS S3
 aws-config = "1.6"

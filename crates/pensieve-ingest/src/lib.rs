@@ -51,8 +51,8 @@ pub use error::{Error, Result};
 // Re-export pipeline components for convenience
 pub use pipeline::{
     ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, DedupeStats, EventStatus,
-    IndexerStats, PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter,
-    pack_nostr_event,
+    IndexerStats, PackedEvent, ParquetShadowConfig, ParquetShadowPublisher, SealedSegment,
+    SegmentConfig, SegmentStats, SegmentWriter, pack_nostr_event, start_parquet_shadow,
 };
 
 // Re-export source trait and adapters

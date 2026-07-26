@@ -37,6 +37,18 @@ test:
 test-verbose:
     cargo test --workspace -- --nocapture
 
+# Regenerate the checked-in canonical Parquet interoperability corpus.
+parquet-fixtures:
+    cargo run -p pensieve-parquet --example generate_parquet_fixtures
+
+# Read the canonical fixture with independent PyArrow and DuckDB implementations.
+parquet-interop:
+    uv run scripts/verify_parquet_interop.py
+
+# Run the resumable sealed-notepack publication campaign.
+parquet-campaign *ARGS:
+    cargo run -p pensieve-lake --bin pensieve-parquet-campaign -- {{ARGS}}
+
 # ============================================================================
 # Build
 # ============================================================================
@@ -231,4 +243,3 @@ audit:
 # Count lines of code
 loc:
     @tokei crates/ || find crates -name "*.rs" | xargs wc -l
-
