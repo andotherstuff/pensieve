@@ -105,16 +105,41 @@ into the three groups above. Final wall time remained comparable to the initial
 
 ## Object-storage checkpoint
 
-The production host and local development environment were checked for a
-Hetzner Object Storage target on 2026-07-26. Neither had a configured endpoint,
-bucket, or Hetzner account context. The only cloud object-store profile on the
-production host belongs to the existing upstream input path and was
-intentionally not used as a Parquet test destination.
+A real S3-compatible round trip was completed on 2026-07-26 against a temporary
+Hetzner Object Storage bucket in `hel1`. The retained test prefix contains the
+checked-in golden fixture, small-segment active/quarantine objects, and
+production-sized active/quarantine objects: five objects totaling 180,860,592
+bytes.
 
-Consequently, conditional upload, `HeadObject` size/SHA-256 verification,
-idempotent retry, and independent-reader download remain implemented and
-fault-tested, but a real Hetzner S3-compatible round trip is still an open P0
-deployment gate.
+| measurement | result |
+|---|---:|
+| golden fixture | 2,029 bytes; conditional upload, `HEAD`, download, and byte-for-byte comparison passed |
+| small campaign publish | 7,010 frames; 7,009 rows; 1 reject; 4,312,638-byte Parquet object; 10.81 s end to end |
+| small journal resume | 0.15 s |
+| small fresh-journal convergence on existing keys | 1.57 s; no replacement upload |
+| production-sized campaign publish | 389,697 frames; 389,695 rows; 2 rejects; 176,544,824-byte Parquet object; 363.16 s end to end |
+| production-sized download | 10.43 s, approximately 16.1 MiB/s |
+| downloaded-object strict validation | 8.19 s |
+| production-sized journal resume | 0.64 s |
+| production-sized fresh-journal convergence | 35.44 s; deterministic artifact matched existing remote object |
+
+Both campaign uploads used conditional `PutObject`, followed by `HeadObject`
+verification of byte length and custom SHA-256 metadata. Downloaded bytes
+matched the inventory SHA-256 exactly. The Rust validator recomputed every ID
+and signature; DuckDB 1.5.5 and PyArrow 25.0.0 independently reported the same
+row counts, timestamp ranges, V1 footer marker, and row-group layout.
+
+The production-sized run used the current single-request publisher from a
+workstation outside Hetzner. Subtracting the separately measured approximately
+36-second conversion leaves about 327 seconds for the 168.4 MiB upload, or
+approximately 0.52 MiB/s. This is not a data-center throughput result, but it
+does establish that the correctness path works and that the next remote
+capacity test should compare the current single `PutObject` with a resumable
+multipart uploader from the production host.
+
+A durable production bucket and credentials are still required before the
+historical campaign starts. The temporary compatibility bucket does not satisfy
+that operational provisioning gate.
 
 ## Interpretation
 
@@ -130,6 +155,9 @@ a final production concurrency setting:
   promise that raw files will reach that size when each source work unit is
   smaller; later compaction can combine these approximately 168 MiB physical
   objects; and
+- production publication should use bounded-concurrency, resumable multipart
+  uploads after a production-host comparison against the current single-request
+  path; and
 - peak memory will vary with event and tag shape, so campaigns should observe
   RSS, throughput, rejection rate, and object-size distributions.
 

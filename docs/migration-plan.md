@@ -308,12 +308,15 @@ can start. P1 collection work already underway does not wait for P0.
 - [x] Disk relief — breathing room already achieved (a few weeks of runway).
 - [ ] (If not already) ClickHouse tiered storage: cold parts → HDD, to keep NVMe headroom
       while the old stack still runs.
-- [ ] Stand up the Hetzner Object Storage bucket; upload a golden V1 file with the
-      selected object-storage tooling, then read it through the independent validator,
-      DuckDB, and a second Parquet implementation.
-      A 2026-07-26 environment audit found no configured Hetzner endpoint,
-      bucket, or account context; the unrelated upstream object-store profile
-      was intentionally not used as a test destination.
+- [x] Prove real Hetzner Object Storage compatibility in a temporary bucket:
+      conditionally upload a golden V1 file and production-sized real-segment
+      output, `HEAD`-verify size/SHA-256 metadata, download them, and read them
+      through the independent validator, DuckDB, and PyArrow. Completed
+      2026-07-26; exact results are in the benchmark document.
+- [ ] Provision the durable production bucket, prefix, and scoped credentials.
+      Before the historical campaign, compare the current single-request upload
+      with a bounded-concurrency resumable multipart path from the production
+      host.
 - [x] Complete the archive-format acceptance and local conformance gate.
 - [ ] Skeleton of the **old-vs-new verification harness** (later phases plug in).
 - [ ] Confirm backups: notepack archive, `relay-stats.db`, RocksDB dedup index.
@@ -488,8 +491,9 @@ writer version, and state in SQLite, and atomically changes the complete object
 set from uploaded to active raw. Local publication uses no-clobber atomic
 renames. S3-compatible publication uses conditional `PutObject`; retries and
 race recovery require a `HeadObject` size and SHA-256 metadata match. Local
-fault injection and real-segment replay are green. A real Hetzner bucket round
-trip is still required before calling the remote path production-proven.
+fault injection, real-segment replay, and a temporary Hetzner bucket round trip
+are green. The durable production bucket and production-host multipart /
+throughput decision remain before the historical campaign.
 
 #### P2d — Converge and verify
 
@@ -697,7 +701,9 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
 ## 9. Status tracker
 
-- **P0 Foundation** — in progress (disk relief done; object-storage bucket / verify harness / backups pending)
+- **P0 Foundation** — in progress (disk relief, archive-format acceptance, and
+  real Hetzner compatibility round trip done; durable production bucket,
+  verification harness, and backups pending)
 - **P1 Collection & coverage** — in progress (initial `e`/`q`
   reference-coverage ✅, NIP-66 catalog first slice ✅, catalog visibility
   gauges ✅, dynamic negentropy target augmentation ✅; multi-monitor trust,
@@ -705,9 +711,10 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 - **P2 Parquet archive** — in progress (shared V1 writer/validator, target-sized
   resumable campaign, publication journal/inventory, immutable local/S3
   publisher, sealed-notepack live shadow, and initial production-sized
-  conversion benchmark are implemented; production S3 round trip,
-  historical/live high-water `H`, parity harness, production-host concurrency
-  sizing, and unsealed-buffer failure-domain proof remain)
+  conversion and real Hetzner round-trip benchmarks are implemented; durable S3
+  provisioning, multipart/production-host throughput, historical/live
+  high-water `H`, parity harness, production-host worker concurrency sizing,
+  and unsealed-buffer failure-domain proof remain)
 - **P3 Optimization + new analytics** — not started
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
