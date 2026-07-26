@@ -16,6 +16,6 @@ pub use inventory::{
 };
 pub use publisher::{LocalObjectStore, PublishedObject, Publisher, S3Publisher, S3PublisherConfig};
 pub use work_unit::{
-    CampaignConfig, CampaignSummary, DEFAULT_TARGET_UNCOMPRESSED_BYTES, run_notepack_work_unit,
-    sha256_file,
+    CampaignConfig, CampaignSummary, CleanupSummary, DEFAULT_TARGET_UNCOMPRESSED_BYTES,
+    cleanup_published_local_artifacts, run_notepack_work_unit, sha256_file,
 };

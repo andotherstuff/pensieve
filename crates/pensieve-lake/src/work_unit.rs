@@ -2,6 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::Read;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use pensieve_parquet::{
@@ -60,6 +61,15 @@ pub struct CampaignSummary {
     pub parquet_objects: usize,
     /// Whether the work unit existed before this invocation.
     pub resumed: bool,
+}
+
+/// Local staging bytes removed after durable publication.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleanupSummary {
+    /// Number of inventoried local artifacts removed.
+    pub files: usize,
+    /// Total bytes removed.
+    pub bytes: u64,
 }
 
 /// Compute lowercase SHA-256 over the exact bytes of a local file.
@@ -139,6 +149,98 @@ pub fn run_notepack_work_unit(
     }
     result?;
     summary(inventory, &work_unit_id, resumed)
+}
+
+/// Remove generated local artifacts after a work unit is durably published.
+///
+/// This never removes the source notepack input. Every inventoried artifact
+/// must be a direct child of this work unit's staging directory, and every
+/// object must already be active or quarantined. Missing files are accepted so
+/// cleanup is safe to repeat after interruption.
+pub fn cleanup_published_local_artifacts(
+    inventory: &Inventory,
+    work_unit_id: &str,
+    staging_dir: impl AsRef<Path>,
+) -> Result<CleanupSummary> {
+    let work = inventory
+        .work_unit(work_unit_id)?
+        .ok_or_else(|| Error::WorkUnitConflict {
+            work_unit_id: work_unit_id.to_owned(),
+            reason: "work unit is not registered".to_owned(),
+        })?;
+    if !matches!(
+        work.state,
+        WorkState::Published | WorkState::SourceCommitted
+    ) {
+        return Err(Error::InvalidTransition {
+            work_unit_id: work_unit_id.to_owned(),
+            from: work.state.to_string(),
+            to: "cleanup_published_local_artifacts".to_owned(),
+        });
+    }
+    if !is_single_path_component(work_unit_id) {
+        return Err(Error::WorkUnitConflict {
+            work_unit_id: work_unit_id.to_owned(),
+            reason: "work unit identifier is not a safe staging directory name".to_owned(),
+        });
+    }
+
+    let staging_dir = staging_dir.as_ref();
+    let work_dir = staging_dir.join(work_unit_id);
+    let objects = inventory.objects_for_work(work_unit_id)?;
+    for object in &objects {
+        if !matches!(
+            object.state,
+            ObjectState::ActiveRaw | ObjectState::Quarantined
+        ) {
+            return Err(Error::InvalidTransition {
+                work_unit_id: work_unit_id.to_owned(),
+                from: object.state.to_string(),
+                to: "cleanup_published_local_artifacts".to_owned(),
+            });
+        }
+        if object.local_path.parent() != Some(work_dir.as_path()) {
+            return Err(Error::WorkUnitConflict {
+                work_unit_id: work_unit_id.to_owned(),
+                reason: format!(
+                    "inventoried artifact is outside its staging directory: {}",
+                    object.local_path.display()
+                ),
+            });
+        }
+    }
+
+    let mut cleanup = CleanupSummary::default();
+    for object in objects {
+        match fs::symlink_metadata(&object.local_path) {
+            Ok(metadata) => {
+                fs::remove_file(&object.local_path)?;
+                cleanup.files += 1;
+                cleanup.bytes =
+                    cleanup
+                        .bytes
+                        .checked_add(metadata.len())
+                        .ok_or(Error::NumericOutOfRange {
+                            field: "cleanup.bytes",
+                        })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    match fs::remove_dir(&work_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    File::open(staging_dir)?.sync_all()?;
+    Ok(cleanup)
+}
+
+fn is_single_path_component(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 fn run_registered_work_unit(

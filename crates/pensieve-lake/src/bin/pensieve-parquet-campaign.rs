@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use pensieve_lake::{
     CampaignConfig, Inventory, LocalObjectStore, Publisher, S3Publisher, S3PublisherConfig,
-    run_notepack_work_unit,
+    cleanup_published_local_artifacts, run_notepack_work_unit,
 };
 use pensieve_parquet::DEFAULT_MAX_EVENT_BYTES;
 
@@ -57,6 +57,9 @@ struct Args {
     /// Continue processing later work units after an error.
     #[arg(long)]
     continue_on_error: bool,
+    /// Remove generated staging artifacts after durable publication.
+    #[arg(long)]
+    cleanup_published_staging: bool,
 }
 
 fn main() {
@@ -91,22 +94,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut failures = 0usize;
     for (index, input) in inputs.iter().enumerate() {
-        match run_notepack_work_unit(&mut inventory, publisher.as_ref(), input, &config) {
-            Ok(summary) => println!(
-                concat!(
-                    "[{}/{}] {}: state={}, input={}, rows={}, rejected={}, ",
-                    "parquet_objects={}, resumed={}"
-                ),
-                index + 1,
-                inputs.len(),
-                input.display(),
-                summary.state,
-                summary.input_events,
-                summary.output_rows,
-                summary.rejected_events,
-                summary.parquet_objects,
-                summary.resumed,
-            ),
+        let outcome = run_notepack_work_unit(&mut inventory, publisher.as_ref(), input, &config)
+            .and_then(|summary| {
+                let cleanup = args
+                    .cleanup_published_staging
+                    .then(|| {
+                        cleanup_published_local_artifacts(
+                            &inventory,
+                            &summary.work_unit_id,
+                            &config.staging_dir,
+                        )
+                    })
+                    .transpose()?;
+                Ok((summary, cleanup))
+            });
+        match outcome {
+            Ok((summary, cleanup)) => {
+                println!(
+                    concat!(
+                        "[{}/{}] {}: state={}, input={}, rows={}, rejected={}, ",
+                        "parquet_objects={}, resumed={}"
+                    ),
+                    index + 1,
+                    inputs.len(),
+                    input.display(),
+                    summary.state,
+                    summary.input_events,
+                    summary.output_rows,
+                    summary.rejected_events,
+                    summary.parquet_objects,
+                    summary.resumed,
+                );
+                if let Some(cleanup) = cleanup {
+                    println!(
+                        "[{}/{}] {}: staging_cleanup_files={}, staging_cleanup_bytes={}",
+                        index + 1,
+                        inputs.len(),
+                        input.display(),
+                        cleanup.files,
+                        cleanup.bytes,
+                    );
+                }
+            }
             Err(error) => {
                 failures += 1;
                 eprintln!(

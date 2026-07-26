@@ -207,7 +207,19 @@ impl S3Publisher {
             {
                 Ok(None)
             }
-            Err(error) => Err(Error::ObjectStore(error.to_string())),
+            Err(error) => {
+                let detail = error.as_service_error().map_or_else(
+                    || error.to_string(),
+                    |service| {
+                        format!(
+                            "code={}, message={}",
+                            service.code().unwrap_or("unknown"),
+                            service.message().unwrap_or("none")
+                        )
+                    },
+                );
+                Err(Error::ObjectStore(format!("HeadObject {key}: {detail}")))
+            }
         }
     }
 }
@@ -260,7 +272,17 @@ impl Publisher for S3Publisher {
                     code == "PreconditionFailed" || code == "ConditionalRequestConflict"
                 });
             if !raced_with_identical_writer {
-                return Err(Error::ObjectStore(error.to_string()));
+                let detail = error.as_service_error().map_or_else(
+                    || error.to_string(),
+                    |service| {
+                        format!(
+                            "code={}, message={}",
+                            service.code().unwrap_or("unknown"),
+                            service.message().unwrap_or("none")
+                        )
+                    },
+                );
+                return Err(Error::ObjectStore(format!("PutObject {key}: {detail}")));
             }
         }
 

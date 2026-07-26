@@ -9,7 +9,7 @@ use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use notepack::NoteBinary;
 use pensieve_lake::{
     CampaignConfig, Error, Inventory, LocalObjectStore, ObjectKind, ObjectState, PublishedObject,
-    Publisher, WorkState, run_notepack_work_unit, sha256_file,
+    Publisher, WorkState, cleanup_published_local_artifacts, run_notepack_work_unit, sha256_file,
 };
 use pensieve_parquet::validate_file;
 
@@ -67,6 +67,15 @@ fn segment(path: &Path) {
     gzip.finish().expect("gzip finish");
 }
 
+fn empty_gzip_segment(path: &Path) {
+    GzEncoder::new(
+        File::create(path).expect("empty gzip segment"),
+        Compression::default(),
+    )
+    .finish()
+    .expect("finish empty gzip segment");
+}
+
 fn config(staging_dir: &Path) -> CampaignConfig {
     CampaignConfig {
         staging_dir: staging_dir.to_owned(),
@@ -74,6 +83,79 @@ fn config(staging_dir: &Path) -> CampaignConfig {
         target_uncompressed_bytes: 500,
         max_event_bytes: 16 * 1024 * 1024,
     }
+}
+
+#[test]
+fn records_empty_plain_and_gzip_segments_as_published_no_ops() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let plain = directory.path().join("empty.notepack");
+    File::create(&plain).expect("empty plain segment");
+    let plain_alias = directory.path().join("empty-alias.notepack");
+    File::create(&plain_alias).expect("empty plain alias");
+    let gzip = directory.path().join("empty.notepack.gz");
+    empty_gzip_segment(&gzip);
+
+    let mut inventory =
+        Inventory::open(directory.path().join("inventory.sqlite")).expect("inventory");
+    let store = LocalObjectStore::new(directory.path().join("lake")).expect("object store");
+    let staging = directory.path().join("staging");
+    let config = config(&staging);
+
+    let plain_summary = run_notepack_work_unit(&mut inventory, &store, &plain, &config)
+        .expect("publish empty plain segment");
+    assert_eq!(plain_summary.state, WorkState::Published);
+    assert_eq!(plain_summary.input_events, 0);
+    assert_eq!(plain_summary.output_rows, 0);
+    assert_eq!(plain_summary.rejected_events, 0);
+    assert_eq!(plain_summary.parquet_objects, 0);
+    assert!(!plain_summary.resumed);
+    assert!(
+        inventory
+            .objects_for_work(&plain_summary.work_unit_id)
+            .expect("plain objects")
+            .is_empty()
+    );
+
+    let alias_summary = run_notepack_work_unit(&mut inventory, &store, &plain_alias, &config)
+        .expect("resume identical empty source");
+    assert_eq!(alias_summary.work_unit_id, plain_summary.work_unit_id);
+    assert!(alias_summary.resumed);
+
+    let gzip_summary = run_notepack_work_unit(&mut inventory, &store, &gzip, &config)
+        .expect("publish empty gzip segment");
+    assert_eq!(gzip_summary.state, WorkState::Published);
+    assert_eq!(gzip_summary.input_events, 0);
+    assert_eq!(gzip_summary.output_rows, 0);
+    assert_eq!(gzip_summary.rejected_events, 0);
+    assert_eq!(gzip_summary.parquet_objects, 0);
+    assert!(!gzip_summary.resumed);
+    assert_ne!(gzip_summary.work_unit_id, plain_summary.work_unit_id);
+    assert!(
+        inventory
+            .objects_for_work(&gzip_summary.work_unit_id)
+            .expect("gzip objects")
+            .is_empty()
+    );
+    assert!(
+        inventory
+            .active_raw_objects()
+            .expect("active objects")
+            .is_empty()
+    );
+
+    assert_eq!(
+        cleanup_published_local_artifacts(&inventory, &plain_summary.work_unit_id, &staging)
+            .expect("clean plain no-op"),
+        Default::default()
+    );
+    assert_eq!(
+        cleanup_published_local_artifacts(&inventory, &gzip_summary.work_unit_id, &staging)
+            .expect("clean gzip no-op"),
+        Default::default()
+    );
+    assert!(plain.is_file());
+    assert!(plain_alias.is_file());
+    assert!(gzip.is_file());
 }
 
 #[test]
@@ -192,6 +274,77 @@ fn publication_failure_never_activates_partial_set_and_retry_converges() {
             .expect("active objects")
             .len(),
         resumed.parquet_objects
+    );
+}
+
+#[test]
+fn cleans_only_published_staging_and_remains_resumable() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let input = directory.path().join("segment.notepack.gz");
+    segment(&input);
+    let mut inventory =
+        Inventory::open(directory.path().join("inventory.sqlite")).expect("inventory");
+    let store = LocalObjectStore::new(directory.path().join("lake")).expect("object store");
+    let staging = directory.path().join("staging");
+    let config = config(&staging);
+
+    let published = run_notepack_work_unit(&mut inventory, &store, &input, &config)
+        .expect("initial publication");
+    let objects = inventory
+        .objects_for_work(&published.work_unit_id)
+        .expect("objects");
+    assert!(objects.iter().all(|object| object.local_path.is_file()));
+
+    let cleanup = cleanup_published_local_artifacts(&inventory, &published.work_unit_id, &staging)
+        .expect("published cleanup");
+    assert_eq!(cleanup.files, objects.len());
+    assert_eq!(
+        cleanup.bytes,
+        objects.iter().map(|object| object.byte_size).sum::<u64>()
+    );
+    assert!(input.is_file());
+    assert!(objects.iter().all(|object| !object.local_path.exists()));
+
+    assert_eq!(
+        cleanup_published_local_artifacts(&inventory, &published.work_unit_id, &staging)
+            .expect("idempotent cleanup"),
+        Default::default()
+    );
+    let resumed = run_notepack_work_unit(&mut inventory, &store, &input, &config).expect("resume");
+    assert_eq!(resumed.state, WorkState::Published);
+    assert!(resumed.resumed);
+}
+
+#[test]
+fn refuses_cleanup_before_publication() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let input = directory.path().join("segment.notepack.gz");
+    segment(&input);
+    let mut inventory =
+        Inventory::open(directory.path().join("inventory.sqlite")).expect("inventory");
+    let store = LocalObjectStore::new(directory.path().join("lake")).expect("object store");
+    let staging = directory.path().join("staging");
+    let config = config(&staging);
+    let failing = FailAfterOne {
+        inner: store,
+        calls: AtomicUsize::new(0),
+    };
+
+    assert!(run_notepack_work_unit(&mut inventory, &failing, &input, &config).is_err());
+    let work_unit_id = format!(
+        "notepack-sha256-{}",
+        sha256_file(&input).expect("source checksum")
+    );
+    assert!(matches!(
+        cleanup_published_local_artifacts(&inventory, &work_unit_id, &staging),
+        Err(Error::InvalidTransition { .. })
+    ));
+    assert!(
+        inventory
+            .objects_for_work(&work_unit_id)
+            .expect("objects")
+            .iter()
+            .all(|object| object.local_path.is_file())
     );
 }
 

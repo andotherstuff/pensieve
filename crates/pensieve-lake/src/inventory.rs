@@ -144,6 +144,12 @@ impl ObjectState {
     }
 }
 
+impl fmt::Display for ObjectState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl FromStr for ObjectState {
     type Err = Error;
 
