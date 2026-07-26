@@ -5,7 +5,9 @@
 # The source remote is never modified. One segment is downloaded into the
 # bounded local spool, published and activated, and only then are the local
 # input and generated staging artifacts removed. The SQLite inventory and
-# durable receipt remain so subsequent runs skip completed source paths.
+# durable receipt remain so subsequent runs skip completed source paths. A
+# failed work unit is logged, removed from the bounded spool, and does not stop
+# later source segments in the same pass; the read-only remote remains intact.
 
 set -euo pipefail
 
@@ -77,7 +79,7 @@ STAGING_DIR="${STAGING_DIR:-/var/lib/pensieve-parquet/staging/campaign}"
 INPUT_DIR="${INPUT_DIR:-/var/lib/pensieve-parquet/input}"
 RECEIPT_DIR="${RECEIPT_DIR:-/var/lib/pensieve-parquet/state/receipts}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/pensieve-parquet/state/campaign.lock}"
-CAMPAIGN_BIN="${CAMPAIGN_BIN:-/srv/pensieve/repo/target/release/pensieve-parquet-campaign}"
+CAMPAIGN_BIN="${CAMPAIGN_BIN:-/home/pensieve/pensieve/target/release/pensieve-parquet-campaign}"
 MIN_FREE_BYTES="${MIN_FREE_BYTES:-5368709120}"
 WORKING_SPACE_MULTIPLIER="${WORKING_SPACE_MULTIPLIER:-3}"
 MAX_WORK_UNITS="${MAX_WORK_UNITS:-0}"
@@ -190,7 +192,9 @@ if [ "$INVENTORY_ONLY" -eq 1 ]; then
     exit 0
 fi
 
-processed=0
+attempted=0
+published=0
+failures=0
 while IFS= read -r filename; do
     [ -n "$filename" ] || continue
     if ! [[ "$filename" =~ ^segment-[0-9]+\.notepack(\.gz)?$ ]]; then
@@ -203,7 +207,7 @@ while IFS= read -r filename; do
         echo "Already published: $filename"
         continue
     fi
-    if [ "$MAX_WORK_UNITS" -ne 0 ] && [ "$processed" -ge "$MAX_WORK_UNITS" ]; then
+    if [ "$MAX_WORK_UNITS" -ne 0 ] && [ "$attempted" -ge "$MAX_WORK_UNITS" ]; then
         break
     fi
 
@@ -249,14 +253,24 @@ while IFS= read -r filename; do
     source_sha256="$(sha256sum "$local_input")"
     source_sha256="${source_sha256%% *}"
     work_unit_id="notepack-sha256-$source_sha256"
-    "$CAMPAIGN_BIN" "$local_input" \
+    attempted=$((attempted + 1))
+    if "$CAMPAIGN_BIN" "$local_input" \
         --state-db "$STATE_DB" \
         --staging-dir "$STAGING_DIR" \
         --s3-bucket "$S3_BUCKET" \
         --s3-region "$AWS_REGION" \
         --s3-endpoint-url "$S3_ENDPOINT_URL" \
         --object-prefix "$S3_ARCHIVE_PREFIX" \
-        --cleanup-published-staging
+        --cleanup-published-staging; then
+        :
+    else
+        campaign_status=$?
+        failures=$((failures + 1))
+        echo "Campaign attempt failed; source remains remote and processing will continue: $filename status=$campaign_status" >&2
+        rm -f -- "$local_input"
+        sync -f "$INPUT_DIR"
+        continue
+    fi
 
     identity="$(published_identity "$work_unit_id")"
     if [ -z "$identity" ]; then
@@ -273,7 +287,7 @@ while IFS= read -r filename; do
 
     rm -f -- "$local_input"
     sync -f "$INPUT_DIR"
-    processed=$((processed + 1))
+    published=$((published + 1))
     read -r _ _ input_events output_rows rejected_events <<<"$identity"
     if [ "$input_events" -eq 0 ] && [ "$output_rows" -eq 0 ] && [ "$rejected_events" -eq 0 ]; then
         echo "Recorded empty source and cleaned: $filename"
@@ -282,4 +296,4 @@ while IFS= read -r filename; do
     fi
 done <"$source_inventory"
 
-echo "Campaign pass complete: processed=$processed"
+echo "Campaign pass complete: attempted=$attempted published=$published failed=$failures"

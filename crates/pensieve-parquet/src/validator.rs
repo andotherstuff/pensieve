@@ -200,12 +200,9 @@ fn validate_column_profiles_and_pages(file_reader: &SerializedFileReader<File>) 
                 )));
             }
             for encoding in column.encodings() {
-                if !matches!(
-                    encoding,
-                    Encoding::PLAIN | Encoding::RLE | Encoding::RLE_DICTIONARY
-                ) {
+                if !is_allowed_encoding(encoding) {
                     return Err(Error::InvalidFile(format!(
-                        "row group {row_group_index} column {column_index} uses forbidden encoding {encoding}"
+                        "row group {row_group_index} column {column_index} footer declares forbidden encoding {encoding}"
                     )));
                 }
             }
@@ -215,15 +212,33 @@ fn validate_column_profiles_and_pages(file_reader: &SerializedFileReader<File>) 
         for column_index in 0..row_group.num_columns() {
             let pages = row_group.get_column_page_reader(column_index)?;
             for page in pages {
-                if matches!(page?, Page::DataPageV2 { .. }) {
-                    return Err(Error::InvalidFile(format!(
-                        "row group {row_group_index} column {column_index} contains a Data Page V2"
-                    )));
-                }
+                validate_page_profile(&page?, row_group_index, column_index)?;
             }
         }
     }
     Ok(())
+}
+
+fn validate_page_profile(page: &Page, row_group_index: usize, column_index: usize) -> Result<()> {
+    if matches!(page, Page::DataPageV2 { .. }) {
+        return Err(Error::InvalidFile(format!(
+            "row group {row_group_index} column {column_index} contains a Data Page V2"
+        )));
+    }
+    let encoding = page.encoding();
+    if !is_allowed_encoding(encoding) {
+        return Err(Error::InvalidFile(format!(
+            "row group {row_group_index} column {column_index} page uses forbidden encoding {encoding}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_allowed_encoding(encoding: Encoding) -> bool {
+    matches!(
+        encoding,
+        Encoding::PLAIN | Encoding::RLE | Encoding::RLE_DICTIONARY
+    )
 }
 
 fn validate_created_at_statistics(
@@ -331,4 +346,30 @@ fn tags_at(array: &ListArray, row_index: usize, global_row: usize) -> Result<Vec
         );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn page_profile_rejects_forbidden_encoding_from_page_header() {
+        let page = Page::DataPage {
+            buf: Bytes::new(),
+            num_values: 0,
+            encoding: Encoding::DELTA_BINARY_PACKED,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        };
+
+        let error = validate_page_profile(&page, 2, 3).expect_err("encoding must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("row group 2 column 3 page uses forbidden encoding")
+        );
+    }
 }

@@ -4,14 +4,17 @@ After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/pensieve/parquet-object-storage.env
 ConditionPathExists=/etc/pensieve/parquet-campaign.env
+StartLimitIntervalSec=30min
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=pensieve
 Group=pensieve
+WorkingDirectory=/home/pensieve/pensieve
 EnvironmentFile=/etc/pensieve/parquet-object-storage.env
 EnvironmentFile=/etc/pensieve/parquet-campaign.env
-ExecStart=/srv/pensieve/repo/ops/scripts/run-parquet-archive-campaign.sh
+ExecStart=/home/pensieve/pensieve/ops/scripts/run-parquet-archive-campaign.sh
 Restart=on-failure
 RestartSec=30s
 TimeoutStopSec=5min
@@ -22,7 +25,7 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 ProtectSystem=strict
 ProtectKernelTunables=true
 ProtectKernelModules=true

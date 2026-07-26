@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -294,6 +294,12 @@ fn cleans_only_published_staging_and_remains_resumable() {
         .objects_for_work(&published.work_unit_id)
         .expect("objects");
     assert!(objects.iter().all(|object| object.local_path.is_file()));
+    let work_dir = staging.join(&published.work_unit_id);
+    fs::write(work_dir.join(".tmp-crash-orphan"), b"partial").expect("orphaned temporary file");
+    let reject_candidate = work_dir.join(".reject-candidate-crash");
+    fs::create_dir(&reject_candidate).expect("orphaned temporary directory");
+    fs::write(reject_candidate.join("rejects.notepack.gz"), b"partial")
+        .expect("nested orphaned artifact");
 
     let cleanup = cleanup_published_local_artifacts(&inventory, &published.work_unit_id, &staging)
         .expect("published cleanup");
@@ -304,6 +310,7 @@ fn cleans_only_published_staging_and_remains_resumable() {
     );
     assert!(input.is_file());
     assert!(objects.iter().all(|object| !object.local_path.exists()));
+    assert!(!work_dir.exists());
 
     assert_eq!(
         cleanup_published_local_artifacts(&inventory, &published.work_unit_id, &staging)

@@ -27,6 +27,22 @@ fn signed_event(created_at: u64, kind: Kind, content: &str, tags: Vec<Tag>) -> E
         .expect("test event should sign")
 }
 
+fn invalid_signature_variant(event: &Event) -> Event {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&event.as_json()).expect("event JSON should parse");
+    let signature = value["sig"]
+        .as_str()
+        .expect("event JSON should contain a signature");
+    let first = if signature.starts_with('0') { "1" } else { "0" };
+    value["sig"] = serde_json::Value::String(format!("{first}{}", &signature[1..]));
+    let invalid =
+        Event::from_json(value.to_string()).expect("mutated signature should deserialize");
+    assert_eq!(invalid.id, event.id);
+    assert!(invalid.verify_id());
+    assert!(!invalid.verify_signature());
+    invalid
+}
+
 fn write_fixture(events: &[Event]) -> (Vec<u8>, pensieve_parquet::WriteSummary) {
     let mut bytes = Vec::new();
     let summary = write_events(&mut bytes, events.iter()).expect("fixture should write");
@@ -261,15 +277,36 @@ fn round_trips_edge_values_and_sorts_and_deduplicates() {
 }
 
 #[test]
-fn rejects_invalid_events_before_writing_bytes() {
+fn all_invalid_events_leave_the_sink_empty() {
     let valid = signed_event(1_700_000_000, Kind::TextNote, "original", vec![]);
     let tampered_json = valid.as_json().replace("original", "tampered");
     let tampered = Event::from_json(tampered_json).expect("tampered event should deserialize");
     let mut bytes = Vec::new();
 
-    let error = write_events(&mut bytes, [&tampered]).expect_err("invalid ID must fail");
-    assert!(matches!(error, Error::InvalidEventId { .. }));
+    let error = write_events(&mut bytes, [&tampered]).expect_err("empty batch must fail");
+    assert!(matches!(error, Error::EmptyBatch));
     assert!(bytes.is_empty());
+}
+
+#[test]
+fn invalid_signature_variant_is_discarded_without_losing_the_valid_event() {
+    let valid = signed_event(1_700_000_000, Kind::TextNote, "original", vec![]);
+    let invalid = invalid_signature_variant(&valid);
+    let mut bytes = Vec::new();
+
+    let summary =
+        write_events(&mut bytes, [&invalid, &valid]).expect("valid variant should be written");
+    assert_eq!(summary.input_events, 1);
+    assert_eq!(summary.output_rows, 1);
+    assert_eq!(summary.duplicate_events, 0);
+
+    let batch = read_batch(&bytes);
+    let signatures = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("signature should be fixed-size binary");
+    assert_eq!(signatures.value(0), valid.sig.as_ref());
 }
 
 #[test]

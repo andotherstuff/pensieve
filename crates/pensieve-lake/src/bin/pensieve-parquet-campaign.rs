@@ -1,5 +1,6 @@
 //! Run resumable local publication for sealed historical notepack segments.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -172,6 +173,14 @@ fn expand_inputs(inputs: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
     }
     result.sort();
     result.dedup();
+    let compressed_representations: HashSet<_> = result
+        .iter()
+        .filter(|path| is_compressed_notepack_segment(path))
+        .map(|path| path.with_extension(""))
+        .collect();
+    result.retain(|path| {
+        !is_plain_notepack_segment(path) || !compressed_representations.contains(path)
+    });
     Ok(result)
 }
 
@@ -180,4 +189,64 @@ fn is_notepack_segment(path: &std::path::Path) -> bool {
         return false;
     };
     name.ends_with(".notepack") || name.ends_with(".notepack.gz")
+}
+
+fn is_plain_notepack_segment(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".notepack"))
+}
+
+fn is_compressed_notepack_segment(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".notepack.gz"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_inputs_prefer_gzip_for_the_same_logical_segment() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for name in [
+            "segment-000000001.notepack",
+            "segment-000000001.notepack.gz",
+            "segment-000000002.notepack",
+            "segment-000000003.notepack.gz",
+            "segment-000000004.notepack.open",
+            "unrelated.txt",
+        ] {
+            fs::write(directory.path().join(name), []).expect("fixture file");
+        }
+
+        let inputs = expand_inputs(&[directory.path().to_owned()]).expect("expand directory");
+        let names: Vec<_> = inputs
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "segment-000000001.notepack.gz",
+                "segment-000000002.notepack",
+                "segment-000000003.notepack.gz",
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_inputs_also_prefer_gzip_and_deduplicate_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let plain = directory.path().join("segment-000000001.notepack");
+        let gzip = directory.path().join("segment-000000001.notepack.gz");
+        fs::write(&plain, []).expect("plain fixture");
+        fs::write(&gzip, []).expect("gzip fixture");
+
+        assert_eq!(
+            expand_inputs(&[plain.clone(), gzip.clone(), plain]).expect("expand files"),
+            vec![gzip]
+        );
+    }
 }

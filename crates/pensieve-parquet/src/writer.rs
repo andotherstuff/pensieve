@@ -25,7 +25,10 @@ use crate::{CanonicalEvent, Error, Result};
 /// Counts describing a completed canonical archive file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteSummary {
-    /// Number of validated input events, including duplicates.
+    /// Number of valid input events, including duplicates.
+    ///
+    /// Invalid events and invalid signature variants are discarded before this
+    /// count is computed.
     pub input_events: usize,
     /// Number of canonical rows written after ID deduplication.
     pub output_rows: usize,
@@ -66,6 +69,9 @@ pub fn partition_prepared_rows(
 }
 
 /// Validate, deduplicate, and sort events for one canonical file.
+///
+/// Invalid events and invalid signature variants are discarded. Duplicate
+/// counts therefore describe only valid inputs.
 ///
 /// Duplicate IDs are collapsed within the batch. When valid variants contain
 /// different signatures, the lexicographically smallest raw signature wins.
@@ -109,8 +115,10 @@ fn prepare_events_with_count<'a>(
     let mut input_events = 0;
 
     for event in events {
+        let Ok(candidate) = CanonicalEvent::from_event(event) else {
+            continue;
+        };
         input_events += 1;
-        let candidate = CanonicalEvent::from_event(event)?;
         match by_id.entry(candidate.id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);

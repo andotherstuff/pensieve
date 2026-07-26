@@ -188,6 +188,20 @@ pub fn cleanup_published_local_artifacts(
     let staging_dir = staging_dir.as_ref();
     let work_dir = staging_dir.join(work_unit_id);
     let objects = inventory.objects_for_work(work_unit_id)?;
+    match fs::symlink_metadata(&work_dir) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(Error::WorkUnitConflict {
+                work_unit_id: work_unit_id.to_owned(),
+                reason: format!(
+                    "staging work path is not a directory: {}",
+                    work_dir.display()
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     for object in &objects {
         if !matches!(
             object.state,
@@ -229,7 +243,10 @@ pub fn cleanup_published_local_artifacts(
         }
     }
 
-    match fs::remove_dir(&work_dir) {
+    // A hard process termination can leave tempfile candidates that were never
+    // registered in the inventory. The content-derived work directory is
+    // isolated to this published work unit, so remove those crash orphans too.
+    match fs::remove_dir_all(&work_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),

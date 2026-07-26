@@ -395,8 +395,12 @@ async fn main() -> Result<()> {
 
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle, parquet_shadow_handle) = init_pipeline(&args)?;
-    let parquet_batch_timer =
-        start_parquet_batch_timer(&args, Arc::clone(&segment_writer), Arc::clone(&running));
+    let parquet_batch_timer = start_parquet_batch_timer(
+        &args,
+        parquet_shadow_handle.is_some(),
+        Arc::clone(&segment_writer),
+        Arc::clone(&running),
+    );
 
     // Initialize relay manager for quality tracking
     let relay_manager_config = RelayManagerConfig {
@@ -1265,14 +1269,17 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         None
     };
 
-    // Set up the derived Parquet shadow channel (optional).
-    let parquet_shadow_receiver = if parquet_shadow_enabled(args) {
-        let (tx, rx) = crossbeam_channel::unbounded::<SealedSegment>();
-        sealed_senders.push(tx);
-        Some(rx)
+    // Initialize the derived Parquet shadow before attaching its sender to the
+    // canonical segment writer. Startup failure disables only this optional sink.
+    let parquet_shadow = if parquet_shadow_enabled(args) {
+        start_optional_parquet_shadow(parquet_shadow_config(args))
     } else {
         None
     };
+    let parquet_shadow_handle = parquet_shadow.map(|(sender, handle)| {
+        sealed_senders.push(sender);
+        handle
+    });
 
     // Initialize segment writer
     let segment_config = SegmentConfig {
@@ -1311,22 +1318,6 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         } else {
             None
         };
-
-    let parquet_shadow_handle = if let Some(receiver) = parquet_shadow_receiver {
-        let config = parquet_shadow_config(args)?;
-        tracing::info!(
-            state_db = %config.state_db.display(),
-            staging_dir = %config.campaign.staging_dir.display(),
-            replay_existing = config.replay_dir.is_some(),
-            "starting Parquet shadow worker"
-        );
-        Some(
-            start_parquet_shadow(config, receiver)
-                .with_context(|| "Failed to start Parquet shadow worker")?,
-        )
-    } else {
-        None
-    };
 
     Ok((
         segment_writer,
@@ -1384,12 +1375,50 @@ fn parquet_shadow_config(args: &Args) -> Result<ParquetShadowConfig> {
     })
 }
 
+fn start_optional_parquet_shadow(
+    config: Result<ParquetShadowConfig>,
+) -> Option<(
+    crossbeam_channel::Sender<SealedSegment>,
+    std::thread::JoinHandle<()>,
+)> {
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            counter!("parquet_shadow_failures_total", "phase" => "startup").increment(1);
+            tracing::warn!(
+                error = %compact_error(&error),
+                "invalid Parquet shadow configuration; continuing without shadow publication"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        state_db = %config.state_db.display(),
+        staging_dir = %config.campaign.staging_dir.display(),
+        replay_existing = config.replay_dir.is_some(),
+        "starting Parquet shadow worker"
+    );
+    let (sender, receiver) = crossbeam_channel::unbounded::<SealedSegment>();
+    match start_parquet_shadow(config, receiver) {
+        Ok(handle) => Some((sender, handle)),
+        Err(error) => {
+            counter!("parquet_shadow_failures_total", "phase" => "startup").increment(1);
+            tracing::warn!(
+                error = %compact_error(&error),
+                "failed to initialize Parquet shadow; continuing without shadow publication"
+            );
+            None
+        }
+    }
+}
+
 fn start_parquet_batch_timer(
     args: &Args,
+    parquet_shadow_active: bool,
     segment_writer: Arc<SegmentWriter>,
     running: Arc<AtomicBool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !parquet_shadow_enabled(args) || args.parquet_shadow_max_batch_age_secs == 0 {
+    if !parquet_shadow_active || args.parquet_shadow_max_batch_age_secs == 0 {
         return None;
     }
     let interval = Duration::from_secs(args.parquet_shadow_max_batch_age_secs);
@@ -1415,4 +1444,26 @@ fn start_parquet_batch_timer(
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_initialization_failure_disables_only_the_optional_sink() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let blocking_file = directory.path().join("not-a-directory");
+        std::fs::write(&blocking_file, b"file").expect("blocking file");
+        let config = ParquetShadowConfig {
+            state_db: directory.path().join("inventory.sqlite"),
+            campaign: CampaignConfig::new(directory.path().join("staging")),
+            publisher: ParquetShadowPublisher::Local {
+                root: blocking_file.join("lake"),
+            },
+            replay_dir: None,
+        };
+
+        assert!(start_optional_parquet_shadow(Ok(config)).is_none());
+    }
 }
