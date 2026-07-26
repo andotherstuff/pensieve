@@ -16,10 +16,10 @@
 //!
 //! Segments are sealed (finalized) when they exceed a size threshold.
 //! On seal:
-//! 1. The segment file is closed
-//! 2. (Future) Upload to S3
-//! 3. Notify ClickHouse indexer via callback
-//! 4. Start a new segment
+//! 1. The open file is fsync'd and atomically renamed to its sealed name
+//! 2. Optional compression runs
+//! 3. All downstream consumers are notified
+//! 4. A new open segment is created on the next write
 
 use crate::logging::compact_error;
 use crate::{Error, Result};
@@ -31,7 +31,7 @@ use flate2::write::GzEncoder;
 use parking_lot::Mutex;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -168,7 +168,7 @@ pub struct SegmentWriter {
     total_bytes: AtomicUsize,
     /// Wrapped in Arc for sharing with background compression threads.
     total_compressed_bytes: Arc<AtomicUsize>,
-    sealed_sender: Option<Sender<SealedSegment>>,
+    sealed_senders: Vec<Sender<SealedSegment>>,
     /// Optional dedupe index. When present, every sealed segment's events are
     /// marked durably `Archived` here (after the segment file is fsync'd), which is
     /// what makes mid-stream seals crash-safe. Backfill binaries pass `None` and
@@ -188,6 +188,15 @@ impl SegmentWriter {
     pub fn new(
         config: SegmentConfig,
         sealed_sender: Option<Sender<SealedSegment>>,
+        dedupe: Option<Arc<DedupeIndex>>,
+    ) -> Result<Self> {
+        Self::new_with_senders(config, sealed_sender.into_iter().collect(), dedupe)
+    }
+
+    /// Create a writer that fans each sealed segment out to all downstream consumers.
+    pub fn new_with_senders(
+        config: SegmentConfig,
+        sealed_senders: Vec<Sender<SealedSegment>>,
         dedupe: Option<Arc<DedupeIndex>>,
     ) -> Result<Self> {
         // Create output directory if it doesn't exist
@@ -210,14 +219,14 @@ impl SegmentWriter {
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
             total_compressed_bytes: Arc::new(AtomicUsize::new(0)),
-            sealed_sender,
+            sealed_senders,
             dedupe,
         })
     }
 
     /// Find the next segment number by scanning existing files.
     fn find_next_segment_number(config: &SegmentConfig) -> Result<u64> {
-        let mut max_num = 0u64;
+        let mut max_num = None;
 
         if config.output_dir.exists() {
             for entry in fs::read_dir(&config.output_dir)? {
@@ -225,23 +234,28 @@ impl SegmentWriter {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
 
-                // Parse segment-NNNNNNNNN.notepack or segment-NNNNNNNNN.notepack.gz
+                // Parse sealed names and the crash-recoverable open-file name.
                 if let Some(rest) = name_str.strip_prefix(&format!("{}-", config.segment_prefix)) {
                     let num_str = rest
                         .strip_suffix(".notepack.gz")
-                        .or_else(|| rest.strip_suffix(".notepack"));
+                        .or_else(|| rest.strip_suffix(".notepack"))
+                        .or_else(|| rest.strip_suffix(".notepack.open"));
 
                     if let Some(num_str) = num_str
                         && let Ok(num) = num_str.parse::<u64>()
                     {
-                        max_num = max_num.max(num);
+                        max_num = Some(max_num.map_or(num, |current: u64| current.max(num)));
                     }
                 }
             }
         }
 
         // Start at the next number after the highest found
-        Ok(if max_num > 0 { max_num + 1 } else { 0 })
+        max_num.map_or(Ok(0), |number| {
+            number
+                .checked_add(1)
+                .ok_or_else(|| Error::Segment("segment number space exhausted".to_string()))
+        })
     }
 
     /// Generate the path for a segment file.
@@ -250,9 +264,20 @@ impl SegmentWriter {
     /// and headroom up to ~1 billion segments (~256 PB at 256MB each).
     fn segment_path(&self, segment_number: u64) -> PathBuf {
         self.config.output_dir.join(format!(
-            "{}-{:09}.notepack",
+            "{}-{:09}.notepack.open",
             self.config.segment_prefix, segment_number
         ))
+    }
+
+    fn sealed_segment_path(path: &Path) -> Result<PathBuf> {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".open"))
+            .ok_or_else(|| {
+                Error::Segment(format!("invalid open segment path: {}", path.display()))
+            })?;
+        Ok(path.with_file_name(name))
     }
 
     /// Get or create the current segment.
@@ -338,7 +363,7 @@ impl SegmentWriter {
     /// blocking the async runtime.
     ///
     /// Returns the sealed segment info (event_ids are immediately available
-    /// for marking as archived). The ClickHouse notification is sent after
+    /// for marking as archived). Downstream notifications are sent after
     /// compression completes (from the background thread).
     pub fn seal(&self) -> Result<Option<SealedSegment>> {
         let segment = {
@@ -351,7 +376,7 @@ impl SegmentWriter {
 
         let CurrentSegment {
             writer,
-            path,
+            path: open_path,
             event_count,
             size_bytes,
             event_ids,
@@ -367,6 +392,28 @@ impl SegmentWriter {
         file.sync_all()?;
         drop(file);
 
+        // Only the final name is discoverable as a sealed work unit. A crash can
+        // therefore leave an `.open` file, but can never make a partial segment
+        // look ready to downstream consumers.
+        let path = Self::sealed_segment_path(&open_path)?;
+        if path.exists() {
+            return Err(Error::Segment(format!(
+                "refusing to replace existing sealed segment: {}",
+                path.display()
+            )));
+        }
+        fs::rename(&open_path, &path)?;
+        File::open(
+            path.parent()
+                .ok_or_else(|| Error::Segment("segment has no parent directory".to_string()))?,
+        )?
+        .sync_all()?;
+
+        // The final name is now occupied even if a later dedupe write fails.
+        // Advance before any subsequent fallible operation so a retry can never
+        // reuse and replace this segment number.
+        let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
+
         // Record the segment's events as durably archived (and clear their in-flight
         // markers). Doing this on EVERY seal — not just the final one — is what makes
         // mid-stream sealed events durable; a crash before this point leaves them
@@ -375,7 +422,6 @@ impl SegmentWriter {
             dedupe.mark_archived(event_ids.iter())?;
         }
 
-        let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
         let sealed_at = Utc::now();
 
         // Build the sealed segment info (returned immediately)
@@ -393,22 +439,13 @@ impl SegmentWriter {
         if self.config.compress {
             // Spawn background thread for compression to avoid blocking async runtime
             let gz_path = path.with_extension("notepack.gz");
-            let sender = self.sealed_sender.clone();
+            let senders = self.sealed_senders.clone();
             let total_compressed_bytes = self.total_compressed_bytes.clone();
             let sealed_for_notify = sealed.clone();
 
             std::thread::spawn(move || {
                 match Self::compress_file_static(&path, &gz_path) {
                     Ok(compressed_bytes) => {
-                        // Remove the uncompressed file
-                        if let Err(e) = fs::remove_file(&path) {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %compact_error(&e),
-                                "failed to remove uncompressed segment"
-                            );
-                        }
-
                         // Guard against divide-by-zero on an empty/forced seal.
                         let ratio_pct = if size_bytes > 0 {
                             (compressed_bytes as f64 / size_bytes as f64) * 100.0
@@ -428,17 +465,12 @@ impl SegmentWriter {
                         // Track compressed bytes
                         total_compressed_bytes.fetch_add(compressed_bytes, Ordering::Relaxed);
 
-                        // Notify ClickHouse indexer with correct compressed path
-                        if let Some(sender) = sender {
-                            let compressed_sealed = SealedSegment {
-                                path: gz_path,
-                                compressed_size_bytes: compressed_bytes,
-                                ..sealed_for_notify
-                            };
-                            if let Err(e) = sender.send(compressed_sealed) {
-                                tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
-                            }
-                        }
+                        let compressed_sealed = SealedSegment {
+                            path: gz_path,
+                            compressed_size_bytes: compressed_bytes,
+                            ..sealed_for_notify
+                        };
+                        Self::notify_all(&senders, &compressed_sealed);
                     }
                     Err(e) => {
                         tracing::error!(
@@ -447,12 +479,22 @@ impl SegmentWriter {
                             error = %compact_error(&e),
                             "failed to compress segment"
                         );
-                        // Still notify indexer with uncompressed segment on error
-                        total_compressed_bytes.fetch_add(size_bytes, Ordering::Relaxed);
-                        if let Some(sender) = sender
-                            && let Err(e) = sender.send(sealed_for_notify)
-                        {
-                            tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
+                        // If the final gzip exists, prefer it even when a later
+                        // directory sync/cleanup step reported an error.
+                        if let Ok(metadata) = fs::metadata(&gz_path) {
+                            let compressed_bytes =
+                                usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+                            total_compressed_bytes.fetch_add(compressed_bytes, Ordering::Relaxed);
+                            let compressed_sealed = SealedSegment {
+                                path: gz_path,
+                                compressed_size_bytes: compressed_bytes,
+                                ..sealed_for_notify
+                            };
+                            Self::notify_all(&senders, &compressed_sealed);
+                        } else {
+                            // Otherwise the authoritative uncompressed segment remains.
+                            total_compressed_bytes.fetch_add(size_bytes, Ordering::Relaxed);
+                            Self::notify_all(&senders, &sealed_for_notify);
                         }
                     }
                 }
@@ -471,18 +513,60 @@ impl SegmentWriter {
                 .fetch_add(size_bytes, Ordering::Relaxed);
 
             // Notify the indexer immediately (no compression to wait for)
-            if let Some(sender) = &self.sealed_sender
-                && let Err(e) = sender.send(sealed.clone())
-            {
-                tracing::warn!(error = %compact_error(&e), "failed to send sealed segment notification");
-            }
+            Self::notify_all(&self.sealed_senders, &sealed);
         }
 
         Ok(Some(sealed))
     }
 
+    fn notify_all(senders: &[Sender<SealedSegment>], sealed: &SealedSegment) {
+        for sender in senders {
+            if let Err(error) = sender.send(sealed.clone()) {
+                tracing::warn!(
+                    error = %compact_error(&error),
+                    path = %sealed.path.display(),
+                    "failed to send sealed segment notification"
+                );
+            }
+        }
+    }
+
     /// Static version of compress_file for use in background threads.
-    fn compress_file_static(src: &PathBuf, dst: &PathBuf) -> Result<usize> {
+    fn compress_file_static(src: &Path, dst: &Path) -> Result<usize> {
+        let temporary = dst.with_extension("gz.open");
+        if temporary.exists() {
+            fs::remove_file(&temporary)?;
+        }
+        if dst.exists() {
+            return Err(Error::Segment(format!(
+                "refusing to replace existing compressed segment: {}",
+                dst.display()
+            )));
+        }
+
+        let result = Self::compress_file_to(src, &temporary).and_then(|compressed_bytes| {
+            fs::rename(&temporary, dst)?;
+            let parent = dst.parent().ok_or_else(|| {
+                Error::Segment("compressed segment has no parent directory".to_string())
+            })?;
+            File::open(parent)?.sync_all()?;
+            if let Err(error) = fs::remove_file(src) {
+                tracing::warn!(
+                    path = %src.display(),
+                    error = %compact_error(&error),
+                    "compressed segment is durable but uncompressed source remains"
+                );
+            }
+            File::open(parent)?.sync_all()?;
+            Ok(compressed_bytes)
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn compress_file_to(src: &Path, dst: &Path) -> Result<usize> {
         let input = File::open(src)?;
         let mut reader = BufReader::new(input);
 
@@ -498,7 +582,12 @@ impl SegmentWriter {
             encoder.write_all(&buffer[..bytes_read])?;
         }
 
-        encoder.finish()?.flush()?;
+        let mut writer = encoder.finish()?;
+        writer.flush()?;
+        let file = writer
+            .into_inner()
+            .map_err(|error| Error::Segment(format!("failed to flush gzip segment: {error}")))?;
+        file.sync_all()?;
 
         // Get compressed size
         let metadata = fs::metadata(dst)?;
@@ -687,5 +776,52 @@ mod tests {
         let sealed = receiver.try_recv().unwrap();
         assert_eq!(sealed.event_count, 1);
         assert_eq!(sealed.segment_number, 0);
+    }
+
+    #[test]
+    fn test_sealed_channel_fanout() {
+        let tmp = TempDir::new().unwrap();
+        let config = SegmentConfig {
+            output_dir: tmp.path().to_path_buf(),
+            compress: false,
+            ..Default::default()
+        };
+        let (first_sender, first_receiver) = crossbeam_channel::unbounded();
+        let (second_sender, second_receiver) = crossbeam_channel::unbounded();
+        let writer =
+            SegmentWriter::new_with_senders(config, vec![first_sender, second_sender], None)
+                .unwrap();
+
+        writer.write(test_event(1)).unwrap();
+        let open_path = tmp.path().join("segment-000000000.notepack.open");
+        assert!(open_path.exists());
+        writer.seal().unwrap();
+
+        assert!(!open_path.exists());
+        assert!(tmp.path().join("segment-000000000.notepack").exists());
+        assert_eq!(first_receiver.try_recv().unwrap().event_count, 1);
+        assert_eq!(second_receiver.try_recv().unwrap().event_count, 1);
+    }
+
+    #[test]
+    fn existing_zero_segment_advances_to_one() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("segment-000000000.notepack.gz"), []).unwrap();
+        let writer = SegmentWriter::new(
+            SegmentConfig {
+                output_dir: tmp.path().to_path_buf(),
+                compress: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        writer.write(test_event(1)).unwrap();
+        writer.seal().unwrap();
+
+        assert!(tmp.path().join("segment-000000001.notepack").exists());
+        assert!(tmp.path().join("segment-000000000.notepack.gz").exists());
     }
 }

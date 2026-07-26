@@ -14,6 +14,10 @@ just ch-migrate docs/migrations/001_active_user_views.sql
 just ch-migrate-all
 ```
 
+`just ch-migrate-all` runs only active top-level `docs/migrations/*.sql`
+files. Prepared operations live under `docs/migrations/prepared/` and require
+an explicit `just ch-migrate <file>` command after their documented preflight.
+
 Or directly via Docker:
 
 ```bash
@@ -39,6 +43,7 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 013_schema_optimizations.sql | Replace slow AggregateFunction tables with pre-computed values | **Yes** (runs automatically) |
 | 014_relay_distribution.sql | Pre-aggregate NIP-65 relay distribution data | **Yes** (runs automatically) |
 | 015_kinds_stats.sql | Pre-aggregate event kind statistics | **Yes** (runs automatically) |
+| prepared/016_drop_events_by_time_projection.sql | Prepared removal of the full-row time projection; excluded from `ch-migrate-all` | No (background removal mutation) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -363,6 +368,103 @@ docker start pensieve-grafana
 
 ---
 
+### prepared/016_drop_events_by_time_projection.sql
+
+**Purpose:** Reclaim the disk and write amplification of the full-row
+`events_by_time` projection while keeping `events_local`, the
+`idx_created_at` minmax skipping index, and the more heavily used
+`events_by_kind` projection.
+
+**Production evidence captured before preparation:**
+
+- ClickHouse version: `24.8.14.39`
+- Projection definition: `SELECT * ORDER BY (created_at, kind, pubkey)`
+- Active projection rows: `1,874,719,482`
+- Projection size: approximately `986.15 GiB`
+- `/data` free before removal: approximately `346 GiB`
+- Representative queries remained operational with
+  `optimize_use_projections = 0`; the slowest sampled query changed from about
+  2.0 seconds to 4.5 seconds and is protected by the API cache.
+
+The migration has been prepared but has not been applied to production.
+
+#### Before applying
+
+1. Capture the current table definition and projection size:
+
+   ```bash
+   just ch-query "SHOW CREATE TABLE nostr.events_local"
+   just ch-query "SELECT name, count() parts, sum(rows) rows, formatReadableSize(sum(bytes_on_disk)) bytes FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND active GROUP BY name ORDER BY name"
+   ```
+
+2. Confirm there is no failed or long-running mutation on `events_local`:
+
+   ```bash
+   just ch-query "SELECT mutation_id, command, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND is_done = 0 ORDER BY create_time"
+   ```
+
+3. Confirm API and Grafana health. No service stop is required, but schedule the
+   change during an observed period because queries will immediately fall back
+   to the base table and its skipping indexes.
+
+#### Apply
+
+```bash
+just ch-migrate docs/migrations/prepared/016_drop_events_by_time_projection.sql
+```
+
+The `ALTER` is asynchronous. The command completing does not mean the disk has
+already been reclaimed.
+
+#### Monitor and verify
+
+```bash
+just ch-query "SELECT mutation_id, command, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND command LIKE '%DROP PROJECTION%events_by_time%' ORDER BY create_time DESC LIMIT 5"
+
+just ch-query "SELECT count() active_parts, sum(rows) rows, formatReadableSize(sum(bytes_on_disk)) bytes FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND name = 'events_by_time' AND active"
+
+just ch-query "SELECT name, path, formatReadableSize(free_space) free, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks ORDER BY name"
+```
+
+Success requires all of the following:
+
+- The newest drop mutation has `is_done = 1`, `parts_to_do = 0`, and no failure.
+- No active `events_by_time` projection parts remain.
+- Free disk has increased as inactive parts age out.
+- API error rate and ClickHouse query latency remain acceptable.
+
+Do not run `OPTIMIZE TABLE nostr.events_local FINAL`; it would create avoidable
+I/O and temporary-space pressure.
+
+#### Rollback
+
+Rollback is available at
+`docs/migrations/rollback/016_restore_events_by_time_projection.sql`.
+It restores the exact former definition and then schedules a full historical
+materialization.
+
+Before rollback:
+
+1. Wait for the drop mutation to finish.
+2. Confirm no other `events_local` mutation is pending.
+3. Require at least `1.2 TiB` of unreserved disk headroom. This is a conservative
+   floor based on the former `986.15 GiB` projection plus working space; more is
+   preferable.
+4. Keep monitoring `/data` throughout materialization.
+
+Then run:
+
+```bash
+just ch-migrate docs/migrations/rollback/016_restore_events_by_time_projection.sql
+```
+
+Monitor the `MATERIALIZE PROJECTION events_by_time` mutation in
+`system.mutations`. The projection is not fully restored for historical
+queries until that mutation reaches `is_done = 1`. If materialization threatens
+the disk reserve, stop and investigate rather than forcing a final optimize.
+
+---
+
 ## Full Deployment Checklist
 
 When deploying new API endpoints that depend on these migrations:
@@ -482,4 +584,3 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/publishers` | Top publishers | None |
 
 All endpoints include HTTP caching headers (`Cache-Control: public, max-age=60, stale-while-revalidate=300`).
-

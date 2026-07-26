@@ -64,7 +64,7 @@ For AI agents making code changes:
 ```bash
 just ch-init                  # Initialize schema from docs/clickhouse_self_hosted.sql
 just ch-migrate <file>        # Run a single migration
-just ch-migrate-all           # Run all migrations in docs/migrations/
+just ch-migrate-all           # Run active top-level docs/migrations/*.sql only
 just ch-query "<sql>"         # Run raw SQL query
 just ch-tables                # List tables and views
 ```
@@ -251,6 +251,7 @@ just ch-tables
 
 - **Truncate + backfill**: Some migrations truncate tables and repopulate from `events_local`. These can take time depending on data volume.
 - **Materialized views**: When fixing MV logic, you typically: drop the view, recreate with new logic, truncate the target table, and backfill.
+- **Prepared operations**: Files under `docs/migrations/prepared/` are excluded from `just ch-migrate-all` and require explicit operator preflight and invocation.
 - **Test locally first**: Run migrations against local ClickHouse before production.
 
 ---
@@ -323,7 +324,7 @@ sudo systemctl status pensieve-api pensieve-ingest
 # Run specific migration
 just ch-migrate docs/migrations/NNN_description.sql
 
-# Or run all pending migrations
+# Or run all active top-level migrations (prepared operations are excluded)
 just ch-migrate-all
 ```
 

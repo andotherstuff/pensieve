@@ -73,8 +73,8 @@ Key design points:
   orderly shutdown; they are never rewritten in place. Mixed `created_at` values are
   expected. Every file is sorted internally and carries native row-group statistics.
   Later compaction improves physical query layout without changing the canonical rows.
-  The draft schema, footer metadata, and lifecycle in §3 must be accepted and covered
-  by conformance tests before P2 writes production-candidate files.
+  The accepted V1 schema, footer metadata, and lifecycle in §3 are covered by
+  conformance tests.
 - **Three independent archive workloads share one implementation:** (1) a
   resumable historical converter from sealed notepack segments, (2) the live
   sink fed by every collector, and (3) a later background optimizer that
@@ -96,12 +96,12 @@ Key design points:
 - **Success metric changed: throughput → coverage** (fraction of the global event set
   captured). Measured continuously (§ Track A).
 
-## 3. Archive format — draft design to accept before P2
+## 3. Archive format — accepted V1 specification
 
 Every production-candidate file written by the live sink, historical converter,
 repair/import tools, or compactor follows the
 [Canonical Nostr Parquet Archive Format](parquet_archive_format.md). That
-document is the current draft V1 schema, validation, footer-metadata,
+document is the accepted V1 schema, validation, footer-metadata,
 file-lifecycle, data-lake, and compaction contract.
 
 ### 3.1 Exact V1 schema
@@ -202,24 +202,45 @@ canonical file writer. Compaction may use DuckDB to scan and transform input,
 but output must flow through the same shared V1 writer as live sealing and
 backfill.
 
-Before P2 writes production-candidate files:
+V1 acceptance and conformance status:
 
-- [ ] Accept or revise the draft archive-format document; it is not accepted yet.
-- [ ] Select and prototype the canonical writer implementation with the required
+- [x] Accept the V1 archive-format specification (accepted 2026-07-26).
+- [x] Select and prototype the canonical writer implementation with the required
       low-level Parquet controls.
-- [ ] Implement schema inspection plus full row validation as a reusable library
+- [x] Implement schema inspection plus full row validation as a reusable library
       and CLI.
-- [ ] Build golden valid fixtures covering empty tags, one-element tags,
+- [x] Build golden valid fixtures covering empty tags, one-element tags,
       variable-length tags, empty tag values, empty and whitespace-only
       `content`, Unicode, multiline strings, `kind` boundaries, and
       `created_at` values on both sides of the signed-64 boundary.
-- [ ] Build invalid fixtures covering nulls, empty inner tags, wrong fixed-byte
+- [x] Build invalid fixtures covering nulls, empty inner tags, wrong fixed-byte
       lengths, bad IDs, bad signatures, duplicate IDs, incorrect ordering,
       incorrect row-group statistics, missing/duplicate version metadata, and
       truncated footers.
-- [ ] Prove round trips through the canonical writer, the independent validator,
+- [x] Prove round trips through the canonical writer, the independent validator,
       DuckDB as a reader, and at least one second Parquet reader without logical
       value changes.
+
+Implementation checkpoint (2026-07-23): `pensieve-parquet` now owns the typed
+raw/notepack validation boundary, deterministic writer, strict validator
+library/CLI, and reproducible valid/invalid corpus. `pensieve-lake` now owns the
+separate work-unit journal, object inventory, target-sized campaign, and
+immutable local/S3 publisher. `pensieve-ingest` can fan durably sealed notepack
+work units to the same machinery as an optional live shadow without changing
+notepack's authority over RocksDB archival state. The valid fixture decodes
+identically through the Rust validator, DuckDB, and PyArrow. Real local segment
+results are recorded in
+[Parquet writer prototype benchmark](parquet_writer_benchmark.md). The archive
+format was accepted as V1 on 2026-07-26 after this implementation and
+interoperability validation. The acceptance rerun regenerated the fixture
+corpus, passed 18 focused Rust conformance and recovery tests, and decoded the
+valid fixture identically through DuckDB 1.5.5 and PyArrow 25.0.0.
+
+A production-sized 256 MiB sealed notepack segment was also replayed through
+the release campaign on 2026-07-26. It produced 389,695 validated rows in one
+168.4 MiB Parquet object with three approximately 128 MiB-or-smaller
+uncompressed row groups in 35.80 seconds, using 1,008 MiB maximum RSS. Details
+and reproduction steps are in the benchmark document.
 
 ## 4. Migration philosophy
 
@@ -252,7 +273,7 @@ data loss.** We split the work by risk:
 
 ```text
 P0  FOUNDATION FOR TRACK B
-    accept V1 → prototype writer + independent validator → object-storage round trip
+    accepted V1 → writer + independent validator → object-storage round trip
 
 TRACK A — COLLECTION  (incremental, additive, no cutover)
     P1  coverage → NIP-66 catalog → dynamic negentropy → windowed REQ
@@ -287,10 +308,16 @@ can start. P1 collection work already underway does not wait for P0.
 - [x] Disk relief — breathing room already achieved (a few weeks of runway).
 - [ ] (If not already) ClickHouse tiered storage: cold parts → HDD, to keep NVMe headroom
       while the old stack still runs.
-- [ ] Stand up the Hetzner Object Storage bucket; upload a golden V1 file with the
-      selected object-storage tooling, then read it through the independent validator,
-      DuckDB, and a second Parquet implementation.
-- [ ] Complete the §3.4 archive-format acceptance and conformance gate.
+- [x] Prove real Hetzner Object Storage compatibility in a temporary bucket:
+      conditionally upload a golden V1 file and production-sized real-segment
+      output, `HEAD`-verify size/SHA-256 metadata, download them, and read them
+      through the independent validator, DuckDB, and PyArrow. Completed
+      2026-07-26; exact results are in the benchmark document.
+- [ ] Provision the durable production bucket, prefix, and scoped credentials.
+      Before the historical campaign, compare the current single-request upload
+      with a bounded-concurrency resumable multipart path from the production
+      host.
+- [x] Complete the archive-format acceptance and local conformance gate.
 - [ ] Skeleton of the **old-vs-new verification harness** (later phases plug in).
 - [ ] Confirm backups: notepack archive, `relay-stats.db`, RocksDB dedup index.
 
@@ -336,19 +363,19 @@ shared infrastructure. Compaction is not required to finish P2.
 
 #### P2a — Shared archive foundation
 
-- [ ] Implement one **V1 writer and canonical row-validation library** used by
+- [x] Implement one **V1 writer and canonical row-validation library** used by
       the converter, live sink, imports, repairs, and future compactor. The
       callers supply rows and work-unit identity; the library owns semantic
       validation, one-ID-per-file enforcement, deterministic signature
       selection, unsigned `(created_at, id)` sorting, and exact physical
       encoding. The independent conformance validator, not the writer itself,
       performs the final reopen-and-inspect gate.
-- [ ] Implement an idempotent **publication state machine** with states such as
+- [x] Implement an idempotent **publication state machine** with states such as
       `open`, `writing`, `uploaded`, `validated`, `published`, and
       `source_committed`. It writes to unique object keys, confirms remote
       durability, and can safely resume or repeat every transition after a
       crash. Publication state is separate from RocksDB seen/dedup state.
-- [ ] Maintain an external **object inventory** recording object key, byte size,
+- [x] Maintain an external **object inventory** recording object key, byte size,
       checksum, publication state, writer version, and operational job/work-unit
       identity. Once compaction exists, the inventory must distinguish:
   - active raw objects;
@@ -380,6 +407,9 @@ shared infrastructure. Compaction is not required to finish P2.
       imports. There is no separate negentropy archive writer. During P2 the
       same accepted stream continues into notepack, which remains authoritative
       and remains the sole owner of the RocksDB `mark_archived` transition.
+  - [x] The live daemon's firehose and negentropy paths now share one downstream
+        sealed-notepack shadow worker. Windowed REQ and bulk-import integration
+        remain pending with those producer paths.
 - [ ] Give the live sink a small durable, appendable **batch buffer / WAL** so
       relay I/O never depends on appending to a Parquet file. SQLite, a simple
       WAL, or a temporary notepack spool are implementation candidates; the
@@ -387,7 +417,7 @@ shared infrastructure. Compaction is not required to finish P2.
       including unsigned `created_at` values above `i64::MAX`, and expose
       recoverable batch state. A rolling live-query window is optional and must
       not be coupled to canonical archive correctness.
-- [ ] Close live batches on target size/row count, maximum age, or orderly
+- [x] Close live batches on target size/row count, maximum age, or orderly
       shutdown—not on an event's `created_at`. For each frozen batch:
   1. validate and deduplicate by `id`;
   2. apply the deterministic signature-variant rule;
@@ -415,25 +445,55 @@ shared infrastructure. Compaction is not required to finish P2.
       with minutes of RPO is not zero loss. During P2, notepack still protects
       canonical durability while this is tested.
 
+Implementation checkpoint (2026-07-23): an open notepack segment now uses a
+`.notepack.open` name. Sealing fsyncs it, atomically renames it to the
+discoverable `.notepack` name, fsyncs the directory, and only then lets the
+existing writer mark its event IDs archived. The optional Parquet worker
+receives the post-compression sealed path; on restart it scans final
+`.notepack[.gz]` names and ignores `.open` files, so a missed in-memory
+notification is replayable. The same work-unit inventory makes replay
+idempotent. A configurable maximum-age timer force-seals the notepack batch;
+size and orderly shutdown use the existing seal path. Any Parquet failure is
+recorded and logged but cannot fail or advance the authoritative notepack /
+RocksDB path.
+
 #### P2c — Convert sealed notepack history
 
-- [ ] Add a dedicated **`notepack-to-parquet` binary**. It reads sealed notepack
+- [x] Add a dedicated **sealed-notepack campaign binary**. It reads sealed notepack
       segments through high-water mark `H` and emits target-sized active-raw V1
       objects through the shared writer, validator, publication state machine,
       and inventory. ClickHouse is not an input.
-- [ ] Make conversion resumable and idempotent. A work unit is one sealed
+  - [x] Local prototype: read one framed plain/gzip notepack segment directly,
+        validate without JSON, deduplicate and sort, write through the shared
+        V1 writer, and publish a completed local file atomically.
+  - [x] Strictly fail by default on invalid records; with an explicit reject
+        path, preserve invalid frames verbatim for quarantine and report counts.
+  - [x] Add target-sized multi-file output, work-unit checkpoints, remote
+        publication, inventory activation, and resumable recovery.
+- [x] Make conversion resumable and idempotent. A work unit is one sealed
       segment or an explicitly bounded group of segments, identified by stable
       path/segment identity plus source checksum. Record migration-local input,
       output, validation, and publication state so a retry cannot silently skip
       an input or activate an output twice.
-- [ ] Preserve every valid event and timestamp. Do not create author-controlled
+- [x] Preserve every valid event and timestamp. Do not create author-controlled
       calendar partitions and do not require global historical deduplication on
       this pass. One-ID-per-file still applies; duplicates across source
       segments or the historical/live overlap are valid raw-lake inputs and are
       resolved logically or by later compaction.
-- [ ] Recompute event IDs and verify signatures while converting. Invalid or
+- [x] Recompute event IDs and verify signatures while converting. Invalid or
       unreadable source records enter an explicit quarantine/report; they must
       not be silently discarded.
+
+The campaign identifies each source as `notepack-sha256-<digest>`, stages
+deterministic `part-NNNNN.parquet` files, publishes content-addressed object
+keys, stores counts, ranges, checksums,
+writer version, and state in SQLite, and atomically changes the complete object
+set from uploaded to active raw. Local publication uses no-clobber atomic
+renames. S3-compatible publication uses conditional `PutObject`; retries and
+race recovery require a `HeadObject` size and SHA-256 metadata match. Local
+fault injection, real-segment replay, and a temporary Hetzner bucket round trip
+are green. The durable production bucket and production-host multipart /
+throughput decision remain before the historical campaign.
 
 #### P2d — Converge and verify
 
@@ -641,12 +701,20 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
 ## 9. Status tracker
 
-- **P0 Foundation** — in progress (disk relief done; object-storage bucket / verify harness / backups pending)
+- **P0 Foundation** — in progress (disk relief, archive-format acceptance, and
+  real Hetzner compatibility round trip done; durable production bucket,
+  verification harness, and backups pending)
 - **P1 Collection & coverage** — in progress (initial `e`/`q`
   reference-coverage ✅, NIP-66 catalog first slice ✅, catalog visibility
   gauges ✅, dynamic negentropy target augmentation ✅; multi-monitor trust,
   richer connection/reconciliation coverage, and windowed REQ pending)
-- **P2 Parquet archive** — not started
+- **P2 Parquet archive** — in progress (shared V1 writer/validator, target-sized
+  resumable campaign, publication journal/inventory, immutable local/S3
+  publisher, sealed-notepack live shadow, and initial production-sized
+  conversion and real Hetzner round-trip benchmarks are implemented; durable S3
+  provisioning, multipart/production-host throughput, historical/live
+  high-water `H`, parity harness, production-host worker concurrency sizing,
+  and unsealed-buffer failure-domain proof remain)
 - **P3 Optimization + new analytics** — not started
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
@@ -658,10 +726,11 @@ secrets in `/etc/pensieve/pensieve.env`; production box cut over to the new layo
 ---
 
 ## Related
-- `docs/parquet_archive_format.md` — draft canonical V1 design; not accepted yet
+- `docs/parquet_archive_format.md` — accepted canonical V1 specification
+- `docs/parquet_writer_benchmark.md` — first real-segment prototype measurement
 - Target-architecture design notes (the *what*)
 - `docs/ingestion_pipeline.md` — current pipeline architecture
-- TSM `event-archives` proposal — informative input to the draft, not the accepted or
+- TSM `event-archives` proposal — informative input to V1, not the accepted or
   normative Pensieve schema: `gitworkshop.dev/manime@nostr4.social/tsm`,
   clone: `https://relay.ngit.dev/npub1manlnflyzyjhgh970t8mmngrdytcp3jrmaa66u846ggg7t20cgqqvyn9tn/tsm.git`
 - Open questions: negentropy strategy, relay-discovery strategy (tracked separately)

@@ -3,7 +3,7 @@
 # Sync archive segments to Hetzner Storage Box
 #
 # This script:
-# 1. Uploads all local segments to Storage Box (if not already there)
+# 1. Uploads sealed local segments to Storage Box (if not already there)
 # 2. Optionally cleans up old local segments if disk is getting full
 #
 # Environment variables (from .env):
@@ -34,9 +34,15 @@ log "Remote: $REMOTE_NAME:$REMOTE_PATH"
 
 log "Syncing to Storage Box..."
 
-# Use rclone copy (not sync) to avoid deleting remote files
+# Use rclone copy (not sync) to avoid deleting remote files.
+# Include only final sealed names: active `.notepack.open` files and temporary
+# `.notepack.gz.open` compression outputs must never become remote archive
+# inputs.
 # --ignore-existing: skip files that already exist on remote
 rclone copy "$ARCHIVE_DIR" "$REMOTE_NAME:$REMOTE_PATH" \
+    --filter '+ /segment-*.notepack' \
+    --filter '+ /segment-*.notepack.gz' \
+    --filter '- **' \
     --ignore-existing \
     --transfers 4 \
     --checkers 8 \
@@ -82,4 +88,3 @@ else
 fi
 
 log "Archive sync finished."
-

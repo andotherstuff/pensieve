@@ -35,6 +35,7 @@ path = "src/bin/relay-cleanup.rs"
 [dependencies]
 # Internal crates
 pensieve-core = { path = "../pensieve-core" }
+pensieve-lake = { path = "../pensieve-lake" }
 
 # Nostr
 notepack.workspace = true
