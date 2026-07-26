@@ -61,7 +61,7 @@ USE nostr;
 -- Materialized columns extract common video tags at insert time for faster queries.
 --
 -- PROJECTIONS provide alternate sort orders for common query patterns:
--- - events_by_time: Optimized for time-range queries (e.g., "last 24 hours")
+-- - Time-range queries use idx_created_at without duplicating every full row.
 -- - events_by_kind: Optimized for kind-filtered queries (e.g., "all reactions")
 -- - events_by_author: Optimized for author queries (e.g., "videos by pubkey X")
 CREATE TABLE IF NOT EXISTS events_local (
@@ -91,10 +91,6 @@ CREATE TABLE IF NOT EXISTS events_local (
 
     -- Projections for alternate query patterns
     -- ClickHouse automatically selects the best projection for each query
-    PROJECTION events_by_time (
-        SELECT *
-        ORDER BY (created_at, kind, pubkey)
-    ),
     PROJECTION events_by_kind (
         SELECT *
         ORDER BY (kind, created_at, pubkey)
