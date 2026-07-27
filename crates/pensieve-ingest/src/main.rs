@@ -1223,6 +1223,7 @@ async fn main() -> Result<()> {
             "sealed final segment"
         );
     }
+    segment_writer.wait_for_compression()?;
 
     // Flush dedupe
     dedupe.flush()?;

@@ -463,6 +463,12 @@ size and orderly shutdown use the existing seal path. Any Parquet failure is
 recorded and logged but cannot fail or advance the authoritative notepack /
 RocksDB path.
 
+Recovery testing on 2026-07-27 also found that finite backfill processes could
+exit while a detached gzip job was still running. `SegmentWriter` now retains
+and joins every compression thread after the final seal and during drop, before
+final statistics are read or downstream publication/indexing queues are
+closed.
+
 #### P2c — Convert sealed notepack history
 
 - [x] Add a dedicated **sealed-notepack campaign binary**. It reads sealed notepack
@@ -498,11 +504,25 @@ set from uploaded to active raw. Local publication uses no-clobber atomic
 renames. S3-compatible publication uses conditional `PutObject`; retries and
 race recovery require a `HeadObject` size and SHA-256 metadata match. Local
 fault injection, real-segment replay, and a temporary Hetzner bucket round trip
-are green. The durable production bucket and production-host multipart /
-throughput decision remain before the historical campaign.
+are green. The durable production bucket is active and the sequential
+historical campaign is running on a dedicated in-network VM with bounded spool
+space and post-publication cleanup. Single-request uploads are sufficient for
+the present campaign; multipart upload and worker concurrency are deferred
+optimizations rather than migration prerequisites. Failed work remains in the
+journal and its source remains available for an idempotent retry. After the
+initial startup inventory completes, a catch-up pass must process any source
+segments that arrived after that inventory was captured.
 
 #### P2d — Converge and verify
 
+- [x] Build a deterministic **unified active-raw snapshot catalog** across the
+      historical campaign, production live shadow, and repair/import
+      inventories. Each writer exports a read-only portable fragment; a strict
+      merge produces one content-addressed snapshot containing published work
+      coverage and active raw object keys/checksums. Incomplete and quarantined
+      state is excluded. Conflicts fail closed, and snapshots explicitly state
+      that raw rows are not event-ID-deduplicated. See
+      `docs/lake_active_file_catalog.md`.
 - [ ] Verify every historical work unit against its sealed notepack input and
       periodically create a coordinated go-forward checkpoint by closing the
       current live batch and sealing the current notepack segment at the same
@@ -518,6 +538,16 @@ throughput decision remain before the historical campaign.
 - [ ] Run every §3 conformance check and fault-inject every publication-journal
       transition. Quarantined or incomplete objects must never enter an active
       query snapshot.
+
+Implementation checkpoint (2026-07-27): fragments from the historical
+campaign, production live shadow, and the segment 7703 repair inventory were
+merged, independently verified, and conditionally published as immutable
+snapshot
+`sha256:9168328eeca44916aac9c9fdfd2a0fee941da515d728337c17af6085b15993a6`.
+It selects 1,082 published work units, 1,597 active raw objects, 255,696,331
+physical rows, and 102,813,011,702 object bytes. This is a reproducible
+checkpoint while both ingestion paths continue, not the still-pending
+historical/live parity proof.
 
 **Gate:** all sealed notepack inputs through `H` and N sustained go-forward
 windows have complete ID-keyed parity; every active output passes the
@@ -539,12 +569,13 @@ shadow-only; authoritative notepack ingestion is unaffected.
       integers per rollup window in Postgres; then only "today so far" needs a live
       merge.) "Today so far" comes from the selected live buffer and/or live
       sketches; it does not require SQLite specifically.
-- [ ] Query an explicit **active-file snapshot** from the external object inventory.
-      A snapshot contains the active raw objects not covered by compaction plus
-      active compacted replacements; it must never contain both a compacted
-      output and the inputs it supersedes. Raw scans group by `id` unless the
-      selected snapshot is certified deduplicated. A sum of physical Parquet
-      rows is not an event count.
+- [ ] Extend and consume the explicit **active-file snapshot** when compaction
+      begins. The P2 foundation currently snapshots active raw objects only.
+      The compaction extension must contain the active raw objects not covered
+      by compaction plus active compacted replacements, and must never contain
+      both a compacted output and the inputs it supersedes. Raw scans group by
+      `id` unless the selected snapshot is certified deduplicated. A sum of
+      physical Parquet rows is not an event count.
 - [ ] Add the independent background **optimizer/compactor** only when file
       count or pruning performance warrants it. It:
   1. selects a bounded active input set from the inventory;
@@ -707,20 +738,31 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
 ## 9. Status tracker
 
-- **P0 Foundation** — in progress (disk relief, archive-format acceptance, and
-  real Hetzner compatibility round trip done; durable production bucket,
-  verification harness, and backups pending)
+Updated 2026-07-27.
+
+- **P0 Foundation** — in progress (disk relief, archive-format acceptance,
+  durable production object storage, real Hetzner compatibility and
+  production-network round trips done; full verification automation and final
+  backup/retention policy pending)
 - **P1 Collection & coverage** — in progress (initial `e`/`q`
   reference-coverage ✅, NIP-66 catalog first slice ✅, catalog visibility
   gauges ✅, dynamic negentropy target augmentation ✅; multi-monitor trust,
   richer connection/reconciliation coverage, and windowed REQ pending)
-- **P2 Parquet archive** — in progress (shared V1 writer/validator, target-sized
-  resumable campaign, publication journal/inventory, immutable local/S3
-  publisher, sealed-notepack live shadow, and initial production-sized
-  conversion and real Hetzner round-trip benchmarks are implemented; durable S3
-  provisioning, multipart/production-host throughput, historical/live
-  high-water `H`, parity harness, production-host worker concurrency sizing,
-  and unsealed-buffer failure-domain proof remain)
+- **P2 Parquet archive** — in progress. Shared V1 writer/validator, resumable
+  target-sized campaign, publication journal/inventory, immutable S3
+  publication, sealed-notepack live shadow, repair publication, and the
+  deterministic unified active-raw snapshot catalog are implemented. The live
+  replay floor is segment 7703, establishing the historical boundary at
+  `H = 7702`. The sequential historical campaign is active on its dedicated VM;
+  transient upload failures remain safely retryable. Segment 7703 was sealed as
+  an empty gzip after a now-fixed seal/compression race. Its exact 21,972 event
+  IDs were preserved from RocksDB; exhaustive relay recovery found 4,833 valid
+  unique event bodies and left 17,139 IDs as an explicit known gap. The repair
+  was validated, published as a separate immutable Parquet work unit, restored
+  to ClickHouse, and included with the historical and live inventories in the
+  first operational unified snapshot. Campaign completion/catch-up, full
+  ID-keyed historical/live parity, coordinated go-forward windows, publication
+  fault coverage, and the post-P5 unsealed-buffer failure-domain proof remain.
 - **P3 Optimization + new analytics** — not started
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
@@ -733,6 +775,10 @@ secrets in `/etc/pensieve/pensieve.env`; production box cut over to the new layo
 
 ## Related
 - `docs/parquet_archive_format.md` — accepted canonical V1 specification
+- `docs/lake_active_file_catalog.md` — deterministic distributed-inventory
+  export, merge, verification, and immutable snapshot publication
+- `docs/segment_7703_recovery.md` — evidence, validation, repair publication,
+  and known-gap audit for the empty live segment incident
 - `docs/parquet_writer_benchmark.md` — first real-segment prototype measurement
 - Target-architecture design notes (the *what*)
 - `docs/ingestion_pipeline.md` — current pipeline architecture

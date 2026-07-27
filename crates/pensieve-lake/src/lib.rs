@@ -4,11 +4,17 @@
 //! `pensieve-parquet`. This crate owns resumability and the external facts that
 //! deliberately do not belong in canonical file metadata.
 
+mod catalog;
 mod error;
 mod inventory;
 mod publisher;
 mod work_unit;
 
+pub use catalog::{
+    ACTIVE_RAW_CATALOG_FORMAT, ActiveRawFragment, ActiveRawSnapshot, CatalogObject, CatalogTotals,
+    CatalogWorkUnit, merge_active_raw_fragments, read_catalog_fragment, read_catalog_snapshot,
+    write_catalog_atomically,
+};
 pub use error::{Error, Result};
 pub use inventory::{
     Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState, WorkUnitRecord,

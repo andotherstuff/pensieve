@@ -18,6 +18,10 @@ pub enum Error {
     #[error("inventory database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Catalog JSON encoding or decoding failed.
+    #[error("catalog JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
     /// Canonical Parquet processing failed.
     #[error("Parquet archive error: {0}")]
     Parquet(#[from] pensieve_parquet::Error),
@@ -86,4 +90,8 @@ pub enum Error {
         /// Logical field name.
         field: &'static str,
     },
+
+    /// A fragment or snapshot violates the catalog contract.
+    #[error("invalid lake catalog: {0}")]
+    InvalidCatalog(String),
 }

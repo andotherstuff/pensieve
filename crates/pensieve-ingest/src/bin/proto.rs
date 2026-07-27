@@ -767,6 +767,8 @@ fn finalize_pipeline(
         }
     }
 
+    segment_writer.wait_for_compression()?;
+
     // Get final stats from segment writer
     let seg_stats = segment_writer.stats();
     stats.notepack_bytes = seg_stats.total_bytes;
