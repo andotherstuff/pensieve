@@ -49,6 +49,10 @@ parquet-interop:
 parquet-campaign *ARGS:
     cargo run -p pensieve-lake --bin pensieve-parquet-campaign -- {{ARGS}}
 
+# Export, merge, or verify deterministic active-file lake catalogs.
+lake-catalog *ARGS:
+    cargo run -p pensieve-lake --bin pensieve-lake-catalog -- {{ARGS}}
+
 # ============================================================================
 # Build
 # ============================================================================

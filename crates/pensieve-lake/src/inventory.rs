@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::{Error, Result};
 
@@ -270,6 +270,14 @@ impl Inventory {
     /// Create an isolated in-memory inventory.
     pub fn open_in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// Open an existing inventory without permitting schema or data changes.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self { connection })
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
@@ -632,6 +640,49 @@ impl Inventory {
             .query_map([], object_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// Read one consistent catalog view of published work and active raw objects.
+    ///
+    /// Published work units with no Parquet objects are included so the catalog
+    /// can record coverage of empty but successfully processed inputs.
+    pub fn active_raw_catalog_records(
+        &mut self,
+    ) -> Result<(Vec<WorkUnitRecord>, Vec<ObjectRecord>)> {
+        let transaction = self.connection.transaction()?;
+        let work_units = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id, source_path, source_bytes, source_sha256,
+                       target_uncompressed_bytes, max_event_bytes, object_prefix,
+                       writer_version, state, input_events, output_rows,
+                       rejected_events, error
+                FROM work_units
+                WHERE state IN ('published', 'source_committed')
+                ORDER BY id
+                "#,
+            )?;
+            statement
+                .query_map([], work_unit_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let objects = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT object_key, work_unit_id, part_number, kind, state,
+                       local_path, byte_size, sha256, writer_version, row_count,
+                       min_created_at, max_created_at
+                FROM objects
+                WHERE state = 'active_raw' AND kind = 'parquet'
+                ORDER BY object_key
+                "#,
+            )?;
+            statement
+                .query_map([], object_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        Ok((work_units, objects))
     }
 }
 

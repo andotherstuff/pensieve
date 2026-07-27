@@ -34,6 +34,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 
 use super::dedupe::DedupeIndex;
 
@@ -168,6 +169,8 @@ pub struct SegmentWriter {
     total_bytes: AtomicUsize,
     /// Wrapped in Arc for sharing with background compression threads.
     total_compressed_bytes: Arc<AtomicUsize>,
+    /// Compression jobs must be joined before a finite writer process exits.
+    compression_threads: Mutex<Vec<JoinHandle<()>>>,
     sealed_senders: Vec<Sender<SealedSegment>>,
     /// Optional dedupe index. When present, every sealed segment's events are
     /// marked durably `Archived` here (after the segment file is fsync'd), which is
@@ -219,6 +222,7 @@ impl SegmentWriter {
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
             total_compressed_bytes: Arc::new(AtomicUsize::new(0)),
+            compression_threads: Mutex::new(Vec::new()),
             sealed_senders,
             dedupe,
         })
@@ -441,13 +445,15 @@ impl SegmentWriter {
         };
 
         if self.config.compress {
+            self.reap_finished_compression_threads();
+
             // Spawn background thread for compression to avoid blocking async runtime
             let gz_path = path.with_extension("notepack.gz");
             let senders = self.sealed_senders.clone();
             let total_compressed_bytes = self.total_compressed_bytes.clone();
             let sealed_for_notify = sealed.clone();
 
-            std::thread::spawn(move || {
+            let compression_thread = std::thread::spawn(move || {
                 match Self::compress_file_static(&path, &gz_path) {
                     Ok(compressed_bytes) => {
                         // Guard against divide-by-zero on an empty/forced seal.
@@ -503,6 +509,7 @@ impl SegmentWriter {
                     }
                 }
             });
+            self.compression_threads.lock().push(compression_thread);
         } else {
             tracing::info!(
                 "Sealed segment {}: {} events, {} bytes at {}",
@@ -521,6 +528,52 @@ impl SegmentWriter {
         }
 
         Ok(Some(sealed))
+    }
+
+    fn reap_finished_compression_threads(&self) {
+        let finished = {
+            let mut threads = self.compression_threads.lock();
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < threads.len() {
+                if threads[index].is_finished() {
+                    finished.push(threads.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            finished
+        };
+
+        for handle in finished {
+            if handle.join().is_err() {
+                tracing::warn!("segment compression thread panicked");
+            }
+        }
+    }
+
+    /// Wait for all compression jobs started by this writer.
+    ///
+    /// Call this after the final [`Self::seal`] and before reading final
+    /// compression statistics or waiting for downstream consumers. The caller
+    /// must ensure no concurrent writes or seals can start new jobs.
+    pub fn wait_for_compression(&self) -> Result<()> {
+        let handles = std::mem::take(&mut *self.compression_threads.lock());
+        let mut panicked = false;
+
+        for handle in handles {
+            if handle.join().is_err() {
+                panicked = true;
+            }
+        }
+
+        if panicked {
+            return Err(Error::Segment(
+                "one or more segment compression threads panicked".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn notify_all(senders: &[Sender<SealedSegment>], sealed: &SealedSegment) {
@@ -631,6 +684,12 @@ impl Drop for SegmentWriter {
         // Seal any remaining segment on drop
         if let Err(e) = self.seal() {
             tracing::warn!(error = %compact_error(&e), "error sealing segment on drop");
+        }
+        if let Err(e) = self.wait_for_compression() {
+            tracing::warn!(
+                error = %compact_error(&e),
+                "error waiting for segment compression on drop"
+            );
         }
     }
 }
@@ -772,18 +831,10 @@ mod tests {
         let writer = SegmentWriter::new(config, None, None).unwrap();
         writer.write(test_event(1)).unwrap();
         writer.seal().unwrap();
+        writer.wait_for_compression().unwrap();
 
-        // Compression happens in a background thread, wait for it
         let segment_path = tmp.path().join("segment-000000000.notepack.gz");
         let uncompressed_path = tmp.path().join("segment-000000000.notepack");
-
-        // Wait up to 5 seconds for compression to complete
-        for _ in 0..50 {
-            if segment_path.exists() && !uncompressed_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
 
         // Check compressed file exists (9-digit format)
         assert!(segment_path.exists(), "Compressed file should exist");
@@ -793,6 +844,33 @@ mod tests {
             !uncompressed_path.exists(),
             "Uncompressed file should be deleted"
         );
+        assert!(writer.stats().total_compressed_bytes > 0);
+    }
+
+    #[test]
+    fn drop_waits_for_background_compression() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let writer = SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: tmp.path().to_path_buf(),
+                    compress: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            writer.write(test_event(1)).unwrap();
+        }
+
+        assert!(tmp.path().join("segment-000000000.notepack.gz").exists());
+        assert!(
+            !tmp.path()
+                .join("segment-000000000.notepack.gz.open")
+                .exists()
+        );
+        assert!(!tmp.path().join("segment-000000000.notepack").exists());
     }
 
     #[test]

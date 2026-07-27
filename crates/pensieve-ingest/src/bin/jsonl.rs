@@ -751,6 +751,8 @@ fn finalize_pipeline(
         }
     }
 
+    segment_writer.wait_for_compression()?;
+
     // Update stats from segment writer
     let seg_stats = segment_writer.stats();
     stats.segments_sealed = seg_stats.segment_number as usize;

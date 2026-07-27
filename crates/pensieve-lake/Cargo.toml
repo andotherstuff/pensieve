@@ -20,6 +20,8 @@ clap = { version = "4.4", features = ["derive"] }
 hex.workspace = true
 pensieve-parquet = { path = "../pensieve-parquet" }
 rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tempfile = "3"
 thiserror.workspace = true
