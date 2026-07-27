@@ -139,61 +139,120 @@ struct Args {
     no_compress: bool,
 
     /// Publish sealed notepack segments to an immutable local Parquet shadow lake.
-    #[arg(long, conflicts_with = "parquet_shadow_s3_bucket")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_LAKE_DIR",
+        conflicts_with = "parquet_shadow_s3_bucket"
+    )]
     parquet_shadow_lake_dir: Option<PathBuf>,
 
     /// Publish sealed notepack segments to this S3-compatible Parquet shadow bucket.
-    #[arg(long, conflicts_with = "parquet_shadow_lake_dir")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_S3_BUCKET",
+        conflicts_with = "parquet_shadow_lake_dir"
+    )]
     parquet_shadow_s3_bucket: Option<String>,
 
     /// AWS region override for the Parquet shadow S3 target.
-    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_S3_REGION",
+        requires = "parquet_shadow_s3_bucket"
+    )]
     parquet_shadow_s3_region: Option<String>,
 
     /// Endpoint URL for an S3-compatible Parquet shadow target.
-    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL",
+        requires = "parquet_shadow_s3_bucket"
+    )]
     parquet_shadow_s3_endpoint_url: Option<String>,
 
     /// Use path-style bucket addressing for the Parquet shadow S3 target.
-    #[arg(long, requires = "parquet_shadow_s3_bucket")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_S3_FORCE_PATH_STYLE",
+        requires = "parquet_shadow_s3_bucket"
+    )]
     parquet_shadow_s3_force_path_style: bool,
 
     /// SQLite publication journal for the Parquet shadow.
     ///
     /// Defaults to <output-dir>/.parquet-shadow/inventory.sqlite.
-    #[arg(long)]
+    #[arg(long, env = "PENSIEVE_PARQUET_SHADOW_STATE_DB")]
     parquet_shadow_state_db: Option<PathBuf>,
 
     /// Durable local staging directory for the Parquet shadow.
     ///
     /// Defaults to <output-dir>/.parquet-shadow/staging.
-    #[arg(long)]
+    #[arg(long, env = "PENSIEVE_PARQUET_SHADOW_STAGING_DIR")]
     parquet_shadow_staging_dir: Option<PathBuf>,
 
     /// Immutable object-key prefix used by the Parquet shadow.
-    #[arg(long, default_value = "nostr/v1")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_OBJECT_PREFIX",
+        default_value = "nostr/v1"
+    )]
     parquet_shadow_object_prefix: String,
 
     /// Target represented bytes per live Parquet object.
-    #[arg(long, default_value_t = pensieve_lake::DEFAULT_TARGET_UNCOMPRESSED_BYTES)]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_TARGET_UNCOMPRESSED_BYTES",
+        default_value_t = pensieve_lake::DEFAULT_TARGET_UNCOMPRESSED_BYTES
+    )]
     parquet_shadow_target_uncompressed_bytes: usize,
 
     /// Maximum accepted notepack frame size in the Parquet shadow.
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_MAX_EVENT_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
     parquet_shadow_max_event_bytes: usize,
 
     /// Maximum age of an open live batch while the Parquet shadow is enabled.
     ///
     /// The timer force-seals the authoritative notepack segment; the resulting
     /// sealed file is then the durable Parquet work unit. Zero disables the timer.
-    #[arg(long, default_value = "300")]
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_MAX_BATCH_AGE_SECS",
+        default_value = "300"
+    )]
     parquet_shadow_max_batch_age_secs: u64,
+
+    /// Replay only sealed segment numbers at or above this inclusive floor.
+    ///
+    /// For a first production activation, stop the ingester and set this to one
+    /// greater than the highest pre-existing segment number. The policy is
+    /// persisted in the shadow inventory and cannot drift across restarts.
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_REPLAY_FROM_SEGMENT",
+        conflicts_with = "no_parquet_shadow_replay"
+    )]
+    parquet_shadow_replay_from_segment: Option<u64>,
+
+    /// Explicitly replay every already sealed notepack file when the shadow starts.
+    ///
+    /// This is intended for isolated/local use. Production first activation
+    /// should use --parquet-shadow-replay-from-segment instead.
+    #[arg(
+        long,
+        env = "PENSIEVE_PARQUET_SHADOW_REPLAY_ALL",
+        conflicts_with_all = ["parquet_shadow_replay_from_segment", "no_parquet_shadow_replay"]
+    )]
+    parquet_shadow_replay_all: bool,
 
     /// Do not replay already sealed notepack files when the shadow starts.
     ///
-    /// Replay is safe and idempotent through the inventory, and is enabled by
-    /// default so a process crash cannot lose an in-memory notification.
-    #[arg(long)]
+    /// This gives up restart recovery for a missed in-memory notification and
+    /// should only be used for controlled tests.
+    #[arg(long, env = "PENSIEVE_PARQUET_SHADOW_NO_REPLAY")]
     no_parquet_shadow_replay: bool,
 
     /// Initial seed relay URLs (comma-separated, overrides seed file)
@@ -1348,6 +1407,19 @@ fn parquet_shadow_config(args: &Args) -> Result<ParquetShadowConfig> {
         .parquet_shadow_staging_dir
         .clone()
         .unwrap_or_else(|| control_dir.join("staging"));
+    let replay_dir = match (
+        args.parquet_shadow_replay_from_segment,
+        args.parquet_shadow_replay_all,
+        args.no_parquet_shadow_replay,
+    ) {
+        (Some(_), false, false) | (None, true, false) => Some(args.output_dir.clone()),
+        (None, false, true) => None,
+        _ => anyhow::bail!(
+            "choose exactly one Parquet shadow replay policy: \
+             --parquet-shadow-replay-from-segment, --parquet-shadow-replay-all, \
+             or --no-parquet-shadow-replay"
+        ),
+    };
     let publisher = match (
         &args.parquet_shadow_lake_dir,
         &args.parquet_shadow_s3_bucket,
@@ -1371,7 +1443,8 @@ fn parquet_shadow_config(args: &Args) -> Result<ParquetShadowConfig> {
             max_event_bytes: args.parquet_shadow_max_event_bytes,
         },
         publisher,
-        replay_dir: (!args.no_parquet_shadow_replay).then(|| args.output_dir.clone()),
+        replay_dir,
+        replay_from_segment: args.parquet_shadow_replay_from_segment,
     })
 }
 
@@ -1396,6 +1469,7 @@ fn start_optional_parquet_shadow(
         state_db = %config.state_db.display(),
         staging_dir = %config.campaign.staging_dir.display(),
         replay_existing = config.replay_dir.is_some(),
+        replay_from_segment = ?config.replay_from_segment,
         "starting Parquet shadow worker"
     );
     let (sender, receiver) = crossbeam_channel::unbounded::<SealedSegment>();
@@ -1451,6 +1525,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shadow_target_requires_an_explicit_replay_policy() {
+        let args = Args::try_parse_from([
+            "pensieve-ingest",
+            "--parquet-shadow-lake-dir",
+            "/tmp/parquet-shadow-test",
+        ])
+        .expect("arguments parse");
+
+        assert!(parquet_shadow_config(&args).is_err());
+    }
+
+    #[test]
+    fn shadow_replay_floor_configures_inclusive_restart_replay() {
+        let args = Args::try_parse_from([
+            "pensieve-ingest",
+            "--output-dir",
+            "/tmp/parquet-shadow-segments",
+            "--parquet-shadow-lake-dir",
+            "/tmp/parquet-shadow-test",
+            "--parquet-shadow-replay-from-segment",
+            "42",
+        ])
+        .expect("arguments parse");
+
+        let config = parquet_shadow_config(&args).expect("valid shadow config");
+        assert_eq!(
+            config.replay_dir,
+            Some(PathBuf::from("/tmp/parquet-shadow-segments"))
+        );
+        assert_eq!(config.replay_from_segment, Some(42));
+    }
+
+    #[test]
     fn shadow_initialization_failure_disables_only_the_optional_sink() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let blocking_file = directory.path().join("not-a-directory");
@@ -1462,6 +1569,7 @@ mod tests {
                 root: blocking_file.join("lake"),
             },
             replay_dir: None,
+            replay_from_segment: None,
         };
 
         assert!(start_optional_parquet_shadow(Ok(config)).is_none());

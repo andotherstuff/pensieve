@@ -51,6 +51,68 @@ provisioning). The ingester exposes Prometheus metrics on `:9091`.
 Verify: `systemctl status pensieve pensieve-api pensieve-ingest pensieve-preview`,
 `curl localhost:8080/health`, `journalctl -u pensieve-ingest -f`.
 
+## First live Parquet shadow activation
+
+Installing the binary and systemd unit does **not** enable the shadow. The
+optional `/etc/pensieve/parquet-shadow.env` file is the activation switch; seed
+it from [`ops/parquet-shadow.env.example`](parquet-shadow.env.example) without
+putting credentials in Git.
+
+The first activation must establish a segment-number boundary while ingestion
+is stopped. A timestamp is not a safe boundary because newly received Nostr
+events may have old or future `created_at` values.
+
+1. Stop the ingester gracefully and verify no compression is still in flight:
+   ```bash
+   sudo systemctl stop pensieve-ingest
+   find /archive/segments -maxdepth 1 -name '*.open' -print
+   ```
+2. Compute the inclusive replay floor as one greater than the highest existing
+   sealed or open segment:
+   ```bash
+   highest_segment="$(
+     find /archive/segments -maxdepth 1 -type f -printf '%f\n' |
+       sed -nE 's/^segment-([0-9]+)\.notepack(\.gz|\.open)?$/\1/p' |
+       sort -n |
+       tail -n 1
+   )"
+   test -n "$highest_segment"
+   replay_from_segment="$((10#$highest_segment + 1))"
+   printf 'highest=%s replay_from=%s\n' "$highest_segment" "$replay_from_segment"
+   ```
+3. Install the restricted configuration, set
+   `PENSIEVE_PARQUET_SHADOW_REPLAY_FROM_SEGMENT` to that exact replay floor
+   (uncommenting the example entry),
+   and verify the object prefix and writer-size settings match the historical
+   campaign:
+   ```bash
+   sudo install -m 600 -o pensieve -g pensieve \
+     ops/parquet-shadow.env.example /etc/pensieve/parquet-shadow.env
+   sudo -u pensieve nano /etc/pensieve/parquet-shadow.env
+   ```
+4. Start the ingester and verify that the durable replay policy is the expected
+   `from-segment:N`, historical segment numbers are not queued, and the normal
+   API/ingest metrics remain healthy:
+   ```bash
+   sudo systemctl start pensieve-ingest
+   journalctl -u pensieve-ingest --since '2 minutes ago' --no-pager
+   sqlite3 /archive/segments/.parquet-shadow/inventory.sqlite \
+     "SELECT key, value FROM inventory_settings ORDER BY key;"
+   ```
+5. Let the five-minute maximum-age timer seal the first live segment. Record
+   that segment as high-water mark `H`, verify its work unit is `published`,
+   and verify the corresponding immutable object and checksum in object
+   storage. The historical campaign's catch-up pass must include every sealed
+   segment through `H`; the intentional overlap is removed logically by event
+   ID later.
+
+On every restart, the live inventory rejects a changed replay policy, object
+store, object prefix, writer-size limit, frame-size limit, or staging directory.
+The ingester continues with its authoritative notepack path while logging that
+the optional shadow is disabled. Treat that as a failed shadow deployment:
+correct the configuration deliberately; do not delete a populated inventory
+merely to bypass the guard.
+
 ## One-time cutover (ops/ move + secrets → /etc)
 
 The move of compose/systemd paths and secrets to `/etc` must happen in lockstep with
