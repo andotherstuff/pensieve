@@ -356,6 +356,18 @@ impl SegmentWriter {
         Ok(seals)
     }
 
+    /// Remove the current segment and reserve the next segment number atomically.
+    ///
+    /// Reserving the number while holding `current` prevents a concurrent writer
+    /// from recreating the same `.open` path while this segment is being flushed
+    /// and renamed.
+    fn take_current_for_seal(&self) -> Option<(CurrentSegment, u64)> {
+        let mut current = self.current.lock();
+        let segment = current.take()?;
+        let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
+        Some((segment, segment_number))
+    }
+
     /// Seal the current segment.
     ///
     /// This finalizes the current segment and prepares for a new one.
@@ -366,13 +378,10 @@ impl SegmentWriter {
     /// for marking as archived). Downstream notifications are sent after
     /// compression completes (from the background thread).
     pub fn seal(&self) -> Result<Option<SealedSegment>> {
-        let segment = {
-            let mut current = self.current.lock();
-            match current.take() {
-                Some(s) => s,
-                None => return Ok(None),
-            }
-        }; // release the `current` lock before durable I/O and dedupe writes
+        let (segment, segment_number) = match self.take_current_for_seal() {
+            Some(segment) => segment,
+            None => return Ok(None),
+        };
 
         let CurrentSegment {
             writer,
@@ -408,11 +417,6 @@ impl SegmentWriter {
                 .ok_or_else(|| Error::Segment("segment has no parent directory".to_string()))?,
         )?
         .sync_all()?;
-
-        // The final name is now occupied even if a later dedupe write fails.
-        // Advance before any subsequent fallible operation so a retry can never
-        // reuse and replace this segment number.
-        let segment_number = self.segment_number.fetch_add(1, Ordering::SeqCst);
 
         // Record the segment's events as durably archived (and clear their in-flight
         // markers). Doing this on EVERY seal — not just the final one — is what makes
@@ -720,6 +724,40 @@ mod tests {
         // Check file exists (9-digit format)
         let segment_path = tmp.path().join("segment-000000000.notepack");
         assert!(segment_path.exists());
+    }
+
+    #[test]
+    fn taking_segment_for_seal_reserves_the_next_open_path() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SegmentWriter::new(
+            SegmentConfig {
+                output_dir: tmp.path().to_path_buf(),
+                compress: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        writer.write(test_event(1)).unwrap();
+        let (sealing, segment_number) = writer.take_current_for_seal().unwrap();
+        assert_eq!(segment_number, 0);
+        assert_eq!(
+            sealing.path,
+            tmp.path().join("segment-000000000.notepack.open")
+        );
+
+        // A write can arrive while the detached segment is still being flushed.
+        // It must create the next path rather than truncating the sealing path.
+        writer.write(test_event(2)).unwrap();
+        let current = writer.current.lock();
+        let current = current.as_ref().unwrap();
+        assert_eq!(
+            current.path,
+            tmp.path().join("segment-000000001.notepack.open")
+        );
+        assert_ne!(current.path, sealing.path);
     }
 
     #[test]
