@@ -9,6 +9,7 @@ Type=simple
 User=pensieve
 Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve
+EnvironmentFile=-/etc/pensieve/parquet-shadow.env
 
 # Binary location (after cargo build --release)
 # Tor proxy enabled by default - .onion relays route through Tor, clearnet connects directly
@@ -61,4 +62,3 @@ ReadWritePaths=/data /archive
 
 [Install]
 WantedBy=multi-user.target
-

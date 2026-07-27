@@ -316,6 +316,12 @@ impl Inventory {
 
             CREATE INDEX IF NOT EXISTS objects_active_kind
                 ON objects(state, kind, object_key);
+
+            CREATE TABLE IF NOT EXISTS inventory_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
             "#,
         )?;
         ensure_column(
@@ -343,6 +349,42 @@ impl Inventory {
             "ALTER TABLE objects ADD COLUMN writer_version TEXT NOT NULL DEFAULT 'unknown'",
         )?;
         Ok(Self { connection })
+    }
+
+    /// Record an immutable operational setting or verify its previously recorded value.
+    ///
+    /// Settings live in the external inventory, not canonical Parquet metadata.
+    /// This is intended for safety boundaries which must survive process restarts.
+    pub fn ensure_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO inventory_settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        let actual: String = self.connection.query_row(
+            "SELECT value FROM inventory_settings WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )?;
+        if actual != value {
+            return Err(Error::InventorySettingConflict {
+                key: key.to_owned(),
+                requested: value.to_owned(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Load one operational inventory setting.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT value FROM inventory_settings WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Register a work unit or verify that an existing identity is compatible.

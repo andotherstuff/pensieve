@@ -31,6 +31,17 @@ pub enum Error {
         reason: String,
     },
 
+    /// An immutable inventory setting differs from the value recorded on first use.
+    #[error("inventory setting {key} is already {actual}, refusing requested value {requested}")]
+    InventorySettingConflict {
+        /// Stable setting key.
+        key: String,
+        /// Requested setting value.
+        requested: String,
+        /// Value already recorded in the inventory.
+        actual: String,
+    },
+
     /// A state transition is not valid for the current work-unit state.
     #[error("invalid work-unit transition for {work_unit_id}: {from} -> {to}")]
     InvalidTransition {

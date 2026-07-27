@@ -439,6 +439,12 @@ shared infrastructure. Compaction is not required to finish P2.
       Parquet includes events observed after live activation. Events accepted
       between activation and sealing `H` intentionally occur in both paths.
       Logical dedup handles that overlap. The boundary is never a timestamp.
+  - [x] The live shadow accepts an inclusive segment-number replay floor and
+        persists the resulting replay policy in its SQLite inventory. On first
+        production activation, the operator records `max(existing segment) + 1`
+        while ingestion is stopped. Restarts replay that segment and every later
+        sealed segment, but cannot silently widen the boundary to the historical
+        archive or change the policy.
 - [ ] Before P5, prove the chosen unsealed-buffer durability contract across the
       intended failure domain. Zero RPO requires synchronous/acknowledged
       durability outside the live process or host; asynchronous replication
