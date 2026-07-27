@@ -3,7 +3,7 @@ use std::path::Path;
 
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use notepack::NoteBinary;
-use pensieve_parquet::{CanonicalEvent, RawEvent, validate_file, write_events};
+use pensieve_parquet::{CanonicalEvent, Error, RawEvent, validate_file, write_events};
 
 fn test_keys() -> Keys {
     Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
@@ -68,6 +68,52 @@ fn validates_raw_and_notepack_without_json() {
     assert_eq!(decoded.tags(), raw.tags);
     assert_eq!(decoded.content(), "");
     assert_eq!(decoded.created_at(), i64::MAX as u64 + 1);
+}
+
+#[test]
+fn strict_notepack_decoder_accepts_content_larger_than_256_kib() {
+    let event = EventBuilder::new(Kind::TextNote, "x".repeat(700_000))
+        .custom_created_at(Timestamp::from(1_700_000_000))
+        .sign_with_keys(&test_keys())
+        .expect("large event should sign");
+    let raw = raw_event(&event);
+    let payload = NoteBinary {
+        id: &raw.id,
+        pubkey: &raw.pubkey,
+        sig: &raw.sig,
+        content: &raw.content,
+        created_at: raw.created_at,
+        kind: u64::from(raw.kind),
+        tags: &raw.tags,
+    }
+    .pack();
+
+    let decoded =
+        CanonicalEvent::from_notepack(&payload).expect("frame-bounded content should decode");
+    assert_eq!(decoded.id(), &raw.id);
+    assert_eq!(decoded.content().len(), 700_000);
+}
+
+#[test]
+fn strict_notepack_decoder_still_rejects_trailing_bytes() {
+    let event = signed_event();
+    let raw = raw_event(&event);
+    let mut payload = NoteBinary {
+        id: &raw.id,
+        pubkey: &raw.pubkey,
+        sig: &raw.sig,
+        content: &raw.content,
+        created_at: raw.created_at,
+        kind: u64::from(raw.kind),
+        tags: &raw.tags,
+    }
+    .pack();
+    payload.push(0);
+
+    assert!(matches!(
+        CanonicalEvent::from_notepack(&payload),
+        Err(Error::Notepack(notepack::Error::TrailingBytes))
+    ));
 }
 
 #[test]

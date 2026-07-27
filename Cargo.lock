@@ -3095,6 +3095,7 @@ dependencies = [
  "parking_lot",
  "pensieve-core",
  "pensieve-lake",
+ "pensieve-parquet",
  "prost",
  "rocksdb",
  "rusqlite",

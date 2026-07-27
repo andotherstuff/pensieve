@@ -23,7 +23,7 @@ use clickhouse::{Client, Row};
 use crossbeam_channel::Receiver;
 use flate2::read::GzDecoder;
 use metrics::counter;
-use notepack::NoteParser;
+use pensieve_parquet::CanonicalEvent;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -395,40 +395,17 @@ impl ClickHouseIndexer {
 
     /// Parse notepack bytes into an EventRow.
     fn parse_notepack(data: &[u8]) -> Result<EventRow> {
-        use notepack::StringType;
-
-        let parser = NoteParser::new(data);
-        let note = parser
-            .into_note()
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-
-        // Convert tags to Vec<Vec<String>>
-        let mut tags: Vec<Vec<String>> = Vec::new();
-        let mut tags_iter = note.tags;
-        while let Some(tag_result) = tags_iter
-            .next_tag()
-            .map_err(|e| Error::Serialization(e.to_string()))?
-        {
-            let mut tag_vec: Vec<String> = Vec::new();
-            for elem in tag_result {
-                let elem = elem.map_err(|e| Error::Serialization(e.to_string()))?;
-                let s = match elem {
-                    StringType::Str(s) => s.to_string(),
-                    StringType::Bytes(b) => hex::encode(b),
-                };
-                tag_vec.push(s);
-            }
-            tags.push(tag_vec);
-        }
+        let event =
+            CanonicalEvent::from_notepack(data).map_err(|e| Error::Serialization(e.to_string()))?;
 
         Ok(EventRow {
-            id: hex::encode(note.id),
-            pubkey: hex::encode(note.pubkey),
-            created_at: note.created_at as u32,
-            kind: note.kind as u16,
-            content: note.content.to_string(),
-            sig: hex::encode(note.sig),
-            tags,
+            id: hex::encode(event.id()),
+            pubkey: hex::encode(event.pubkey()),
+            created_at: event.created_at() as u32,
+            kind: event.kind(),
+            content: event.content().to_owned(),
+            sig: hex::encode(event.signature()),
+            tags: event.tags().to_owned(),
             relay_source: String::new(), // Backfill doesn't have relay source
         })
     }
@@ -480,12 +457,44 @@ pub struct IndexerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Timestamp};
+    use notepack::NoteBinary;
 
     #[test]
     fn test_config_default() {
         let config = ClickHouseConfig::default();
         assert_eq!(config.database, "nostr");
         assert_eq!(config.table, "events_local");
+    }
+
+    #[test]
+    fn clickhouse_parser_accepts_frame_bounded_large_content() {
+        let keys = Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+            .expect("valid test secret key");
+        let event = EventBuilder::new(Kind::TextNote, "x".repeat(700_000))
+            .custom_created_at(Timestamp::from(1_700_000_000))
+            .sign_with_keys(&keys)
+            .expect("large event should sign");
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().iter().map(ToString::to_string).collect())
+            .collect();
+        let payload = NoteBinary {
+            id: event.id.as_bytes(),
+            pubkey: event.pubkey.as_bytes(),
+            sig: event.sig.as_ref(),
+            content: &event.content,
+            created_at: event.created_at.as_secs(),
+            kind: u64::from(event.kind.as_u16()),
+            tags: &tags,
+        }
+        .pack();
+
+        let row = ClickHouseIndexer::parse_notepack(&payload)
+            .expect("frame-bounded content should decode");
+        assert_eq!(row.id, event.id.to_hex());
+        assert_eq!(row.content.len(), 700_000);
     }
 
     // Integration tests would require a running ClickHouse instance
