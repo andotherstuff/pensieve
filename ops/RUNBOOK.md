@@ -81,7 +81,8 @@ events may have old or future `created_at` values.
    printf 'highest=%s replay_from=%s\n' "$highest_segment" "$replay_from_segment"
    ```
 3. Install the restricted configuration, set
-   `PENSIEVE_PARQUET_SHADOW_REPLAY_FROM_SEGMENT` to that exact replay floor,
+   `PENSIEVE_PARQUET_SHADOW_REPLAY_FROM_SEGMENT` to that exact replay floor
+   (uncommenting the example entry),
    and verify the object prefix and writer-size settings match the historical
    campaign:
    ```bash
