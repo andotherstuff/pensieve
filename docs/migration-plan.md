@@ -525,6 +525,15 @@ joins the frozen source universe to the complete campaign inventory and active
 raw catalog view, then reports missing, failed, in-progress, unexpected, and
 event-accounting defects.
 
+Recovery checkpoint (2026-07-28): terminally truncated source files now have a
+fail-closed salvage path that atomically retains every complete frame, the
+exact incomplete terminal bytes, and a content-addressed evidence report.
+Published salvage work is bound to the failed original through an immutable
+exception ledger, so campaign completion can account for a damaged input
+without relabeling it as a normal success. Exact-ID relay recovery is also a
+first-class resumable binary with operator-supplied relay sets, validated
+append-only output, durable batch journaling, and atomic missing-ID snapshots.
+
 #### P2d — Converge and verify
 
 - [x] Build a deterministic **unified active-raw snapshot catalog** across the

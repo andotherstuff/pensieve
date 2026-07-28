@@ -52,6 +52,7 @@ aws-sdk-s3 = "1.82"
 
 # Concurrency
 crossbeam-channel = "0.5"
+futures-util = "0.3"
 parking_lot = "0.12"
 num_cpus = "1.16"
 

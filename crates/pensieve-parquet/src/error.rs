@@ -61,6 +61,14 @@ pub enum Error {
         frame_index: usize,
     },
 
+    /// A salvage operation was requested for a structurally complete segment.
+    #[error("notepack segment is complete; refusing to create a salvage artifact")]
+    SegmentNotTruncated,
+
+    /// A salvage bundle or its requested destination is invalid.
+    #[error("invalid notepack salvage: {0}")]
+    InvalidSalvage(String),
+
     /// A framed notepack payload failed decoding or canonical validation.
     #[error("notepack frame {frame_index} failed validation: {source}")]
     FrameValidation {

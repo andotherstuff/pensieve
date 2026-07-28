@@ -3087,6 +3087,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "flate2",
+ "futures-util",
  "hex",
  "metrics",
  "nostr-sdk",
@@ -3143,7 +3144,9 @@ dependencies = [
  "nostr",
  "notepack",
  "parquet",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.17",
 ]

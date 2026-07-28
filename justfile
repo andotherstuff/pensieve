@@ -53,6 +53,14 @@ parquet-campaign *ARGS:
 source-manifest *ARGS:
     cargo run -p pensieve-lake --bin pensieve-source-manifest -- {{ARGS}}
 
+# Recover exact event IDs from an operator-supplied relay set.
+recover-events *ARGS:
+    cargo run -p pensieve-ingest --bin recover-events -- {{ARGS}}
+
+# Preserve the complete prefix and terminal evidence of a truncated notepack.
+salvage-notepack *ARGS:
+    cargo run -p pensieve-parquet --bin pensieve-notepack-salvage -- {{ARGS}}
+
 # Export, merge, or verify deterministic active-file lake catalogs.
 lake-catalog *ARGS:
     cargo run -p pensieve-lake --bin pensieve-lake-catalog -- {{ARGS}}

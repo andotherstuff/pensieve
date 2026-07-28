@@ -23,10 +23,12 @@ pub use inventory::{
 };
 pub use publisher::{LocalObjectStore, PublishedObject, Publisher, S3Publisher, S3PublisherConfig};
 pub use source_manifest::{
-    CompletionProblem, CompletionTotals, HISTORICAL_SOURCE_MANIFEST_FORMAT,
-    HistoricalCompletionAudit, HistoricalSourceEntry, HistoricalSourceManifest,
-    HistoricalSourceTotals, audit_historical_completion, read_historical_source_manifest,
-    write_historical_source_manifest_noclobber,
+    CompletionProblem, CompletionTotals, HISTORICAL_SOURCE_EXCEPTIONS_FORMAT,
+    HISTORICAL_SOURCE_MANIFEST_FORMAT, HistoricalCompletionAudit, HistoricalSourceEntry,
+    HistoricalSourceException, HistoricalSourceExceptions, HistoricalSourceManifest,
+    HistoricalSourceTotals, audit_historical_completion, historical_source_exception_from_salvage,
+    read_historical_source_exceptions, read_historical_source_manifest,
+    write_historical_source_exceptions_noclobber, write_historical_source_manifest_noclobber,
 };
 pub use work_unit::{
     CampaignConfig, CampaignSummary, CleanupSummary, DEFAULT_TARGET_UNCOMPRESSED_BYTES,
