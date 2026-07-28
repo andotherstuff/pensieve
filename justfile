@@ -57,6 +57,10 @@ source-manifest *ARGS:
 lake-catalog *ARGS:
     cargo run -p pensieve-lake --bin pensieve-lake-catalog -- {{ARGS}}
 
+# Build and optionally publish exact Slice A analytics.
+analytics-build *ARGS:
+    cargo run -p pensieve-analytics -- {{ARGS}}
+
 # ============================================================================
 # Build
 # ============================================================================
