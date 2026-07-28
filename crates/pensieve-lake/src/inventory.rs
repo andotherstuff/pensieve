@@ -470,6 +470,24 @@ impl Inventory {
             .map_err(Into::into)
     }
 
+    /// List every work unit in stable source-path and identity order.
+    pub fn work_units(&self) -> Result<Vec<WorkUnitRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT id, source_path, source_bytes, source_sha256,
+                   target_uncompressed_bytes, max_event_bytes, object_prefix,
+                   writer_version, state, input_events, output_rows,
+                   rejected_events, error
+            FROM work_units
+            ORDER BY source_path, id
+            "#,
+        )?;
+        let records = statement
+            .query_map([], work_unit_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Transition a work unit, enforcing the durable state machine.
     pub fn transition_work(
         &mut self,
