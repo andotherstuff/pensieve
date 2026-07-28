@@ -94,4 +94,8 @@ pub enum Error {
     /// A fragment or snapshot violates the catalog contract.
     #[error("invalid lake catalog: {0}")]
     InvalidCatalog(String),
+
+    /// A historical source manifest or its completion accounting is invalid.
+    #[error("invalid historical source manifest: {0}")]
+    InvalidSourceManifest(String),
 }

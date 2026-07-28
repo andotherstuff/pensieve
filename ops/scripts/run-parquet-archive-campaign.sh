@@ -80,16 +80,20 @@ INPUT_DIR="${INPUT_DIR:-/var/lib/pensieve-parquet/input}"
 RECEIPT_DIR="${RECEIPT_DIR:-/var/lib/pensieve-parquet/state/receipts}"
 LOCK_FILE="${LOCK_FILE:-/var/lib/pensieve-parquet/state/campaign.lock}"
 CAMPAIGN_BIN="${CAMPAIGN_BIN:-/home/pensieve/pensieve/target/release/pensieve-parquet-campaign}"
+SOURCE_MANIFEST_BIN="${SOURCE_MANIFEST_BIN:-/home/pensieve/pensieve/target/release/pensieve-source-manifest}"
+SOURCE_MANIFEST="${SOURCE_MANIFEST:-/var/lib/pensieve-parquet/state/historical-source-manifest.json}"
+HISTORICAL_MAX_SEGMENT="${HISTORICAL_MAX_SEGMENT:-}"
 MIN_FREE_BYTES="${MIN_FREE_BYTES:-5368709120}"
 WORKING_SPACE_MULTIPLIER="${WORKING_SPACE_MULTIPLIER:-3}"
 MAX_WORK_UNITS="${MAX_WORK_UNITS:-0}"
 INVENTORY_ONLY="${INVENTORY_ONLY:-0}"
 
 for name in SOURCE_REMOTE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION \
-    S3_BUCKET S3_ENDPOINT_URL S3_ARCHIVE_PREFIX; do
+    S3_BUCKET S3_ENDPOINT_URL S3_ARCHIVE_PREFIX HISTORICAL_MAX_SEGMENT; do
     require_env "$name"
 done
-for name in MIN_FREE_BYTES WORKING_SPACE_MULTIPLIER MAX_WORK_UNITS INVENTORY_ONLY; do
+for name in HISTORICAL_MAX_SEGMENT MIN_FREE_BYTES WORKING_SPACE_MULTIPLIER \
+    MAX_WORK_UNITS INVENTORY_ONLY; do
     require_uint "$name"
 done
 if [ "$WORKING_SPACE_MULTIPLIER" -lt 2 ]; then
@@ -104,90 +108,42 @@ if [ ! -x "$CAMPAIGN_BIN" ]; then
     echo "Campaign binary is not executable: $CAMPAIGN_BIN" >&2
     exit 2
 fi
+if [ ! -x "$SOURCE_MANIFEST_BIN" ]; then
+    echo "Source manifest binary is not executable: $SOURCE_MANIFEST_BIN" >&2
+    exit 2
+fi
 
-install -d -m 0750 "$INPUT_DIR" "$STAGING_DIR" "$RECEIPT_DIR" "$(dirname "$LOCK_FILE")"
+install -d -m 0750 "$INPUT_DIR" "$STAGING_DIR" "$RECEIPT_DIR" \
+    "$(dirname "$LOCK_FILE")" "$(dirname "$SOURCE_MANIFEST")"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     echo "Another Parquet archive campaign holds $LOCK_FILE" >&2
     exit 3
 fi
 
-source_inventory_raw="$(mktemp "$RECEIPT_DIR/.source-inventory-raw.XXXXXX")"
 source_inventory="$(mktemp "$RECEIPT_DIR/.source-inventory.XXXXXX")"
-source_inventory_meta="$(mktemp "$RECEIPT_DIR/.source-inventory-meta.XXXXXX")"
-trap 'rm -f "$source_inventory_raw" "$source_inventory" "$source_inventory_meta"' EXIT
-rclone lsf "$SOURCE_REMOTE" \
-    --files-only \
-    --max-depth 1 \
-    --include 'segment-*.notepack' \
-    --include 'segment-*.notepack.gz' >"$source_inventory_raw"
+trap 'rm -f "$source_inventory"' EXIT
 
-# The legacy archive may contain both the plain and gzip representation of the
-# same sealed segment. Prefer gzip and never process both. A plain-only segment
-# is eligible only below the highest gzip segment number: the plain file at or
-# above that high-water mark may still be the live, unsealed segment.
-if ! awk -v metadata="$source_inventory_meta" '
-    function segment_number(name, value) {
-        value = name
-        sub(/^segment-/, "", value)
-        sub(/[.]notepack([.]gz)?$/, "", value)
-        return value + 0
-    }
-
-    /^segment-[0-9]+[.]notepack[.]gz$/ {
-        base = $0
-        sub(/[.]gz$/, "", base)
-        gzip_by_base[base] = $0
-        number = segment_number($0)
-        if (!have_gzip || number > max_gzip) {
-            max_gzip = number
-        }
-        have_gzip = 1
-        next
-    }
-
-    /^segment-[0-9]+[.]notepack$/ {
-        plain[$0] = 1
-        next
-    }
-
-    {
-        print "Skipping unexpected source name: " $0 > "/dev/stderr"
-    }
-
-    END {
-        if (!have_gzip) {
-            print "No sealed gzip segments found; refusing to infer a safe source high-water mark" > "/dev/stderr"
-            exit 42
-        }
-
-        selected = 0
-        paired = 0
-        skipped_high_water = 0
-        for (base in gzip_by_base) {
-            print gzip_by_base[base]
-            selected++
-        }
-        for (name in plain) {
-            if (name in gzip_by_base) {
-                paired++
-            } else if (segment_number(name) < max_gzip) {
-                print name
-                selected++
-            } else {
-                skipped_high_water++
-            }
-        }
-        print max_gzip, selected, paired, skipped_high_water > metadata
-        close(metadata)
-    }
-' "$source_inventory_raw" >"$source_inventory"; then
-    echo "Unable to select a safe sealed source inventory" >&2
-    exit 4
+if [ ! -e "$SOURCE_MANIFEST" ]; then
+    source_inventory_json="$(mktemp "$RECEIPT_DIR/.source-inventory.XXXXXX.json")"
+    trap 'rm -f "$source_inventory" "${source_inventory_json:-}"' EXIT
+    rclone lsjson "$SOURCE_REMOTE" \
+        --files-only \
+        --max-depth 1 \
+        --include 'segment-*.notepack' \
+        --include 'segment-*.notepack.gz' >"$source_inventory_json"
+    "$SOURCE_MANIFEST_BIN" build \
+        --rclone-lsjson "$source_inventory_json" \
+        --max-segment-number "$HISTORICAL_MAX_SEGMENT" \
+        --output "$SOURCE_MANIFEST"
+    rm -f "$source_inventory_json"
 fi
-sort -V -o "$source_inventory" "$source_inventory"
-read -r max_sealed_gzip selected_sources paired_sources skipped_high_water <"$source_inventory_meta"
-echo "Source inventory: selected=$selected_sources max_sealed_gzip=$max_sealed_gzip paired_plain_skipped=$paired_sources high_water_plain_skipped=$skipped_high_water"
+
+"$SOURCE_MANIFEST_BIN" verify \
+    --manifest "$SOURCE_MANIFEST" \
+    --expected-max-segment-number "$HISTORICAL_MAX_SEGMENT"
+"$SOURCE_MANIFEST_BIN" entries \
+    --manifest "$SOURCE_MANIFEST" >"$source_inventory"
 if [ "$INVENTORY_ONLY" -eq 1 ]; then
     exit 0
 fi
@@ -195,11 +151,15 @@ fi
 attempted=0
 published=0
 failures=0
-while IFS= read -r filename; do
+while IFS=$'\t' read -r filename remote_bytes; do
     [ -n "$filename" ] || continue
     if ! [[ "$filename" =~ ^segment-[0-9]+\.notepack(\.gz)?$ ]]; then
         echo "Skipping unexpected source name: $filename" >&2
         continue
+    fi
+    if ! [[ "$remote_bytes" =~ ^[0-9]+$ ]]; then
+        echo "Manifest has invalid source size: $filename bytes=$remote_bytes" >&2
+        exit 4
     fi
 
     local_input="$INPUT_DIR/$filename"
@@ -212,11 +172,6 @@ while IFS= read -r filename; do
     fi
 
     remote_source="$SOURCE_REMOTE/$filename"
-    remote_bytes="$(rclone size --json "$remote_source" | jq -r '.bytes')"
-    if ! [[ "$remote_bytes" =~ ^[0-9]+$ ]]; then
-        echo "Unable to determine nonnegative source size: $remote_source" >&2
-        exit 4
-    fi
     available_bytes="$(df --output=avail -B1 "$INPUT_DIR" | tail -n 1 | tr -d ' ')"
     required_bytes=$((MIN_FREE_BYTES + remote_bytes * WORKING_SPACE_MULTIPLIER))
     if [ "$available_bytes" -lt "$required_bytes" ]; then

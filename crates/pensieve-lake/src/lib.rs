@@ -8,6 +8,7 @@ mod catalog;
 mod error;
 mod inventory;
 mod publisher;
+mod source_manifest;
 mod work_unit;
 
 pub use catalog::{
@@ -21,6 +22,12 @@ pub use inventory::{
     WorkUnitRegistration,
 };
 pub use publisher::{LocalObjectStore, PublishedObject, Publisher, S3Publisher, S3PublisherConfig};
+pub use source_manifest::{
+    CompletionProblem, CompletionTotals, HISTORICAL_SOURCE_MANIFEST_FORMAT,
+    HistoricalCompletionAudit, HistoricalSourceEntry, HistoricalSourceManifest,
+    HistoricalSourceTotals, audit_historical_completion, read_historical_source_manifest,
+    write_historical_source_manifest_noclobber,
+};
 pub use work_unit::{
     CampaignConfig, CampaignSummary, CleanupSummary, DEFAULT_TARGET_UNCOMPRESSED_BYTES,
     cleanup_published_local_artifacts, run_notepack_work_unit, sha256_file,

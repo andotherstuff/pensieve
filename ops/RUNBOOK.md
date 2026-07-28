@@ -113,6 +113,66 @@ the optional shadow is disabled. Treat that as a failed shadow deployment:
 correct the configuration deliberately; do not delete a populated inventory
 merely to bypass the guard.
 
+## Bounded historical Parquet catch-up
+
+The historical campaign is finite. Its immutable input universe ends at the
+inclusive historical/live boundary `H = 7702`; later live segments belong to
+the live shadow. Do not restart a healthy campaign merely to deploy the source
+manifest support. Install it for the next pass after the current sequential
+pass has stopped normally.
+
+1. Pull the merged revision and build both campaign binaries:
+   ```bash
+   cd /home/pensieve/pensieve
+   git pull --ff-only origin master
+   cargo build --release -p pensieve-lake \
+     --bin pensieve-parquet-campaign \
+     --bin pensieve-source-manifest
+   ```
+2. Set these non-secret values in the campaign environment:
+   ```bash
+   HISTORICAL_MAX_SEGMENT=7702
+   SOURCE_MANIFEST=/var/lib/pensieve-parquet/state/historical-source-manifest.json
+   SOURCE_MANIFEST_BIN=/home/pensieve/pensieve/target/release/pensieve-source-manifest
+   ```
+3. Freeze and inspect the manifest without downloading or publishing:
+   ```bash
+   sudo systemctl stop pensieve-parquet-campaign
+   sudo systemd-run --wait --pipe --collect \
+     --unit=pensieve-parquet-manifest-freeze \
+     --uid=pensieve --gid=pensieve \
+     --working-directory=/home/pensieve/pensieve \
+     --property=EnvironmentFile=/etc/pensieve/parquet-object-storage.env \
+     --property=EnvironmentFile=/etc/pensieve/parquet-campaign.env \
+     --setenv=INVENTORY_ONLY=1 \
+     /home/pensieve/pensieve/ops/scripts/run-parquet-archive-campaign.sh
+   sudo -u pensieve /home/pensieve/pensieve/target/release/pensieve-source-manifest \
+     verify \
+     --manifest /var/lib/pensieve-parquet/state/historical-source-manifest.json \
+     --expected-max-segment-number 7702
+   ```
+   The build is no-clobber. If the file already exists, the wrapper verifies
+   and reuses it. Never delete or replace a populated manifest to make a
+   boundary mismatch disappear; investigate the configuration instead.
+4. Start the bounded catch-up and let normal inventory idempotency skip sources
+   already published:
+   ```bash
+   sudo systemctl start pensieve-parquet-campaign
+   journalctl -u pensieve-parquet-campaign -f
+   ```
+5. After the pass is idle, write the content-addressed completion report:
+   ```bash
+   sudo -u pensieve /home/pensieve/pensieve/target/release/pensieve-source-manifest \
+     audit \
+     --manifest /var/lib/pensieve-parquet/state/historical-source-manifest.json \
+     --inventory /var/lib/pensieve-parquet/state/campaign.sqlite \
+     --output /var/lib/pensieve-parquet/state/historical-completion-audit.json
+   ```
+   Exit status `0` means the manifest, complete inventory, and active-raw view
+   reconcile. Exit status `2` means the report is valid but incomplete; repair
+   every named retryable failure or damaged-source exception rather than
+   editing the report or an existing Parquet object.
+
 ## One-time cutover (ops/ move + secrets → /etc)
 
 The move of compose/systemd paths and secrets to `/etc` must happen in lockstep with

@@ -510,8 +510,20 @@ space and post-publication cleanup. Single-request uploads are sufficient for
 the present campaign; multipart upload and worker concurrency are deferred
 optimizations rather than migration prerequisites. Failed work remains in the
 journal and its source remains available for an idempotent retry. After the
-initial startup inventory completes, a catch-up pass must process any source
-segments that arrived after that inventory was captured.
+initial startup inventory completes, a catch-up pass must process the remaining
+sources from a frozen, content-addressed manifest whose inclusive segment
+boundary is exactly `H`. The worker must never keep extending that finite
+historical campaign merely because newer source objects appear remotely.
+
+Implementation checkpoint (2026-07-28): the campaign has a canonical source
+manifest built from one `rclone lsjson` capture. It records the selected source
+name and exact byte size for every segment through `H = 7702`, prefers gzip
+when both representations exist, excludes an unsafe plain high-water file, and
+is created with no-clobber semantics. Every later pass verifies the configured
+boundary and consumes that same manifest. A deterministic completion audit
+joins the frozen source universe to the complete campaign inventory and active
+raw catalog view, then reports missing, failed, in-progress, unexpected, and
+event-accounting defects.
 
 #### P2d — Converge and verify
 
@@ -523,14 +535,22 @@ segments that arrived after that inventory was captured.
       state is excluded. Conflicts fail closed, and snapshots explicitly state
       that raw rows are not event-ID-deduplicated. See
       `docs/lake_active_file_catalog.md`.
-- [ ] Verify every historical work unit against its sealed notepack input and
-      periodically create a coordinated go-forward checkpoint by closing the
+- [ ] Complete the frozen historical-source manifest through `H`: every entry
+      must have one published inventory work unit, valid input/output/reject/
+      duplicate accounting, and active objects that pass strict checksum and
+      V1 validation. Repair or explicitly quarantine every reported exception.
+- [ ] Perform full seven-field source-to-Parquet comparison for every anomaly,
+      repaired or salvaged input, historical/live boundary input, and a
+      deterministic sample of ordinary historical work. A second exhaustive
+      1.4-billion-event body comparison is not a migration prerequisite: the
+      converter already verifies every source event ID/signature and the strict
+      validator independently reopens every output row and verifies all seven
+      logical fields.
+- [ ] Periodically create a coordinated go-forward checkpoint by closing the
       current live batch and sealing the current notepack segment at the same
-      ingest barrier. Compare ID-keyed seven-field values through that barrier,
-      not file counts or physical row counts.
-- [ ] Verify the active union of historical and live raw objects against the
-      notepack archive through `H` plus the sustained go-forward stream. The
-      intentional overlap at `H` must disappear under ID-keyed comparison.
+      ingest barrier. Compare complete ID-keyed seven-field values through that
+      barrier. The intentional historical/live overlap at `H` must disappear
+      under ID-keyed comparison.
 - [ ] If a go-forward mismatch is found, replay the corresponding post-`H`
       notepack range through the shared repair/import path, publish the repair
       as active raw objects, and repeat parity verification. Do not hide a gap
@@ -549,10 +569,12 @@ physical rows, and 102,813,011,702 object bytes. This is a reproducible
 checkpoint while both ingestion paths continue, not the still-pending
 historical/live parity proof.
 
-**Gate:** all sealed notepack inputs through `H` and N sustained go-forward
-windows have complete ID-keyed parity; every active output passes the
-independent V1 validator; crash recovery converges at every publication
-transition; and the proposed P5 unsealed-event RPO is demonstrated.
+**Gate:** the frozen manifest accounts for every sealed notepack input through
+`H`; all active output passes the independent V1 validator; anomaly, repair,
+boundary, and deterministic-sample content comparisons pass; N sustained
+go-forward windows have complete ID-keyed parity; crash recovery converges at
+every publication transition; and the proposed P5 unsealed-event RPO is
+demonstrated.
 
 **Rollback:** stop live Parquet sealing and historical conversion. Parquet is
 shadow-only; authoritative notepack ingestion is unaffected.
@@ -738,7 +760,7 @@ The diff harness (seeded in P0) is what makes cutovers trustworthy:
 
 ## 9. Status tracker
 
-Updated 2026-07-27.
+Updated 2026-07-28.
 
 - **P0 Foundation** — in progress (disk relief, archive-format acceptance,
   durable production object storage, real Hetzner compatibility and
@@ -754,15 +776,19 @@ Updated 2026-07-27.
   deterministic unified active-raw snapshot catalog are implemented. The live
   replay floor is segment 7703, establishing the historical boundary at
   `H = 7702`. The sequential historical campaign is active on its dedicated VM;
-  transient upload failures remain safely retryable. Segment 7703 was sealed as
-  an empty gzip after a now-fixed seal/compression race. Its exact 21,972 event
-  IDs were preserved from RocksDB; exhaustive relay recovery found 4,833 valid
-  unique event bodies and left 17,139 IDs as an explicit known gap. The repair
-  was validated, published as a separate immutable Parquet work unit, restored
-  to ClickHouse, and included with the historical and live inventories in the
-  first operational unified snapshot. Campaign completion/catch-up, full
-  ID-keyed historical/live parity, coordinated go-forward windows, publication
-  fault coverage, and the post-P5 unsealed-buffer failure-domain proof remain.
+  transient upload failures remain safely retryable. The finite catch-up source
+  universe is now frozen at `H` and has deterministic completion accounting.
+  Segment 7703 was sealed as an empty gzip after a now-fixed seal/compression
+  race. Its exact 21,972 event IDs were preserved from RocksDB; initial
+  exact-ID relay recovery found 4,833 valid unique event bodies, with 17,139
+  IDs currently unrecovered and eligible for recurring wider-relay attempts.
+  The repair was validated, published as a separate immutable Parquet work
+  unit, restored to ClickHouse, and included with the historical and live
+  inventories in the first operational unified snapshot. Campaign
+  completion/catch-up, explicit handling of damaged historical inputs,
+  targeted historical content comparison, coordinated go-forward parity
+  windows, publication fault coverage, and the post-P5 unsealed-buffer
+  failure-domain proof remain.
 - **P3 Optimization + new analytics** — not started
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
