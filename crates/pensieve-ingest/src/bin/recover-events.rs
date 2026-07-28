@@ -148,15 +148,23 @@ async fn run() -> Result<()> {
             match result {
                 Ok(events) => {
                     for event in events {
-                        if !target_ids.contains(&event.id) || recovered.contains(&event.id) {
-                            continue;
+                        match append_recovered_event(
+                            &mut writer,
+                            &mut recovered,
+                            &target_ids,
+                            &event,
+                        )? {
+                            AppendOutcome::Added => added += 1,
+                            AppendOutcome::Ignored => {}
+                            AppendOutcome::Invalid { error } => {
+                                eprintln!(
+                                    "invalid_event pass={} batch={} id={} error={error}",
+                                    pass_index + 1,
+                                    batch_index + 1,
+                                    event.id
+                                );
+                            }
                         }
-                        event.verify().with_context(|| {
-                            format!("relay returned invalid event {}", event.id)
-                        })?;
-                        writeln!(writer, "{}", event.as_json())?;
-                        recovered.insert(event.id);
-                        added += 1;
                     }
                     if added > 0 {
                         writer.flush()?;
@@ -275,6 +283,32 @@ fn read_recovered(path: &Path, target_ids: &HashSet<EventId>) -> Result<HashSet<
     Ok(recovered)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum AppendOutcome {
+    Added,
+    Ignored,
+    Invalid { error: String },
+}
+
+fn append_recovered_event(
+    writer: &mut impl Write,
+    recovered: &mut HashSet<EventId>,
+    target_ids: &HashSet<EventId>,
+    event: &Event,
+) -> Result<AppendOutcome> {
+    if !target_ids.contains(&event.id) || recovered.contains(&event.id) {
+        return Ok(AppendOutcome::Ignored);
+    }
+    if let Err(error) = event.verify() {
+        return Ok(AppendOutcome::Invalid {
+            error: error.to_string(),
+        });
+    }
+    writeln!(writer, "{}", event.as_json())?;
+    recovered.insert(event.id);
+    Ok(AppendOutcome::Added)
+}
+
 fn write_missing_atomically(
     path: &Path,
     ids: &[EventId],
@@ -363,6 +397,41 @@ mod tests {
         fs::write(&output, format!("{}\n", other.as_json())).expect("output");
         let error = read_recovered(&output, &HashSet::from([target.id])).expect_err("non-target");
         assert!(error.to_string().contains("non-target"));
+    }
+
+    #[test]
+    fn invalid_relay_event_is_skipped_without_losing_later_valid_event() {
+        let valid = event("target");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&valid.as_json()).expect("event JSON");
+        let signature = value["sig"].as_str().expect("signature");
+        let first = if signature.starts_with('0') { "1" } else { "0" };
+        value["sig"] = serde_json::Value::String(format!("{first}{}", &signature[1..]));
+        let invalid = Event::from_json(value.to_string()).expect("invalid event shape");
+        assert_eq!(invalid.id, valid.id);
+        assert!(invalid.verify().is_err());
+
+        let targets = HashSet::from([valid.id]);
+        let mut recovered = HashSet::new();
+        let mut output = Vec::new();
+        assert!(matches!(
+            append_recovered_event(&mut output, &mut recovered, &targets, &invalid)
+                .expect("skip invalid event"),
+            AppendOutcome::Invalid { .. }
+        ));
+        assert!(output.is_empty());
+        assert!(recovered.is_empty());
+
+        assert_eq!(
+            append_recovered_event(&mut output, &mut recovered, &targets, &valid)
+                .expect("append valid event"),
+            AppendOutcome::Added
+        );
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8 JSONL"),
+            format!("{}\n", valid.as_json())
+        );
+        assert_eq!(recovered, targets);
     }
 
     #[test]
