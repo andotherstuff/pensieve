@@ -453,6 +453,9 @@ fn scalar_u64(connection: &Connection, sql: &str) -> Result<u64> {
         .ok_or_else(|| Error::Validation(format!("query returned no scalar row: {sql}")))
 }
 
+// DuckDB does not accept bind parameters in `CREATE SECRET` options or in a
+// `read_parquet` file-list literal. Those values come from the operator-selected
+// catalog and CLI configuration, so quote and escape them in one place.
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
