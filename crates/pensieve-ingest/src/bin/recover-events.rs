@@ -41,6 +41,12 @@ struct Args {
 }
 
 fn main() {
+    // The workspace enables both rustls providers transitively. Relay connections
+    // cannot choose safely between them without a process-level default.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     if let Err(error) = run() {
         eprintln!("event recovery failed: {error:#}");
         std::process::exit(1);
