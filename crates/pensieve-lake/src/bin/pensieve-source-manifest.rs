@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use pensieve_lake::{
     ActiveRawFragment, HistoricalSourceManifest, Inventory, audit_historical_completion,
-    read_historical_source_manifest, write_catalog_atomically,
-    write_historical_source_manifest_noclobber,
+    historical_source_exception_from_salvage, read_catalog_fragment,
+    read_historical_source_exceptions, read_historical_source_manifest, write_catalog_atomically,
+    write_historical_source_exceptions_noclobber, write_historical_source_manifest_noclobber,
 };
+use pensieve_parquet::read_salvage_report;
 
 #[derive(Debug, Parser)]
 #[command(about = "Manage the frozen historical notepack source universe")]
@@ -46,6 +48,21 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    /// Bind terminal-truncation evidence to one published repair work unit.
+    BuildExceptionLedger {
+        /// Frozen historical source manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Canonical report from `pensieve-notepack-salvage`.
+        #[arg(long)]
+        salvage_report: PathBuf,
+        /// Active-raw catalog fragment containing the published repair work.
+        #[arg(long)]
+        repair_fragment: PathBuf,
+        /// Immutable exception-ledger destination.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Audit manifest coverage against a campaign inventory.
     Audit {
         /// Canonical source manifest.
@@ -54,6 +71,12 @@ enum Command {
         /// Existing SQLite campaign inventory.
         #[arg(long)]
         inventory: PathBuf,
+        /// Optional immutable damaged-source exception ledger.
+        #[arg(long)]
+        exceptions: Option<PathBuf>,
+        /// Active-raw repair fragment referenced by the exception ledger.
+        #[arg(long)]
+        repair_fragment: Vec<PathBuf>,
         /// Canonical JSON audit-report destination.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -102,12 +125,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}\t{}", entry.source_name, entry.source_bytes);
             }
         }
-        Command::Audit {
+        Command::BuildExceptionLedger {
             manifest,
-            inventory,
+            salvage_report,
+            repair_fragment,
             output,
         } => {
             let manifest = read_historical_source_manifest(manifest)?;
+            let report = read_salvage_report(salvage_report)?;
+            let repair_fragment = read_catalog_fragment(repair_fragment)?;
+            let exceptions =
+                historical_source_exception_from_salvage(&manifest, &report, &repair_fragment)?;
+            write_historical_source_exceptions_noclobber(output, &exceptions)?;
+            println!(
+                "exceptions={} manifest={} entries={}",
+                exceptions.exceptions_id,
+                exceptions.manifest_id(),
+                exceptions.entries().len()
+            );
+        }
+        Command::Audit {
+            manifest,
+            inventory,
+            exceptions,
+            repair_fragment,
+            output,
+        } => {
+            let manifest = read_historical_source_manifest(manifest)?;
+            let exceptions = exceptions
+                .map(read_historical_source_exceptions)
+                .transpose()?;
+            let repair_fragments = repair_fragment
+                .into_iter()
+                .map(read_catalog_fragment)
+                .collect::<Result<Vec<_>, _>>()?;
             let mut inventory = Inventory::open_read_only(inventory)?;
             let work_units = inventory.work_units()?;
             let fragment = ActiveRawFragment::export(
@@ -126,6 +177,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &active_work_unit_ids,
                 fragment.totals().objects,
                 fragment.totals().physical_rows,
+                exceptions.as_ref(),
+                &repair_fragments,
             )?;
             if let Some(output) = output {
                 write_catalog_atomically(output, &audit)?;

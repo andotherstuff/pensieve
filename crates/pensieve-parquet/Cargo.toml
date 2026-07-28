@@ -22,9 +22,11 @@ hex.workspace = true
 nostr.workspace = true
 notepack.workspace = true
 parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 
 [dev-dependencies]
 bytes = "1"
-serde_json.workspace = true

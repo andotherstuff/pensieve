@@ -6,8 +6,9 @@ use flate2::write::GzEncoder;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use notepack::NoteBinary;
 use pensieve_parquet::{
-    DEFAULT_MAX_EVENT_BYTES, Error, convert_segment, convert_segment_quarantining_invalid,
-    scan_framed_notepack, validate_file,
+    DEFAULT_MAX_EVENT_BYTES, Error, SALVAGE_REPORT_NAME, SALVAGED_SEGMENT_NAME, SalvageReport,
+    TRUNCATED_TAIL_NAME, convert_segment, convert_segment_quarantining_invalid,
+    read_salvage_report, salvage_truncated_segment, scan_framed_notepack, validate_file,
 };
 
 fn test_keys() -> Keys {
@@ -142,4 +143,69 @@ fn truncated_segment_never_publishes_an_output_file() {
         Err(Error::TruncatedFrame { frame_index: 0 })
     ));
     assert!(!output.exists());
+}
+
+#[test]
+fn terminal_truncation_salvage_preserves_complete_frames_and_exact_tail() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("segment-000000001.notepack");
+    let bundle = directory.path().join("salvage");
+    let valid = pack(&event(1, "valid"));
+    let mut segment = File::create(&input).expect("input segment");
+    write_frame(&mut segment, &[1, 2, 3]);
+    write_frame(&mut segment, &valid);
+    segment
+        .write_all(&10u32.to_le_bytes())
+        .expect("tail length");
+    segment.write_all(&[4, 5, 6]).expect("tail payload");
+    segment.sync_all().expect("sync input");
+
+    let report = salvage_truncated_segment(&input, &bundle, DEFAULT_MAX_EVENT_BYTES)
+        .expect("salvage terminal truncation");
+    assert_eq!(report.complete_frames(), 2);
+    assert_eq!(report.valid_events(), 1);
+    assert_eq!(report.rejected_events(), 1);
+    assert_eq!(report.truncated_frame_index(), 2);
+
+    let scan = scan_framed_notepack(
+        File::open(bundle.join(SALVAGED_SEGMENT_NAME)).expect("salvaged segment"),
+        DEFAULT_MAX_EVENT_BYTES,
+    )
+    .expect("complete salvaged prefix");
+    assert_eq!(scan.events.len(), 1);
+    assert_eq!(scan.rejected.len(), 1);
+    let mut expected_tail = 10u32.to_le_bytes().to_vec();
+    expected_tail.extend([4, 5, 6]);
+    assert_eq!(
+        fs::read(bundle.join(TRUNCATED_TAIL_NAME)).expect("tail"),
+        expected_tail
+    );
+    let stored_report: SalvageReport =
+        serde_json::from_slice(&fs::read(bundle.join(SALVAGE_REPORT_NAME)).expect("report"))
+            .expect("canonical report JSON");
+    assert_eq!(stored_report, report);
+    assert_eq!(
+        read_salvage_report(bundle.join(SALVAGE_REPORT_NAME)).expect("validated report"),
+        report
+    );
+    assert!(matches!(
+        salvage_truncated_segment(&input, &bundle, DEFAULT_MAX_EVENT_BYTES),
+        Err(Error::OutputExists { .. })
+    ));
+}
+
+#[test]
+fn complete_segment_is_not_silently_reclassified_as_salvage() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("complete.notepack");
+    let bundle = directory.path().join("salvage");
+    let mut segment = File::create(&input).expect("input segment");
+    write_frame(&mut segment, &pack(&event(1, "complete")));
+    segment.sync_all().expect("sync input");
+
+    assert!(matches!(
+        salvage_truncated_segment(&input, &bundle, DEFAULT_MAX_EVENT_BYTES),
+        Err(Error::SegmentNotTruncated)
+    ));
+    assert!(!bundle.exists());
 }

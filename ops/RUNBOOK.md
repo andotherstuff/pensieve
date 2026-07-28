@@ -173,6 +173,12 @@ pass has stopped normally.
    every named retryable failure or damaged-source exception rather than
    editing the report or an existing Parquet object.
 
+Damaged-source salvage and recurring exact-ID relay recovery follow
+[`docs/archive_recovery.md`](../docs/archive_recovery.md). Keep repairs in
+separate inventories, publish them under the same canonical object prefix, and
+merge their active fragments into the unified snapshot. Never delete the
+failed historical inventory row to make the completion report green.
+
 ## One-time cutover (ops/ move + secrets → /etc)
 
 The move of compose/systemd paths and secrets to `/etc` must happen in lockstep with

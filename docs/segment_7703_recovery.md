@@ -1,6 +1,6 @@
 # Segment 7703 recovery record
 
-*Status: repair published; recovery complete with a known unavailable-event gap*
+*Status: initial repair published; recurring exact-ID recovery remains open*
 
 This is the durable audit record for the first production live-shadow segment,
 `segment-000007703.notepack.gz`.
@@ -111,6 +111,10 @@ The full recovery evidence archive is retained on production at
 - the catalog archive expands to the three source fragments and the exact
   unified snapshot JSON.
 
-The 17,139 missing IDs remain an explicit known gap. An event body cannot be
-reconstructed from an ID alone; these unavailable events are retained in the
-audit instead of being fabricated or silently counted as recovered.
+The 17,139 IDs not found in the initial relay rounds remain an explicit known
+gap. They are currently unrecovered, not classified as permanently
+unavailable. The retained missing-ID set can be used for recurring recovery
+against materially broader relay sets with the first-class `recover-events`
+tool described in [`archive_recovery.md`](archive_recovery.md). An event body
+cannot be reconstructed from an ID alone, so every still-missing event remains
+in the audit instead of being fabricated or silently counted as recovered.

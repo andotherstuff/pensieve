@@ -6,6 +6,7 @@
 
 mod error;
 mod row;
+mod salvage;
 mod schema;
 mod segment;
 mod validator;
@@ -13,6 +14,10 @@ mod writer;
 
 pub use error::{Error, Result};
 pub use row::{CanonicalEvent, RawEvent};
+pub use salvage::{
+    NOTEPACK_SALVAGE_FORMAT, SALVAGE_REPORT_NAME, SALVAGED_SEGMENT_NAME, SalvageReport,
+    TRUNCATED_TAIL_NAME, read_salvage_report, salvage_truncated_segment,
+};
 pub use schema::{
     ARCHIVE_VERSION, ARCHIVE_VERSION_KEY, ROW_GROUP_TARGET_BYTES, canonical_arrow_schema,
 };
