@@ -2,7 +2,7 @@
 
 *Status: active / executing*
 *Created: 2026-06-14*
-*Last updated: 2026-07-23*
+*Last updated: 2026-07-28*
 *Owner: Jeff*
 
 This is the canonical execution plan for migrating Pensieve from its current stack
@@ -19,7 +19,7 @@ It is a companion to the target-architecture design notes. Where the design doc 
 ```
 relay collectors ─► RocksDB dedup ─► notepack .gz segments (source of truth)
                                           └─► ClickHouse (events_local + ~7 MVs)
-                                                 ├─► pensieve-serve (32 analytics endpoints)
+                                                 ├─► pensieve-serve (24 ClickHouse-backed analytics routes)
                                                  └─► pensieve-preview (per-event pages) ← being dropped
 ```
 
@@ -28,8 +28,9 @@ relay collectors ─► RocksDB dedup ─► notepack .gz segments (source of tr
   (`github.com/erskingardner/notepack`) — durability risk over a 10-year horizon.
 - **Analytics:** ClickHouse, ~2.6 TiB on NVMe and growing. Already pre-aggregates via
   materialized views (DAU/WAU/MAU, first-seen, zaps, kinds, relay distribution).
-- **Serving:** `pensieve-serve` (real, 32 endpoints — *not* a placeholder) +
-  `pensieve-preview` (random-access-by-id event pages).
+- **Serving:** `pensieve-serve` (30 GET routes: 24 ClickHouse-backed analytics,
+  3 relay-operational SQLite routes, authenticated ping, and 2 public service
+  routes) + `pensieve-preview` (random-access-by-id event pages).
 - **Dedup:** RocksDB, ~50 GB at 1.4 B events. It currently filters the global
   ingest stream and participates in archive state transitions. It is retained
   during migration, but the target archive must remain correct if this
@@ -590,8 +591,21 @@ shadow-only; authoritative notepack ingestion is unaffected.
 
 ### P3 — Optimize the lake and build analytics in parallel  *(Track B)*
 
+- [x] Freeze the current analytics surface in the
+      [endpoint migration ledger](analytics_endpoint_migration.md): 24
+      ClickHouse-backed routes plus the separately scoped relay-operational and
+      service routes. The ledger records request/response contracts, current
+      query semantics, proposed DuckDB products, candidate Postgres serving
+      shapes, parity classifications, and the initial implementation order.
+- [x] Implement the first shadow analytics slice: active-snapshot consumption,
+      exact cross-file ID deduplication, overview/daily/kind DuckDB products,
+      reconciliations, versioned Postgres serving DDL, input/run provenance,
+      streamed publication, and an atomic current-run pointer. See
+      [Analytics Slice A](analytics_slice_a.md). This is not yet deployed,
+      parity-approved, or connected to the API.
 - [ ] Stand up **Postgres** rollup store.
-- [ ] **DuckDB batch jobs** reproducing all 32 endpoints' metrics from Parquet.
+- [ ] **DuckDB batch jobs** reproducing all 24 ClickHouse-backed analytics
+      routes' metrics from Parquet.
       Distinct/rolling metrics use **Apache DataSketches HLL end-to-end**: DuckDB's
       built-in `approx_count_distinct` exposes no mergeable sketch state, and
       `postgresql-hll`'s binary format is **incompatible** with DataSketches — so it's
@@ -798,7 +812,11 @@ Updated 2026-07-28.
   targeted historical content comparison, coordinated go-forward parity
   windows, publication fault coverage, and the post-P5 unsealed-buffer
   failure-domain proof remain.
-- **P3 Optimization + new analytics** — not started
+- **P3 Optimization + new analytics** — implementation started. The current
+  ClickHouse-backed API surface and endpoint-by-endpoint parity contract are
+  inventoried. Slice A now has an executable DuckDB builder and transactional
+  Postgres serving schema; real-snapshot shadow deployment, old/new comparison,
+  later slices, endpoint cutover, and the optimizer remain.
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
 - **P6 Retire old storage** — not started
@@ -809,6 +827,8 @@ secrets in `/etc/pensieve/pensieve.env`; production box cut over to the new layo
 ---
 
 ## Related
+- `docs/analytics_endpoint_migration.md` — draft endpoint contract, DuckDB
+  product mapping, Postgres serving candidates, and parity ledger for P3
 - `docs/parquet_archive_format.md` — accepted canonical V1 specification
 - `docs/lake_active_file_catalog.md` — deterministic distributed-inventory
   export, merge, verification, and immutable snapshot publication

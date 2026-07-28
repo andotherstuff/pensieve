@@ -1,0 +1,33 @@
+[package]
+name = "pensieve-analytics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "DuckDB-to-Postgres analytics builder for Pensieve"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap = { version = "4.4", features = ["derive", "env"] }
+duckdb.workspace = true
+hex.workspace = true
+pensieve-core = { path = "../pensieve-core" }
+pensieve-lake = { path = "../pensieve-lake" }
+postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+nostr.workspace = true
+pensieve-parquet = { path = "../pensieve-parquet" }
+tempfile = "3"
