@@ -699,48 +699,52 @@ pub fn write_historical_source_manifest_noclobber(
     Ok(())
 }
 
-/// Build a one-entry exception ledger from validated salvage and repair evidence.
-pub fn historical_source_exception_from_salvage(
+/// Build an exception ledger from validated salvage and repair evidence.
+pub fn historical_source_exceptions_from_salvage(
     manifest: &HistoricalSourceManifest,
-    report: &SalvageReport,
+    reports: &[SalvageReport],
     repair_fragment: &ActiveRawFragment,
 ) -> Result<HistoricalSourceExceptions> {
     manifest.validate()?;
-    report.validate().map_err(|error| {
-        Error::InvalidSourceManifest(format!("invalid salvage report: {error}"))
-    })?;
     repair_fragment.validate()?;
-    let source = manifest
-        .entries()
-        .iter()
-        .find(|entry| entry.source_name == report.source_name())
-        .ok_or_else(|| {
-            Error::InvalidSourceManifest(format!(
-                "salvage source {} is absent from the frozen manifest",
-                report.source_name()
-            ))
-        })?;
-    if source.source_bytes != report.source_bytes() {
-        return Err(Error::InvalidSourceManifest(format!(
-            "salvage source bytes differ from the manifest for {}",
-            report.source_name()
-        )));
+    if reports.is_empty() {
+        return Err(Error::InvalidSourceManifest(
+            "at least one salvage report is required".to_owned(),
+        ));
     }
-    let repair_work_unit_id = format!("notepack-sha256-{}", report.salvaged_segment_sha256());
-    let repair = repair_fragment
-        .work_units()
-        .iter()
-        .find(|work| work.work_unit_id == repair_work_unit_id)
-        .ok_or_else(|| {
-            Error::InvalidSourceManifest(format!(
-                "repair fragment does not contain {repair_work_unit_id}"
-            ))
+    let mut entries = Vec::with_capacity(reports.len());
+    for report in reports {
+        report.validate().map_err(|error| {
+            Error::InvalidSourceManifest(format!("invalid salvage report: {error}"))
         })?;
-    validate_repair_accounting(report, repair)?;
-    let payload = HistoricalSourceExceptionsPayload {
-        format: HISTORICAL_SOURCE_EXCEPTIONS_FORMAT.to_owned(),
-        manifest_id: manifest.manifest_id.clone(),
-        entries: vec![HistoricalSourceException {
+        let source = manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.source_name == report.source_name())
+            .ok_or_else(|| {
+                Error::InvalidSourceManifest(format!(
+                    "salvage source {} is absent from the frozen manifest",
+                    report.source_name()
+                ))
+            })?;
+        if source.source_bytes != report.source_bytes() {
+            return Err(Error::InvalidSourceManifest(format!(
+                "salvage source bytes differ from the manifest for {}",
+                report.source_name()
+            )));
+        }
+        let repair_work_unit_id = format!("notepack-sha256-{}", report.salvaged_segment_sha256());
+        let repair = repair_fragment
+            .work_units()
+            .iter()
+            .find(|work| work.work_unit_id == repair_work_unit_id)
+            .ok_or_else(|| {
+                Error::InvalidSourceManifest(format!(
+                    "repair fragment does not contain {repair_work_unit_id}"
+                ))
+            })?;
+        validate_repair_accounting(report, repair)?;
+        entries.push(HistoricalSourceException {
             source_name: source.source_name.clone(),
             source_bytes: source.source_bytes,
             source_sha256: report.source_sha256().to_owned(),
@@ -750,7 +754,13 @@ pub fn historical_source_exception_from_salvage(
             complete_frames: report.complete_frames(),
             rejected_events: report.rejected_events(),
             truncated_frame_index: report.truncated_frame_index(),
-        }],
+        });
+    }
+    entries.sort();
+    let payload = HistoricalSourceExceptionsPayload {
+        format: HISTORICAL_SOURCE_EXCEPTIONS_FORMAT.to_owned(),
+        manifest_id: manifest.manifest_id.clone(),
+        entries,
     };
     let exceptions = HistoricalSourceExceptions {
         exceptions_id: content_id(&payload)?,
@@ -758,6 +768,19 @@ pub fn historical_source_exception_from_salvage(
     };
     exceptions.validate()?;
     Ok(exceptions)
+}
+
+/// Build a one-entry exception ledger from validated salvage and repair evidence.
+pub fn historical_source_exception_from_salvage(
+    manifest: &HistoricalSourceManifest,
+    report: &SalvageReport,
+    repair_fragment: &ActiveRawFragment,
+) -> Result<HistoricalSourceExceptions> {
+    historical_source_exceptions_from_salvage(
+        manifest,
+        std::slice::from_ref(report),
+        repair_fragment,
+    )
 }
 
 /// Read and fully validate a canonical historical exception ledger.

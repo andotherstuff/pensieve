@@ -27,8 +27,9 @@ pub use source_manifest::{
     HISTORICAL_SOURCE_MANIFEST_FORMAT, HistoricalCompletionAudit, HistoricalSourceEntry,
     HistoricalSourceException, HistoricalSourceExceptions, HistoricalSourceManifest,
     HistoricalSourceTotals, audit_historical_completion, historical_source_exception_from_salvage,
-    read_historical_source_exceptions, read_historical_source_manifest,
-    write_historical_source_exceptions_noclobber, write_historical_source_manifest_noclobber,
+    historical_source_exceptions_from_salvage, read_historical_source_exceptions,
+    read_historical_source_manifest, write_historical_source_exceptions_noclobber,
+    write_historical_source_manifest_noclobber,
 };
 pub use work_unit::{
     CampaignConfig, CampaignSummary, CleanupSummary, DEFAULT_TARGET_UNCOMPRESSED_BYTES,

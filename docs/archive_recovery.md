@@ -31,13 +31,16 @@ decoding failures and oversized frames are not terminal-truncation cases.
 3. Run `salvaged.notepack` through `pensieve-parquet-campaign` with a separate
    repair inventory and the canonical object-store prefix. Export its
    active-raw fragment with `pensieve-lake-catalog export`.
-4. Bind the failed original source, salvage evidence, and published repair:
+4. Bind the failed original sources, salvage evidence, and published repairs.
+   Pass `--salvage-report` once for each damaged source; the repair fragment
+   must contain every referenced repair work unit:
 
    ```bash
    pensieve-source-manifest build-exception-ledger \
      --manifest historical-source-manifest.json \
      --salvage-report segment-000001151-salvage/report.json \
-     --repair-fragment segment-000001151-repair-fragment.json \
+     --salvage-report segment-000002788-salvage/report.json \
+     --repair-fragment historical-repair-fragment.json \
      --output historical-source-exceptions.json
    ```
 

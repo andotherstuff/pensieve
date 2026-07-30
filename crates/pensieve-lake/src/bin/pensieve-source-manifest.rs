@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use pensieve_lake::{
     ActiveRawFragment, HistoricalSourceManifest, Inventory, audit_historical_completion,
-    historical_source_exception_from_salvage, read_catalog_fragment,
+    historical_source_exceptions_from_salvage, read_catalog_fragment,
     read_historical_source_exceptions, read_historical_source_manifest, write_catalog_atomically,
     write_historical_source_exceptions_noclobber, write_historical_source_manifest_noclobber,
 };
@@ -48,15 +48,16 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
-    /// Bind terminal-truncation evidence to one published repair work unit.
+    /// Bind terminal-truncation evidence to published repair work units.
     BuildExceptionLedger {
         /// Frozen historical source manifest.
         #[arg(long)]
         manifest: PathBuf,
         /// Canonical report from `pensieve-notepack-salvage`.
         #[arg(long)]
-        salvage_report: PathBuf,
-        /// Active-raw catalog fragment containing the published repair work.
+        #[arg(required = true)]
+        salvage_report: Vec<PathBuf>,
+        /// Active-raw catalog fragment containing every published repair work unit.
         #[arg(long)]
         repair_fragment: PathBuf,
         /// Immutable exception-ledger destination.
@@ -132,10 +133,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output,
         } => {
             let manifest = read_historical_source_manifest(manifest)?;
-            let report = read_salvage_report(salvage_report)?;
+            let reports = salvage_report
+                .into_iter()
+                .map(read_salvage_report)
+                .collect::<Result<Vec<_>, _>>()?;
             let repair_fragment = read_catalog_fragment(repair_fragment)?;
             let exceptions =
-                historical_source_exception_from_salvage(&manifest, &report, &repair_fragment)?;
+                historical_source_exceptions_from_salvage(&manifest, &reports, &repair_fragment)?;
             write_historical_source_exceptions_noclobber(output, &exceptions)?;
             println!(
                 "exceptions={} manifest={} entries={}",
