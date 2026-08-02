@@ -8,7 +8,8 @@ use notepack::NoteBinary;
 use pensieve_parquet::{
     DEFAULT_MAX_EVENT_BYTES, Error, SALVAGE_REPORT_NAME, SALVAGED_SEGMENT_NAME, SalvageReport,
     TRUNCATED_TAIL_NAME, convert_segment, convert_segment_quarantining_invalid,
-    read_salvage_report, salvage_truncated_segment, scan_framed_notepack, validate_file,
+    prepare_canonical_events, read_salvage_report, read_validated_file, salvage_truncated_segment,
+    scan_framed_notepack, scan_segment, validate_file,
 };
 
 fn test_keys() -> Keys {
@@ -76,6 +77,15 @@ fn converts_gzipped_segment_atomically_with_sorting_and_deduplication() {
     assert_eq!(validation.rows, 2);
     assert_eq!(validation.min_created_at, Some(1));
     assert_eq!(validation.max_created_at, Some(2));
+    let source_rows = prepare_canonical_events(
+        scan_segment(&input, DEFAULT_MAX_EVENT_BYTES)
+            .expect("scan source")
+            .events,
+    );
+    assert_eq!(
+        read_validated_file(&output).expect("read output"),
+        source_rows
+    );
 
     assert!(matches!(
         convert_segment(&input, &output, DEFAULT_MAX_EVENT_BYTES),

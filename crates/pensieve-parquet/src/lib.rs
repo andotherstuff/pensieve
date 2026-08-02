@@ -26,7 +26,7 @@ pub use segment::{
     convert_segment_quarantining_invalid, read_framed_notepack, scan_framed_notepack, scan_segment,
     write_rejected_segment,
 };
-pub use validator::{ValidationReport, validate_file};
+pub use validator::{ValidationReport, read_validated_file, validate_file};
 pub use writer::{
     WriteSummary, partition_prepared_rows, prepare_canonical_events, prepare_events,
     write_canonical_events, write_events, write_prepared,

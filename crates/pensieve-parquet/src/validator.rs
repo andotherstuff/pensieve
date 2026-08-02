@@ -147,6 +147,40 @@ pub fn validate_file(path: impl AsRef<Path>) -> Result<ValidationReport> {
     })
 }
 
+/// Strictly validate a canonical V1 file and return every decoded event row.
+///
+/// This is intended for bounded migration comparisons and recovery audits.
+/// Callers should not use it for unbounded query execution because all rows
+/// are retained in memory.
+pub fn read_validated_file(path: impl AsRef<Path>) -> Result<Vec<CanonicalEvent>> {
+    let path = path.as_ref();
+    validate_file(path)?;
+    let mut rows = Vec::new();
+    let batches = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
+    for batch in batches {
+        let batch = batch?;
+        let ids = downcast::<FixedSizeBinaryArray>(&batch, 0, "id")?;
+        let pubkeys = downcast::<FixedSizeBinaryArray>(&batch, 1, "pubkey")?;
+        let created_at = downcast::<UInt64Array>(&batch, 2, "created_at")?;
+        let kinds = downcast::<UInt16Array>(&batch, 3, "kind")?;
+        let tags = downcast::<ListArray>(&batch, 4, "tags")?;
+        let contents = downcast::<StringArray>(&batch, 5, "content")?;
+        let signatures = downcast::<FixedSizeBinaryArray>(&batch, 6, "sig")?;
+        for row_index in 0..batch.num_rows() {
+            rows.push(CanonicalEvent::from_raw(RawEvent {
+                id: fixed_bytes::<32>(ids, row_index, "id")?,
+                pubkey: fixed_bytes::<32>(pubkeys, row_index, "pubkey")?,
+                created_at: created_at.value(row_index),
+                kind: kinds.value(row_index),
+                tags: tags_at(tags, row_index, rows.len())?,
+                content: contents.value(row_index).to_owned(),
+                sig: fixed_bytes::<64>(signatures, row_index, "sig")?,
+            })?);
+        }
+    }
+    Ok(rows)
+}
+
 fn validate_schema_and_metadata(file_reader: &SerializedFileReader<File>) -> Result<()> {
     let expected_schema = parse_message_type(CANONICAL_PARQUET_SCHEMA)?;
     let actual_schema = file_reader
