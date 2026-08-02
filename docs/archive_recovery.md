@@ -65,6 +65,16 @@ The durable receipt directory also preserves per-filename coverage when two
 manifest objects have identical bytes and therefore share one content-addressed
 inventory work unit; aggregate rows and objects are still counted only once.
 
+For the P2d semantic gate, build a tab-separated comparison plan with columns
+`label`, `source kind` (`remote` or `local`), `source`, catalog fragment, and an
+optional explicit work-unit ID. Run
+`ops/scripts/run-parquet-seven-field-verification.sh PLAN EVIDENCE_DIR` with
+the campaign and object-store environments loaded. The runner downloads every
+selected immutable object, verifies its catalog size and SHA-256, strictly
+reopens V1, and compares all seven event fields after canonical per-source ID
+deduplication. It retains the plan, per-comparison summaries, object identities,
+source hashes, and evidence checksums while cleaning only its bounded scratch.
+
 ## Exact-ID relay recovery
 
 `recover-events` accepts a preserved target ID file and an operator-supplied
