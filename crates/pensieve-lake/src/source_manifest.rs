@@ -47,11 +47,11 @@ pub struct HistoricalSourceReceipt {
     /// SHA-256 of the source bytes.
     pub source_sha256: String,
     /// Source events observed by the converter.
-    pub input_events: u64,
+    pub input_events: Option<u64>,
     /// Canonical rows written by the converter.
-    pub output_rows: u64,
+    pub output_rows: Option<u64>,
     /// Invalid frames quarantined by the converter.
-    pub rejected_events: u64,
+    pub rejected_events: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -491,9 +491,15 @@ pub fn audit_historical_completion(
             )));
         };
         if work.source_sha256 != receipt.source_sha256
-            || work.input_events != receipt.input_events
-            || work.output_rows != receipt.output_rows
-            || work.rejected_events != receipt.rejected_events
+            || receipt
+                .input_events
+                .is_some_and(|count| work.input_events != count)
+            || receipt
+                .output_rows
+                .is_some_and(|count| work.output_rows != count)
+            || receipt
+                .rejected_events
+                .is_some_and(|count| work.rejected_events != count)
         {
             return Err(Error::InvalidSourceManifest(format!(
                 "publication receipt for {} differs from inventory work {}",
@@ -778,9 +784,9 @@ pub fn read_historical_source_receipts(
         };
         let text = fs::read_to_string(&path)?;
         let fields: Vec<_> = text.split_whitespace().collect();
-        if fields.len() != 5 {
+        if fields.len() != 2 && fields.len() != 5 {
             return Err(Error::InvalidSourceManifest(format!(
-                "publication receipt {filename} must contain exactly five fields"
+                "publication receipt {filename} must contain exactly two or five fields"
             )));
         }
         let parse_count = |field: &str, label: &str| {
@@ -800,9 +806,18 @@ pub fn read_historical_source_receipts(
             source_name: source_name.to_owned(),
             work_unit_id: fields[0].to_owned(),
             source_sha256: fields[1].to_owned(),
-            input_events: parse_count(fields[2], "input event count")?,
-            output_rows: parse_count(fields[3], "output row count")?,
-            rejected_events: parse_count(fields[4], "rejected event count")?,
+            input_events: fields
+                .get(2)
+                .map(|field| parse_count(field, "input event count"))
+                .transpose()?,
+            output_rows: fields
+                .get(3)
+                .map(|field| parse_count(field, "output row count"))
+                .transpose()?,
+            rejected_events: fields
+                .get(4)
+                .map(|field| parse_count(field, "rejected event count"))
+                .transpose()?,
         });
     }
     Ok(receipts)
@@ -1315,9 +1330,9 @@ mod tests {
             source_name: "segment-000000001.notepack.gz".to_owned(),
             work_unit_id: id.clone(),
             source_sha256: sha,
-            input_events: 2,
-            output_rows: 2,
-            rejected_events: 0,
+            input_events: Some(2),
+            output_rows: Some(2),
+            rejected_events: Some(0),
         };
 
         let audit = audit_historical_completion(
@@ -1337,6 +1352,28 @@ mod tests {
         assert_eq!(audit.totals().published_sources, 2);
         assert_eq!(audit.totals().output_rows, 2);
         assert_eq!(audit.totals().active_raw_rows, 2);
+    }
+
+    #[test]
+    fn legacy_two_field_publication_receipt_retains_strict_identity() {
+        let directory = tempfile::tempdir().expect("receipt directory");
+        let sha = "ab".repeat(32);
+        fs::write(
+            directory
+                .path()
+                .join("segment-000000001.notepack.gz.published"),
+            format!("notepack-sha256-{sha} {sha}\n"),
+        )
+        .expect("write receipt");
+
+        let receipts = read_historical_source_receipts(directory.path()).expect("read receipt");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].source_name, "segment-000000001.notepack.gz");
+        assert_eq!(receipts[0].source_sha256, sha);
+        assert_eq!(receipts[0].input_events, None);
+        assert_eq!(receipts[0].output_rows, None);
+        assert_eq!(receipts[0].rejected_events, None);
     }
 
     #[test]
