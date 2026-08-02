@@ -5,9 +5,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use pensieve_lake::{
-    ActiveRawFragment, HistoricalSourceManifest, Inventory, audit_historical_completion,
-    historical_source_exceptions_from_salvage, read_catalog_fragment,
-    read_historical_source_exceptions, read_historical_source_manifest, write_catalog_atomically,
+    ActiveRawFragment, HistoricalCompletionEvidence, HistoricalSourceManifest, Inventory,
+    audit_historical_completion, historical_source_exceptions_from_salvage, read_catalog_fragment,
+    read_historical_source_exceptions, read_historical_source_manifest,
+    read_historical_source_receipts, write_catalog_atomically,
     write_historical_source_exceptions_noclobber, write_historical_source_manifest_noclobber,
 };
 use pensieve_parquet::read_salvage_report;
@@ -78,6 +79,9 @@ enum Command {
         /// Active-raw repair fragment referenced by the exception ledger.
         #[arg(long)]
         repair_fragment: Vec<PathBuf>,
+        /// Optional directory of durable filename-to-work publication receipts.
+        #[arg(long)]
+        receipt_dir: Option<PathBuf>,
         /// Canonical JSON audit-report destination.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -153,6 +157,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             inventory,
             exceptions,
             repair_fragment,
+            receipt_dir,
             output,
         } => {
             let manifest = read_historical_source_manifest(manifest)?;
@@ -163,6 +168,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(read_catalog_fragment)
                 .collect::<Result<Vec<_>, _>>()?;
+            let source_receipts = receipt_dir
+                .map(read_historical_source_receipts)
+                .transpose()?
+                .unwrap_or_default();
             let mut inventory = Inventory::open_read_only(inventory)?;
             let work_units = inventory.work_units()?;
             let fragment = ActiveRawFragment::export(
@@ -181,8 +190,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &active_work_unit_ids,
                 fragment.totals().objects,
                 fragment.totals().physical_rows,
-                exceptions.as_ref(),
-                &repair_fragments,
+                HistoricalCompletionEvidence {
+                    exceptions: exceptions.as_ref(),
+                    repair_fragments: &repair_fragments,
+                    source_receipts: &source_receipts,
+                },
             )?;
             if let Some(output) = output {
                 write_catalog_atomically(output, &audit)?;

@@ -53,6 +53,7 @@ decoding failures and oversized frames are not terminal-truncation cases.
    pensieve-source-manifest audit \
      --manifest historical-source-manifest.json \
      --inventory campaign.sqlite \
+     --receipt-dir receipts \
      --exceptions historical-source-exceptions.json \
      --repair-fragment segment-000001151-repair-fragment.json \
      --output historical-completion-audit.json
@@ -60,6 +61,9 @@ decoding failures and oversized frames are not terminal-truncation cases.
 
 The audit counts the source as resolved, not normally published. It keeps the
 failed original inventory row and verifies the repair fragment on every run.
+The durable receipt directory also preserves per-filename coverage when two
+manifest objects have identical bytes and therefore share one content-addressed
+inventory work unit; aggregate rows and objects are still counted only once.
 
 ## Exact-ID relay recovery
 

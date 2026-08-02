@@ -37,6 +37,23 @@ pub struct HistoricalSourceTotals {
     pub source_bytes: u64,
 }
 
+/// Durable publication evidence binding one manifest filename to content-addressed work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalSourceReceipt {
+    /// Exact source filename represented by the receipt filename.
+    pub source_name: String,
+    /// Published content-addressed inventory work-unit ID.
+    pub work_unit_id: String,
+    /// SHA-256 of the source bytes.
+    pub source_sha256: String,
+    /// Source events observed by the converter.
+    pub input_events: u64,
+    /// Canonical rows written by the converter.
+    pub output_rows: u64,
+    /// Invalid frames quarantined by the converter.
+    pub rejected_events: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct HistoricalSourcePayload {
     format: String,
@@ -364,6 +381,17 @@ impl HistoricalCompletionAudit {
     }
 }
 
+/// Optional immutable evidence used to resolve non-standard source coverage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HistoricalCompletionEvidence<'a> {
+    /// Explicit terminal-truncation exception ledger.
+    pub exceptions: Option<&'a HistoricalSourceExceptions>,
+    /// Active catalog fragments containing repair work referenced by exceptions.
+    pub repair_fragments: &'a [ActiveRawFragment],
+    /// Durable per-filename receipts for content-addressed publication aliases.
+    pub source_receipts: &'a [HistoricalSourceReceipt],
+}
+
 /// Compare a frozen source universe with the complete inventory and active catalog view.
 pub fn audit_historical_completion(
     manifest: &HistoricalSourceManifest,
@@ -371,9 +399,13 @@ pub fn audit_historical_completion(
     active_work_unit_ids: &BTreeSet<String>,
     active_raw_objects: u64,
     active_raw_rows: u64,
-    exceptions: Option<&HistoricalSourceExceptions>,
-    repair_fragments: &[ActiveRawFragment],
+    evidence: HistoricalCompletionEvidence<'_>,
 ) -> Result<HistoricalCompletionAudit> {
+    let HistoricalCompletionEvidence {
+        exceptions,
+        repair_fragments,
+        source_receipts,
+    } = evidence;
     manifest.validate()?;
     if let Some(exceptions) = exceptions {
         exceptions.validate()?;
@@ -423,6 +455,10 @@ pub fn audit_historical_completion(
         .map(|entry| entry.source_name.as_str())
         .collect();
     let mut by_source = BTreeMap::<String, Vec<&WorkUnitRecord>>::new();
+    let by_id: BTreeMap<_, _> = work_units
+        .iter()
+        .map(|work| (work.id.as_str(), work))
+        .collect();
     let mut problems = Vec::new();
     for work in work_units {
         let Some(source_name) = work
@@ -440,28 +476,79 @@ pub fn audit_historical_completion(
         by_source.entry(source_name).or_default().push(work);
     }
 
+    let mut receipt_by_source = BTreeMap::new();
+    for receipt in source_receipts {
+        if receipt.work_unit_id != format!("notepack-sha256-{}", receipt.source_sha256) {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt for {} has inconsistent identity",
+                receipt.source_name
+            )));
+        }
+        let Some(work) = by_id.get(receipt.work_unit_id.as_str()) else {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt for {} references absent work {}",
+                receipt.source_name, receipt.work_unit_id
+            )));
+        };
+        if work.source_sha256 != receipt.source_sha256
+            || work.input_events != receipt.input_events
+            || work.output_rows != receipt.output_rows
+            || work.rejected_events != receipt.rejected_events
+        {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt for {} differs from inventory work {}",
+                receipt.source_name, receipt.work_unit_id
+            )));
+        }
+        if !matches!(
+            work.state,
+            WorkState::Published | WorkState::SourceCommitted
+        ) {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt for {} references {} work",
+                receipt.source_name, work.state
+            )));
+        }
+        if receipt_by_source
+            .insert(receipt.source_name.as_str(), *work)
+            .is_some()
+        {
+            return Err(Error::InvalidSourceManifest(format!(
+                "multiple publication receipts cover {}",
+                receipt.source_name
+            )));
+        }
+    }
+
     let mut totals = CompletionTotals {
         manifest_sources: manifest.totals().sources,
         active_raw_objects,
         active_raw_rows,
         ..CompletionTotals::default()
     };
+    let mut accounted_work_ids = BTreeSet::new();
     for entry in manifest.entries() {
-        let Some(records) = by_source.get(&entry.source_name) else {
-            problems.push(CompletionProblem {
-                source_name: entry.source_name.clone(),
-                reason: "source has no inventory work unit".to_owned(),
-            });
-            continue;
+        let work = match by_source.get(&entry.source_name) {
+            Some(records) if records.len() == 1 => records[0],
+            Some(records) => {
+                problems.push(CompletionProblem {
+                    source_name: entry.source_name.clone(),
+                    reason: format!("source has {} inventory work units", records.len()),
+                });
+                continue;
+            }
+            None => {
+                let Some(work) = receipt_by_source.get(entry.source_name.as_str()) else {
+                    problems.push(CompletionProblem {
+                        source_name: entry.source_name.clone(),
+                        reason: "source has no inventory work unit or publication receipt"
+                            .to_owned(),
+                    });
+                    continue;
+                };
+                *work
+            }
         };
-        if records.len() != 1 {
-            problems.push(CompletionProblem {
-                source_name: entry.source_name.clone(),
-                reason: format!("source has {} inventory work units", records.len()),
-            });
-            continue;
-        }
-        let work = records[0];
         if work.source_bytes != entry.source_bytes {
             problems.push(CompletionProblem {
                 source_name: entry.source_name.clone(),
@@ -534,26 +621,31 @@ pub fn audit_historical_completion(
                     });
                     continue;
                 };
-                add_completion_totals(
-                    &mut totals,
-                    repair.output_rows,
-                    repair.rejected_events,
-                    duplicate_events,
-                )?;
-                totals.active_raw_rows = totals
-                    .active_raw_rows
-                    .checked_add(repair.output_rows)
-                    .ok_or_else(|| {
-                        Error::InvalidSourceManifest("active repair row count overflows".to_owned())
-                    })?;
-                totals.active_raw_objects = totals
-                    .active_raw_objects
-                    .checked_add(*repair_objects)
-                    .ok_or_else(|| {
-                        Error::InvalidSourceManifest(
-                            "active repair object count overflows".to_owned(),
-                        )
-                    })?;
+                add_published_source(&mut totals)?;
+                if accounted_work_ids.insert(repair.work_unit_id.as_str()) {
+                    add_work_totals(
+                        &mut totals,
+                        repair.output_rows,
+                        repair.rejected_events,
+                        duplicate_events,
+                    )?;
+                    totals.active_raw_rows = totals
+                        .active_raw_rows
+                        .checked_add(repair.output_rows)
+                        .ok_or_else(|| {
+                            Error::InvalidSourceManifest(
+                                "active repair row count overflows".to_owned(),
+                            )
+                        })?;
+                    totals.active_raw_objects = totals
+                        .active_raw_objects
+                        .checked_add(*repair_objects)
+                        .ok_or_else(|| {
+                            Error::InvalidSourceManifest(
+                                "active repair object count overflows".to_owned(),
+                            )
+                        })?;
+                }
                 continue;
             }
             problems.push(CompletionProblem {
@@ -582,12 +674,15 @@ pub fn audit_historical_completion(
             });
             continue;
         };
-        add_completion_totals(
-            &mut totals,
-            work.output_rows,
-            work.rejected_events,
-            duplicate_events,
-        )?;
+        add_published_source(&mut totals)?;
+        if accounted_work_ids.insert(work.id.as_str()) {
+            add_work_totals(
+                &mut totals,
+                work.output_rows,
+                work.rejected_events,
+                duplicate_events,
+            )?;
+        }
     }
 
     for source_name in by_source.keys() {
@@ -631,15 +726,19 @@ pub fn audit_historical_completion(
     })
 }
 
-fn add_completion_totals(
+fn add_published_source(totals: &mut CompletionTotals) -> Result<()> {
+    totals.published_sources = totals.published_sources.checked_add(1).ok_or_else(|| {
+        Error::InvalidSourceManifest("published source count overflows u64".to_owned())
+    })?;
+    Ok(())
+}
+
+fn add_work_totals(
     totals: &mut CompletionTotals,
     output_rows: u64,
     rejected_events: u64,
     duplicate_events: u64,
 ) -> Result<()> {
-    totals.published_sources = totals.published_sources.checked_add(1).ok_or_else(|| {
-        Error::InvalidSourceManifest("published source count overflows u64".to_owned())
-    })?;
     totals.output_rows = totals
         .output_rows
         .checked_add(output_rows)
@@ -657,6 +756,56 @@ fn add_completion_totals(
             Error::InvalidSourceManifest("duplicate event count overflows u64".to_owned())
         })?;
     Ok(())
+}
+
+/// Read publication receipts from a campaign receipt directory in filename order.
+pub fn read_historical_source_receipts(
+    directory: impl AsRef<Path>,
+) -> Result<Vec<HistoricalSourceReceipt>> {
+    let mut paths = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    let mut receipts = Vec::new();
+    for path in paths {
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err(Error::InvalidSourceManifest(
+                "publication receipt filename is not UTF-8".to_owned(),
+            ));
+        };
+        let Some(source_name) = filename.strip_suffix(".published") else {
+            continue;
+        };
+        let text = fs::read_to_string(&path)?;
+        let fields: Vec<_> = text.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt {filename} must contain exactly five fields"
+            )));
+        }
+        let parse_count = |field: &str, label: &str| {
+            field.parse::<u64>().map_err(|_| {
+                Error::InvalidSourceManifest(format!(
+                    "publication receipt {filename} has invalid {label}"
+                ))
+            })
+        };
+        validate_sha256("publication receipt source checksum", fields[1])?;
+        if fields[0] != format!("notepack-sha256-{}", fields[1]) {
+            return Err(Error::InvalidSourceManifest(format!(
+                "publication receipt {filename} has inconsistent identity"
+            )));
+        }
+        receipts.push(HistoricalSourceReceipt {
+            source_name: source_name.to_owned(),
+            work_unit_id: fields[0].to_owned(),
+            source_sha256: fields[1].to_owned(),
+            input_events: parse_count(fields[2], "input event count")?,
+            output_rows: parse_count(fields[3], "output row count")?,
+            rejected_events: parse_count(fields[4], "rejected event count")?,
+        });
+    }
+    Ok(receipts)
 }
 
 /// Read and fully validate a canonical source manifest.
@@ -1123,8 +1272,7 @@ mod tests {
             &BTreeSet::from(["work-published".to_owned()]),
             1,
             2,
-            None,
-            &[],
+            HistoricalCompletionEvidence::default(),
         )
         .expect("audit");
 
@@ -1143,6 +1291,52 @@ mod tests {
                 .iter()
                 .any(|problem| problem.reason.contains("outside"))
         );
+    }
+
+    #[test]
+    fn publication_receipt_covers_content_identical_source_without_double_counting_rows() {
+        let manifest = HistoricalSourceManifest::from_rclone_lsjson(
+            &lsjson(&[
+                ("segment-000000000.notepack.gz", 50),
+                ("segment-000000001.notepack.gz", 50),
+            ]),
+            1,
+        )
+        .expect("manifest");
+        let sha = "11".repeat(32);
+        let id = format!("notepack-sha256-{sha}");
+        let published = work(
+            &id,
+            "segment-000000000.notepack.gz",
+            50,
+            WorkState::Published,
+        );
+        let receipt = HistoricalSourceReceipt {
+            source_name: "segment-000000001.notepack.gz".to_owned(),
+            work_unit_id: id.clone(),
+            source_sha256: sha,
+            input_events: 2,
+            output_rows: 2,
+            rejected_events: 0,
+        };
+
+        let audit = audit_historical_completion(
+            &manifest,
+            &[published],
+            &BTreeSet::from([id]),
+            1,
+            2,
+            HistoricalCompletionEvidence {
+                source_receipts: &[receipt],
+                ..HistoricalCompletionEvidence::default()
+            },
+        )
+        .expect("audit");
+
+        assert!(audit.is_complete());
+        assert_eq!(audit.totals().published_sources, 2);
+        assert_eq!(audit.totals().output_rows, 2);
+        assert_eq!(audit.totals().active_raw_rows, 2);
     }
 
     #[test]
@@ -1241,8 +1435,11 @@ mod tests {
             &BTreeSet::new(),
             0,
             0,
-            Some(&exceptions),
-            &[repair_fragment],
+            HistoricalCompletionEvidence {
+                exceptions: Some(&exceptions),
+                repair_fragments: &[repair_fragment],
+                source_receipts: &[],
+            },
         )
         .expect("completion audit");
         assert!(audit.is_complete());
