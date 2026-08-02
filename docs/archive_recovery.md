@@ -75,6 +75,13 @@ reopens V1, and compares all seven event fields after canonical per-source ID
 deduplication. It retains the plan, per-comparison summaries, object identities,
 source hashes, and evidence checksums while cleaning only its bounded scratch.
 
+If an older writer rejected a row that the current frame-bounded decoder
+accepts, do not replace the existing immutable object. Use
+`pensieve-parquet-missing-jsonl` to prove the old Parquet output is an exact
+subset of its source and extract only the now-valid missing rows. Process that
+JSONL through the normal validating backfill, publish it from a separate repair
+inventory, and include the repair fragment in the next unified snapshot.
+
 ## Exact-ID relay recovery
 
 `recover-events` accepts a preserved target ID file and an operator-supplied

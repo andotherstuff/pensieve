@@ -5,7 +5,8 @@ How the production box is actually operated. The box runs at `/home/pensieve/pen
 
 ## Layout
 
-- `ops/production/compose.yml` — Docker stack: ClickHouse, Prometheus, Grafana, Caddy.
+- `ops/production/compose.yml` — Docker stack: ClickHouse, Postgres analytics,
+  Prometheus, Grafana, Caddy.
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
 - `ops/systemd/*.service`, `*.timer` — **source copies** of the installed units. Editing a
   file here does NOT change the running unit; you must install + `daemon-reload` (below).
@@ -18,7 +19,7 @@ How the production box is actually operated. The box runs at `/home/pensieve/pen
 
 | Component | Runs as |
 |-----------|---------|
-| ClickHouse, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` |
+| ClickHouse, Postgres analytics, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` |
 | `pensieve-ingest`, `pensieve-serve`, `pensieve-preview` | native binaries via systemd |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` |
 
@@ -178,6 +179,27 @@ Damaged-source salvage and recurring exact-ID relay recovery follow
 separate inventories, publish them under the same canonical object prefix, and
 merge their active fragments into the unified snapshot. Never delete the
 failed historical inventory row to make the completion report green.
+
+## Shadow analytics Postgres
+
+`postgres-analytics` is a localhost-only serving store for the DuckDB-built
+shadow analytics products. Set `POSTGRES_ANALYTICS_PASSWORD` in the private
+`/etc/pensieve/pensieve.env`, then start only this dependency with:
+
+```bash
+sudo docker compose \
+  --project-directory /home/pensieve/pensieve/ops/production \
+  --env-file /etc/pensieve/pensieve.env \
+  -f /home/pensieve/pensieve/ops/production/compose.yml \
+  up -d postgres-analytics
+```
+
+Install `/etc/pensieve/analytics.env` with mode `0600`; its `DATABASE_URL`
+must use `127.0.0.1`, the `pensieve` database, and the
+`pensieve_analytics` user. Run Slice A as a batch job following
+[`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md). Do not point the
+API or Grafana at the shadow views until the fixed-`as_of` comparison gate is
+accepted.
 
 ## One-time cutover (ops/ move + secrets → /etc)
 

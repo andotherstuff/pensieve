@@ -1,6 +1,6 @@
 # Segment 7703 recovery record
 
-*Status: initial repair published; recurring exact-ID recovery remains open*
+*Status: initial repair and first recurring recovery delta published; recurring exact-ID recovery remains open*
 
 This is the durable audit record for the first production live-shadow segment,
 `segment-000007703.notepack.gz`.
@@ -118,3 +118,38 @@ against materially broader relay sets with the first-class `recover-events`
 tool described in [`archive_recovery.md`](archive_recovery.md). An event body
 cannot be reconstructed from an ID alone, so every still-missing event remains
 in the audit instead of being fabricated or silently counted as recovered.
+
+## Recurring recovery round 2
+
+On 2026-08-02, the first materially broader exact-ID retry queried 15 public
+relays. The retained sets reconcile exactly: the 17,139 round targets equal
+17,135 still-missing IDs plus 4 recovered IDs, with unique inputs, no overlap,
+and no unaccounted ID.
+
+All four returned events passed the normal JSONL ID/signature validation path
+with zero invalid or duplicate events. They were written to a new isolated
+notepack work unit and published as a separate immutable Parquet object; no
+prior source, repair, inventory, or object was changed.
+
+- Recovered events: **4**
+- Still-missing target IDs: **17,135**
+- Missing-ID SHA-256:
+  `d4fbaad04a7cc993d857ba4f30ab10531085fe2e56fca6e1e5ed95b6c91cc348`
+- Recovered JSONL SHA-256:
+  `0a547605dc8ae92050a454b2393db55e0364997ef66452a6b3a6914d8fc6e13e`
+- Recovery journal SHA-256:
+  `1065c4b8b176c78a56e9c9f223e5186e98b3db6ff0c05f3e8494063ce60d554c`
+- Relay-list SHA-256:
+  `f72854d8cf2bad00ca73a9a474f875bd32e156d53f2aff0a0e3974a87ead4603`
+- Repair work-unit ID:
+  `notepack-sha256-335ce966c7638ea20ad305aaef6fd43ddc10dd3b8519510637474fb25e430cfd`
+- Active Parquet object:
+  `nostr/v1/raw/notepack-sha256-335ce966c7638ea20ad305aaef6fd43ddc10dd3b8519510637474fb25e430cfd/part-00000-2d67ac13ff199a3c59fb82de0a594753612051fdc226199e63746da828fa22ef.parquet`
+- Parquet object: **4 rows**, **3,562 bytes**, SHA-256
+  `2d67ac13ff199a3c59fb82de0a594753612051fdc226199e63746da828fa22ef`
+- Superseding unified snapshot ID:
+  `sha256:143aaf19143b79851f36ed7c507abd0e4174a0030a66f89e7be19e414fea6688`
+
+The object was independently downloaded and compared to the round-2 notepack:
+all four IDs and all seven canonical event fields matched exactly. The
+superseding snapshot was also re-downloaded byte-for-byte and revalidated.

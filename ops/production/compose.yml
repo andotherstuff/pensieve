@@ -19,6 +19,31 @@
 name: pensieve-deploy
 
 services:
+  # PostgreSQL - shadow lakehouse analytics serving store
+  postgres-analytics:
+    image: postgres:16-alpine
+    container_name: pensieve-postgres-analytics
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - /data/postgres-analytics:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=pensieve
+      - POSTGRES_USER=pensieve_analytics
+      - POSTGRES_PASSWORD=${POSTGRES_ANALYTICS_PASSWORD:?set POSTGRES_ANALYTICS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pensieve_analytics -d pensieve"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   # ═══════════════════════════════════════════════════════════════════════════
   # Caddy - Reverse Proxy with Auto-HTTPS
   # ═══════════════════════════════════════════════════════════════════════════

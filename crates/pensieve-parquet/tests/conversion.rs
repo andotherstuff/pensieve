@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
+use std::process::Command;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -91,6 +92,50 @@ fn converts_gzipped_segment_atomically_with_sorting_and_deduplication() {
         convert_segment(&input, &output, DEFAULT_MAX_EVENT_BYTES),
         Err(Error::OutputExists { .. })
     ));
+}
+
+#[test]
+fn extracts_only_valid_source_rows_missing_from_parquet() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("source.notepack");
+    let subset = directory.path().join("subset.notepack");
+    let parquet = directory.path().join("subset.parquet");
+    let missing_jsonl = directory.path().join("missing.jsonl");
+    let included = event(1, "included");
+    let missing = event(2, "missing");
+
+    let mut source_file = File::create(&source).expect("source segment");
+    write_frame(&mut source_file, &pack(&included));
+    write_frame(&mut source_file, &pack(&missing));
+    source_file.sync_all().expect("sync source");
+    let mut subset_file = File::create(&subset).expect("subset segment");
+    write_frame(&mut subset_file, &pack(&included));
+    subset_file.sync_all().expect("sync subset");
+    convert_segment(&subset, &parquet, DEFAULT_MAX_EVENT_BYTES).expect("convert subset");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pensieve-parquet-missing-jsonl"))
+        .args([
+            "--source",
+            source.to_str().unwrap(),
+            "--parquet",
+            parquet.to_str().unwrap(),
+            "--output",
+            missing_jsonl.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run missing-row extractor");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("summary JSON");
+    assert_eq!(summary["missing_events"], 1);
+    let extracted: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missing_jsonl).expect("missing JSONL"))
+            .expect("one JSON event");
+    assert_eq!(extracted["id"], missing.id.to_hex());
 }
 
 #[test]
