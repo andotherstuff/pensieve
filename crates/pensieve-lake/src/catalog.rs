@@ -281,8 +281,14 @@ pub fn merge_active_raw_fragments(
         let fragment_object_sets = object_sets(fragment.objects());
         for work_unit in fragment.work_units() {
             if let Some(existing) = work_units.get(&work_unit.work_unit_id) {
-                if work_object_sets.get(&work_unit.work_unit_id)
-                    != fragment_object_sets.get(&work_unit.work_unit_id)
+                if work_object_sets
+                    .get(&work_unit.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    != fragment_object_sets
+                        .get(&work_unit.work_unit_id)
+                        .cloned()
+                        .unwrap_or_default()
                     || !same_content_work(existing, work_unit)
                 {
                     return Err(Error::InvalidCatalog(format!(
@@ -874,6 +880,41 @@ mod tests {
         assert_eq!(
             forward.work_units()[0].source_name,
             "another-source.notepack.gz"
+        );
+    }
+
+    #[test]
+    fn content_identical_empty_source_aliases_merge_deterministically() {
+        let mut first_work = work("empty-work");
+        first_work.source_name = "segment-000006633.notepack.gz".to_owned();
+        first_work.input_events = 0;
+        first_work.output_rows = 0;
+        let first = ActiveRawFragment::from_records(
+            "history".to_owned(),
+            "s3://test".to_owned(),
+            vec![first_work.clone()],
+            vec![],
+        )
+        .expect("first fragment");
+        first_work.source_name = "segment-000007703.notepack.gz".to_owned();
+        let second = ActiveRawFragment::from_records(
+            "live".to_owned(),
+            "s3://test".to_owned(),
+            vec![first_work],
+            vec![],
+        )
+        .expect("second fragment");
+
+        let forward =
+            merge_active_raw_fragments([first.clone(), second.clone()]).expect("forward merge");
+        let reverse = merge_active_raw_fragments([second, first]).expect("reverse merge");
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.totals().work_units, 1);
+        assert_eq!(forward.totals().objects, 0);
+        assert_eq!(
+            forward.work_units()[0].source_name,
+            "segment-000006633.notepack.gz"
         );
     }
 
