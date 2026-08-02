@@ -79,6 +79,14 @@ Merge rejects:
 An identical fragment, work unit, or object may be supplied more than once and
 is idempotently collapsed.
 
+Because work IDs are derived from source content, byte-identical source files
+in different inventories can share one work ID while retaining different
+filenames. Merge accepts that case only when every conversion field and active
+object key agrees, and keeps the lexicographically smallest filename as the V1
+snapshot's deterministic representative. Per-filename historical completeness
+remains evidence in the frozen-manifest completion audit and its publication
+receipts rather than being inferred from this deduplicated active-object view.
+
 `store_id` must identify the full object-store namespace, not only a bucket
 name that might exist at multiple providers. Pensieve uses
 `s3+https://hel1.your-objectstorage.com/pensieve-parquet`; it contains no

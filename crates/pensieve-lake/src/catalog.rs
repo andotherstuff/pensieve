@@ -281,14 +281,17 @@ pub fn merge_active_raw_fragments(
         let fragment_object_sets = object_sets(fragment.objects());
         for work_unit in fragment.work_units() {
             if let Some(existing) = work_units.get(&work_unit.work_unit_id) {
-                if existing != work_unit
-                    || work_object_sets.get(&work_unit.work_unit_id)
-                        != fragment_object_sets.get(&work_unit.work_unit_id)
+                if work_object_sets.get(&work_unit.work_unit_id)
+                    != fragment_object_sets.get(&work_unit.work_unit_id)
+                    || !same_content_work(existing, work_unit)
                 {
                     return Err(Error::InvalidCatalog(format!(
                         "work unit {} has conflicting records across fragments",
                         work_unit.work_unit_id
                     )));
+                }
+                if work_unit.source_name < existing.source_name {
+                    work_units.insert(work_unit.work_unit_id.clone(), work_unit.clone());
                 }
             } else {
                 work_units.insert(work_unit.work_unit_id.clone(), work_unit.clone());
@@ -350,6 +353,14 @@ pub fn merge_active_raw_fragments(
         snapshot_id,
         payload,
     })
+}
+
+fn same_content_work(left: &CatalogWorkUnit, right: &CatalogWorkUnit) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.source_name.clear();
+    right.source_name.clear();
+    left == right
 }
 
 /// Read and validate one inventory fragment.
@@ -845,6 +856,25 @@ mod tests {
         let twice =
             merge_active_raw_fragments([fragment.clone(), fragment]).expect("duplicate merge");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn content_identical_source_aliases_merge_deterministically() {
+        let first = fragment("history", "work-a", "raw/a.parquet");
+        let mut second = fragment("live", "work-a", "raw/a.parquet");
+        second.payload.work_units[0].source_name = "another-source.notepack.gz".to_owned();
+        second.fragment_id = content_id(&second.payload).expect("new identity");
+
+        let forward =
+            merge_active_raw_fragments([first.clone(), second.clone()]).expect("forward merge");
+        let reverse = merge_active_raw_fragments([second, first]).expect("reverse merge");
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.totals().work_units, 1);
+        assert_eq!(
+            forward.work_units()[0].source_name,
+            "another-source.notepack.gz"
+        );
     }
 
     #[test]
