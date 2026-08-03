@@ -105,6 +105,8 @@ Set `PENSIEVE_ANALYTICS_DUCKDB_MEMORY_LIMIT` (default `48GB`) below the memory
 needed by colocated ClickHouse and ingestion. This is an engine-level limit,
 not merely a systemd guard: DuckDB spills earlier instead of driving the host
 into swap. Retain a higher systemd `MemoryMax` as a final fail-closed boundary.
+Set `PENSIEVE_ANALYTICS_DUCKDB_THREADS` (default `4`) as an engine-level worker
+limit; lowering worker concurrency also reduces per-query memory reservations.
 
 ## Shadow Postgres publication
 

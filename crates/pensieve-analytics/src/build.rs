@@ -28,6 +28,8 @@ pub struct BuildConfig {
     pub s3_force_path_style: bool,
     /// DuckDB buffer-manager limit; lower values spill earlier to protect colocated services.
     pub memory_limit: String,
+    /// DuckDB worker threads; fewer workers reduce per-query memory reservations.
+    pub threads: usize,
 }
 
 /// One-row overview product.
@@ -243,7 +245,16 @@ impl AnalyticsBuild {
 }
 
 fn configure_execution(connection: &Connection, config: &BuildConfig) -> Result<()> {
-    let sql = format!("SET memory_limit = {}", sql_string(&config.memory_limit));
+    if config.threads == 0 {
+        return Err(Error::Validation(
+            "DuckDB worker thread count must be greater than zero".to_owned(),
+        ));
+    }
+    let sql = format!(
+        "SET memory_limit = {}; SET threads = {}",
+        sql_string(&config.memory_limit),
+        config.threads
+    );
     connection.execute_batch(&sql)?;
     Ok(())
 }
@@ -316,19 +327,15 @@ fn materialize_canonical_events(
         .map(|location| sql_string(&location.duckdb_path()))
         .collect::<Vec<_>>()
         .join(", ");
+    // Every input row was cryptographically validated before publication. A
+    // Nostr event ID commits to created_at and kind, so duplicates of the
+    // projected tuple are the exact logical-event duplicates we must remove.
+    // Avoid carrying `sig` through a global window sort when it is not stored.
     let sql = format!(
         "
         CREATE TABLE canonical_events AS
-        SELECT id, created_at, kind
-        FROM (
-            SELECT
-                id,
-                created_at,
-                kind,
-                row_number() OVER (PARTITION BY id ORDER BY sig) AS canonical_rank
-            FROM read_parquet([{paths}], union_by_name = false)
-        )
-        WHERE canonical_rank = 1;
+        SELECT DISTINCT id, created_at, kind
+        FROM read_parquet([{paths}], union_by_name = false);
         "
     );
     connection.execute_batch(&sql)?;

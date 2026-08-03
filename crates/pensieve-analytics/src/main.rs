@@ -48,6 +48,9 @@ struct Args {
         default_value = "48GB"
     )]
     duckdb_memory_limit: String,
+    /// DuckDB worker threads. Lower values reduce peak query memory.
+    #[arg(long, env = "PENSIEVE_ANALYTICS_DUCKDB_THREADS", default_value_t = 4)]
+    duckdb_threads: usize,
 }
 
 #[derive(Serialize)]
@@ -94,6 +97,7 @@ fn run() -> Result<()> {
             s3_region: args.s3_region,
             s3_force_path_style: args.s3_force_path_style,
             memory_limit: args.duckdb_memory_limit,
+            threads: args.duckdb_threads,
         },
     )
     .context("materialize and validate DuckDB rollups")?;
