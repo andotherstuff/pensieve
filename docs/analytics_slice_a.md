@@ -81,6 +81,26 @@ the standard AWS environment credential chain. The first S3 run therefore
 needs extension-repository network access; later runs use DuckDB's local
 extension cache.
 
+For a production-scale snapshot, stage the exact immutable object set before
+starting DuckDB. This separates resumable network transfer from the single
+large materialization transaction:
+
+```bash
+ops/scripts/stage-active-raw-snapshot.sh \
+  /var/lib/pensieve-analytics/catalog/active-raw.json \
+  /archive/analytics/lake/<snapshot-id> \
+  /var/lib/pensieve-analytics/staging/<snapshot-id>
+```
+
+The staging wrapper uses the catalog's object-key list, bounded concurrent
+`rclone` transfers, and retry/backoff. It then verifies every staged object's
+exact byte size and SHA-256 against the snapshot. Rerunning after an interrupted
+transfer reuses completed files. Only after `SHA256SUMS` exists should the
+analytics build use `--local-object-root` with that staged root.
+
+Direct S3 reads retain defensive DuckDB HTTP retries, but they are a canary
+path rather than the preferred production-scale build path.
+
 ## Shadow Postgres publication
 
 Install a private environment file based on `ops/analytics.env.example`, set

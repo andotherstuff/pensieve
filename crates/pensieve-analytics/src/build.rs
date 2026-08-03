@@ -247,7 +247,18 @@ fn configure_remote_access(
     let Some(endpoint) = snapshot.s3_endpoint.as_deref() else {
         return Ok(());
     };
-    connection.execute_batch("INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;")?;
+    connection.execute_batch(
+        "
+        INSTALL httpfs;
+        LOAD httpfs;
+        INSTALL aws;
+        LOAD aws;
+        SET http_retries = 12;
+        SET http_retry_wait_ms = 500;
+        SET http_retry_backoff = 2;
+        SET http_timeout = 120;
+        ",
+    )?;
 
     let url_style = if config.s3_force_path_style {
         "path"

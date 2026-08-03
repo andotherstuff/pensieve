@@ -83,6 +83,15 @@ enum Command {
         #[arg(long, conflicts_with = "fragment")]
         snapshot: Option<PathBuf>,
     },
+    /// Verify every local object against a snapshot's exact size and SHA-256.
+    VerifyLocal {
+        /// Canonically encoded active-raw snapshot JSON.
+        #[arg(long)]
+        snapshot: PathBuf,
+        /// Local root below which catalog object keys were staged.
+        #[arg(long)]
+        local_object_root: PathBuf,
+    },
 }
 
 fn main() {
@@ -188,6 +197,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => return Err("exactly one of --fragment or --snapshot is required".into()),
         },
+        Command::VerifyLocal {
+            snapshot,
+            local_object_root,
+        } => {
+            let snapshot = read_catalog_snapshot(snapshot)?;
+            let mut verified_bytes = 0u64;
+            for (index, object) in snapshot.objects().iter().enumerate() {
+                let path = local_object_root.join(&object.object_key);
+                let byte_size = std::fs::metadata(&path)
+                    .map_err(|error| {
+                        format!("local object is missing: {}: {error}", path.display())
+                    })?
+                    .len();
+                if byte_size != object.byte_size {
+                    return Err(format!(
+                        "local object size mismatch: {}: expected {}, got {}",
+                        path.display(),
+                        object.byte_size,
+                        byte_size
+                    )
+                    .into());
+                }
+                let sha256 = sha256_file(&path)?;
+                if sha256 != object.sha256 {
+                    return Err(format!(
+                        "local object SHA-256 mismatch: {}: expected {}, got {}",
+                        path.display(),
+                        object.sha256,
+                        sha256
+                    )
+                    .into());
+                }
+                verified_bytes = verified_bytes
+                    .checked_add(byte_size)
+                    .ok_or("verified byte count overflow")?;
+                if (index + 1) % 100 == 0 || index + 1 == snapshot.objects().len() {
+                    eprintln!(
+                        "verified local objects: {}/{}",
+                        index + 1,
+                        snapshot.objects().len()
+                    );
+                }
+            }
+            if verified_bytes != snapshot.totals().object_bytes {
+                return Err(format!(
+                    "verified byte total mismatch: expected {}, got {}",
+                    snapshot.totals().object_bytes,
+                    verified_bytes
+                )
+                .into());
+            }
+            println!(
+                "valid local snapshot={} objects={} bytes={} root={}",
+                snapshot.snapshot_id,
+                snapshot.objects().len(),
+                verified_bytes,
+                local_object_root.display()
+            );
+        }
     }
     Ok(())
 }
