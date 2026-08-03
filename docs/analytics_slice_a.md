@@ -130,6 +130,12 @@ previous complete run or the next complete run, never a mixture. Retrying the
 same deterministic run while it remains current is a no-op. Attempting to make
 an older already-published run current again is rejected.
 
+If DuckDB finishes but Postgres connection or publication fails, preserve the
+work database and retry with `--reuse-completed-build`. This mode revalidates
+all reconciled products against the exact catalog before publication and never
+reruns Parquet materialization. Supply `POSTGRES_ANALYTICS_PASSWORD` from a
+private environment file rather than embedding it in `DATABASE_URL`.
+
 The current client uses a non-TLS Postgres connection. Deploy it against a
 colocated Unix socket or trusted localhost. Remote Postgres TLS support must be
 added before any networked deployment.

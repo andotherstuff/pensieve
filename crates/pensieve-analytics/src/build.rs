@@ -153,6 +153,28 @@ impl AnalyticsBuild {
         })
     }
 
+    /// Open and revalidate a completed work database without rebuilding it.
+    ///
+    /// This supports publication retries after a downstream Postgres failure.
+    /// Missing, partial, or snapshot-inconsistent products fail the same
+    /// reconciliation checks as a fresh build.
+    pub fn open_completed(
+        work_database: impl AsRef<Path>,
+        snapshot: ResolvedSnapshot,
+        config: BuildConfig,
+    ) -> Result<Self> {
+        let connection = Connection::open(work_database)?;
+        configure_execution(&connection, &config)?;
+        let summary = validate_rollups(&connection, &snapshot)?;
+
+        Ok(Self {
+            connection,
+            snapshot,
+            config,
+            summary,
+        })
+    }
+
     /// Read the one-row overview product.
     pub fn overview(&self) -> Result<Overview> {
         self.connection

@@ -239,8 +239,9 @@ fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
     write_catalog_atomically(&catalog_path, &snapshot).expect("write empty snapshot");
     let resolved = resolve_snapshot(&catalog_path, Some(directory.path()))
         .expect("resolve empty local snapshot");
+    let database_path = directory.path().join("empty.duckdb");
     let build = AnalyticsBuild::create(
-        directory.path().join("empty.duckdb"),
+        &database_path,
         resolved,
         BuildConfig {
             as_of_epoch: AS_OF,
@@ -264,6 +265,25 @@ fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
     assert_eq!(overview.latest_event, 0);
     assert_eq!(overview.events_7d, 0);
     assert_eq!(overview.kinds_30d, 0);
+
+    let expected_summary = build.summary.clone();
+    drop(build);
+    let resolved = resolve_snapshot(&catalog_path, Some(directory.path()))
+        .expect("resolve empty local snapshot for reopen");
+    let reopened = AnalyticsBuild::open_completed(
+        &database_path,
+        resolved,
+        BuildConfig {
+            as_of_epoch: AS_OF,
+            code_version: "test".to_owned(),
+            s3_region: "test".to_owned(),
+            s3_force_path_style: false,
+            memory_limit: "1GB".to_owned(),
+            threads: 1,
+        },
+    )
+    .expect("reopen completed analytics");
+    assert_eq!(reopened.summary, expected_summary);
 }
 
 #[test]

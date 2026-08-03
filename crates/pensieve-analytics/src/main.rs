@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use pensieve_analytics::{AnalyticsBuild, BuildConfig, PublishOutcome, publish, resolve_snapshot};
-use postgres::{Client, NoTls};
+use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -19,6 +19,9 @@ struct Args {
     /// Persistent DuckDB work database used for scans and spill.
     #[arg(long)]
     work_database: PathBuf,
+    /// Revalidate and publish an already completed work database without rebuilding it.
+    #[arg(long)]
+    reuse_completed_build: bool,
     /// Resolve catalog keys below this local root instead of reading S3.
     #[arg(long)]
     local_object_root: Option<PathBuf>,
@@ -35,6 +38,9 @@ struct Args {
     /// Postgres connection string. Omit to build and validate without publishing.
     #[arg(long, env = "DATABASE_URL")]
     postgres_url: Option<String>,
+    /// Postgres password supplied separately from the non-secret connection string.
+    #[arg(long, env = "POSTGRES_ANALYTICS_PASSWORD")]
+    postgres_password: Option<String>,
     /// AWS region used by DuckDB's environment credential chain.
     #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
     s3_region: String,
@@ -88,24 +94,34 @@ fn run() -> Result<()> {
     let as_of_epoch = args.as_of.unwrap_or_else(unix_now);
     let snapshot = resolve_snapshot(&args.catalog, args.local_object_root.as_deref())
         .context("resolve active-file snapshot")?;
-    let build = AnalyticsBuild::create(
-        &args.work_database,
-        snapshot,
-        BuildConfig {
-            as_of_epoch,
-            code_version: args.code_version,
-            s3_region: args.s3_region,
-            s3_force_path_style: args.s3_force_path_style,
-            memory_limit: args.duckdb_memory_limit,
-            threads: args.duckdb_threads,
-        },
-    )
-    .context("materialize and validate DuckDB rollups")?;
+    let config = BuildConfig {
+        as_of_epoch,
+        code_version: args.code_version,
+        s3_region: args.s3_region,
+        s3_force_path_style: args.s3_force_path_style,
+        memory_limit: args.duckdb_memory_limit,
+        threads: args.duckdb_threads,
+    };
+    let build = if args.reuse_completed_build {
+        AnalyticsBuild::open_completed(&args.work_database, snapshot, config)
+            .context("open and revalidate completed DuckDB rollups")?
+    } else {
+        AnalyticsBuild::create(&args.work_database, snapshot, config)
+            .context("materialize and validate DuckDB rollups")?
+    };
     let completed_at = Utc::now();
     let publication = args
         .postgres_url
         .as_deref()
-        .map(|url| publish_build(url, &build, started_at, completed_at))
+        .map(|url| {
+            publish_build(
+                url,
+                args.postgres_password.as_deref(),
+                &build,
+                started_at,
+                completed_at,
+            )
+        })
         .transpose()?;
     let output = Output {
         snapshot_id: &build.snapshot.catalog.snapshot_id,
@@ -121,12 +137,18 @@ fn run() -> Result<()> {
 
 fn publish_build(
     postgres_url: &str,
+    postgres_password: Option<&str>,
     build: &AnalyticsBuild,
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
 ) -> Result<PublicationOutput> {
-    let mut client =
-        Client::connect(postgres_url, NoTls).context("connect to Postgres without TLS")?;
+    let mut config: PostgresConfig = postgres_url.parse().context("parse Postgres connection")?;
+    if let Some(password) = postgres_password {
+        config.password(password);
+    }
+    let mut client = config
+        .connect(NoTls)
+        .context("connect to Postgres without TLS")?;
     Ok(
         match publish(&mut client, build, started_at, completed_at)? {
             PublishOutcome::Published {
