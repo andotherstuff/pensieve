@@ -7,9 +7,8 @@ use postgres::{Client, GenericClient};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{AnalyticsBuild, Error, QUERY_VERSION, Result};
+use crate::{AnalyticsBuild, Error, QUERY_VERSION, Result, schema::SCHEMA_SQL};
 
-const SCHEMA_SQL: &str = include_str!("../../../docs/postgres/001_analytics_slice_a.sql");
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
 
 /// Result of attempting to publish a deterministic run.
@@ -67,6 +66,7 @@ pub fn publish(
         .is_some()
     {
         if current_run_id.as_deref() == Some(run_id.as_str()) {
+            reconcile_applied_objects(&mut transaction, &run_id, build)?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -131,6 +131,7 @@ pub fn publish(
         ],
     )?;
     insert_inputs(&mut transaction, &run_id, build)?;
+    reconcile_applied_objects(&mut transaction, &run_id, build)?;
     transaction.execute(
         "
         INSERT INTO pensieve_analytics.overview (
@@ -177,6 +178,57 @@ pub fn publish(
         run_id,
         previous_run_id: current_run_id,
     })
+}
+
+fn reconcile_applied_objects(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    build: &AnalyticsBuild,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE pensieve_analytics.applied_objects SET active = false, updated_at = now() WHERE active = true",
+        &[],
+    )?;
+    let statement = transaction.prepare(
+        "
+        INSERT INTO pensieve_analytics.applied_objects (
+            object_key, work_unit_id, sha256, byte_size, physical_rows,
+            min_created_at, max_created_at, first_applied_run_id,
+            last_applied_run_id, active, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, true, now())
+        ON CONFLICT (object_key) DO UPDATE SET
+            last_applied_run_id = EXCLUDED.last_applied_run_id,
+            active = true,
+            updated_at = now()
+        WHERE pensieve_analytics.applied_objects.work_unit_id = EXCLUDED.work_unit_id
+          AND pensieve_analytics.applied_objects.sha256 = EXCLUDED.sha256
+          AND pensieve_analytics.applied_objects.byte_size = EXCLUDED.byte_size
+          AND pensieve_analytics.applied_objects.physical_rows = EXCLUDED.physical_rows
+        ",
+    )?;
+    for object in build.snapshot.catalog.objects() {
+        let changed = transaction.execute(
+            &statement,
+            &[
+                &object.object_key,
+                &object.work_unit_id,
+                &object.sha256,
+                &to_i64("object byte_size", object.byte_size)?,
+                &to_i64("object row_count", object.row_count)?,
+                &object.min_created_at,
+                &object.max_created_at,
+                &run_id,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::Validation(format!(
+                "immutable applied object {} conflicts with its existing ledger identity",
+                object.object_key
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn insert_inputs(

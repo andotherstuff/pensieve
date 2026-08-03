@@ -37,6 +37,33 @@ pub enum Error {
     /// A deterministic run already exists but is not the current run.
     #[error("analytics run {0} was already published and cannot replace a newer current run")]
     StalePublishedRun(String),
+    /// An immutable object key was reused with different content or accounting.
+    #[error(
+        "immutable catalog object {object_key} changed identity: previous SHA-256 \
+         {previous_sha256}, selected SHA-256 {selected_sha256}"
+    )]
+    ImmutableObjectChanged {
+        /// Reused immutable key.
+        object_key: String,
+        /// Previously applied content digest.
+        previous_sha256: String,
+        /// Digest in the selected catalog.
+        selected_sha256: String,
+    },
+    /// Summing catalog delta accounting exceeded the unsigned 64-bit domain.
+    #[error("catalog delta {0} exceeds the unsigned 64-bit domain")]
+    PlanOverflow(&'static str),
+    /// A timestamp loaded from the durable object ledger is not unsigned decimal.
+    #[error("applied-object ledger contains invalid timestamp {0:?}")]
+    InvalidLedgerTimestamp(String),
+    /// A supposedly non-negative ledger counter was negative.
+    #[error("applied-object ledger {field} is negative: {value}")]
+    NegativeLedgerValue {
+        /// Counter name.
+        field: &'static str,
+        /// Invalid signed value.
+        value: i64,
+    },
     /// Writing streamed COPY data failed.
     #[error("failed to stream Postgres COPY data: {0}")]
     CopyIo(#[from] std::io::Error),

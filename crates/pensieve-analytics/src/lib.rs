@@ -6,7 +6,9 @@
 mod build;
 mod error;
 mod input;
+mod plan;
 mod publish;
+mod schema;
 
 pub use build::{
     AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime, Overview,
@@ -14,4 +16,5 @@ pub use build::{
 };
 pub use error::{Error, Result};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
+pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta};
 pub use publish::{PublishOutcome, publish};

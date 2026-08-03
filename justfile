@@ -69,6 +69,10 @@ lake-catalog *ARGS:
 analytics-build *ARGS:
     cargo run -p pensieve-analytics -- {{ARGS}}
 
+# Plan the object delta from the currently published analytics run.
+analytics-plan *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-plan -- {{ARGS}}
+
 # ============================================================================
 # Build
 # ============================================================================

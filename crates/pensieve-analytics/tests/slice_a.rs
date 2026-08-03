@@ -2,7 +2,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
-use pensieve_analytics::{AnalyticsBuild, BuildConfig, PublishOutcome, publish, resolve_snapshot};
+use pensieve_analytics::{
+    AnalyticsBuild, BuildConfig, PlannedRunKind, PublishOutcome, plan_catalog_delta, publish,
+    resolve_snapshot,
+};
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
     WorkUnitRegistration, merge_active_raw_fragments, sha256_file, write_catalog_atomically,
@@ -328,4 +331,20 @@ fn slice_a_publication_is_atomic_and_idempotent() {
         publish(&mut client, &fixture.build, started_at, completed_at,).expect("retry current run"),
         PublishOutcome::AlreadyCurrent { run_id }
     );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.applied_objects WHERE active = true",
+                &[],
+            )
+            .expect("count active applied objects")
+            .get::<_, i64>(0),
+        2
+    );
+    let plan = plan_catalog_delta(&mut client, &fixture.build.snapshot.catalog)
+        .expect("plan current snapshot");
+    assert_eq!(plan.run_kind, PlannedRunKind::NoChange);
+    assert_eq!(plan.unchanged_objects, 2);
+    assert!(plan.added_objects.is_empty());
+    assert!(plan.removed_objects.is_empty());
 }

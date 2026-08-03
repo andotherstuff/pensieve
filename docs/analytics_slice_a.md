@@ -31,9 +31,33 @@ The build fails before publication unless:
 - both daily products sum to the API-representable logical total; and
 - all-time kind counts sum to the complete logical total.
 
-This first version is deliberately a full rebuild. Late historical events are
+The materializer is still deliberately a full rebuild. Late historical events are
 therefore placed into their correct historical day automatically. Incremental
-and affected-period rebuild modes remain future work.
+and affected-period materialization remain future work. The catalog-difference
+planner and durable applied-object ledger are implemented as the bounded first
+step toward those modes.
+
+## Plan the next catalog delta
+
+Planning reads only the selected catalog and Postgres metadata; it does not
+download or scan Parquet objects:
+
+```bash
+just analytics-plan \
+  --catalog /var/lib/pensieve-parquet/catalog/active-raw.json
+```
+
+The plan compares immutable key, work-unit, checksum, byte-size, and row-count
+identity against `pensieve_analytics.applied_objects`. Existing deployments
+without ledger rows fall back to the current run's `run_inputs`; retrying the
+current completed publication populates the explicit ledger atomically.
+
+An append-only catalog produces an `incremental` plan containing only new
+objects and their exact bytes/rows. Removed objects produce an
+`affected_period_rebuild` plan. Reuse of an immutable key with changed identity
+is rejected. Object timestamp bounds describe the historical range touched by
+the delta; `affected_range_complete = false` prevents a later executor from
+assuming a bounded rebuild when legacy ledger rows lack those bounds.
 
 ## Frozen Slice A time semantics
 
@@ -127,8 +151,9 @@ It:
 
 Readers use the `pensieve_analytics.current_*` views. They see either the
 previous complete run or the next complete run, never a mixture. Retrying the
-same deterministic run while it remains current is a no-op. Attempting to make
-an older already-published run current again is rejected.
+same deterministic run while it remains current leaves serving data unchanged
+and idempotently repairs the applied-object ledger. Attempting to make an older
+already-published run current again is rejected.
 
 If DuckDB finishes but Postgres connection or publication fails, preserve the
 work database and retry with `--reuse-completed-build`. This mode revalidates
