@@ -41,6 +41,13 @@ struct Args {
     /// Use path-style S3 addressing.
     #[arg(long)]
     s3_force_path_style: bool,
+    /// DuckDB buffer-manager limit. Keep below host capacity for colocated services.
+    #[arg(
+        long,
+        env = "PENSIEVE_ANALYTICS_DUCKDB_MEMORY_LIMIT",
+        default_value = "48GB"
+    )]
+    duckdb_memory_limit: String,
 }
 
 #[derive(Serialize)]
@@ -86,6 +93,7 @@ fn run() -> Result<()> {
             code_version: args.code_version,
             s3_region: args.s3_region,
             s3_force_path_style: args.s3_force_path_style,
+            memory_limit: args.duckdb_memory_limit,
         },
     )
     .context("materialize and validate DuckDB rollups")?;

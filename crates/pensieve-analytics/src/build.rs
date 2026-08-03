@@ -26,6 +26,8 @@ pub struct BuildConfig {
     pub s3_region: String,
     /// Use S3 path-style addressing instead of virtual-host addressing.
     pub s3_force_path_style: bool,
+    /// DuckDB buffer-manager limit; lower values spill earlier to protect colocated services.
+    pub memory_limit: String,
 }
 
 /// One-row overview product.
@@ -124,6 +126,7 @@ impl AnalyticsBuild {
         }
 
         let connection = Connection::open(work_database)?;
+        configure_execution(&connection, &config)?;
         connection.execute_batch(
             "
             SET TimeZone = 'UTC';
@@ -237,6 +240,12 @@ impl AnalyticsBuild {
         }
         Ok(())
     }
+}
+
+fn configure_execution(connection: &Connection, config: &BuildConfig) -> Result<()> {
+    let sql = format!("SET memory_limit = {}", sql_string(&config.memory_limit));
+    connection.execute_batch(&sql)?;
+    Ok(())
 }
 
 fn configure_remote_access(

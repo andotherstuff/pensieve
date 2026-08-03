@@ -101,6 +101,11 @@ analytics build use `--local-object-root` with that staged root.
 Direct S3 reads retain defensive DuckDB HTTP retries, but they are a canary
 path rather than the preferred production-scale build path.
 
+Set `PENSIEVE_ANALYTICS_DUCKDB_MEMORY_LIMIT` (default `48GB`) below the memory
+needed by colocated ClickHouse and ingestion. This is an engine-level limit,
+not merely a systemd guard: DuckDB spills earlier instead of driving the host
+into swap. Retain a higher systemd `MemoryMax` as a final fail-closed boundary.
+
 ## Shadow Postgres publication
 
 Install a private environment file based on `ops/analytics.env.example`, set

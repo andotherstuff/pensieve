@@ -133,6 +133,7 @@ fn fixture() -> Fixture {
             code_version: "test".to_owned(),
             s3_region: "test".to_owned(),
             s3_force_path_style: false,
+            memory_limit: "1GB".to_owned(),
         },
     )
     .expect("build analytics");
@@ -245,6 +246,7 @@ fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
             code_version: "test".to_owned(),
             s3_region: "test".to_owned(),
             s3_force_path_style: false,
+            memory_limit: "1GB".to_owned(),
         },
     )
     .expect("build empty analytics");
