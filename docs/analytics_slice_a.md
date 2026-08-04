@@ -59,6 +59,24 @@ is rejected. Object timestamp bounds describe the historical range touched by
 the delta; `affected_range_complete = false` prevents a later executor from
 assuming a bounded rebuild when legacy ledger rows lack those bounds.
 
+Stage an accepted incremental plan into a snapshot-specific cache with explicit
+object and byte ceilings:
+
+```bash
+MAX_STAGE_OBJECTS=1000 MAX_STAGE_BYTES=107374182400 \
+  ops/scripts/stage-analytics-delta.sh \
+  /var/lib/pensieve-analytics/plans/<snapshot-id>.json \
+  /archive/analytics/deltas/<snapshot-id> \
+  /var/lib/pensieve-analytics/staging/<snapshot-id>
+```
+
+The wrapper rejects non-incremental plans, removals, empty deltas, inconsistent
+byte accounting, or limits exceeded before contacting object storage. It then
+downloads only `added_objects`, verifies every size and SHA-256, rejects extra
+local files, and writes a checksummed completion receipt. A dedicated local
+root per plan makes retries resumable without allowing files from another
+snapshot to satisfy verification.
+
 ## Frozen Slice A time semantics
 
 These rules are versioned as `slice-a-v1` and are candidates for shadow
