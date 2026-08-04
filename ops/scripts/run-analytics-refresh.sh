@@ -26,9 +26,9 @@ retain_deltas="${PENSIEVE_ANALYTICS_RETAIN_DELTAS:-2}"
 min_archive_free_bytes="${PENSIEVE_ANALYTICS_MIN_ARCHIVE_FREE_BYTES:-536870912000}"
 require_ingest_active="${PENSIEVE_ANALYTICS_REQUIRE_INGEST_ACTIVE:-1}"
 
-s3_bucket="${S3_BUCKET:-${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-}}"
-s3_endpoint_url="${S3_ENDPOINT_URL:-${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-}}"
-s3_region="${AWS_REGION:-${PENSIEVE_PARQUET_SHADOW_S3_REGION:-}}"
+s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
+s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
+s3_region="${PENSIEVE_PARQUET_SHADOW_S3_REGION:-${AWS_REGION:-}}"
 
 for path in "$catalog_bin" "$plan_bin" "$incremental_bin" "$stage_script"; do
     if [ ! -x "$path" ]; then

@@ -220,6 +220,8 @@ pair; `advance` checks that relationship on every refresh:
 ```bash
 snapshot_hex=90658e6f86fb7430642082369ecf59e3282f1b58c9f6767fec916c26f81ac6fa
 sudo install -d -m 0750 -o pensieve -g pensieve \
+  /var/lib/pensieve-analytics/refresh \
+  /var/lib/pensieve-analytics/refresh/generations \
   /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex \
   /var/lib/pensieve-analytics/refresh/runs \
   /archive/analytics/deltas /archive/analytics/backups

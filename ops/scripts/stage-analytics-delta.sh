@@ -7,9 +7,9 @@ plan="${1:?usage: stage-analytics-delta.sh PLAN LOCAL_ROOT EVIDENCE_DIR}"
 local_root="${2:?usage: stage-analytics-delta.sh PLAN LOCAL_ROOT EVIDENCE_DIR}"
 evidence_dir="${3:?usage: stage-analytics-delta.sh PLAN LOCAL_ROOT EVIDENCE_DIR}"
 
-s3_bucket="${S3_BUCKET:-${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-}}"
-s3_endpoint_url="${S3_ENDPOINT_URL:-${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-}}"
-s3_region="${AWS_REGION:-${PENSIEVE_PARQUET_SHADOW_S3_REGION:-}}"
+s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
+s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
+s3_region="${PENSIEVE_PARQUET_SHADOW_S3_REGION:-${AWS_REGION:-}}"
 max_objects="${MAX_STAGE_OBJECTS:-1000}"
 max_bytes="${MAX_STAGE_BYTES:-107374182400}"
 
