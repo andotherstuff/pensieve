@@ -361,6 +361,245 @@ pub fn merge_active_raw_fragments(
     })
 }
 
+/// Advance one snapshot source to an append-only replacement fragment.
+///
+/// The previous fragment must be the exact source recorded by `baseline`, and
+/// every one of its work units and objects must remain unchanged in
+/// `replacement`. This makes advancing a live writer possible without needing
+/// to reacquire unrelated historical fragments, while refusing removals,
+/// compaction, or immutable-object mutation.
+pub fn advance_active_raw_snapshot(
+    baseline: &ActiveRawSnapshot,
+    previous: &ActiveRawFragment,
+    replacement: &ActiveRawFragment,
+) -> Result<ActiveRawSnapshot> {
+    baseline.validate()?;
+    previous.validate()?;
+    replacement.validate()?;
+    if previous.inventory_id() != replacement.inventory_id() {
+        return Err(Error::InvalidCatalog(format!(
+            "replacement inventory {} does not match previous inventory {}",
+            replacement.inventory_id(),
+            previous.inventory_id()
+        )));
+    }
+    if baseline.store_id() != previous.store_id() || baseline.store_id() != replacement.store_id() {
+        return Err(Error::InvalidCatalog(
+            "baseline and replacement fragments use different stores".to_owned(),
+        ));
+    }
+    let source = baseline
+        .payload
+        .sources
+        .iter()
+        .find(|source| source.inventory_id == previous.inventory_id())
+        .ok_or_else(|| {
+            Error::InvalidCatalog(format!(
+                "baseline does not contain inventory {}",
+                previous.inventory_id()
+            ))
+        })?;
+    if source.fragment_id != previous.fragment_id {
+        return Err(Error::InvalidCatalog(format!(
+            "baseline inventory {} records fragment {}, not {}",
+            previous.inventory_id(),
+            source.fragment_id,
+            previous.fragment_id
+        )));
+    }
+
+    ensure_append_only_fragment(previous, replacement)?;
+    ensure_snapshot_contains_fragment(baseline, previous)?;
+
+    let mut work_units: BTreeMap<_, _> = baseline
+        .work_units()
+        .iter()
+        .cloned()
+        .map(|work| (work.work_unit_id.clone(), work))
+        .collect();
+    let mut objects: BTreeMap<_, _> = baseline
+        .objects()
+        .iter()
+        .cloned()
+        .map(|object| (object.object_key.clone(), object))
+        .collect();
+    let mut work_object_sets = object_sets(baseline.objects());
+    let replacement_object_sets = object_sets(replacement.objects());
+    let mut parts: BTreeMap<_, _> = baseline
+        .objects()
+        .iter()
+        .map(|object| {
+            (
+                (object.work_unit_id.clone(), object.part_number),
+                object.object_key.clone(),
+            )
+        })
+        .collect();
+
+    for work in replacement.work_units() {
+        if let Some(existing) = work_units.get(&work.work_unit_id) {
+            if !same_content_work(existing, work)
+                || work_object_sets
+                    .get(&work.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    != replacement_object_sets
+                        .get(&work.work_unit_id)
+                        .cloned()
+                        .unwrap_or_default()
+            {
+                return Err(Error::InvalidCatalog(format!(
+                    "replacement work unit {} conflicts with the baseline",
+                    work.work_unit_id
+                )));
+            }
+            if work.source_name < existing.source_name {
+                work_units.insert(work.work_unit_id.clone(), work.clone());
+            }
+        } else {
+            work_units.insert(work.work_unit_id.clone(), work.clone());
+            work_object_sets.insert(
+                work.work_unit_id.clone(),
+                replacement_object_sets
+                    .get(&work.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    for object in replacement.objects() {
+        let part = (object.work_unit_id.clone(), object.part_number);
+        if let Some(existing_key) = parts.get(&part) {
+            if existing_key != &object.object_key {
+                return Err(Error::InvalidCatalog(format!(
+                    "replacement work unit {} part {} maps to conflicting object keys",
+                    object.work_unit_id, object.part_number
+                )));
+            }
+        } else {
+            parts.insert(part, object.object_key.clone());
+        }
+        if let Some(existing) = objects.get(&object.object_key) {
+            if existing != object {
+                return Err(Error::InvalidCatalog(format!(
+                    "replacement object key {} conflicts with the baseline",
+                    object.object_key
+                )));
+            }
+        } else {
+            objects.insert(object.object_key.clone(), object.clone());
+        }
+    }
+
+    let mut sources = baseline.payload.sources.clone();
+    let source = sources
+        .iter_mut()
+        .find(|source| source.inventory_id == replacement.inventory_id())
+        .expect("validated baseline source must remain present");
+    source.fragment_id.clone_from(&replacement.fragment_id);
+    let work_units: Vec<_> = work_units.into_values().collect();
+    let objects: Vec<_> = objects.into_values().collect();
+    let payload = SnapshotPayload {
+        format: ACTIVE_RAW_CATALOG_FORMAT.to_owned(),
+        store_id: baseline.store_id().to_owned(),
+        object_class: "active_raw".to_owned(),
+        deduplicated_by_event_id: false,
+        sources,
+        totals: catalog_totals(&work_units, &objects)?,
+        work_units,
+        objects,
+    };
+    validate_snapshot_payload(&payload)?;
+    let snapshot_id = content_id(&payload)?;
+    Ok(ActiveRawSnapshot {
+        snapshot_id,
+        payload,
+    })
+}
+
+fn ensure_append_only_fragment(
+    previous: &ActiveRawFragment,
+    replacement: &ActiveRawFragment,
+) -> Result<()> {
+    let replacement_work: BTreeMap<_, _> = replacement
+        .work_units()
+        .iter()
+        .map(|work| (&work.work_unit_id, work))
+        .collect();
+    for work in previous.work_units() {
+        if replacement_work.get(&work.work_unit_id) != Some(&work) {
+            return Err(Error::InvalidCatalog(format!(
+                "replacement fragment removed or changed work unit {}",
+                work.work_unit_id
+            )));
+        }
+    }
+    let replacement_objects: BTreeMap<_, _> = replacement
+        .objects()
+        .iter()
+        .map(|object| (&object.object_key, object))
+        .collect();
+    for object in previous.objects() {
+        if replacement_objects.get(&object.object_key) != Some(&object) {
+            return Err(Error::InvalidCatalog(format!(
+                "replacement fragment removed or changed object {}",
+                object.object_key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_contains_fragment(
+    snapshot: &ActiveRawSnapshot,
+    fragment: &ActiveRawFragment,
+) -> Result<()> {
+    let snapshot_work: BTreeMap<_, _> = snapshot
+        .work_units()
+        .iter()
+        .map(|work| (&work.work_unit_id, work))
+        .collect();
+    let snapshot_object_sets = object_sets(snapshot.objects());
+    let fragment_object_sets = object_sets(fragment.objects());
+    for work in fragment.work_units() {
+        let Some(existing) = snapshot_work.get(&work.work_unit_id) else {
+            return Err(Error::InvalidCatalog(format!(
+                "baseline is missing work unit {} from its recorded fragment",
+                work.work_unit_id
+            )));
+        };
+        if !same_content_work(existing, work)
+            || snapshot_object_sets
+                .get(&work.work_unit_id)
+                .cloned()
+                .unwrap_or_default()
+                != fragment_object_sets
+                    .get(&work.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default()
+        {
+            return Err(Error::InvalidCatalog(format!(
+                "baseline work unit {} conflicts with its recorded fragment",
+                work.work_unit_id
+            )));
+        }
+    }
+    let snapshot_objects: BTreeMap<_, _> = snapshot
+        .objects()
+        .iter()
+        .map(|object| (&object.object_key, object))
+        .collect();
+    for object in fragment.objects() {
+        if snapshot_objects.get(&object.object_key) != Some(&object) {
+            return Err(Error::InvalidCatalog(format!(
+                "baseline object {} conflicts with its recorded fragment",
+                object.object_key
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn same_content_work(left: &CatalogWorkUnit, right: &CatalogWorkUnit) -> bool {
     let mut left = left.clone();
     let mut right = right.clone();
@@ -862,6 +1101,47 @@ mod tests {
         let twice =
             merge_active_raw_fragments([fragment.clone(), fragment]).expect("duplicate merge");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn append_only_advance_matches_a_full_fragment_merge() {
+        let history = fragment("history", "work-a", "raw/a.parquet");
+        let previous = fragment("live", "work-b", "raw/b.parquet");
+        let new_work = work("work-c");
+        let new_object = object("work-c", "raw/c.parquet", 0);
+        let replacement = ActiveRawFragment::from_records(
+            "live".to_owned(),
+            "s3://test".to_owned(),
+            vec![previous.work_units()[0].clone(), new_work],
+            vec![previous.objects()[0].clone(), new_object],
+        )
+        .expect("replacement");
+        let baseline =
+            merge_active_raw_fragments([history.clone(), previous.clone()]).expect("baseline");
+
+        let advanced = advance_active_raw_snapshot(&baseline, &previous, &replacement)
+            .expect("append-only advance");
+        let rebuilt = merge_active_raw_fragments([history, replacement]).expect("full merge");
+
+        assert_eq!(advanced, rebuilt);
+        assert_eq!(advanced.totals().objects, 3);
+    }
+
+    #[test]
+    fn append_only_advance_rejects_a_removed_object() {
+        let previous = fragment("live", "work-a", "raw/a.parquet");
+        let replacement = ActiveRawFragment::from_records(
+            "live".to_owned(),
+            "s3://test".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("empty replacement");
+        let baseline = merge_active_raw_fragments([previous.clone()]).expect("baseline");
+
+        let error = advance_active_raw_snapshot(&baseline, &previous, &replacement)
+            .expect_err("removal must fail");
+        assert!(error.to_string().contains("removed or changed work unit"));
     }
 
     #[test]

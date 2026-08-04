@@ -124,6 +124,23 @@ just lake-catalog merge \
 just lake-catalog verify --snapshot active-raw.json
 ```
 
+After the initial multi-inventory merge, an append-only writer can advance its
+source without reacquiring unrelated historical fragments. The command proves
+that the old fragment is the exact source named by the baseline and that every
+old work unit and object remains unchanged in the replacement:
+
+```bash
+just lake-catalog advance \
+  --baseline active-raw.json \
+  --previous-fragment production-live-previous.json \
+  --replacement-fragment production-live-current.json \
+  --output active-raw-current.json
+```
+
+Any removal, compaction, changed immutable object, inventory mismatch, or store
+mismatch fails without writing the output. Those changes require reacquiring
+all source fragments and performing a normal full merge.
+
 The merge replaces its local output atomically. Publishing uses the same
 conditional, checksum-confirming immutable S3 machinery as Parquet objects:
 
