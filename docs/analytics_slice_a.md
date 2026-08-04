@@ -1,7 +1,7 @@
 # Analytics Slice A — Builder and Publication Runbook
 
-*Status: implemented for local/shadow validation; not accepted for API cutover*
-*Last updated: 2026-07-28*
+*Status: deployed as shadow analytics; not accepted for API cutover*
+*Last updated: 2026-08-04*
 
 This is the first executable DuckDB/Postgres analytics slice described by the
 [analytics endpoint migration ledger](analytics_endpoint_migration.md). It
@@ -31,11 +31,11 @@ The build fails before publication unless:
 - both daily products sum to the API-representable logical total; and
 - all-time kind counts sum to the complete logical total.
 
-The materializer is still deliberately a full rebuild. Late historical events are
-therefore placed into their correct historical day automatically. Incremental
-and affected-period materialization remain future work. The catalog-difference
-planner and durable applied-object ledger are implemented as the bounded first
-step toward those modes.
+The initial materializer remains available as a full-rebuild path. The
+incremental executor handles append-only catalogs with exact cross-delta ID
+matching and places late historical events into their correct historical day.
+Catalog removals still require the future affected-period executor and fail
+closed rather than silently applying an append-only update.
 
 ## Plan the next catalog delta
 
@@ -108,6 +108,28 @@ The current implementation performs one sequential scan of `canonical_events`
 per delta to match IDs and another to refresh rolling overview metrics. Measure
 both on production before selecting a schedule. It never scans unchanged
 Parquet objects.
+
+## Recurring production refresh
+
+`ops/scripts/run-analytics-refresh.sh` composes catalog export/advance,
+content-addressed catalog publication, metadata-only planning, bounded delta
+staging, a copy-on-write checkpoint backup, incremental execution, atomic
+Postgres publication, generation-pointer advancement, and retention. The
+systemd service applies the production-measured limits of two DuckDB threads,
+a 16 GiB engine limit, a 20 GiB cgroup soft limit, a 24 GiB hard limit, and
+reduced I/O weight.
+
+The generation symlink moves only after Postgres publication succeeds. If the
+process dies after publication but before that move, the next run advances from
+the older selected generation, replans against the newer Postgres ledger, and
+converges without reapplying published objects. A plan with removals or another
+unsupported run kind fails and preserves all evidence for operator action.
+
+The default timer runs once per day because each delta still scans the durable
+event-ID checkpoint and rolling overview. This cadence keeps staged downloads
+small without pretending the Parquet-only shadow can satisfy the current API's
+near-real-time latest-event contract. The newest three DuckDB backups and two
+verified local delta caches are retained; compact run evidence is not pruned.
 
 ## Frozen Slice A time semantics
 

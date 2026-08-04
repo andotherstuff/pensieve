@@ -601,9 +601,11 @@ shadow-only; authoritative notepack ingestion is unaffected.
       exact cross-file ID deduplication, overview/daily/kind DuckDB products,
       reconciliations, versioned Postgres serving DDL, input/run provenance,
       streamed publication, and an atomic current-run pointer. See
-      [Analytics Slice A](analytics_slice_a.md). This is not yet deployed,
-      parity-approved, or connected to the API.
-- [ ] Stand up **Postgres** rollup store.
+      [Analytics Slice A](analytics_slice_a.md). Slice A and its append-only
+      recurring refresh are deployed in shadow mode, but are not yet
+      parity-approved or connected to the API.
+- [x] Stand up the shadow **Postgres** rollup store and atomic publication
+      pointer for Slice A.
 - [ ] **DuckDB batch jobs** reproducing all 24 ClickHouse-backed analytics
       routes' metrics from Parquet.
       Distinct/rolling metrics use **Apache DataSketches HLL end-to-end**: DuckDB's

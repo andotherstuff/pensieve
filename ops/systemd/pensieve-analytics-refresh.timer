@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Pensieve shadow analytics refresh
+Documentation=https://github.com/andotherstuff/pensieve
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=1200
+Persistent=true
+Unit=pensieve-analytics-refresh.service
+
+[Install]
+WantedBy=timers.target

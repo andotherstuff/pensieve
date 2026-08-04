@@ -22,6 +22,7 @@ How the production box is actually operated. The box runs at `/home/pensieve/pen
 | ClickHouse, Postgres analytics, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` |
 | `pensieve-ingest`, `pensieve-serve`, `pensieve-preview` | native binaries via systemd |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` |
+| shadow analytics refresh (daily) | `pensieve-analytics-refresh.timer` → `pensieve-analytics-refresh.service` |
 
 Grafana datasources/dashboards are configured **on the running instance** (no repo
 provisioning). The ingester exposes Prometheus metrics on `:9091`.
@@ -200,6 +201,77 @@ must use `127.0.0.1`, the `pensieve` database, and the
 [`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md). Do not point the
 API or Grafana at the shadow views until the fixed-`as_of` comparison gate is
 accepted.
+
+### Recurring Slice A refresh
+
+The daily refresh advances only the `production-live-shadow` fragment in the
+currently selected catalog generation. It publishes the immutable catalog,
+plans against the current Postgres object ledger, stages only added objects,
+takes a copy-on-write DuckDB backup, and atomically applies and publishes an
+append-only delta. `no_change` is a successful no-op. Removals, immutable-key
+changes, full rebuilds, affected-period plans, staging-limit violations, or any
+failed validation leave the generation pointer unchanged and fail the unit for
+operator inspection.
+
+Bootstrap the generation pointer once from the exact snapshot and live
+fragment used by the current published run. The two files must be a matching
+pair; `advance` checks that relationship on every refresh:
+
+```bash
+snapshot_hex=90658e6f86fb7430642082369ecf59e3282f1b58c9f6767fec916c26f81ac6fa
+sudo install -d -m 0750 -o pensieve -g pensieve \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex \
+  /var/lib/pensieve-analytics/refresh/runs \
+  /archive/analytics/deltas /archive/analytics/backups
+sudo install -m 0640 -o pensieve -g pensieve \
+  /var/lib/pensieve-parquet/catalog/incremental-20260804T055921Z/active-raw.json \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/active-raw.json
+sudo install -m 0640 -o pensieve -g pensieve \
+  /var/lib/pensieve-parquet/catalog/incremental-20260804T055921Z/production-live.json \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/production-live.json
+printf 'sha256:%s\n' "$snapshot_hex" | sudo tee \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED >/dev/null
+sudo chown pensieve:pensieve \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED
+sudo chmod 0640 \
+  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED
+sudo ln -sfn generations/$snapshot_hex \
+  /var/lib/pensieve-analytics/refresh/current
+sudo chown -h pensieve:pensieve /var/lib/pensieve-analytics/refresh/current
+```
+
+Install a non-secret `/etc/pensieve/analytics-refresh.env` based on
+[`analytics-refresh.env.example`](analytics-refresh.env.example). Point
+`PENSIEVE_ANALYTICS_WORK_DATABASE` at the current persistent DuckDB file. Then
+install and activate the units:
+
+```bash
+sudo install -m 0755 ops/scripts/run-analytics-refresh.sh \
+  /home/pensieve/pensieve/ops/scripts/run-analytics-refresh.sh
+sudo install -m 0644 ops/systemd/pensieve-analytics-refresh.service \
+  ops/systemd/pensieve-analytics-refresh.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pensieve-analytics-refresh.timer
+sudo systemctl start pensieve-analytics-refresh.service
+```
+
+The timer runs daily at 03:20 local time with up to 20 minutes of jitter. The
+service is limited to two CPUs, a 20 GiB memory soft limit, a 24 GiB hard limit,
+and reduced I/O weight. It retains the newest three copy-on-write DuckDB
+backups and two verified local delta caches. Compact catalogs, plans,
+verification receipts, status JSON, and checksums remain under
+`/var/lib/pensieve-analytics/refresh/runs/` for audit.
+
+Verify a run without exposing secrets:
+
+```bash
+systemctl status pensieve-analytics-refresh.service
+journalctl -u pensieve-analytics-refresh.service --since today --no-pager
+readlink -f /var/lib/pensieve-analytics/refresh/current
+jq . /var/lib/pensieve-analytics/refresh/runs/*/status.json
+systemctl is-active pensieve-ingest
+systemctl show pensieve-ingest -p NRestarts
+```
 
 ## One-time cutover (ops/ move + secrets → /etc)
 

@@ -1,0 +1,37 @@
+[Unit]
+Description=Refresh Pensieve shadow analytics from the live Parquet catalog
+Documentation=https://github.com/andotherstuff/pensieve
+After=network-online.target pensieve.service
+Wants=network-online.target pensieve.service
+
+[Service]
+Type=oneshot
+User=pensieve
+Group=pensieve
+WorkingDirectory=/home/pensieve/pensieve
+EnvironmentFile=/etc/pensieve/analytics.env
+EnvironmentFile=/etc/pensieve/pensieve.env
+EnvironmentFile=/etc/pensieve/parquet-shadow.env
+EnvironmentFile=-/etc/pensieve/analytics-refresh.env
+RuntimeDirectory=pensieve-analytics-refresh
+RuntimeDirectoryMode=0750
+ExecStart=/home/pensieve/pensieve/ops/scripts/run-analytics-refresh.sh
+
+Nice=10
+CPUQuota=200%
+IOWeight=25
+MemoryAccounting=true
+MemoryHigh=20G
+MemoryMax=24G
+TimeoutStartSec=6h
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pensieve-analytics-refresh
