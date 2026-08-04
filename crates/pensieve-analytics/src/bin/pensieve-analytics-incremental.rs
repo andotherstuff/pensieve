@@ -112,7 +112,7 @@ fn run() -> Result<()> {
     acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
     let live_plan = plan_catalog_delta(&mut client, &target.catalog)
         .context("re-plan target against current Postgres run")?;
-    if live_plan != persisted_plan {
+    if live_plan != persisted_plan && !target_is_already_current(&live_plan, &persisted_plan) {
         bail!("persisted staging plan no longer matches the live catalog plan");
     }
     let previous_run_id = persisted_plan
@@ -184,4 +184,71 @@ fn run() -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn target_is_already_current(
+    live_plan: &CatalogDeltaPlan,
+    persisted_plan: &CatalogDeltaPlan,
+) -> bool {
+    live_plan.previous_snapshot_id.as_deref() == Some(persisted_plan.snapshot_id.as_str())
+        && live_plan.snapshot_id == persisted_plan.snapshot_id
+        && live_plan.added_objects.is_empty()
+        && live_plan.removed_objects.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pensieve_analytics::PlannedRunKind;
+
+    fn plan(
+        snapshot_id: &str,
+        previous_snapshot_id: Option<&str>,
+        added_objects: usize,
+    ) -> CatalogDeltaPlan {
+        CatalogDeltaPlan {
+            snapshot_id: snapshot_id.to_owned(),
+            previous_run_id: Some("run".to_owned()),
+            previous_snapshot_id: previous_snapshot_id.map(str::to_owned),
+            run_kind: PlannedRunKind::Incremental,
+            added_objects: (0..added_objects)
+                .map(|index| pensieve_lake::CatalogObject {
+                    object_key: format!("object-{index}"),
+                    work_unit_id: format!("work-{index}"),
+                    part_number: 0,
+                    byte_size: 1,
+                    sha256: "0".repeat(64),
+                    writer_version: "test".to_owned(),
+                    row_count: 1,
+                    min_created_at: Some("1".to_owned()),
+                    max_created_at: Some("1".to_owned()),
+                })
+                .collect(),
+            removed_objects: Vec::new(),
+            unchanged_objects: 0,
+            added_bytes: added_objects as u64,
+            added_physical_rows: added_objects as u64,
+            affected_min_created_at: None,
+            affected_max_created_at: None,
+            affected_range_complete: true,
+        }
+    }
+
+    #[test]
+    fn already_current_target_accepts_the_original_persisted_plan() {
+        let persisted = plan("sha256:target", Some("sha256:baseline"), 1);
+        let live = plan("sha256:target", Some("sha256:target"), 0);
+
+        assert!(target_is_already_current(&live, &persisted));
+    }
+
+    #[test]
+    fn different_or_partially_applied_live_target_is_not_a_retry() {
+        let persisted = plan("sha256:target", Some("sha256:baseline"), 1);
+        let different = plan("sha256:other", Some("sha256:other"), 0);
+        let partial = plan("sha256:target", Some("sha256:target"), 1);
+
+        assert!(!target_is_already_current(&different, &persisted));
+        assert!(!target_is_already_current(&partial, &persisted));
+    }
 }
