@@ -5,6 +5,7 @@
 
 mod build;
 mod error;
+mod incremental;
 mod input;
 mod plan;
 mod publish;
@@ -15,6 +16,7 @@ pub use build::{
     QUERY_VERSION,
 };
 pub use error::{Error, Result};
+pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta};
-pub use publish::{PublishOutcome, publish};
+pub use publish::{PublishOutcome, acquire_publication_lock, publish, publish_incremental};

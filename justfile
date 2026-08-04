@@ -73,6 +73,10 @@ analytics-build *ARGS:
 analytics-plan *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-plan -- {{ARGS}}
 
+# Apply one verified append-only analytics delta.
+analytics-incremental *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-incremental -- {{ARGS}}
+
 # ============================================================================
 # Build
 # ============================================================================

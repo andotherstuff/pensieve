@@ -77,6 +77,38 @@ local files, and writes a checksummed completion receipt. A dedicated local
 root per plan makes retries resumable without allowing files from another
 snapshot to satisfy verification.
 
+## Apply one verified incremental delta
+
+Use one fixed `as_of` for dry-run and application. The dry-run re-verifies all
+staged SHA-256 values, deduplicates the delta, scans the existing event-ID
+checkpoint for matches, validates committed fields, and rolls its DuckDB
+transaction back:
+
+```bash
+just analytics-incremental \
+  --catalog /var/lib/pensieve-analytics/catalog/<target>.json \
+  --plan /var/lib/pensieve-analytics/plans/<target>.json \
+  --work-database /archive/analytics/slice-a.duckdb \
+  --delta-object-root /archive/analytics/deltas/<target> \
+  --as-of 1785840000 \
+  --dry-run
+```
+
+Remove `--dry-run` only after its counts and resource measurements are
+accepted. The executor holds the Postgres publication lock from re-planning
+through DuckDB completion, so another publisher cannot invalidate its
+baseline. Persistent DuckDB changes are one transaction: exact new event IDs,
+additive daily/kind rollups, the rolling overview, and checkpoint metadata
+commit together. Postgres then records a complete `incremental` run and moves
+the serving pointer atomically. A Postgres failure leaves the completed DuckDB
+checkpoint reusable; rerunning with the same catalog, plan, `as_of`, and code
+version skips the already-applied delta and retries publication.
+
+The current implementation performs one sequential scan of `canonical_events`
+per delta to match IDs and another to refresh rolling overview metrics. Measure
+both on production before selecting a schedule. It never scans unchanged
+Parquet objects.
+
 ## Frozen Slice A time semantics
 
 These rules are versioned as `slice-a-v1` and are candidates for shadow

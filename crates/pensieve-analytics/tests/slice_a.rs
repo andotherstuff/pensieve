@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
-    AnalyticsBuild, BuildConfig, PlannedRunKind, PublishOutcome, plan_catalog_delta, publish,
-    resolve_snapshot,
+    AnalyticsBuild, BuildConfig, CatalogDeltaPlan, PlannedRunKind, PublishOutcome,
+    apply_incremental, plan_catalog_delta, publish, resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -287,6 +287,129 @@ fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
     )
     .expect("reopen completed analytics");
     assert_eq!(reopened.summary, expected_summary);
+}
+
+#[test]
+fn incremental_build_inserts_only_new_ids_and_is_idempotent() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let duplicate = event(AS_OF - 10, 1, "duplicate");
+    let added = event(AS_OF - 20, 2, "added");
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "first",
+        std::slice::from_ref(&duplicate),
+    );
+    let baseline_fragment = ActiveRawFragment::export(
+        &mut inventory,
+        "test",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("baseline fragment");
+    let baseline_snapshot =
+        merge_active_raw_fragments([baseline_fragment]).expect("baseline snapshot");
+    let baseline_catalog = directory.path().join("baseline.json");
+    write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
+    let database = directory.path().join("incremental.duckdb");
+    let baseline = resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("baseline resolve");
+    AnalyticsBuild::create(
+        &database,
+        baseline,
+        BuildConfig {
+            as_of_epoch: AS_OF,
+            code_version: "baseline".to_owned(),
+            s3_region: "test".to_owned(),
+            s3_force_path_style: false,
+            memory_limit: "1GB".to_owned(),
+            threads: 1,
+        },
+    )
+    .expect("baseline build");
+
+    publish_object(&mut inventory, &lake_root, "second", &[duplicate, added]);
+    let target_fragment = ActiveRawFragment::export(
+        &mut inventory,
+        "test",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("target fragment");
+    let target_snapshot = merge_active_raw_fragments([target_fragment]).expect("target snapshot");
+    let target_catalog = directory.path().join("target.json");
+    write_catalog_atomically(&target_catalog, &target_snapshot).expect("target catalog");
+    let added_object = target_snapshot
+        .objects()
+        .iter()
+        .find(|object| object.work_unit_id == "second")
+        .expect("second object")
+        .clone();
+    let plan = CatalogDeltaPlan {
+        snapshot_id: target_snapshot.snapshot_id.clone(),
+        previous_run_id: Some("baseline-run".to_owned()),
+        previous_snapshot_id: Some(baseline_snapshot.snapshot_id),
+        run_kind: PlannedRunKind::Incremental,
+        added_objects: vec![added_object.clone()],
+        removed_objects: Vec::new(),
+        unchanged_objects: 1,
+        added_bytes: added_object.byte_size,
+        added_physical_rows: added_object.row_count,
+        affected_min_created_at: added_object.min_created_at.clone(),
+        affected_max_created_at: added_object.max_created_at.clone(),
+        affected_range_complete: true,
+    };
+    let locations = resolve_delta_locations(&plan, &lake_root).expect("delta locations");
+    let config = BuildConfig {
+        as_of_epoch: AS_OF + 100,
+        code_version: "incremental".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "1GB".to_owned(),
+        threads: 1,
+    };
+    let target = resolve_snapshot(&target_catalog, Some(&lake_root)).expect("dry target resolve");
+    let (dry_build, dry_run) = apply_incremental(
+        &database,
+        target,
+        &plan,
+        &locations,
+        config.clone(),
+        AS_OF,
+        true,
+    )
+    .expect("incremental dry run");
+    assert_eq!(dry_run.existing_events, 1);
+    assert_eq!(dry_run.inserted_events, 1);
+    assert_eq!(dry_build.summary.logical_events, 1);
+    drop(dry_build);
+
+    let target = resolve_snapshot(&target_catalog, Some(&lake_root)).expect("target resolve");
+    let (build, incremental) = apply_incremental(
+        &database,
+        target,
+        &plan,
+        &locations,
+        config.clone(),
+        AS_OF,
+        false,
+    )
+    .expect("incremental build");
+    assert_eq!(incremental.delta_physical_rows, 2);
+    assert_eq!(incremental.delta_logical_events, 2);
+    assert_eq!(incremental.existing_events, 1);
+    assert_eq!(incremental.inserted_events, 1);
+    assert!(!incremental.already_applied);
+    assert_eq!(build.summary.physical_rows, 3);
+    assert_eq!(build.summary.logical_events, 2);
+    assert_eq!(build.summary.duplicate_rows, 1);
+    drop(build);
+
+    let target = resolve_snapshot(&target_catalog, Some(&lake_root)).expect("target re-resolve");
+    let (build, retry) =
+        apply_incremental(&database, target, &plan, &locations, config, AS_OF, false)
+            .expect("idempotent retry");
+    assert!(retry.already_applied);
+    assert_eq!(build.summary.logical_events, 2);
 }
 
 #[test]

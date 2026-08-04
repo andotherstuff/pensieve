@@ -10,7 +10,7 @@ use crate::{Error, ResolvedSnapshot, Result};
 
 /// Version of the SQL semantics materialized by this crate.
 pub const QUERY_VERSION: &str = "slice-a-v1";
-const API_TIMESTAMP_MAX: u64 = u32::MAX as u64;
+pub(crate) const API_TIMESTAMP_MAX: u64 = u32::MAX as u64;
 const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
 const HOURS_PER_SEVEN_DAYS: f64 = 168.0;
@@ -101,7 +101,7 @@ pub struct BuildSummary {
 
 /// One completed DuckDB build, ready for Postgres publication.
 pub struct AnalyticsBuild {
-    connection: Connection,
+    pub(crate) connection: Connection,
     /// Validated catalog and exact object locations used by the build.
     pub snapshot: ResolvedSnapshot,
     /// Fixed build configuration.
@@ -266,7 +266,7 @@ impl AnalyticsBuild {
     }
 }
 
-fn configure_execution(connection: &Connection, config: &BuildConfig) -> Result<()> {
+pub(crate) fn configure_execution(connection: &Connection, config: &BuildConfig) -> Result<()> {
     if config.threads == 0 {
         return Err(Error::Validation(
             "DuckDB worker thread count must be greater than zero".to_owned(),
@@ -365,6 +365,52 @@ fn materialize_canonical_events(
 }
 
 fn materialize_rollups(connection: &Connection, as_of: u64) -> Result<()> {
+    materialize_overview(connection, as_of)?;
+    connection.execute(
+        "
+        CREATE TABLE rollup_event_daily AS
+        SELECT
+            DATE '1970-01-01' + CAST(created_at // 86400 AS INTEGER) AS day,
+            count(*)::UBIGINT AS event_count
+        FROM canonical_events
+        WHERE created_at <= ?
+        GROUP BY day
+        ORDER BY day
+        ",
+        params![API_TIMESTAMP_MAX],
+    )?;
+    connection.execute(
+        "
+        CREATE TABLE rollup_event_daily_kind AS
+        SELECT
+            DATE '1970-01-01' + CAST(created_at // 86400 AS INTEGER) AS day,
+            kind,
+            count(*)::UBIGINT AS event_count
+        FROM canonical_events
+        WHERE created_at <= ?
+        GROUP BY day, kind
+        ORDER BY day, kind
+        ",
+        params![API_TIMESTAMP_MAX],
+    )?;
+    connection.execute_batch(
+        "
+        CREATE TABLE rollup_kind_all_time AS
+        SELECT kind, count(*)::UBIGINT AS event_count
+        FROM canonical_events
+        GROUP BY kind
+        ORDER BY kind;
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn replace_overview(connection: &Connection, as_of: u64) -> Result<()> {
+    connection.execute_batch("DROP TABLE rollup_overview")?;
+    materialize_overview(connection, as_of)
+}
+
+fn materialize_overview(connection: &Connection, as_of: u64) -> Result<()> {
     let seven_day_start = as_of.saturating_sub(SEVEN_DAYS_SECS);
     let thirty_day_start = as_of.saturating_sub(THIRTY_DAYS_SECS);
     connection.execute(
@@ -409,48 +455,18 @@ fn materialize_rollups(connection: &Connection, as_of: u64) -> Result<()> {
             as_of,
         ],
     )?;
-    connection.execute(
-        "
-        CREATE TABLE rollup_event_daily AS
-        SELECT
-            DATE '1970-01-01' + CAST(created_at // 86400 AS INTEGER) AS day,
-            count(*)::UBIGINT AS event_count
-        FROM canonical_events
-        WHERE created_at <= ?
-        GROUP BY day
-        ORDER BY day
-        ",
-        params![API_TIMESTAMP_MAX],
-    )?;
-    connection.execute(
-        "
-        CREATE TABLE rollup_event_daily_kind AS
-        SELECT
-            DATE '1970-01-01' + CAST(created_at // 86400 AS INTEGER) AS day,
-            kind,
-            count(*)::UBIGINT AS event_count
-        FROM canonical_events
-        WHERE created_at <= ?
-        GROUP BY day, kind
-        ORDER BY day, kind
-        ",
-        params![API_TIMESTAMP_MAX],
-    )?;
-    connection.execute_batch(
-        "
-        CREATE TABLE rollup_kind_all_time AS
-        SELECT kind, count(*)::UBIGINT AS event_count
-        FROM canonical_events
-        GROUP BY kind
-        ORDER BY kind;
-        ",
-    )?;
     Ok(())
 }
 
 fn validate_rollups(connection: &Connection, snapshot: &ResolvedSnapshot) -> Result<BuildSummary> {
+    validate_rollups_for_physical_rows(connection, snapshot.catalog.totals().physical_rows)
+}
+
+pub(crate) fn validate_rollups_for_physical_rows(
+    connection: &Connection,
+    physical_rows: u64,
+) -> Result<BuildSummary> {
     let logical_events = scalar_u64(connection, "SELECT count(*) FROM canonical_events")?;
-    let physical_rows = snapshot.catalog.totals().physical_rows;
     let duplicate_rows = physical_rows.checked_sub(logical_events).ok_or_else(|| {
         Error::Validation(format!(
             "catalog claims {physical_rows} physical rows but DuckDB produced {logical_events} logical rows"
@@ -495,7 +511,7 @@ fn validate_sum(connection: &Connection, table: &str, expected: u64) -> Result<(
     Ok(())
 }
 
-fn scalar_u64(connection: &Connection, sql: &str) -> Result<u64> {
+pub(crate) fn scalar_u64(connection: &Connection, sql: &str) -> Result<u64> {
     connection
         .query_row(sql, [], |row| row.get(0))
         .optional()?
@@ -505,6 +521,6 @@ fn scalar_u64(connection: &Connection, sql: &str) -> Result<u64> {
 // DuckDB does not accept bind parameters in `CREATE SECRET` options or in a
 // `read_parquet` file-list literal. Those values come from the operator-selected
 // catalog and CLI configuration, so quote and escape them in one place.
-fn sql_string(value: &str) -> String {
+pub(crate) fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }

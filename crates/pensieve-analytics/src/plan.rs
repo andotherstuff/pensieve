@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 
 use pensieve_lake::{ActiveRawSnapshot, CatalogObject};
 use postgres::{Client, GenericClient};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, schema::SCHEMA_SQL};
 
 /// Execution mode required to advance from the currently published snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannedRunKind {
     /// There is no published analytics baseline.
@@ -23,7 +23,7 @@ pub enum PlannedRunKind {
 }
 
 /// One object from the durable applied-object ledger.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppliedObject {
     /// Immutable object-store key.
     pub object_key: String,
@@ -42,7 +42,7 @@ pub struct AppliedObject {
 }
 
 /// Exact catalog work required after the current successful publication.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogDeltaPlan {
     /// Selected target snapshot.
     pub snapshot_id: String,

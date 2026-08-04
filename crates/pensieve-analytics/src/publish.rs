@@ -11,6 +11,16 @@ use crate::{AnalyticsBuild, Error, QUERY_VERSION, Result, schema::SCHEMA_SQL};
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
 
+/// Hold the analytics publication lock for the lifetime of `client`.
+///
+/// Incremental executors use this before planning so no other publisher can
+/// advance Postgres between the catalog diff and the DuckDB commit. PostgreSQL
+/// releases the session-scoped lock automatically if the process disconnects.
+pub fn acquire_publication_lock(client: &mut Client) -> Result<()> {
+    client.query_one("SELECT pg_advisory_lock($1)", &[&PUBLICATION_LOCK_ID])?;
+    Ok(())
+}
+
 /// Result of attempting to publish a deterministic run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublishOutcome {
@@ -47,6 +57,42 @@ pub fn publish(
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
 ) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "full_rebuild",
+        None,
+    )
+}
+
+/// Publish an incrementally advanced build if its planned baseline is current.
+pub fn publish_incremental(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+    )
+}
+
+fn publish_kind(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    run_kind: &'static str,
+    expected_previous_run_id: Option<&str>,
+) -> Result<PublishOutcome> {
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build);
     let mut transaction = client.transaction()?;
@@ -71,6 +117,14 @@ pub fn publish(
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
         return Err(Error::StalePublishedRun(run_id));
+    }
+    if let Some(expected) = expected_previous_run_id
+        && current_run_id.as_deref() != Some(expected)
+    {
+        return Err(Error::PublicationBaselineChanged {
+            expected: expected.to_owned(),
+            actual: current_run_id,
+        });
     }
 
     let overview = build.overview()?;
@@ -104,14 +158,15 @@ pub fn publish(
             validation
         )
         VALUES (
-            $1, $2, $3, 'full_rebuild', $4, $5, $6, $7, $8, now(),
-            $9, $10, $11, $12, $13, $14, $15, $16
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
+            $10, $11, $12, $13, $14, $15, $16, $17
         )
         ",
         &[
             &run_id,
             &build.snapshot.catalog.snapshot_id,
             &current_run_id,
+            &run_kind,
             &QUERY_VERSION,
             &build.config.code_version,
             &to_i64("as_of_epoch", build.config.as_of_epoch)?,

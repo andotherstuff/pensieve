@@ -64,6 +64,28 @@ pub enum Error {
         /// Invalid signed value.
         value: i64,
     },
+    /// The selected delta plan is inconsistent with the target snapshot.
+    #[error("invalid incremental analytics plan: {0}")]
+    InvalidIncrementalPlan(String),
+    /// The durable DuckDB checkpoint is for a different snapshot.
+    #[error("DuckDB checkpoint is at snapshot {actual}, expected {expected}")]
+    CheckpointSnapshotMismatch {
+        /// Snapshot stored in DuckDB.
+        actual: String,
+        /// Required baseline or target snapshot.
+        expected: String,
+    },
+    /// A delta repeated an event ID with conflicting committed fields.
+    #[error("delta contains {0} event IDs whose created_at or kind conflicts with the checkpoint")]
+    ConflictingDeltaEvents(u64),
+    /// Postgres advanced while an incremental build was running.
+    #[error("Postgres current run changed: expected {expected}, found {actual:?}")]
+    PublicationBaselineChanged {
+        /// Run against which the delta was planned.
+        expected: String,
+        /// Current run observed under the publication lock.
+        actual: Option<String>,
+    },
     /// Writing streamed COPY data failed.
     #[error("failed to stream Postgres COPY data: {0}")]
     CopyIo(#[from] std::io::Error),
