@@ -9,6 +9,7 @@ mod incremental;
 mod input;
 mod plan;
 mod publish;
+mod reconcile;
 mod schema;
 
 pub use build::{
@@ -20,3 +21,7 @@ pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locat
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta};
 pub use publish::{PublishOutcome, acquire_publication_lock, publish, publish_incremental};
+pub use reconcile::{
+    Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
+    ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
+};

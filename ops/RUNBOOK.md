@@ -275,6 +275,44 @@ systemctl is-active pensieve-ingest
 systemctl show pensieve-ingest -p NRestarts
 ```
 
+### Slice A comparison evidence
+
+After a successful refresh, run the read-only comparison harness before any
+reader cutover. It obtains the fixed `as_of` from the current Postgres run and
+uses `events_local FINAL` for ID-deduplicated ClickHouse values. Do not pass
+secrets on the command line. Give a root-owned systemd unit or transient
+service these environment files:
+
+- `/etc/pensieve/analytics.env` for the Postgres connection and password; and
+- `/etc/pensieve/pensieve.env` for the ClickHouse connection, when its
+  defaults are not sufficient.
+
+The first production probe should use the same resource envelope as the
+refresh job because exact `FINAL` scans are expensive:
+
+```bash
+sudo install -d -m 0750 -o pensieve -g pensieve \
+  /var/lib/pensieve-analytics/comparisons
+sudo systemd-run --wait --pipe --collect \
+  --unit=pensieve-analytics-compare-manual \
+  --uid=pensieve --gid=pensieve \
+  --working-directory=/home/pensieve/pensieve \
+  --property=EnvironmentFile=/etc/pensieve/analytics.env \
+  --property=EnvironmentFile=/etc/pensieve/pensieve.env \
+  --property=CPUQuota=200% \
+  --property=MemoryHigh=20G --property=MemoryMax=24G \
+  --property=IOWeight=25 \
+  /home/pensieve/pensieve/target/release/pensieve-analytics-compare \
+    --output /var/lib/pensieve-analytics/comparisons/<snapshot-id>.json \
+    --completed-days 30
+```
+
+The exact command, exit-status meanings, alignment-evidence schema, and
+resource warnings are documented in
+[`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md#fixed-as-of-comparison-harness).
+An unproven report is useful reconciliation evidence but cannot approve the
+P3 parity gate. Keep `pensieve-serve` and Grafana on ClickHouse.
+
 ## One-time cutover (ops/ move + secrets → /etc)
 
 The move of compose/systemd paths and secrets to `/etc` must happen in lockstep with

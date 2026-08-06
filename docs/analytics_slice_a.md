@@ -248,3 +248,74 @@ Do not point `pensieve-serve` or Grafana at these views yet. The next gate is:
 5. measure DuckDB work-database size, peak memory, S3 bytes read, build time,
    Postgres relation sizes, and publication time; and
 6. record every old/new difference using the ledger classifications.
+
+## Fixed-as-of comparison harness
+
+`pensieve-analytics-compare` is a read-only parity probe for the Slice A
+products already published to Postgres. It reads the current immutable
+Postgres run, takes that run's `as_of_epoch`, and queries `events_local FINAL`
+so ClickHouse duplicate rows are collapsed by event ID. It compares:
+
+- API-representable total, earliest, fixed-`as_of` latest, rolling seven-day
+  events, and rolling 30-day kinds;
+- daily event counts for a bounded set of complete UTC days;
+- daily-kind counts over the same complete-day window; and
+- per-kind totals through the last complete UTC day.
+
+The partial UTC day containing `as_of` is deliberately excluded from daily
+series. Slice A's daily tables contain complete event-date buckets, while an
+endpoint comparison capped partway through that day would require an hourly or
+live-delta product.
+
+Run it with the same private environment used by the analytics publisher:
+
+```bash
+snapshot_id="$(
+  psql "$DATABASE_URL" -Atc \
+    'SELECT snapshot_id FROM pensieve_analytics.current_run_metadata'
+)"
+snapshot_hex="$(printf '%s' "$snapshot_id" | cut -d: -f2)"
+report="/var/lib/pensieve-analytics/comparisons/$snapshot_hex.json"
+
+pensieve-analytics-compare \
+  --output "$report" \
+  --completed-days 30 \
+  --clickhouse-max-threads 2 \
+  --clickhouse-max-memory-usage 17179869184
+```
+
+The output is immutable evidence: publication uses a same-filesystem hard
+link, refuses to replace an existing report, and stores no connection strings
+or passwords. ClickHouse queries set `readonly=1`, use two threads by default,
+cap memory at 16 GiB, and allow at most six hours. `FINAL` scans are still
+expensive; run the first production probe under the same CPU, memory, and I/O
+controls used for analytics refreshes, and keep ingestion health under
+observation.
+
+A fixed event timestamp is not an ingestion barrier. Without independent
+input-set evidence, an unequal value is classified `old_stack_uncertainty`
+and the report gate is `incomplete`, even if every compared value happens to
+match. Exit status `2` means the report is valid but cannot approve parity.
+
+To make mismatches actionable, provide JSON evidence from an exact ID-keyed
+Parquet/ClickHouse barrier comparison:
+
+```json
+{
+  "schema_version": 1,
+  "evidence_type": "pensieve-clickhouse-parquet-id-parity-v1",
+  "status": "passed",
+  "snapshot_id": "sha256:<current-snapshot>",
+  "clickhouse_database": "nostr",
+  "clickhouse_table": "events_local",
+  "clickhouse_indexed_at_max_epoch": 1786000000,
+  "id_keyed_equal": true
+}
+```
+
+Then invoke the harness with `--input-alignment-proven
+--alignment-evidence <file>`. Every ClickHouse query applies the attested
+`indexed_at` barrier. With aligned inputs, exact matches produce exit status
+`0`; any scalar or keyed difference is classified `bug`, the gate is
+`failed`, and the command exits `2`. Connection, query, or report failures
+exit `1`.
