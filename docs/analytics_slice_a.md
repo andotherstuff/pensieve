@@ -253,8 +253,9 @@ Do not point `pensieve-serve` or Grafana at these views yet. The next gate is:
 
 `pensieve-analytics-compare` is a read-only parity probe for the Slice A
 products already published to Postgres. It reads the current immutable
-Postgres run, takes that run's `as_of_epoch`, and queries `events_local FINAL`
-so ClickHouse duplicate rows are collapsed by event ID. It compares:
+Postgres run, takes that run's `as_of_epoch`, and reads `events_local` in
+ordered event-ID ranges. Within each range, `argMax(..., indexed_at)` collapses
+duplicate rows by event ID at one fixed ingestion barrier. It compares:
 
 - API-representable total, earliest, fixed-`as_of` latest, rolling seven-day
   events, and rolling 30-day kinds;
@@ -270,34 +271,50 @@ live-delta product.
 Run it with the same private environment used by the analytics publisher:
 
 ```bash
-snapshot_id="$(
+run_id="$(
   psql "$DATABASE_URL" -Atc \
-    'SELECT snapshot_id FROM pensieve_analytics.current_run_metadata'
+    'SELECT run_id FROM pensieve_analytics.current_run_metadata'
 )"
-snapshot_hex="$(printf '%s' "$snapshot_id" | cut -d: -f2)"
-report="/var/lib/pensieve-analytics/comparisons/$snapshot_hex.json"
+report="/var/lib/pensieve-analytics/comparisons/$run_id.json"
+checkpoints="$report.checkpoints"
 
 pensieve-analytics-compare \
   --output "$report" \
+  --postgres-run-id "$run_id" \
   --completed-days 30 \
-  --clickhouse-max-threads 2 \
-  --clickhouse-max-memory-usage 17179869184
+  --clickhouse-shards 256 \
+  --clickhouse-checkpoint-dir "$checkpoints" \
+  --clickhouse-shard-delay-seconds 30 \
+  --clickhouse-max-threads 1 \
+  --clickhouse-max-memory-usage 8589934592
 ```
 
 The output is immutable evidence: publication uses a same-filesystem hard
 link, refuses to replace an existing report, and stores no connection strings
-or passwords. The binary issues only hard-coded `SELECT` statements and is
-compatible with the production read-only ClickHouse profile. Queries use two
-threads by default, cap memory at 16 GiB, and allow at most six hours. All
-scalars and keyed products are derived from one grouped `FINAL` scan rather
-than repeatedly reading the table. The scan is still expensive; run the first
-production probe under the same CPU, memory, and I/O controls used for
-analytics refreshes, and keep ingestion health under observation.
+or passwords. Every completed shard is also published as immutable JSON and
+is validated against the database, table, Postgres snapshot, `as_of`, ingestion
+barrier, day range, harness version, and exact ID bounds before reuse. An
+interrupted invocation therefore resumes completed work and refuses stale or
+cross-snapshot checkpoints. Pin `--postgres-run-id` for any run expected to
+cross a daily publication boundary.
 
-A fixed event timestamp is not an ingestion barrier. Without independent
-input-set evidence, an unequal value is classified `old_stack_uncertainty`
-and the report gate is `incomplete`, even if every compared value happens to
-match. Exit status `2` means the report is valid but cannot approve parity.
+The default 256 shards cover the complete ClickHouse string keyspace without
+gaps. ID predicates use the `events_local` primary key, each query is bounded,
+and partial aggregates merge exactly: counts add, minima/maxima merge, and the
+rolling kind set unions. The first query freezes `indexed_at` at comparison
+start unless stronger alignment evidence supplies an attested barrier. Each
+shard performs one all-time kind/scalar pass and one bounded daily-kind pass,
+avoiding the former all-history `(day, kind)` result. The final report is only
+published after every shard is present. Run production probes with one thread,
+resource controls, a delay between new shards, and ingestion health under
+observation.
+
+A fixed ClickHouse ingestion barrier prevents shards from seeing newly indexed
+events at different times, but does not prove that Postgres and ClickHouse had
+the same input IDs. Without independent input-set evidence, an unequal value
+is classified `old_stack_uncertainty` and the report gate is `incomplete`, even
+if every compared value happens to match. Exit status `2` means the report is
+valid but cannot approve parity.
 
 To make mismatches actionable, provide JSON evidence from an exact ID-keyed
 Parquet/ClickHouse barrier comparison:
