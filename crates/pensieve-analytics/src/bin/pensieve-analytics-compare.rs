@@ -1,6 +1,7 @@
 //! Compare the current Postgres Slice A publication with ClickHouse at one fixed boundary.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -175,31 +176,14 @@ struct ClickhouseOverview {
 }
 
 #[derive(Debug, Deserialize, Row)]
-struct ClickhouseOverviewRow {
-    api_representable_events: u64,
+struct ClickhouseAggregateRow {
+    day: String,
+    kind: u16,
+    event_count: u64,
     earliest_event: u32,
     latest_event: u32,
     events_7d: u64,
-    kinds_30d: u64,
-}
-
-#[derive(Debug, Deserialize, Row)]
-struct ClickhouseDailyRow {
-    day: String,
-    event_count: u64,
-}
-
-#[derive(Debug, Deserialize, Row)]
-struct ClickhouseDailyKindRow {
-    day: String,
-    kind: u16,
-    event_count: u64,
-}
-
-#[derive(Debug, Deserialize, Row)]
-struct ClickhouseKindRow {
-    kind: u16,
-    event_count: u64,
+    events_30d: u64,
 }
 
 fn main() -> ExitCode {
@@ -502,14 +486,14 @@ async fn load_clickhouse_snapshot(
         .unwrap_or(u32::MAX);
     let seven_day_start = as_of.saturating_sub(SEVEN_DAYS_SECONDS as u32);
     let thirty_day_start = as_of.saturating_sub(THIRTY_DAYS_SECONDS as u32);
-    let completed_start_epoch = midnight_epoch(completed_start)?;
-    let completed_end_epoch = midnight_epoch(completed_end)?;
 
-    let row = client
+    let rows = client
         .query(
             "
             SELECT
-                count() AS api_representable_events,
+                toString(toDate(created_at, 'UTC')) AS day,
+                kind,
+                count() AS event_count,
                 toUInt32(min(created_at)) AS earliest_event,
                 toUInt32(maxIf(created_at, created_at <= toDateTime({as_of:UInt32}, 'UTC')))
                     AS latest_event,
@@ -517,91 +501,87 @@ async fn load_clickhouse_snapshot(
                     created_at >= toDateTime({seven_day_start:UInt32}, 'UTC')
                     AND created_at <= toDateTime({as_of:UInt32}, 'UTC')
                 ) AS events_7d,
-                uniqExactIf(
-                    kind,
+                countIf(
                     created_at >= toDateTime({thirty_day_start:UInt32}, 'UTC')
                     AND created_at <= toDateTime({as_of:UInt32}, 'UTC')
-                ) AS kinds_30d
+                ) AS events_30d
             FROM events_local FINAL
             WHERE indexed_at <= toDateTime({indexed_at_max:UInt32}, 'UTC')
+            GROUP BY day, kind
+            ORDER BY day, kind
             ",
         )
         .param("as_of", as_of)
         .param("indexed_at_max", indexed_at_max)
         .param("seven_day_start", seven_day_start)
         .param("thirty_day_start", thirty_day_start)
-        .fetch_one::<ClickhouseOverviewRow>()
+        .fetch_all::<ClickhouseAggregateRow>()
         .await
-        .context("query exact ClickHouse overview from events_local FINAL")?;
+        .context("query exact ClickHouse aggregates from one events_local FINAL scan")?;
+    aggregate_clickhouse_rows(rows, completed_start, completed_end)
+}
+
+fn aggregate_clickhouse_rows(
+    rows: Vec<ClickhouseAggregateRow>,
+    completed_start: NaiveDate,
+    completed_end: NaiveDate,
+) -> Result<ClickhouseSnapshot> {
+    let mut api_representable_events = 0_u64;
+    let mut earliest_event = None::<u32>;
+    let mut latest_event = 0_u32;
+    let mut events_7d = 0_u64;
+    let mut kinds_30d = BTreeSet::new();
+    let mut daily = BTreeMap::new();
+    let mut daily_kind = BTreeMap::new();
+    let mut completed_kind = BTreeMap::new();
+    for row in rows {
+        let day = NaiveDate::parse_from_str(&row.day, "%Y-%m-%d")
+            .with_context(|| format!("parse ClickHouse UTC day {}", row.day))?;
+        api_representable_events = checked_add(
+            "ClickHouse API-representable events",
+            api_representable_events,
+            row.event_count,
+        )?;
+        earliest_event = Some(earliest_event.map_or(row.earliest_event, |current| {
+            current.min(row.earliest_event)
+        }));
+        latest_event = latest_event.max(row.latest_event);
+        events_7d = checked_add("ClickHouse seven-day events", events_7d, row.events_7d)?;
+        if row.events_30d != 0 {
+            kinds_30d.insert(row.kind);
+        }
+        if day >= completed_start && day < completed_end {
+            let daily_total = daily.entry(row.day.clone()).or_insert(0_u64);
+            *daily_total = checked_add("ClickHouse daily events", *daily_total, row.event_count)?;
+            if daily_kind
+                .insert(format!("{}|{}", row.day, row.kind), row.event_count)
+                .is_some()
+            {
+                bail!("ClickHouse returned a duplicate daily-kind group");
+            }
+        }
+        if day < completed_end {
+            let kind_total = completed_kind.entry(row.kind.to_string()).or_insert(0_u64);
+            *kind_total = checked_add(
+                "ClickHouse completed-day kind events",
+                *kind_total,
+                row.event_count,
+            )?;
+        }
+    }
+    let kinds_30d =
+        u64::try_from(kinds_30d.len()).context("ClickHouse 30-day kind count overflowed u64")?;
     let overview = ClickhouseOverview {
-        api_representable_events: row.api_representable_events,
-        earliest_event: u64::from(row.earliest_event.max(NOSTR_GENESIS_TIMESTAMP)),
-        latest_event: u64::from(row.latest_event),
-        events_7d: row.events_7d,
-        kinds_30d: row.kinds_30d,
+        api_representable_events,
+        earliest_event: u64::from(
+            earliest_event
+                .unwrap_or_default()
+                .max(NOSTR_GENESIS_TIMESTAMP),
+        ),
+        latest_event: u64::from(latest_event),
+        events_7d,
+        kinds_30d,
     };
-    let daily = client
-        .query(
-            "
-            SELECT toString(toDate(created_at, 'UTC')) AS day, count() AS event_count
-            FROM events_local FINAL
-            WHERE indexed_at <= toDateTime({indexed_at_max:UInt32}, 'UTC')
-              AND created_at >= toDateTime({start:UInt32}, 'UTC')
-              AND created_at < toDateTime({end:UInt32}, 'UTC')
-            GROUP BY day
-            ORDER BY day
-            ",
-        )
-        .param("indexed_at_max", indexed_at_max)
-        .param("start", completed_start_epoch)
-        .param("end", completed_end_epoch)
-        .fetch_all::<ClickhouseDailyRow>()
-        .await
-        .context("query exact ClickHouse daily rows from events_local FINAL")?
-        .into_iter()
-        .map(|row| (row.day, row.event_count))
-        .collect();
-    let daily_kind = client
-        .query(
-            "
-            SELECT toString(toDate(created_at, 'UTC')) AS day, kind,
-                   count() AS event_count
-            FROM events_local FINAL
-            WHERE indexed_at <= toDateTime({indexed_at_max:UInt32}, 'UTC')
-              AND created_at >= toDateTime({start:UInt32}, 'UTC')
-              AND created_at < toDateTime({end:UInt32}, 'UTC')
-            GROUP BY day, kind
-            ORDER BY day, kind
-            ",
-        )
-        .param("indexed_at_max", indexed_at_max)
-        .param("start", completed_start_epoch)
-        .param("end", completed_end_epoch)
-        .fetch_all::<ClickhouseDailyKindRow>()
-        .await
-        .context("query exact ClickHouse daily-kind rows from events_local FINAL")?
-        .into_iter()
-        .map(|row| (format!("{}|{}", row.day, row.kind), row.event_count))
-        .collect();
-    let completed_kind = client
-        .query(
-            "
-            SELECT kind, count() AS event_count
-            FROM events_local FINAL
-            WHERE indexed_at <= toDateTime({indexed_at_max:UInt32}, 'UTC')
-              AND created_at < toDateTime({end:UInt32}, 'UTC')
-            GROUP BY kind
-            ORDER BY kind
-            ",
-        )
-        .param("indexed_at_max", indexed_at_max)
-        .param("end", completed_end_epoch)
-        .fetch_all::<ClickhouseKindRow>()
-        .await
-        .context("query exact ClickHouse completed-day kind totals from events_local FINAL")?
-        .into_iter()
-        .map(|row| (row.kind.to_string(), row.event_count))
-        .collect();
     Ok(ClickhouseSnapshot {
         overview,
         daily,
@@ -713,17 +693,13 @@ fn completed_day_range(as_of: u64, days: u64) -> Result<(NaiveDate, NaiveDate)> 
     Ok((start, end))
 }
 
-fn midnight_epoch(day: NaiveDate) -> Result<u32> {
-    let epoch = day
-        .and_hms_opt(0, 0, 0)
-        .context("construct UTC midnight")?
-        .and_utc()
-        .timestamp();
-    u32::try_from(epoch).context("UTC midnight is outside ClickHouse DateTime domain")
-}
-
 fn nonnegative(name: &str, value: i64) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{name} must be non-negative"))
+}
+
+fn checked_add(name: &str, left: u64, right: u64) -> Result<u64> {
+    left.checked_add(right)
+        .with_context(|| format!("{name} overflowed u64"))
 }
 
 fn endpoints(values: &[&str]) -> Vec<String> {
@@ -759,4 +735,60 @@ fn write_report(path: &Path, report: &Report) -> Result<()> {
     })();
     let _ = fs::remove_file(&partial);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_grouped_scan_derives_every_clickhouse_product() {
+        let rows = vec![
+            ClickhouseAggregateRow {
+                day: "2026-08-01".to_owned(),
+                kind: 1,
+                event_count: 10,
+                earliest_event: 1_500_000_000,
+                latest_event: 1_600_000_000,
+                events_7d: 4,
+                events_30d: 10,
+            },
+            ClickhouseAggregateRow {
+                day: "2026-08-01".to_owned(),
+                kind: 2,
+                event_count: 3,
+                earliest_event: 1_550_000_000,
+                latest_event: 1_650_000_000,
+                events_7d: 1,
+                events_30d: 3,
+            },
+            ClickhouseAggregateRow {
+                day: "2026-08-03".to_owned(),
+                kind: 1,
+                event_count: 7,
+                earliest_event: 1_700_000_000,
+                latest_event: 1_750_000_000,
+                events_7d: 7,
+                events_30d: 7,
+            },
+        ];
+        let snapshot = aggregate_clickhouse_rows(
+            rows,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.overview.api_representable_events, 20);
+        assert_eq!(
+            snapshot.overview.earliest_event,
+            u64::from(NOSTR_GENESIS_TIMESTAMP)
+        );
+        assert_eq!(snapshot.overview.latest_event, 1_750_000_000);
+        assert_eq!(snapshot.overview.events_7d, 12);
+        assert_eq!(snapshot.overview.kinds_30d, 2);
+        assert_eq!(snapshot.daily.get("2026-08-01"), Some(&13));
+        assert_eq!(snapshot.daily_kind.get("2026-08-01|1"), Some(&10));
+        assert_eq!(snapshot.completed_kind.get("1"), Some(&10));
+        assert_eq!(snapshot.completed_kind.get("2"), Some(&3));
+    }
 }
