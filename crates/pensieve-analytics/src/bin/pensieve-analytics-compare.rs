@@ -202,9 +202,8 @@ struct ClickhouseKindRow {
     event_count: u64,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    match run() {
         Ok(ComparisonGate::Passed) => ExitCode::SUCCESS,
         Ok(ComparisonGate::Incomplete | ComparisonGate::Failed) => ExitCode::from(2),
         Err(error) => {
@@ -214,7 +213,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<ComparisonGate> {
+fn run() -> Result<ComparisonGate> {
     let args = Args::parse();
     validate_args(&args)?;
 
@@ -226,14 +225,17 @@ async fn run() -> Result<ComparisonGate> {
     let alignment = load_alignment(&args, &postgres_snapshot.run.snapshot_id)?;
 
     let clickhouse_client = connect_clickhouse(&args);
-    let clickhouse_snapshot = load_clickhouse_snapshot(
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create ClickHouse query runtime")?;
+    let clickhouse_snapshot = runtime.block_on(load_clickhouse_snapshot(
         &clickhouse_client,
         postgres_snapshot.run.as_of_epoch,
         alignment.clickhouse_indexed_at_max_epoch,
         completed_start,
         completed_end,
-    )
-    .await?;
+    ))?;
 
     let metrics = compare_overview(
         &postgres_snapshot.overview,
