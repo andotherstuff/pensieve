@@ -420,7 +420,7 @@ fn load_run(client: &mut PostgresClient, run_id: Option<&str>) -> Result<RunMeta
                    query_version, code_version, as_of_epoch, published_at,
                    physical_rows, logical_events, duplicate_rows,
                    api_representable_events
-            FROM pensieve_analytics.run_metadata
+            FROM pensieve_analytics.runs
             WHERE run_id = $1
             ",
             &[&run_id],
