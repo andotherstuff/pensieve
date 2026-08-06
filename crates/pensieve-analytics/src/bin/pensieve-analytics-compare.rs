@@ -348,7 +348,7 @@ fn run() -> Result<ComparisonGate> {
         clickhouse: ClickhouseMetadata {
             database: args.clickhouse_database,
             table: "events_local",
-            deduplication: "argMax by event id at a fixed indexed_at barrier",
+            deduplication: "ReplacingMergeTree FINAL by event id at a fixed indexed_at barrier",
             max_threads: args.clickhouse_max_threads,
             max_memory_usage: args.clickhouse_max_memory_usage,
             max_execution_time: args.clickhouse_max_execution_time,
@@ -691,14 +691,8 @@ async fn query_clickhouse_shard(
                 ) AS events_30d,
                 countIf(created_at < toDateTime({{completed_end:UInt32}}, 'UTC'))
                     AS completed_events
-            FROM (
-                SELECT id,
-                       argMax(created_at, indexed_at) AS created_at,
-                       argMax(kind, indexed_at) AS kind
-                FROM events_local
-                WHERE indexed_at <= toDateTime({{indexed_at_max:UInt32}}, 'UTC'){id_filter}
-                GROUP BY id
-            )
+            FROM events_local FINAL
+            WHERE indexed_at <= toDateTime({{indexed_at_max:UInt32}}, 'UTC'){id_filter}
             GROUP BY kind
             ORDER BY kind
             "
@@ -725,15 +719,9 @@ async fn query_clickhouse_shard(
         "
         SELECT toString(toDate(created_at, 'UTC')) AS day,
                kind, count() AS event_count
-        FROM (
-            SELECT id,
-                   argMax(created_at, indexed_at) AS created_at,
-                   argMax(kind, indexed_at) AS kind
-            FROM events_local
-            WHERE indexed_at <= toDateTime({{indexed_at_max:UInt32}}, 'UTC'){id_filter}
-            GROUP BY id
-        )
-        WHERE created_at >= toDateTime({{completed_start:UInt32}}, 'UTC')
+        FROM events_local FINAL
+        WHERE indexed_at <= toDateTime({{indexed_at_max:UInt32}}, 'UTC'){id_filter}
+          AND created_at >= toDateTime({{completed_start:UInt32}}, 'UTC')
           AND created_at < toDateTime({{completed_end:UInt32}}, 'UTC')
         GROUP BY day, kind
         ORDER BY day, kind

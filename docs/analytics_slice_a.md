@@ -254,8 +254,8 @@ Do not point `pensieve-serve` or Grafana at these views yet. The next gate is:
 `pensieve-analytics-compare` is a read-only parity probe for the Slice A
 products already published to Postgres. It reads the current immutable
 Postgres run, takes that run's `as_of_epoch`, and reads `events_local` in
-ordered event-ID ranges. Within each range, `argMax(..., indexed_at)` collapses
-duplicate rows by event ID at one fixed ingestion barrier. It compares:
+ordered event-ID ranges. Within each range, `FINAL` collapses duplicate rows by
+event ID at one fixed ingestion barrier. It compares:
 
 - API-representable total, earliest, fixed-`as_of` latest, rolling seven-day
   events, and rolling 30-day kinds;
