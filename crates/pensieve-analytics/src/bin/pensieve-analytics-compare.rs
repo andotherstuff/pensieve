@@ -469,7 +469,6 @@ fn connect_clickhouse(args: &Args) -> clickhouse::Client {
     let mut client = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_database)
-        .with_option("readonly", "1")
         .with_option("max_threads", args.clickhouse_max_threads.to_string())
         .with_option(
             "max_memory_usage",

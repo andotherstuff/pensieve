@@ -286,11 +286,12 @@ pensieve-analytics-compare \
 
 The output is immutable evidence: publication uses a same-filesystem hard
 link, refuses to replace an existing report, and stores no connection strings
-or passwords. ClickHouse queries set `readonly=1`, use two threads by default,
-cap memory at 16 GiB, and allow at most six hours. `FINAL` scans are still
-expensive; run the first production probe under the same CPU, memory, and I/O
-controls used for analytics refreshes, and keep ingestion health under
-observation.
+or passwords. The binary issues only hard-coded `SELECT` statements and is
+compatible with the production read-only ClickHouse profile. Queries use two
+threads by default, cap memory at 16 GiB, and allow at most six hours. `FINAL`
+scans are still expensive; run the first production probe under the same CPU,
+memory, and I/O controls used for analytics refreshes, and keep ingestion
+health under observation.
 
 A fixed event timestamp is not an ingestion barrier. Without independent
 input-set evidence, an unequal value is classified `old_stack_uncertainty`
