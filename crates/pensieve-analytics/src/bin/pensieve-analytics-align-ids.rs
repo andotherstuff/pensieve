@@ -495,11 +495,14 @@ async fn export_clickhouse_ids(
     } else {
         "SELECT id FROM events_local WHERE indexed_at <= toDateTime({barrier:UInt32}, 'UTC') AND id >= {lower:String} GROUP BY id ORDER BY id"
     };
-    let query = client.query(sql).bind(indexed_at).bind(lower);
-    let mut cursor = match upper {
-        Some(upper) => query.bind(upper).fetch::<ClickhouseIdRow>()?,
-        None => query.fetch::<ClickhouseIdRow>()?,
-    };
+    let mut query = client
+        .query(sql)
+        .param("barrier", indexed_at)
+        .param("lower", lower);
+    if let Some(upper) = upper {
+        query = query.param("upper", upper);
+    }
+    let mut cursor = query.fetch::<ClickhouseIdRow>()?;
     let mut writer = BufWriter::new(File::create(output)?);
     let mut digest = Sha256::new();
     let mut count = 0_u64;
