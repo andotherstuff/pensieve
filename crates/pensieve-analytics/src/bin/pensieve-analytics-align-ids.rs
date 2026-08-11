@@ -388,6 +388,10 @@ fn validate_index_metadata(
 }
 
 fn connect_clickhouse(args: &Args) -> clickhouse::Client {
+    // ID-prefix shards still contain tens of millions of rows. Force both the
+    // de-duplication and final ordering phases to spill well before the hard
+    // query ceiling instead of letting either phase consume all query memory.
+    let external_spill_threshold = (args.clickhouse_max_memory_usage / 4).max(1);
     let mut client = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_database)
@@ -399,6 +403,14 @@ fn connect_clickhouse(args: &Args) -> clickhouse::Client {
         .with_option(
             "max_execution_time",
             args.clickhouse_max_execution_time.to_string(),
+        )
+        .with_option(
+            "max_bytes_before_external_group_by",
+            external_spill_threshold.to_string(),
+        )
+        .with_option(
+            "max_bytes_before_external_sort",
+            external_spill_threshold.to_string(),
         )
         .with_option("optimize_aggregation_in_order", "1");
     if let Some(user) = args.clickhouse_user.as_deref() {
