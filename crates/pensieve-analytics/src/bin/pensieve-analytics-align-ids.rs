@@ -489,7 +489,8 @@ fn export_duckdb_ids(
     upper: Option<&[u8]>,
     output: &Path,
 ) -> Result<ExportSummary> {
-    let connection = Connection::open(&args.work_database)?;
+    let config = Config::default().access_mode(AccessMode::ReadOnly)?;
+    let connection = Connection::open_with_flags(&args.work_database, config)?;
     configure_duckdb(&connection, args)?;
     let mut statement = if upper.is_some() {
         connection.prepare("SELECT id FROM ids WHERE id >= ? AND id < ? ORDER BY id")?
