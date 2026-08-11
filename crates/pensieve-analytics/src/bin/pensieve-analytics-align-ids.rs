@@ -34,6 +34,9 @@ struct Args {
     /// Immutable final JSON evidence path.
     #[arg(long)]
     output: PathBuf,
+    /// Optional directory for immutable full directional difference ID streams.
+    #[arg(long)]
+    difference_dir: Option<PathBuf>,
     /// Snapshot ID expected inside the frozen DuckDB checkpoint.
     #[arg(long)]
     snapshot_id: String,
@@ -103,6 +106,14 @@ struct ShardCheckpoint {
     clickhouse_only_count: u64,
     parquet_only_examples: Vec<String>,
     clickhouse_only_examples: Vec<String>,
+    #[serde(default)]
+    parquet_only_ids_file: Option<String>,
+    #[serde(default)]
+    parquet_only_ids_sha256: Option<String>,
+    #[serde(default)]
+    clickhouse_only_ids_file: Option<String>,
+    #[serde(default)]
+    clickhouse_only_ids_sha256: Option<String>,
     id_keyed_equal: bool,
     completed_at: DateTime<Utc>,
 }
@@ -126,6 +137,7 @@ struct Evidence {
     checkpoint_directory: String,
     source_database: String,
     source_size_bytes: u64,
+    difference_directory: Option<String>,
     generated_at: DateTime<Utc>,
 }
 
@@ -141,6 +153,8 @@ struct DifferenceSummary {
     right_only_count: u64,
     left_only_examples: Vec<String>,
     right_only_examples: Vec<String>,
+    left_only_sha256: Option<String>,
+    right_only_sha256: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -160,6 +174,10 @@ async fn run() -> Result<()> {
             args.checkpoint_dir.display()
         )
     })?;
+    if let Some(directory) = &args.difference_dir {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("create difference directory {}", directory.display()))?;
+    }
     ensure!(
         !args.output.exists(),
         "refusing to replace immutable evidence {}",
@@ -228,6 +246,10 @@ async fn run() -> Result<()> {
         checkpoint_directory: args.checkpoint_dir.display().to_string(),
         source_database: metadata.source_database,
         source_size_bytes: metadata.source_size_bytes,
+        difference_directory: args
+            .difference_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
         generated_at: Utc::now(),
     };
     write_json_immutable(&args.output, &evidence, "alignment evidence")?;
@@ -408,10 +430,19 @@ async fn compare_shard(
     )
     .await
     .with_context(|| format!("export ClickHouse ID shard {shard}"))?;
+    let difference_paths = args.difference_dir.as_ref().map(|directory| {
+        (
+            directory.join(format!("shard-{shard:03}.parquet-only.ids")),
+            directory.join(format!("shard-{shard:03}.clickhouse-only.ids")),
+        )
+    });
     let differences = compare_sorted_id_files(
         &parquet_path,
         &clickhouse_path,
         args.max_difference_examples,
+        difference_paths
+            .as_ref()
+            .map(|(left, right)| (left.as_path(), right.as_path())),
     )?;
     let checkpoint = ShardCheckpoint {
         schema_version: SCHEMA_VERSION,
@@ -431,6 +462,14 @@ async fn compare_shard(
         clickhouse_only_count: differences.right_only_count,
         parquet_only_examples: differences.left_only_examples,
         clickhouse_only_examples: differences.right_only_examples,
+        parquet_only_ids_file: difference_paths
+            .as_ref()
+            .map(|(path, _)| path.display().to_string()),
+        parquet_only_ids_sha256: differences.left_only_sha256,
+        clickhouse_only_ids_file: difference_paths
+            .as_ref()
+            .map(|(_, path)| path.display().to_string()),
+        clickhouse_only_ids_sha256: differences.right_only_sha256,
         id_keyed_equal: differences.left_only_count == 0 && differences.right_only_count == 0,
         completed_at: Utc::now(),
     };
@@ -546,12 +585,19 @@ fn compare_sorted_id_files(
     left: &Path,
     right: &Path,
     max_examples: usize,
+    difference_paths: Option<(&Path, &Path)>,
 ) -> Result<DifferenceSummary> {
     let mut left = IdReader::open(left)?;
     let mut right = IdReader::open(right)?;
     let mut left_id = left.next_id()?;
     let mut right_id = right.next_id()?;
     let mut summary = DifferenceSummary::default();
+    let mut left_sink = difference_paths
+        .map(|(path, _)| DifferenceSink::new(path))
+        .transpose()?;
+    let mut right_sink = difference_paths
+        .map(|(_, path)| DifferenceSink::new(path))
+        .transpose()?;
     while left_id.is_some() || right_id.is_some() {
         match (left_id.as_ref(), right_id.as_ref()) {
             (Some(a), Some(b)) if a == b => {
@@ -562,6 +608,7 @@ fn compare_sorted_id_files(
                 record_difference(
                     &mut summary.left_only_count,
                     &mut summary.left_only_examples,
+                    left_sink.as_mut(),
                     a,
                     max_examples,
                 )?;
@@ -571,6 +618,7 @@ fn compare_sorted_id_files(
                 record_difference(
                     &mut summary.right_only_count,
                     &mut summary.right_only_examples,
+                    right_sink.as_mut(),
                     b,
                     max_examples,
                 )?;
@@ -580,6 +628,7 @@ fn compare_sorted_id_files(
                 record_difference(
                     &mut summary.left_only_count,
                     &mut summary.left_only_examples,
+                    left_sink.as_mut(),
                     a,
                     max_examples,
                 )?;
@@ -589,6 +638,7 @@ fn compare_sorted_id_files(
                 record_difference(
                     &mut summary.right_only_count,
                     &mut summary.right_only_examples,
+                    right_sink.as_mut(),
                     b,
                     max_examples,
                 )?;
@@ -597,12 +647,15 @@ fn compare_sorted_id_files(
             (None, None) => break,
         }
     }
+    summary.left_only_sha256 = left_sink.map(DifferenceSink::finish).transpose()?;
+    summary.right_only_sha256 = right_sink.map(DifferenceSink::finish).transpose()?;
     Ok(summary)
 }
 
 fn record_difference(
     count: &mut u64,
     examples: &mut Vec<String>,
+    sink: Option<&mut DifferenceSink>,
     id: &[u8; ID_BYTES],
     max_examples: usize,
 ) -> Result<()> {
@@ -610,7 +663,61 @@ fn record_difference(
     if examples.len() < max_examples {
         examples.push(hex::encode(id));
     }
+    if let Some(sink) = sink {
+        sink.write(id)?;
+    }
     Ok(())
+}
+
+struct DifferenceSink {
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    writer: BufWriter<File>,
+    digest: Sha256,
+}
+
+impl DifferenceSink {
+    fn new(final_path: &Path) -> Result<Self> {
+        let partial_path = final_path.with_extension("ids.partial");
+        remove_if_exists(&partial_path)?;
+        let writer = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&partial_path)?,
+        );
+        Ok(Self {
+            final_path: final_path.to_owned(),
+            partial_path,
+            writer,
+            digest: Sha256::new(),
+        })
+    }
+
+    fn write(&mut self, id: &[u8; ID_BYTES]) -> Result<()> {
+        self.writer.write_all(id)?;
+        self.digest.update(id);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        let sha256 = hex::encode(self.digest.finalize());
+        let expected_size = self.partial_path.metadata()?.len();
+        if self.final_path.exists() {
+            ensure!(
+                self.final_path.metadata()?.len() == expected_size
+                    && sha256_file(&self.final_path)? == sha256,
+                "existing directional ID stream differs from recomputed output {}",
+                self.final_path.display()
+            );
+            fs::remove_file(&self.partial_path)?;
+        } else {
+            fs::rename(&self.partial_path, &self.final_path)?;
+        }
+        Ok(sha256)
+    }
 }
 
 struct IdReader(BufReader<File>);
@@ -693,6 +800,68 @@ fn validate_checkpoint(args: &Args, shard: u16, checkpoint: &ShardCheckpoint) ->
         is_sha256_hex(&checkpoint.parquet_sha256) && is_sha256_hex(&checkpoint.clickhouse_sha256),
         "shard {shard} has an invalid stream digest"
     );
+    match &args.difference_dir {
+        Some(directory) => {
+            let parquet_path = directory.join(format!("shard-{shard:03}.parquet-only.ids"));
+            let clickhouse_path = directory.join(format!("shard-{shard:03}.clickhouse-only.ids"));
+            validate_difference_file(
+                shard,
+                "Parquet-only",
+                &parquet_path,
+                checkpoint.parquet_only_count,
+                checkpoint.parquet_only_ids_file.as_deref(),
+                checkpoint.parquet_only_ids_sha256.as_deref(),
+            )?;
+            validate_difference_file(
+                shard,
+                "ClickHouse-only",
+                &clickhouse_path,
+                checkpoint.clickhouse_only_count,
+                checkpoint.clickhouse_only_ids_file.as_deref(),
+                checkpoint.clickhouse_only_ids_sha256.as_deref(),
+            )?;
+        }
+        None => ensure!(
+            checkpoint.parquet_only_ids_file.is_none()
+                && checkpoint.parquet_only_ids_sha256.is_none()
+                && checkpoint.clickhouse_only_ids_file.is_none()
+                && checkpoint.clickhouse_only_ids_sha256.is_none(),
+            "shard {shard} unexpectedly contains directional ID stream metadata"
+        ),
+    }
+    Ok(())
+}
+
+fn validate_difference_file(
+    shard: u16,
+    label: &str,
+    expected_path: &Path,
+    expected_count: u64,
+    recorded_path: Option<&str>,
+    recorded_sha256: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        recorded_path == Some(expected_path.display().to_string().as_str()),
+        "shard {shard} {label} ID stream path mismatch"
+    );
+    let recorded_sha256 = recorded_sha256
+        .with_context(|| format!("shard {shard} {label} ID stream digest is missing"))?;
+    ensure!(
+        is_sha256_hex(recorded_sha256),
+        "shard {shard} {label} ID stream digest is invalid"
+    );
+    ensure!(
+        expected_path.is_file(),
+        "shard {shard} {label} ID stream is missing"
+    );
+    ensure!(
+        expected_path.metadata()?.len() == expected_count * ID_BYTES as u64,
+        "shard {shard} {label} ID stream size mismatch"
+    );
+    ensure!(
+        sha256_file(expected_path)? == recorded_sha256,
+        "shard {shard} {label} ID stream SHA-256 mismatch"
+    );
     Ok(())
 }
 
@@ -729,6 +898,20 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -758,11 +941,18 @@ mod tests {
         let id = |byte| [byte; ID_BYTES];
         fs::write(&left, [id(1), id(2), id(4)].concat()).unwrap();
         fs::write(&right, [id(1), id(3), id(4), id(5)].concat()).unwrap();
-        let result = compare_sorted_id_files(&left, &right, 1).unwrap();
+        let left_only = directory.path().join("left-only.ids");
+        let right_only = directory.path().join("right-only.ids");
+        let result =
+            compare_sorted_id_files(&left, &right, 1, Some((&left_only, &right_only))).unwrap();
         assert_eq!(result.left_only_count, 1);
         assert_eq!(result.right_only_count, 2);
         assert_eq!(result.left_only_examples, vec![hex::encode(id(2))]);
         assert_eq!(result.right_only_examples, vec![hex::encode(id(3))]);
+        assert_eq!(fs::read(left_only).unwrap(), id(2));
+        assert_eq!(fs::read(right_only).unwrap(), [id(3), id(5)].concat());
+        assert!(result.left_only_sha256.is_some());
+        assert!(result.right_only_sha256.is_some());
     }
 
     #[test]
@@ -807,6 +997,7 @@ mod tests {
             work_database: directory.path().join("work.duckdb"),
             checkpoint_dir: directory.path().join("checkpoints"),
             output: directory.path().join("evidence.json"),
+            difference_dir: None,
             snapshot_id: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_owned(),
             clickhouse_indexed_at_max_epoch: 1,
