@@ -336,23 +336,12 @@ async fn query_clickhouse(
             )?;
             (checkpoint, true)
         } else {
-            let input: Vec<String> = batch.iter().map(hex::encode).collect();
-            let rows = client
-                .query(
-                    "SELECT id, toUInt32(argMax(created_at, indexed_at)) AS created_at,
-                            argMax(kind, indexed_at) AS kind,
-                            toUInt32(min(indexed_at)) AS first_indexed_at,
-                            toUInt32(max(indexed_at)) AS last_indexed_at,
-                            count() AS versions,
-                            argMax(relay_source, indexed_at) AS relay_source
-                     FROM events_local WHERE id IN {ids:Array(String)} GROUP BY id ORDER BY id
-                     SETTINGS max_memory_usage={max_memory:UInt64}, max_execution_time={max_time:UInt64}",
-                )
-                .param("ids", input)
-                .param("max_memory", args.clickhouse_max_memory_usage)
-                .param("max_time", args.clickhouse_max_execution_time)
-                .fetch_all::<MetadataRow>()
-                .await?;
+            let query = clickhouse_metadata_query(
+                batch,
+                args.clickhouse_max_memory_usage,
+                args.clickhouse_max_execution_time,
+            );
+            let rows = client.query(&query).fetch_all::<MetadataRow>().await?;
             let checkpoint = BatchCheckpoint {
                 schema_version: SCHEMA_VERSION,
                 runner_version: RUNNER_VERSION.to_owned(),
@@ -557,6 +546,24 @@ fn connect_clickhouse(args: &Args) -> clickhouse::Client {
     client
 }
 
+fn clickhouse_metadata_query(ids: &[[u8; 32]], max_memory: u64, max_time: u64) -> String {
+    let ids = ids
+        .iter()
+        .map(|id| format!("'{}'", hex::encode(id)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "SELECT id, toUInt32(argMax(created_at, indexed_at)) AS created_at,
+                argMax(kind, indexed_at) AS kind,
+                toUInt32(min(indexed_at)) AS first_indexed_at,
+                toUInt32(max(indexed_at)) AS last_indexed_at,
+                count() AS versions,
+                argMax(relay_source, indexed_at) AS relay_source
+         FROM events_local WHERE id IN ({ids}) GROUP BY id ORDER BY id
+         SETTINGS max_memory_usage={max_memory}, max_execution_time={max_time}"
+    )
+}
+
 fn epoch_datetime(epoch: u32) -> DateTime<Utc> {
     DateTime::from_timestamp(i64::from(epoch), 0).expect("UInt32 epoch is a valid DateTime")
 }
@@ -599,7 +606,7 @@ fn write_json_immutable(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attribution, percent, percentile};
+    use super::{attribution, clickhouse_metadata_query, percent, percentile};
 
     #[test]
     fn attribution_is_sorted_and_exact() {
@@ -615,5 +622,14 @@ mod tests {
         assert_eq!(percent(1, 0), 0.0);
         assert_eq!(percentile(vec![5, 1, 3, 2, 4], 50), Some(3));
         assert_eq!(percentile(Vec::new(), 50), None);
+    }
+
+    #[test]
+    fn clickhouse_query_embeds_only_fixed_width_hex_ids() {
+        let query = clickhouse_metadata_query(&[[0xab; 32], [0x01; 32]], 123, 45);
+        assert!(query.contains(&format!("'{}'", "ab".repeat(32))));
+        assert!(query.contains(&format!("'{}'", "01".repeat(32))));
+        assert!(query.contains("max_memory_usage=123"));
+        assert!(query.contains("max_execution_time=45"));
     }
 }
