@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use duckdb::{Connection, params};
 use pensieve_lake::{ActiveRawSnapshot, CatalogObject, read_catalog_snapshot};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,9 @@ const ID_BYTES: u64 = 32;
 #[derive(Debug, Parser)]
 #[command(about = "Attribute exact Parquet-only IDs to catalog objects and source work")]
 struct Args {
+    /// Directional mismatch population to classify.
+    #[arg(long, value_enum, default_value_t = CandidateDirection::ParquetOnly)]
+    direction: CandidateDirection,
     /// Completed full directional alignment evidence.
     #[arg(long)]
     alignment_evidence: PathBuf,
@@ -39,6 +42,10 @@ struct Args {
     /// Exact active-raw catalog used to build the frozen analytics snapshot.
     #[arg(long)]
     catalog: PathBuf,
+    /// Frozen baseline catalog, required when classifying ClickHouse-only IDs
+    /// against objects appended by a newer target catalog.
+    #[arg(long)]
+    baseline_catalog: Option<PathBuf>,
     /// Local root containing the catalog object keys.
     #[arg(long)]
     local_object_root: PathBuf,
@@ -65,6 +72,21 @@ struct Args {
     max_examples: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CandidateDirection {
+    ParquetOnly,
+    ClickhouseOnly,
+}
+
+impl CandidateDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ParquetOnly => "parquet_only",
+            Self::ClickhouseOnly => "clickhouse_only",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AlignmentEvidence {
     schema_version: u32,
@@ -88,6 +110,9 @@ struct AlignmentCheckpoint {
     parquet_only_count: u64,
     parquet_only_ids_file: Option<String>,
     parquet_only_ids_sha256: Option<String>,
+    clickhouse_only_count: u64,
+    clickhouse_only_ids_file: Option<String>,
+    clickhouse_only_ids_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -128,6 +153,7 @@ struct Evidence {
     runner_version: &'static str,
     status: &'static str,
     generated_at: DateTime<Utc>,
+    candidate_direction: &'static str,
     alignment_evidence: String,
     alignment_evidence_sha256: String,
     alignment_snapshot_id: String,
@@ -137,6 +163,9 @@ struct Evidence {
     catalog: String,
     catalog_sha256: String,
     catalog_snapshot_id: String,
+    baseline_catalog: Option<String>,
+    baseline_catalog_sha256: Option<String>,
+    catalog_objects_scanned: usize,
     catalog_objects: usize,
     catalog_work_units: usize,
     local_object_root: String,
@@ -156,6 +185,12 @@ struct Evidence {
     checkpoint_directory: String,
     completed_batches: usize,
     note: &'static str,
+}
+
+struct ClassificationScope {
+    objects: Vec<CatalogObject>,
+    baseline_catalog: Option<String>,
+    baseline_catalog_sha256: Option<String>,
 }
 
 fn main() {
@@ -187,12 +222,9 @@ fn run() -> Result<()> {
     let catalog_bytes = fs::read(&args.catalog)?;
     let catalog_sha256 = sha256_bytes(&catalog_bytes);
     let catalog = read_catalog_snapshot(&args.catalog).context("read active-raw catalog")?;
-    ensure!(
-        catalog.snapshot_id == alignment.snapshot_id,
-        "catalog and alignment snapshot IDs differ"
-    );
+    let scope = classification_scope(&args, &alignment, &catalog)?;
     let source_names = source_names(&catalog);
-    validate_catalog_objects(&args, &catalog, &source_names)?;
+    validate_catalog_objects(&args, &scope.objects, &source_names)?;
 
     let streams = validate_difference_streams(&args, &alignment)?;
     let is_new = !args.work_database.exists();
@@ -205,13 +237,21 @@ fn run() -> Result<()> {
             &alignment,
             &alignment_sha256,
             &catalog_sha256,
+            scope.baseline_catalog_sha256.as_deref(),
             &streams,
         )?;
     } else {
-        validate_work_database(&connection, &alignment, &alignment_sha256, &catalog_sha256)?;
+        validate_work_database(
+            &connection,
+            &args,
+            &alignment,
+            &alignment_sha256,
+            &catalog_sha256,
+            scope.baseline_catalog_sha256.as_deref(),
+        )?;
     }
 
-    let objects = catalog.objects();
+    let objects = &scope.objects;
     let total_batches = objects.len().div_ceil(args.objects_per_batch);
     for (batch_index, batch) in objects.chunks(args.objects_per_batch).enumerate() {
         let start = batch_index * args.objects_per_batch;
@@ -278,6 +318,9 @@ fn run() -> Result<()> {
         alignment_sha256,
         &catalog,
         catalog_sha256,
+        scope.baseline_catalog,
+        scope.baseline_catalog_sha256,
+        objects.len(),
         total_batches,
     )?;
     write_json_immutable(&args.output, &evidence, "classification evidence")?;
@@ -299,6 +342,18 @@ fn validate_args(args: &Args) -> Result<()> {
         "difference directory is missing"
     );
     ensure!(args.catalog.is_file(), "catalog is not a file");
+    match args.direction {
+        CandidateDirection::ParquetOnly => ensure!(
+            args.baseline_catalog.is_none(),
+            "baseline catalog is only valid for ClickHouse-only classification"
+        ),
+        CandidateDirection::ClickhouseOnly => ensure!(
+            args.baseline_catalog
+                .as_ref()
+                .is_some_and(|path| path.is_file()),
+            "ClickHouse-only classification requires a baseline catalog file"
+        ),
+    }
     ensure!(
         args.local_object_root.is_dir(),
         "local object root is missing"
@@ -339,6 +394,13 @@ fn validate_alignment(evidence: &AlignmentEvidence) -> Result<()> {
     Ok(())
 }
 
+fn candidate_population(args: &Args, alignment: &AlignmentEvidence) -> u64 {
+    match args.direction {
+        CandidateDirection::ParquetOnly => alignment.parquet_only_count,
+        CandidateDirection::ClickhouseOnly => alignment.clickhouse_only_count,
+    }
+}
+
 fn source_names(catalog: &ActiveRawSnapshot) -> BTreeMap<String, String> {
     catalog
         .work_units()
@@ -347,12 +409,76 @@ fn source_names(catalog: &ActiveRawSnapshot) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn classification_scope(
+    args: &Args,
+    alignment: &AlignmentEvidence,
+    target: &ActiveRawSnapshot,
+) -> Result<ClassificationScope> {
+    match args.direction {
+        CandidateDirection::ParquetOnly => {
+            ensure!(
+                target.snapshot_id == alignment.snapshot_id,
+                "catalog and alignment snapshot IDs differ"
+            );
+            Ok(ClassificationScope {
+                objects: target.objects().to_vec(),
+                baseline_catalog: None,
+                baseline_catalog_sha256: None,
+            })
+        }
+        CandidateDirection::ClickhouseOnly => {
+            let baseline_path = args
+                .baseline_catalog
+                .as_ref()
+                .context("baseline catalog is required")?;
+            let baseline_bytes = fs::read(baseline_path)?;
+            let baseline_sha256 = sha256_bytes(&baseline_bytes);
+            let baseline =
+                read_catalog_snapshot(baseline_path).context("read baseline active-raw catalog")?;
+            ensure!(
+                baseline.snapshot_id == alignment.snapshot_id,
+                "baseline catalog and alignment snapshot IDs differ"
+            );
+            ensure!(
+                target.snapshot_id != baseline.snapshot_id,
+                "target catalog does not advance the baseline"
+            );
+            let mut baseline_objects: BTreeMap<_, _> = baseline
+                .objects()
+                .iter()
+                .map(|object| (object.object_key.as_str(), object))
+                .collect();
+            let mut added = Vec::new();
+            for object in target.objects() {
+                match baseline_objects.remove(object.object_key.as_str()) {
+                    None => added.push(object.clone()),
+                    Some(previous) => ensure!(
+                        previous == object,
+                        "immutable catalog object changed: {}",
+                        object.object_key
+                    ),
+                }
+            }
+            ensure!(
+                baseline_objects.is_empty(),
+                "target catalog removes baseline objects"
+            );
+            ensure!(!added.is_empty(), "target catalog adds no objects");
+            Ok(ClassificationScope {
+                objects: added,
+                baseline_catalog: Some(baseline_path.display().to_string()),
+                baseline_catalog_sha256: Some(baseline_sha256),
+            })
+        }
+    }
+}
+
 fn validate_catalog_objects(
     args: &Args,
-    catalog: &ActiveRawSnapshot,
+    objects: &[CatalogObject],
     source_names: &BTreeMap<String, String>,
 ) -> Result<()> {
-    for object in catalog.objects() {
+    for object in objects {
         ensure!(
             source_names.contains_key(&object.work_unit_id),
             "catalog object references unknown work unit"
@@ -392,33 +518,50 @@ fn validate_difference_streams(args: &Args, alignment: &AlignmentEvidence) -> Re
                 && checkpoint.shard == shard,
             "alignment checkpoint identity mismatch for shard {shard}"
         );
+        let (file_name, expected_path, expected_count, expected_sha256) = match args.direction {
+            CandidateDirection::ParquetOnly => (
+                "parquet-only",
+                checkpoint.parquet_only_ids_file.as_deref(),
+                checkpoint.parquet_only_count,
+                checkpoint.parquet_only_ids_sha256.as_deref(),
+            ),
+            CandidateDirection::ClickhouseOnly => (
+                "clickhouse-only",
+                checkpoint.clickhouse_only_ids_file.as_deref(),
+                checkpoint.clickhouse_only_count,
+                checkpoint.clickhouse_only_ids_sha256.as_deref(),
+            ),
+        };
         let path = args
             .difference_dir
-            .join(format!("shard-{shard:03}.parquet-only.ids"));
+            .join(format!("shard-{shard:03}.{file_name}.ids"));
         ensure!(
-            checkpoint.parquet_only_ids_file.as_deref() == Some(path.to_string_lossy().as_ref()),
-            "Parquet-only stream path mismatch for shard {shard}"
+            expected_path == Some(path.to_string_lossy().as_ref()),
+            "directional stream path mismatch for shard {shard}"
         );
-        let expected_size = checkpoint
-            .parquet_only_count
+        let expected_size = expected_count
             .checked_mul(ID_BYTES)
-            .context("Parquet-only stream size overflow")?;
+            .context("directional stream size overflow")?;
         ensure!(
             path.metadata()?.len() == expected_size,
-            "Parquet-only stream size mismatch for shard {shard}"
+            "directional stream size mismatch for shard {shard}"
         );
         ensure!(
-            checkpoint.parquet_only_ids_sha256.as_deref() == Some(&sha256_file(&path)?),
-            "Parquet-only stream digest mismatch for shard {shard}"
+            expected_sha256 == Some(&sha256_file(&path)?),
+            "directional stream digest mismatch for shard {shard}"
         );
         total = total
-            .checked_add(checkpoint.parquet_only_count)
+            .checked_add(expected_count)
             .context("candidate count overflow")?;
         paths.push(path);
     }
     ensure!(
-        total == alignment.parquet_only_count,
-        "directional streams do not reproduce alignment Parquet-only count"
+        total
+            == match args.direction {
+                CandidateDirection::ParquetOnly => alignment.parquet_only_count,
+                CandidateDirection::ClickhouseOnly => alignment.clickhouse_only_count,
+            },
+        "directional streams do not reproduce the alignment count"
     );
     Ok(paths)
 }
@@ -440,6 +583,7 @@ fn initialize_work_database(
     alignment: &AlignmentEvidence,
     alignment_sha256: &str,
     catalog_sha256: &str,
+    baseline_catalog_sha256: Option<&str>,
     streams: &[PathBuf],
 ) -> Result<()> {
     connection.execute_batch(
@@ -488,16 +632,22 @@ fn initialize_work_database(
         }
         appender.flush()?;
         ensure!(
-            count == alignment.parquet_only_count,
+            count == candidate_population(args, alignment),
             "candidate load count mismatch"
         );
         connection.execute(
-            "INSERT INTO run_metadata VALUES ('runner_version', ?), ('alignment_snapshot_id', ?), ('alignment_evidence_sha256', ?), ('catalog_sha256', ?), ('candidate_count', ?)",
+            "INSERT INTO run_metadata VALUES
+             ('runner_version', ?), ('candidate_direction', ?),
+             ('alignment_snapshot_id', ?), ('alignment_evidence_sha256', ?),
+             ('catalog_sha256', ?), ('baseline_catalog_sha256', ?),
+             ('candidate_count', ?)",
             params![
                 RUNNER_VERSION,
+                args.direction.as_str(),
                 alignment.snapshot_id,
                 alignment_sha256,
                 catalog_sha256,
+                baseline_catalog_sha256.unwrap_or("none"),
                 count.to_string()
             ],
         )?;
@@ -512,8 +662,9 @@ fn initialize_work_database(
     }
     connection.execute_batch("CHECKPOINT")?;
     eprintln!(
-        "loaded {} exact Parquet-only candidate IDs",
-        alignment.parquet_only_count
+        "loaded {} exact {} candidate IDs",
+        candidate_population(args, alignment),
+        args.direction.as_str()
     );
     ensure!(
         args.work_database.is_file(),
@@ -524,16 +675,26 @@ fn initialize_work_database(
 
 fn validate_work_database(
     connection: &Connection,
+    args: &Args,
     alignment: &AlignmentEvidence,
     alignment_sha256: &str,
     catalog_sha256: &str,
+    baseline_catalog_sha256: Option<&str>,
 ) -> Result<()> {
     for (key, expected) in [
         ("runner_version", RUNNER_VERSION.to_owned()),
+        ("candidate_direction", args.direction.as_str().to_owned()),
         ("alignment_snapshot_id", alignment.snapshot_id.clone()),
         ("alignment_evidence_sha256", alignment_sha256.to_owned()),
         ("catalog_sha256", catalog_sha256.to_owned()),
-        ("candidate_count", alignment.parquet_only_count.to_string()),
+        (
+            "baseline_catalog_sha256",
+            baseline_catalog_sha256.unwrap_or("none").to_owned(),
+        ),
+        (
+            "candidate_count",
+            candidate_population(args, alignment).to_string(),
+        ),
     ] {
         let actual: String = connection.query_row(
             "SELECT value FROM run_metadata WHERE key = ?",
@@ -548,7 +709,7 @@ fn validate_work_database(
     let count: u64 =
         connection.query_row("SELECT count(*) FROM candidates", [], |row| row.get(0))?;
     ensure!(
-        count == alignment.parquet_only_count,
+        count == candidate_population(args, alignment),
         "work database candidate count mismatch"
     );
     Ok(())
@@ -700,6 +861,7 @@ fn validate_batch_checkpoint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_evidence(
     connection: &Connection,
     args: &Args,
@@ -707,6 +869,9 @@ fn build_evidence(
     alignment_sha256: String,
     catalog: &ActiveRawSnapshot,
     catalog_sha256: String,
+    baseline_catalog: Option<String>,
+    baseline_catalog_sha256: Option<String>,
+    catalog_objects_scanned: usize,
     total_batches: usize,
 ) -> Result<Evidence> {
     let candidate_ids: u64 =
@@ -747,6 +912,7 @@ fn build_evidence(
         runner_version: RUNNER_VERSION,
         status: "completed",
         generated_at: Utc::now(),
+        candidate_direction: args.direction.as_str(),
         alignment_evidence: args.alignment_evidence.display().to_string(),
         alignment_evidence_sha256: alignment_sha256,
         alignment_snapshot_id: alignment.snapshot_id.clone(),
@@ -756,6 +922,9 @@ fn build_evidence(
         catalog: args.catalog.display().to_string(),
         catalog_sha256,
         catalog_snapshot_id: catalog.snapshot_id.clone(),
+        baseline_catalog,
+        baseline_catalog_sha256,
+        catalog_objects_scanned,
         catalog_objects: catalog.objects().len(),
         catalog_work_units: catalog.work_units().len(),
         local_object_root: args.local_object_root.display().to_string(),
@@ -774,7 +943,14 @@ fn build_evidence(
         work_database: args.work_database.display().to_string(),
         checkpoint_directory: args.checkpoint_dir.display().to_string(),
         completed_batches: total_batches,
-        note: "Attribution counts preserve every catalog-object occurrence. Unique-ID counts de-duplicate overlaps, and residual IDs are exact candidates not found in any object from the catalog that built the frozen snapshot.",
+        note: match args.direction {
+            CandidateDirection::ParquetOnly => {
+                "Attribution counts preserve every catalog-object occurrence. Unique-ID counts de-duplicate overlaps, and residual IDs are exact candidates not found in any object from the catalog that built the frozen snapshot."
+            }
+            CandidateDirection::ClickhouseOnly => {
+                "Matched IDs are timing differences found in immutable objects appended after the frozen baseline. Residual IDs remain absent from the selected newer Parquet catalog."
+            }
+        },
     })
 }
 
@@ -910,7 +1086,7 @@ mod tests {
     use pensieve_lake::CatalogObject;
     use tempfile::tempdir;
 
-    use super::{Args, object_keys_sha256, percent, process_batch, sql_string};
+    use super::{Args, CandidateDirection, object_keys_sha256, percent, process_batch, sql_string};
 
     fn object(key: &str) -> CatalogObject {
         CatalogObject {
@@ -979,11 +1155,13 @@ mod tests {
             max_created_at: None,
         };
         let args = Args {
+            direction: CandidateDirection::ParquetOnly,
             alignment_evidence: PathBuf::new(),
             alignment_evidence_sha256: String::new(),
             alignment_checkpoint_dir: PathBuf::new(),
             difference_dir: PathBuf::new(),
             catalog: PathBuf::new(),
+            baseline_catalog: None,
             local_object_root: directory.path().to_owned(),
             work_database: directory.path().join("work.duckdb"),
             checkpoint_dir: directory.path().join("checkpoints"),
