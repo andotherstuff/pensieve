@@ -54,12 +54,6 @@ struct Args {
     /// Maximum candidate IDs per primary-key ClickHouse lookup.
     #[arg(long, default_value_t = 10_000)]
     clickhouse_batch_size: usize,
-    /// Maximum ClickHouse memory per lookup in bytes.
-    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
-    clickhouse_max_memory_usage: u64,
-    /// Maximum ClickHouse execution time per lookup in seconds.
-    #[arg(long, default_value_t = 900)]
-    clickhouse_max_execution_time: u64,
     /// Pause after each newly completed ClickHouse batch.
     #[arg(long, default_value_t = 100)]
     batch_delay_millis: u64,
@@ -336,11 +330,7 @@ async fn query_clickhouse(
             )?;
             (checkpoint, true)
         } else {
-            let query = clickhouse_metadata_query(
-                batch,
-                args.clickhouse_max_memory_usage,
-                args.clickhouse_max_execution_time,
-            );
+            let query = clickhouse_metadata_query(batch);
             let rows = client.query(&query).fetch_all::<MetadataRow>().await?;
             let checkpoint = BatchCheckpoint {
                 schema_version: SCHEMA_VERSION,
@@ -546,7 +536,7 @@ fn connect_clickhouse(args: &Args) -> clickhouse::Client {
     client
 }
 
-fn clickhouse_metadata_query(ids: &[[u8; 32]], max_memory: u64, max_time: u64) -> String {
+fn clickhouse_metadata_query(ids: &[[u8; 32]]) -> String {
     let ids = ids
         .iter()
         .map(|id| format!("'{}'", hex::encode(id)))
@@ -559,8 +549,7 @@ fn clickhouse_metadata_query(ids: &[[u8; 32]], max_memory: u64, max_time: u64) -
                 toUInt32(max(indexed_at)) AS last_indexed_at,
                 count() AS versions,
                 argMax(relay_source, indexed_at) AS relay_source
-         FROM events_local WHERE id IN ({ids}) GROUP BY id ORDER BY id
-         SETTINGS max_memory_usage={max_memory}, max_execution_time={max_time}"
+         FROM events_local WHERE id IN ({ids}) GROUP BY id ORDER BY id"
     )
 }
 
@@ -626,10 +615,9 @@ mod tests {
 
     #[test]
     fn clickhouse_query_embeds_only_fixed_width_hex_ids() {
-        let query = clickhouse_metadata_query(&[[0xab; 32], [0x01; 32]], 123, 45);
+        let query = clickhouse_metadata_query(&[[0xab; 32], [0x01; 32]]);
         assert!(query.contains(&format!("'{}'", "ab".repeat(32))));
         assert!(query.contains(&format!("'{}'", "01".repeat(32))));
-        assert!(query.contains("max_memory_usage=123"));
-        assert!(query.contains("max_execution_time=45"));
+        assert!(!query.contains("SETTINGS"));
     }
 }
