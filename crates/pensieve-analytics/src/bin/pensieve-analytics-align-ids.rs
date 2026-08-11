@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use clickhouse::Row;
-use duckdb::{Connection, params};
+use duckdb::{AccessMode, Config, Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -284,25 +284,30 @@ fn validate_args(args: &Args) -> Result<()> {
 
 fn prepare_index(args: &Args) -> Result<IndexMetadata> {
     let source_size_bytes = fs::metadata(&args.source_database)?.len();
-    let connection = Connection::open(&args.work_database)
-        .with_context(|| format!("open work database {}", args.work_database.display()))?;
-    configure_duckdb(&connection, args)?;
-    let metadata_exists: bool = connection.query_row(
-        "SELECT count(*) != 0 FROM information_schema.tables WHERE table_name = 'alignment_metadata'",
-        [],
-        |row| row.get(0),
-    )?;
-    if metadata_exists {
-        let encoded: String = connection.query_row(
-            "SELECT metadata_json FROM alignment_metadata WHERE singleton = true",
+    if args.work_database.is_file() {
+        let config = Config::default().access_mode(AccessMode::ReadOnly)?;
+        let connection = Connection::open_with_flags(&args.work_database, config)
+            .with_context(|| format!("open work database {}", args.work_database.display()))?;
+        configure_duckdb(&connection, args)?;
+        let metadata_exists: bool = connection.query_row(
+            "SELECT count(*) != 0 FROM information_schema.tables WHERE table_name = 'alignment_metadata'",
             [],
             |row| row.get(0),
         )?;
-        let metadata: IndexMetadata = serde_json::from_str(&encoded)?;
-        validate_index_metadata(args, source_size_bytes, &metadata)?;
-        return Ok(metadata);
+        if metadata_exists {
+            let encoded: String = connection.query_row(
+                "SELECT metadata_json FROM alignment_metadata WHERE singleton = true",
+                [],
+                |row| row.get(0),
+            )?;
+            let metadata: IndexMetadata = serde_json::from_str(&encoded)?;
+            validate_index_metadata(args, source_size_bytes, &metadata)?;
+            return Ok(metadata);
+        }
     }
-
+    let connection = Connection::open(&args.work_database)
+        .with_context(|| format!("open work database {}", args.work_database.display()))?;
+    configure_duckdb(&connection, args)?;
     connection.execute_batch("DROP TABLE IF EXISTS ids")?;
     let source = sql_string(&args.source_database.display().to_string());
     connection.execute_batch(&format!("ATTACH {source} AS source (READ_ONLY)"))?;
@@ -1013,6 +1018,8 @@ mod tests {
         };
         let metadata = prepare_index(&args).unwrap();
         assert_eq!(metadata.event_count, 2);
+        let resumed_metadata = prepare_index(&args).unwrap();
+        assert_eq!(resumed_metadata.event_count, 2);
         let work = Connection::open(&args.work_database).unwrap();
         let ids = work
             .prepare("SELECT hex(id) FROM ids ORDER BY id")
