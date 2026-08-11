@@ -25,6 +25,7 @@ retain_backups="${PENSIEVE_ANALYTICS_RETAIN_BACKUPS:-3}"
 retain_deltas="${PENSIEVE_ANALYTICS_RETAIN_DELTAS:-2}"
 min_archive_free_bytes="${PENSIEVE_ANALYTICS_MIN_ARCHIVE_FREE_BYTES:-536870912000}"
 require_ingest_active="${PENSIEVE_ANALYTICS_REQUIRE_INGEST_ACTIVE:-1}"
+additional_fragment_source="${PENSIEVE_ANALYTICS_ADDITIONAL_FRAGMENT:-}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -48,6 +49,10 @@ for path in "$work_database" "$live_inventory"; do
         exit 2
     fi
 done
+if [ -n "$additional_fragment_source" ] && [ ! -s "$additional_fragment_source" ]; then
+    echo "Additional catalog fragment is missing: $additional_fragment_source" >&2
+    exit 2
+fi
 for value_name in s3_bucket s3_endpoint_url s3_region; do
     if [ -z "${!value_name}" ]; then
         echo "Required S3 setting is empty: $value_name" >&2
@@ -153,6 +158,13 @@ trap finish EXIT
 replacement_fragment="$run_dir/production-live.json"
 target_snapshot="$run_dir/active-raw.json"
 plan="$run_dir/analytics-plan.json"
+advance_output="$target_snapshot"
+additional_fragment=""
+if [ -n "$additional_fragment_source" ]; then
+    additional_fragment="$run_dir/catalog-addition.json"
+    install -m 0640 "$additional_fragment_source" "$additional_fragment"
+    advance_output="$run_dir/active-raw-live.json"
+fi
 
 store_id="$(jq -er '.store_id' "$current_snapshot")"
 "$catalog_bin" export \
@@ -165,8 +177,15 @@ store_id="$(jq -er '.store_id' "$current_snapshot")"
     --baseline "$current_snapshot" \
     --previous-fragment "$previous_fragment" \
     --replacement-fragment "$replacement_fragment" \
-    --output "$target_snapshot" \
+    --output "$advance_output" \
     | tee "$run_dir/catalog-advance.txt"
+if [ -n "$additional_fragment" ]; then
+    "$catalog_bin" extend \
+        --baseline "$advance_output" \
+        --addition "$additional_fragment" \
+        --output "$target_snapshot" \
+        | tee "$run_dir/catalog-extension.txt"
+fi
 "$catalog_bin" verify --snapshot "$target_snapshot" \
     | tee "$run_dir/catalog-verification.txt"
 
@@ -203,11 +222,17 @@ promote_generation() {
     if [ -e "$generation" ]; then
         cmp "$target_snapshot" "$generation/active-raw.json"
         cmp "$replacement_fragment" "$generation/production-live.json"
+        if [ -n "$additional_fragment" ]; then
+            cmp "$additional_fragment" "$generation/catalog-addition.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
         install -m 0640 "$target_snapshot" "$partial_generation/active-raw.json"
         install -m 0640 "$replacement_fragment" "$partial_generation/production-live.json"
+        if [ -n "$additional_fragment" ]; then
+            install -m 0640 "$additional_fragment" "$partial_generation/catalog-addition.json"
+        fi
         install -m 0640 "$plan" "$partial_generation/analytics-plan.json"
         if [ -s "$run_dir/apply.json" ]; then
             install -m 0640 "$run_dir/apply.json" "$partial_generation/apply.json"
@@ -350,8 +375,11 @@ jq \
     '. + {ingest_active:$ingest_active, ingest_restarts:$ingest_restarts}' \
     "$status_file" >"$status_file.new"
 mv "$status_file.new" "$status_file"
-sha256sum "$replacement_fragment" "$target_snapshot" "$plan" "$status_file" \
-    >"$run_dir/SHA256SUMS"
+evidence_files=("$replacement_fragment" "$target_snapshot" "$plan" "$status_file")
+if [ -n "$additional_fragment" ]; then
+    evidence_files+=("$additional_fragment")
+fi
+sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"
 printf 'passed\n' >"$run_dir/SUCCESS"
 sync -f "$run_dir/SUCCESS"

@@ -13,8 +13,9 @@ mod work_unit;
 
 pub use catalog::{
     ACTIVE_RAW_CATALOG_FORMAT, ActiveRawFragment, ActiveRawSnapshot, CatalogObject, CatalogTotals,
-    CatalogWorkUnit, advance_active_raw_snapshot, merge_active_raw_fragments,
-    read_catalog_fragment, read_catalog_snapshot, write_catalog_atomically,
+    CatalogWorkUnit, advance_active_raw_snapshot, extend_active_raw_snapshot,
+    merge_active_raw_fragments, read_catalog_fragment, read_catalog_snapshot,
+    write_catalog_atomically,
 };
 pub use error::{Error, Result};
 pub use inventory::{

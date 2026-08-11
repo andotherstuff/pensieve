@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use pensieve_lake::{
     ActiveRawFragment, Inventory, LocalObjectStore, Publisher, S3Publisher, S3PublisherConfig,
-    advance_active_raw_snapshot, merge_active_raw_fragments, read_catalog_fragment,
-    read_catalog_snapshot, sha256_file, write_catalog_atomically,
+    advance_active_raw_snapshot, extend_active_raw_snapshot, merge_active_raw_fragments,
+    read_catalog_fragment, read_catalog_snapshot, sha256_file, write_catalog_atomically,
 };
 
 #[derive(Debug, Parser)]
@@ -54,6 +54,18 @@ enum Command {
         #[arg(long)]
         replacement_fragment: PathBuf,
         /// Advanced unified snapshot JSON destination.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Add one previously absent inventory fragment to an existing snapshot.
+    Extend {
+        /// Existing unified snapshot that must remain unchanged.
+        #[arg(long)]
+        baseline: PathBuf,
+        /// New inventory fragment to add.
+        #[arg(long)]
+        addition: PathBuf,
+        /// Extended unified snapshot JSON destination.
         #[arg(long)]
         output: PathBuf,
     },
@@ -164,6 +176,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let previous = read_catalog_fragment(previous_fragment)?;
             let replacement = read_catalog_fragment(replacement_fragment)?;
             let snapshot = advance_active_raw_snapshot(&baseline, &previous, &replacement)?;
+            write_catalog_atomically(output, &snapshot)?;
+            println!(
+                "snapshot={} store={} work_units={} objects={} rows={} bytes={}",
+                snapshot.snapshot_id,
+                snapshot.store_id(),
+                snapshot.totals().work_units,
+                snapshot.totals().objects,
+                snapshot.totals().physical_rows,
+                snapshot.totals().object_bytes
+            );
+        }
+        Command::Extend {
+            baseline,
+            addition,
+            output,
+        } => {
+            let baseline = read_catalog_snapshot(baseline)?;
+            let addition = read_catalog_fragment(addition)?;
+            let snapshot = extend_active_raw_snapshot(&baseline, &addition)?;
             write_catalog_atomically(output, &snapshot)?;
             println!(
                 "snapshot={} store={} work_units={} objects={} rows={} bytes={}",

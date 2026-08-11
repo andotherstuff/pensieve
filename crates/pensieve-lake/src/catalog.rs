@@ -361,6 +361,139 @@ pub fn merge_active_raw_fragments(
     })
 }
 
+/// Add one previously absent inventory fragment to an existing snapshot.
+///
+/// Existing snapshot sources, work units, and objects remain immutable. Content-identical
+/// work shared by inventories is accepted using the same deterministic alias rules as a full
+/// fragment merge, while conflicting work or object identities are rejected.
+pub fn extend_active_raw_snapshot(
+    baseline: &ActiveRawSnapshot,
+    addition: &ActiveRawFragment,
+) -> Result<ActiveRawSnapshot> {
+    baseline.validate()?;
+    addition.validate()?;
+    if baseline.store_id() != addition.store_id() {
+        return Err(Error::InvalidCatalog(
+            "baseline and additional fragment use different stores".to_owned(),
+        ));
+    }
+    if baseline
+        .payload
+        .sources
+        .iter()
+        .any(|source| source.inventory_id == addition.inventory_id())
+    {
+        return Err(Error::InvalidCatalog(format!(
+            "snapshot already contains inventory {}",
+            addition.inventory_id()
+        )));
+    }
+
+    let mut sources = baseline.payload.sources.clone();
+    sources.push(SnapshotSource {
+        inventory_id: addition.inventory_id().to_owned(),
+        fragment_id: addition.fragment_id.clone(),
+    });
+    sources.sort();
+
+    let mut work_units: BTreeMap<_, _> = baseline
+        .work_units()
+        .iter()
+        .map(|work| (work.work_unit_id.clone(), work.clone()))
+        .collect();
+    let mut work_object_sets = object_sets(baseline.objects());
+    let addition_object_sets = object_sets(addition.objects());
+    for work in addition.work_units() {
+        if let Some(existing) = work_units.get(&work.work_unit_id) {
+            if work_object_sets
+                .get(&work.work_unit_id)
+                .cloned()
+                .unwrap_or_default()
+                != addition_object_sets
+                    .get(&work.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default()
+                || !same_content_work(existing, work)
+            {
+                return Err(Error::InvalidCatalog(format!(
+                    "work unit {} conflicts with the baseline snapshot",
+                    work.work_unit_id
+                )));
+            }
+            if work.source_name < existing.source_name {
+                work_units.insert(work.work_unit_id.clone(), work.clone());
+            }
+        } else {
+            work_units.insert(work.work_unit_id.clone(), work.clone());
+            work_object_sets.insert(
+                work.work_unit_id.clone(),
+                addition_object_sets
+                    .get(&work.work_unit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    let mut objects: BTreeMap<_, _> = baseline
+        .objects()
+        .iter()
+        .map(|object| (object.object_key.clone(), object.clone()))
+        .collect();
+    let mut parts: BTreeMap<_, _> = baseline
+        .objects()
+        .iter()
+        .map(|object| {
+            (
+                (object.work_unit_id.clone(), object.part_number),
+                object.object_key.clone(),
+            )
+        })
+        .collect();
+    for object in addition.objects() {
+        let part = (object.work_unit_id.clone(), object.part_number);
+        if let Some(existing) = parts.get(&part) {
+            if existing != &object.object_key {
+                return Err(Error::InvalidCatalog(format!(
+                    "work unit {} part {} maps to conflicting object keys",
+                    object.work_unit_id, object.part_number
+                )));
+            }
+        } else {
+            parts.insert(part, object.object_key.clone());
+        }
+        if let Some(existing) = objects.get(&object.object_key) {
+            if existing != object {
+                return Err(Error::InvalidCatalog(format!(
+                    "object key {} conflicts with the baseline snapshot",
+                    object.object_key
+                )));
+            }
+        } else {
+            objects.insert(object.object_key.clone(), object.clone());
+        }
+    }
+
+    let work_units: Vec<_> = work_units.into_values().collect();
+    let objects: Vec<_> = objects.into_values().collect();
+    let payload = SnapshotPayload {
+        format: ACTIVE_RAW_CATALOG_FORMAT.to_owned(),
+        store_id: baseline.store_id().to_owned(),
+        object_class: "active_raw".to_owned(),
+        deduplicated_by_event_id: false,
+        sources,
+        totals: catalog_totals(&work_units, &objects)?,
+        work_units,
+        objects,
+    };
+    validate_snapshot_payload(&payload)?;
+    let snapshot_id = content_id(&payload)?;
+    Ok(ActiveRawSnapshot {
+        snapshot_id,
+        payload,
+    })
+}
+
 /// Advance one snapshot source to an append-only replacement fragment.
 ///
 /// The previous fragment must be the exact source recorded by `baseline`, and
@@ -1125,6 +1258,26 @@ mod tests {
 
         assert_eq!(advanced, rebuilt);
         assert_eq!(advanced.totals().objects, 3);
+    }
+
+    #[test]
+    fn snapshot_extension_matches_a_full_fragment_merge() {
+        let history = fragment("history", "work-a", "raw/a.parquet");
+        let recovery = fragment("recovery", "work-b", "raw/b.parquet");
+        let baseline = merge_active_raw_fragments([history.clone()]).expect("baseline");
+        let extended =
+            extend_active_raw_snapshot(&baseline, &recovery).expect("snapshot extension");
+        let rebuilt = merge_active_raw_fragments([history, recovery]).expect("full merge");
+        assert_eq!(extended, rebuilt);
+    }
+
+    #[test]
+    fn snapshot_extension_rejects_an_existing_inventory() {
+        let history = fragment("history", "work-a", "raw/a.parquet");
+        let baseline = merge_active_raw_fragments([history.clone()]).expect("baseline");
+        let error = extend_active_raw_snapshot(&baseline, &history)
+            .expect_err("existing inventory must be rejected");
+        assert!(error.to_string().contains("already contains inventory"));
     }
 
     #[test]
