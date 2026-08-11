@@ -22,6 +22,7 @@ duckdb.workspace = true
 hex.workspace = true
 pensieve-core = { path = "../pensieve-core" }
 pensieve-lake = { path = "../pensieve-lake" }
+pensieve-parquet = { path = "../pensieve-parquet" }
 postgres.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,5 +32,4 @@ tokio.workspace = true
 
 [dev-dependencies]
 nostr.workspace = true
-pensieve-parquet = { path = "../pensieve-parquet" }
 tempfile = "3"
