@@ -25,9 +25,13 @@ fn test_keys() -> Keys {
 }
 
 fn event(created_at: u64, kind: u16, content: &str) -> Event {
+    event_with_keys(&test_keys(), created_at, kind, content)
+}
+
+fn event_with_keys(keys: &Keys, created_at: u64, kind: u16, content: &str) -> Event {
     EventBuilder::new(Kind::from_u16(kind), content)
         .custom_created_at(Timestamp::from(created_at))
-        .sign_with_keys(&test_keys())
+        .sign_with_keys(keys)
         .expect("test event should sign")
 }
 
@@ -99,7 +103,7 @@ fn fixture() -> Fixture {
     let duplicate = event(AS_OF - 10, 1, "duplicate");
     let lower_boundary = event(AS_OF - 7 * 24 * 60 * 60, 2, "lower");
     let recent = event(AS_OF - 100_000, 2, "recent");
-    let pre_genesis = event(100, 3, "old");
+    let pre_genesis = event_with_keys(&Keys::generate(), 100, 3, "old");
     let overflow = event(u64::from(u32::MAX) + 1, 4, "overflow");
     let future = event(AS_OF + 100, 5, "future");
 
@@ -160,6 +164,7 @@ fn slice_a_deduplicates_and_reconciles_exact_rollups() {
 
     let overview = build.overview().expect("overview");
     assert_eq!(overview.total_events, 6);
+    assert_eq!(overview.total_pubkeys, 1);
     assert_eq!(overview.api_representable_events, 5);
     assert_eq!(
         overview.earliest_event,
@@ -169,6 +174,8 @@ fn slice_a_deduplicates_and_reconciles_exact_rollups() {
     assert_eq!(overview.events_7d, 3);
     assert_eq!(overview.events_per_hour_7d, 3.0 / 168.0);
     assert_eq!(overview.kinds_30d, 2);
+    assert_eq!(build.summary.eligible_pubkeys, 1);
+    assert_eq!(build.summary.new_users_daily_rows, 1);
 
     let mut daily_sum = 0;
     build
@@ -196,6 +203,62 @@ fn slice_a_deduplicates_and_reconciles_exact_rollups() {
         })
         .expect("kind rows");
     assert_eq!(kind_counts, vec![(1, 1), (2, 2), (3, 1), (4, 1), (5, 1)]);
+}
+
+#[test]
+fn identity_slice_uses_eligible_first_seen_and_fixed_date_domain() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let first = test_keys();
+    let second = Keys::generate();
+    let before_genesis = Keys::generate();
+    let future = Keys::generate();
+    let events = vec![
+        event_with_keys(&first, AS_OF - 86_400, 1, "first"),
+        event_with_keys(&first, AS_OF - 172_800, 445, "excluded earlier event"),
+        event_with_keys(&second, AS_OF - 10, 3, "second"),
+        event_with_keys(&before_genesis, 100, 1, "invalid early first seen"),
+        event_with_keys(&future, AS_OF + 1, 1, "future first seen"),
+    ];
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(&mut inventory, &lake_root, "identity", &events);
+    let fragment = ActiveRawFragment::export(
+        &mut inventory,
+        "identity-test",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("fragment");
+    let snapshot = merge_active_raw_fragments([fragment]).expect("snapshot");
+    let catalog = directory.path().join("identity.json");
+    write_catalog_atomically(&catalog, &snapshot).expect("catalog");
+    let resolved = resolve_snapshot(&catalog, Some(&lake_root)).expect("resolve");
+    let build = AnalyticsBuild::create(
+        directory.path().join("identity.duckdb"),
+        resolved,
+        BuildConfig {
+            as_of_epoch: AS_OF,
+            code_version: "test".to_owned(),
+            s3_region: "test".to_owned(),
+            s3_force_path_style: false,
+            memory_limit: "1GB".to_owned(),
+            threads: 1,
+        },
+    )
+    .expect("identity build");
+
+    assert_eq!(build.overview().expect("overview").total_pubkeys, 2);
+    assert_eq!(build.summary.eligible_pubkeys, 2);
+    let mut total = 0;
+    let mut days = 0;
+    build
+        .for_each_new_users_daily(|row| {
+            total += row.new_pubkeys;
+            days += 1;
+            Ok(())
+        })
+        .expect("daily new users");
+    assert_eq!(total, 2);
+    assert_eq!(days, 2);
 }
 
 #[test]
@@ -294,7 +357,7 @@ fn incremental_build_inserts_only_new_ids_and_is_idempotent() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let lake_root = directory.path().join("lake");
     let duplicate = event(AS_OF - 10, 1, "duplicate");
-    let added = event(AS_OF - 20, 2, "added");
+    let added = event(AS_OF - 86_420, 2, "added");
     let mut inventory = Inventory::open_in_memory().expect("inventory");
     publish_object(
         &mut inventory,
@@ -314,7 +377,7 @@ fn incremental_build_inserts_only_new_ids_and_is_idempotent() {
     write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
     let database = directory.path().join("incremental.duckdb");
     let baseline = resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("baseline resolve");
-    AnalyticsBuild::create(
+    let baseline_build = AnalyticsBuild::create(
         &database,
         baseline,
         BuildConfig {
@@ -327,6 +390,14 @@ fn incremental_build_inserts_only_new_ids_and_is_idempotent() {
         },
     )
     .expect("baseline build");
+    let mut baseline_new_user_day = None;
+    baseline_build
+        .for_each_new_users_daily(|row| {
+            baseline_new_user_day = Some(row.day);
+            Ok(())
+        })
+        .expect("baseline new users");
+    drop(baseline_build);
 
     publish_object(&mut inventory, &lake_root, "second", &[duplicate, added]);
     let target_fragment = ActiveRawFragment::export(
@@ -402,6 +473,20 @@ fn incremental_build_inserts_only_new_ids_and_is_idempotent() {
     assert_eq!(build.summary.physical_rows, 3);
     assert_eq!(build.summary.logical_events, 2);
     assert_eq!(build.summary.duplicate_rows, 1);
+    assert_eq!(build.summary.eligible_pubkeys, 1);
+    let mut new_user_days = Vec::new();
+    build
+        .for_each_new_users_daily(|row| {
+            new_user_days.push((row.day, row.new_pubkeys));
+            Ok(())
+        })
+        .expect("incremental new users");
+    assert_eq!(new_user_days.len(), 1);
+    assert_eq!(new_user_days[0].1, 1);
+    assert!(
+        new_user_days[0].0 < baseline_new_user_day.expect("baseline day"),
+        "late historical event must move first seen to the earlier day"
+    );
     drop(build);
 
     let target = resolve_snapshot(&target_catalog, Some(&lake_root)).expect("target re-resolve");
@@ -449,6 +534,26 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             .expect("read current overview")
             .get::<_, i64>(0),
         6
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT total_pubkeys FROM pensieve_analytics.current_overview",
+                &[],
+            )
+            .expect("read current pubkey total")
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT sum(new_pubkeys)::BIGINT FROM pensieve_analytics.current_new_users_daily",
+                &[],
+            )
+            .expect("read current new users")
+            .get::<_, i64>(0),
+        1
     );
     assert_eq!(
         publish(&mut client, &fixture.build, started_at, completed_at,).expect("retry current run"),

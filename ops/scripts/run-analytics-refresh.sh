@@ -1,5 +1,5 @@
 #!/bin/bash
-# Advance the shadow Slice A analytics checkpoint from the live Parquet inventory.
+# Advance the shadow analytics checkpoint from the live Parquet inventory.
 
 set -euo pipefail
 

@@ -8,8 +8,8 @@ use pensieve_lake::{CatalogObject, sha256_file};
 use serde::Serialize;
 
 use crate::build::{
-    API_TIMESTAMP_MAX, configure_execution, replace_overview, scalar_u64, sql_string,
-    validate_rollups_for_physical_rows,
+    API_TIMESTAMP_MAX, configure_execution, replace_new_users_daily, replace_overview, scalar_u64,
+    sql_string, validate_rollups_for_physical_rows,
 };
 use crate::{
     AnalyticsBuild, BuildConfig, CatalogDeltaPlan, Error, ObjectLocation, PlannedRunKind,
@@ -169,8 +169,10 @@ pub fn apply_incremental(
             CREATE TEMP TABLE matched_delta_events AS
             SELECT
                 delta.id,
+                delta.pubkey,
                 delta.created_at,
                 delta.kind,
+                existing.pubkey AS existing_pubkey,
                 existing.created_at AS existing_created_at,
                 existing.kind AS existing_kind
             FROM canonical_events existing
@@ -181,7 +183,8 @@ pub fn apply_incremental(
             &connection,
             "
             SELECT count(*) FROM matched_delta_events
-            WHERE created_at != existing_created_at OR kind != existing_kind
+            WHERE pubkey != existing_pubkey
+               OR created_at != existing_created_at OR kind != existing_kind
             ",
         )?;
         if conflicts != 0 {
@@ -219,9 +222,11 @@ pub fn apply_incremental(
         }
 
         connection.execute_batch(
-            "INSERT INTO canonical_events SELECT id, created_at, kind FROM new_events",
+            "INSERT INTO canonical_events SELECT id, pubkey, created_at, kind FROM new_events",
         )?;
         replace_additive_rollups(&connection)?;
+        update_pubkey_first_seen(&connection)?;
+        replace_new_users_daily(&connection, config.as_of_epoch)?;
         replace_overview(&connection, config.as_of_epoch)?;
         connection.execute(
             "
@@ -363,10 +368,33 @@ fn materialize_delta(connection: &Connection, locations: &[ObjectLocation]) -> R
     connection.execute_batch(&format!(
         "
         CREATE TEMP TABLE delta_events AS
-        SELECT DISTINCT id, created_at, kind
+        SELECT DISTINCT id, pubkey, created_at, kind
         FROM read_parquet([{paths}], union_by_name = false);
         "
     ))?;
+    Ok(())
+}
+
+fn update_pubkey_first_seen(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
+        CREATE TEMP TABLE delta_pubkey_first_seen AS
+        SELECT pubkey, min(created_at)::UBIGINT AS first_seen
+        FROM new_events
+        WHERE kind NOT IN (445, 1059)
+        GROUP BY pubkey;
+
+        UPDATE rollup_pubkey_first_seen AS existing
+        SET first_seen = least(existing.first_seen, delta.first_seen)
+        FROM delta_pubkey_first_seen AS delta
+        WHERE existing.pubkey = delta.pubkey;
+
+        INSERT INTO rollup_pubkey_first_seen
+        SELECT delta.pubkey, delta.first_seen
+        FROM delta_pubkey_first_seen AS delta
+        ANTI JOIN rollup_pubkey_first_seen AS existing USING (pubkey);
+        ",
+    )?;
     Ok(())
 }
 

@@ -13,8 +13,8 @@ mod reconcile;
 mod schema;
 
 pub use build::{
-    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime, Overview,
-    QUERY_VERSION,
+    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime,
+    NewUsersDaily, Overview, QUERY_VERSION,
 };
 pub use error::{Error, Result};
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};

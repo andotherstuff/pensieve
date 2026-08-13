@@ -6,7 +6,7 @@ use pensieve_lake::{ActiveRawSnapshot, CatalogObject};
 use postgres::{Client, GenericClient};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, schema::SCHEMA_SQL};
+use crate::{Error, QUERY_VERSION, Result, schema::SCHEMA_SQL};
 
 /// Execution mode required to advance from the currently published snapshot.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,12 +87,13 @@ pub fn plan_catalog_delta(
 struct Baseline {
     run_id: String,
     snapshot_id: String,
+    query_version: String,
     objects: Vec<AppliedObject>,
 }
 
 fn load_baseline(client: &mut impl GenericClient) -> Result<Option<Baseline>> {
     let Some(run) = client.query_opt(
-        "SELECT run_id, snapshot_id FROM pensieve_analytics.current_run_metadata",
+        "SELECT run_id, snapshot_id, query_version FROM pensieve_analytics.current_run_metadata",
         &[],
     )?
     else {
@@ -100,6 +101,7 @@ fn load_baseline(client: &mut impl GenericClient) -> Result<Option<Baseline>> {
     };
     let run_id = run.get::<_, String>(0);
     let snapshot_id = run.get::<_, String>(1);
+    let query_version = run.get::<_, String>(2);
     let objects = client
         .query(
             "
@@ -126,6 +128,7 @@ fn load_baseline(client: &mut impl GenericClient) -> Result<Option<Baseline>> {
     Ok(Some(Baseline {
         run_id,
         snapshot_id,
+        query_version,
         objects,
     }))
 }
@@ -156,6 +159,16 @@ fn plan_from_baseline(
             0,
         );
     };
+    if baseline.query_version != QUERY_VERSION {
+        return finish_plan(
+            snapshot,
+            None,
+            None,
+            snapshot.objects().to_vec(),
+            Vec::new(),
+            0,
+        );
+    }
     let mut previous: BTreeMap<_, _> = baseline
         .objects
         .into_iter()
@@ -360,6 +373,7 @@ mod tests {
         let baseline = Baseline {
             run_id: "run-1".to_owned(),
             snapshot_id: "snapshot-1".to_owned(),
+            query_version: QUERY_VERSION.to_owned(),
             objects: vec![applied(&selected.objects()[0])],
         };
         let plan = plan_from_baseline(&selected, Some(baseline)).expect("plan");
@@ -381,6 +395,7 @@ mod tests {
         let baseline = Baseline {
             run_id: "run-1".to_owned(),
             snapshot_id: "snapshot-1".to_owned(),
+            query_version: QUERY_VERSION.to_owned(),
             objects: vec![applied(&removed_catalog.objects()[0])],
         };
         let plan = plan_from_baseline(&selected, Some(baseline)).expect("plan");
@@ -401,10 +416,29 @@ mod tests {
             Some(Baseline {
                 run_id: "run-1".to_owned(),
                 snapshot_id: "snapshot-1".to_owned(),
+                query_version: QUERY_VERSION.to_owned(),
                 objects: vec![old],
             }),
         )
         .expect_err("changed key must fail");
         assert!(matches!(error, Error::ImmutableObjectChanged { .. }));
+    }
+
+    #[test]
+    fn query_version_change_requires_full_rebuild() {
+        let selected = snapshot(&[("nostr/v1/a.parquet", &"aa".repeat(32), 10, 2, 100, 200)]);
+        let plan = plan_from_baseline(
+            &selected,
+            Some(Baseline {
+                run_id: "run-1".to_owned(),
+                snapshot_id: "snapshot-1".to_owned(),
+                query_version: "slice-a-v1".to_owned(),
+                objects: vec![applied(&selected.objects()[0])],
+            }),
+        )
+        .expect("version upgrade plan");
+        assert_eq!(plan.run_kind, PlannedRunKind::FullRebuild);
+        assert_eq!(plan.added_objects, selected.objects());
+        assert_eq!(plan.unchanged_objects, 0);
     }
 }
