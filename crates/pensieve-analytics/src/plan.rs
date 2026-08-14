@@ -432,7 +432,7 @@ mod tests {
             Some(Baseline {
                 run_id: "run-1".to_owned(),
                 snapshot_id: "snapshot-1".to_owned(),
-                query_version: "slice-a-v1".to_owned(),
+                query_version: "slice-b-identity-v1".to_owned(),
                 objects: vec![applied(&selected.objects()[0])],
             }),
         )

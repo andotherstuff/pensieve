@@ -1,4 +1,4 @@
-//! Exact additive and identity analytics in a persistent DuckDB work database.
+//! Exact Slice A computation in a persistent DuckDB work database.
 
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::{Error, ResolvedSnapshot, Result};
 
 /// Version of the SQL semantics materialized by this crate.
-pub const QUERY_VERSION: &str = "slice-b-identity-v1";
+pub const QUERY_VERSION: &str = "slice-a-v1";
 pub(crate) const API_TIMESTAMP_MAX: u64 = u32::MAX as u64;
 const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
@@ -37,8 +37,6 @@ pub struct BuildConfig {
 pub struct Overview {
     /// Logical events after cross-file event-ID deduplication.
     pub total_events: u64,
-    /// Eligible pubkeys first seen within the fixed API date domain.
-    pub total_pubkeys: u64,
     /// Logical events in the API-representable unsigned timestamp domain.
     pub api_representable_events: u64,
     /// Earliest representable event timestamp, clamped to Nostr genesis.
@@ -82,15 +80,6 @@ pub struct KindAllTime {
     pub event_count: u64,
 }
 
-/// One UTC date new-pubkey count row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NewUsersDaily {
-    /// ISO-8601 UTC date.
-    pub day: String,
-    /// Exact pubkeys whose earliest eligible event falls on the date.
-    pub new_pubkeys: u64,
-}
-
 /// Reconciled counts describing materialized DuckDB products.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BuildSummary {
@@ -108,10 +97,6 @@ pub struct BuildSummary {
     pub event_daily_kind_rows: u64,
     /// Rows in the all-time kind relation.
     pub kind_all_time_rows: u64,
-    /// Eligible pubkeys whose first-seen time is in the fixed API date domain.
-    pub eligible_pubkeys: u64,
-    /// Rows in the daily new-user relation.
-    pub new_users_daily_rows: u64,
 }
 
 /// One completed DuckDB build, ready for Postgres publication.
@@ -126,7 +111,7 @@ pub struct AnalyticsBuild {
 }
 
 impl AnalyticsBuild {
-    /// Build all implemented analytics products in `work_database`.
+    /// Build all Slice A products in `work_database`.
     ///
     /// The work database is persistent so large scans can spill out of core and
     /// the completed products survive a transient Postgres publication failure.
@@ -152,8 +137,6 @@ impl AnalyticsBuild {
             DROP TABLE IF EXISTS rollup_event_daily;
             DROP TABLE IF EXISTS rollup_event_daily_kind;
             DROP TABLE IF EXISTS rollup_kind_all_time;
-            DROP TABLE IF EXISTS rollup_new_users_daily;
-            DROP TABLE IF EXISTS rollup_pubkey_first_seen;
             DROP TABLE IF EXISTS canonical_events;
             ",
         )?;
@@ -199,7 +182,6 @@ impl AnalyticsBuild {
                 "
                 SELECT
                     total_events,
-                    total_pubkeys,
                     api_representable_events,
                     earliest_event,
                     latest_event,
@@ -212,13 +194,12 @@ impl AnalyticsBuild {
                 |row| {
                     Ok(Overview {
                         total_events: row.get(0)?,
-                        total_pubkeys: row.get(1)?,
-                        api_representable_events: row.get(2)?,
-                        earliest_event: row.get(3)?,
-                        latest_event: row.get(4)?,
-                        events_7d: row.get(5)?,
-                        events_per_hour_7d: row.get(6)?,
-                        kinds_30d: row.get(7)?,
+                        api_representable_events: row.get(1)?,
+                        earliest_event: row.get(2)?,
+                        latest_event: row.get(3)?,
+                        events_7d: row.get(4)?,
+                        events_per_hour_7d: row.get(5)?,
+                        kinds_30d: row.get(6)?,
                     })
                 },
             )
@@ -279,24 +260,6 @@ impl AnalyticsBuild {
             visit(KindAllTime {
                 kind: row.get(0)?,
                 event_count: row.get(1)?,
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Visit daily new-user rows in stable ascending key order.
-    pub fn for_each_new_users_daily(
-        &self,
-        mut visit: impl FnMut(NewUsersDaily) -> Result<()>,
-    ) -> Result<()> {
-        let mut statement = self.connection.prepare(
-            "SELECT CAST(day AS VARCHAR), new_pubkeys FROM rollup_new_users_daily ORDER BY day",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            visit(NewUsersDaily {
-                day: row.get(0)?,
-                new_pubkeys: row.get(1)?,
             })?;
         }
         Ok(())
@@ -372,7 +335,6 @@ fn materialize_canonical_events(
             "
             CREATE TABLE canonical_events (
                 id BLOB NOT NULL,
-                pubkey BLOB NOT NULL,
                 created_at UBIGINT NOT NULL,
                 kind USMALLINT NOT NULL
             );
@@ -388,13 +350,13 @@ fn materialize_canonical_events(
         .collect::<Vec<_>>()
         .join(", ");
     // Every input row was cryptographically validated before publication. A
-    // Nostr event ID commits to pubkey, created_at, and kind, so duplicates of the
+    // Nostr event ID commits to created_at and kind, so duplicates of the
     // projected tuple are the exact logical-event duplicates we must remove.
     // Avoid carrying `sig` through a global window sort when it is not stored.
     let sql = format!(
         "
         CREATE TABLE canonical_events AS
-        SELECT DISTINCT id, pubkey, created_at, kind
+        SELECT DISTINCT id, created_at, kind
         FROM read_parquet([{paths}], union_by_name = false);
         "
     );
@@ -403,16 +365,6 @@ fn materialize_canonical_events(
 }
 
 fn materialize_rollups(connection: &Connection, as_of: u64) -> Result<()> {
-    connection.execute_batch(
-        "
-        CREATE TABLE rollup_pubkey_first_seen AS
-        SELECT pubkey, min(created_at)::UBIGINT AS first_seen
-        FROM canonical_events
-        WHERE kind NOT IN (445, 1059)
-        GROUP BY pubkey;
-        ",
-    )?;
-    materialize_new_users_daily(connection, as_of)?;
     materialize_overview(connection, as_of)?;
     connection.execute(
         "
@@ -453,28 +405,6 @@ fn materialize_rollups(connection: &Connection, as_of: u64) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn replace_new_users_daily(connection: &Connection, as_of: u64) -> Result<()> {
-    connection.execute_batch("DROP TABLE rollup_new_users_daily")?;
-    materialize_new_users_daily(connection, as_of)
-}
-
-fn materialize_new_users_daily(connection: &Connection, as_of: u64) -> Result<()> {
-    connection.execute(
-        "
-        CREATE TABLE rollup_new_users_daily AS
-        SELECT
-            DATE '1970-01-01' + CAST(first_seen // 86400 AS INTEGER) AS day,
-            count(*)::UBIGINT AS new_pubkeys
-        FROM rollup_pubkey_first_seen
-        WHERE first_seen >= ? AND first_seen <= ?
-        GROUP BY day
-        ORDER BY day
-        ",
-        params![NOSTR_GENESIS_TIMESTAMP, as_of],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn replace_overview(connection: &Connection, as_of: u64) -> Result<()> {
     connection.execute_batch("DROP TABLE rollup_overview")?;
     materialize_overview(connection, as_of)
@@ -488,8 +418,6 @@ fn materialize_overview(connection: &Connection, as_of: u64) -> Result<()> {
         CREATE TABLE rollup_overview AS
         SELECT
             count(*)::UBIGINT AS total_events,
-            (SELECT count(*)::UBIGINT FROM rollup_pubkey_first_seen
-             WHERE first_seen >= ? AND first_seen <= ?) AS total_pubkeys,
             count(*) FILTER (WHERE created_at <= ?)::UBIGINT
                 AS api_representable_events,
             greatest(
@@ -514,8 +442,6 @@ fn materialize_overview(connection: &Connection, as_of: u64) -> Result<()> {
         FROM canonical_events
         ",
         params![
-            NOSTR_GENESIS_TIMESTAMP,
-            as_of,
             API_TIMESTAMP_MAX,
             API_TIMESTAMP_MAX,
             NOSTR_GENESIS_TIMESTAMP,
@@ -557,16 +483,6 @@ pub(crate) fn validate_rollups_for_physical_rows(
         api_representable_events,
     )?;
     validate_sum(connection, "rollup_kind_all_time", logical_events)?;
-    let eligible_pubkeys = scalar_u64(connection, "SELECT total_pubkeys FROM rollup_overview")?;
-    let new_users_sum = scalar_u64(
-        connection,
-        "SELECT coalesce(sum(new_pubkeys), 0)::UBIGINT FROM rollup_new_users_daily",
-    )?;
-    if new_users_sum != eligible_pubkeys {
-        return Err(Error::Validation(format!(
-            "rollup_new_users_daily sums to {new_users_sum}, expected {eligible_pubkeys}"
-        )));
-    }
 
     Ok(BuildSummary {
         physical_rows,
@@ -579,11 +495,6 @@ pub(crate) fn validate_rollups_for_physical_rows(
             "SELECT count(*) FROM rollup_event_daily_kind",
         )?,
         kind_all_time_rows: scalar_u64(connection, "SELECT count(*) FROM rollup_kind_all_time")?,
-        eligible_pubkeys,
-        new_users_daily_rows: scalar_u64(
-            connection,
-            "SELECT count(*) FROM rollup_new_users_daily",
-        )?,
     })
 }
 

@@ -1,4 +1,4 @@
-//! Build and optionally publish the implemented lakehouse analytics products.
+//! Build and optionally publish the first lakehouse analytics slice.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
-#[command(about = "Build exact lakehouse analytics from one active-file snapshot")]
+#[command(about = "Build exact Slice A analytics from one active-file snapshot")]
 struct Args {
     /// Canonically encoded active-raw snapshot JSON.
     #[arg(long)]

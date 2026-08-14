@@ -1,4 +1,4 @@
-//! Transactional Postgres publication for completed analytics products.
+//! Transactional Postgres publication for completed Slice A products.
 
 use std::io::Write;
 
@@ -43,7 +43,6 @@ struct ValidationRecord {
     event_daily_sum: u64,
     event_daily_kind_sum: u64,
     kind_all_time_sum: u64,
-    new_users_daily_sum: u64,
     result: &'static str,
 }
 
@@ -133,7 +132,6 @@ fn publish_kind(
         event_daily_sum: build.summary.api_representable_events,
         event_daily_kind_sum: build.summary.api_representable_events,
         kind_all_time_sum: build.summary.logical_events,
-        new_users_daily_sum: build.summary.eligible_pubkeys,
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -157,13 +155,11 @@ fn publish_kind(
             event_daily_rows,
             event_daily_kind_rows,
             kind_all_time_rows,
-            eligible_pubkeys,
-            new_users_daily_rows,
             validation
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
-            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $10, $11, $12, $13, $14, $15, $16, $17
         )
         ",
         &[
@@ -186,8 +182,6 @@ fn publish_kind(
             &to_i64("event_daily_rows", build.summary.event_daily_rows)?,
             &to_i64("event_daily_kind_rows", build.summary.event_daily_kind_rows)?,
             &to_i64("kind_all_time_rows", build.summary.kind_all_time_rows)?,
-            &to_i64("eligible_pubkeys", build.summary.eligible_pubkeys)?,
-            &to_i64("new_users_daily_rows", build.summary.new_users_daily_rows)?,
             &validation,
         ],
     )?;
@@ -198,7 +192,6 @@ fn publish_kind(
         INSERT INTO pensieve_analytics.overview (
             run_id,
             total_events,
-            total_pubkeys,
             api_representable_events,
             earliest_event,
             latest_event,
@@ -206,12 +199,11 @@ fn publish_kind(
             events_per_hour_7d,
             kinds_30d
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ",
         &[
             &run_id,
             &to_i64("total_events", overview.total_events)?,
-            &to_i64("total_pubkeys", overview.total_pubkeys)?,
             &to_i64(
                 "api_representable_events",
                 overview.api_representable_events,
@@ -227,7 +219,6 @@ fn publish_kind(
     copy_event_daily(&mut transaction, &run_id, build)?;
     copy_event_daily_kind(&mut transaction, &run_id, build)?;
     copy_kind_all_time(&mut transaction, &run_id, build)?;
-    copy_new_users_daily(&mut transaction, &run_id, build)?;
 
     transaction.execute(
         "
@@ -392,29 +383,6 @@ fn copy_kind_all_time(
     })?;
     let inserted = writer.finish()?;
     expect_copied("kind_all_time", inserted, build.summary.kind_all_time_rows)
-}
-
-fn copy_new_users_daily(
-    transaction: &mut impl GenericClient,
-    run_id: &str,
-    build: &AnalyticsBuild,
-) -> Result<()> {
-    let mut writer = transaction.copy_in(
-        "
-        COPY pensieve_analytics.new_users_daily (run_id, day, new_pubkeys)
-        FROM STDIN WITH (FORMAT csv)
-        ",
-    )?;
-    build.for_each_new_users_daily(|row| {
-        writeln!(writer, "{run_id},{},{}", row.day, row.new_pubkeys)?;
-        Ok(())
-    })?;
-    let inserted = writer.finish()?;
-    expect_copied(
-        "new_users_daily",
-        inserted,
-        build.summary.new_users_daily_rows,
-    )
 }
 
 fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
