@@ -7,6 +7,10 @@ This document freezes the current `pensieve-serve` analytics surface and maps
 each ClickHouse-backed endpoint to a proposed DuckDB computation and Postgres
 serving shape. It is the working contract for P3 of the lakehouse migration.
 
+The implementation sequence, bounded-memory invariants, per-metric execution
+strategies, and commit-sized delivery slices are defined in the
+[bounded analytics migration plan](bounded_analytics_plan.md).
+
 The first objective is behavioral parity with the existing API. This document
 does not accept a Postgres schema, sketch implementation, batch frequency, or
 intentional behavior change. Those decisions must be supported by endpoint
