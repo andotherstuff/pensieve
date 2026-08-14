@@ -1,6 +1,6 @@
 # Bounded Analytics Migration Plan
 
-*Status: accepted architecture plan; implementation pending*
+*Status: Slice 0 complete; Slice 1 is next*
 *Last updated: 2026-08-14*
 
 This document turns the
@@ -282,6 +282,33 @@ Goal: separate unfinished identity work from the deployed Slice A checkpoint.
 
 Gate: current generation advances normally, ingestion remains active with an
 unchanged restart count, and no B1 publication is current.
+
+Completed 2026-08-14 in commit `f0ac995`:
+
+- restored the normal computation and publication contract to `slice-a-v1`
+  while retaining the fail-closed query-version planner guard;
+- kept the unaccepted B1 Postgres relations dormant and preserved all failed
+  B1 DuckDB databases as evidence;
+- deployed only the analytics planner and incremental binaries, without
+  restarting ingestion or the API;
+- validated a manual incremental publication from snapshot
+  `sha256:1cf964f3e9368e3d5569c49254e9f7d258b9f6f59fb5f5e853371572c470caaf`
+  to
+  `sha256:3a5b90356854ebecec360035dbb9416b48098c0005629953b1831db562ec0b51`,
+  including run checksums, exact Postgres row accounting, and the atomic
+  current-generation pointer;
+- re-enabled the persistent timer and validated its immediate catch-up
+  publication from
+  `sha256:3a5b90356854ebecec360035dbb9416b48098c0005629953b1831db562ec0b51`
+  to
+  `sha256:718846ca4a7a3c04db634478f76cbebe5006186a2718baf65e3de0e30ddd95df`;
+- confirmed the timer is waiting for its next daily activation, Postgres is
+  current on `slice-a-v1`, and ingestion remained active with zero restarts.
+
+Canonical run evidence is retained under:
+
+- `/var/lib/pensieve-analytics/refresh/runs/20260814T083243Z-3879967`; and
+- `/var/lib/pensieve-analytics/refresh/runs/20260814T085859Z-3887760`.
 
 ### Slice 1 — bounded run/checkpoint primitives
 
