@@ -14,9 +14,10 @@ mod reconcile;
 mod schema;
 
 pub use bounded::{
-    ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION,
-    BoundedExecutionError, InputIdentity, RunCheckpoint, RunIdentity, publish_run_checkpoint,
-    read_run_checkpoint, validate_run_checkpoint,
+    ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
+    BoundedExecutionError, FixedRecordLayout, InputBatch, InputIdentity, MergeStats, RunCheckpoint,
+    RunIdentity, merge_fixed_runs, plan_input_batches, publish_run_checkpoint, read_run_checkpoint,
+    validate_run_checkpoint,
 };
 pub use build::{
     AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime, Overview,

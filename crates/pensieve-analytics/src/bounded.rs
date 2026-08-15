@@ -4,8 +4,10 @@
 //! lanes may only reuse a completed artifact after its canonical checkpoint,
 //! exact inputs, byte size, and SHA-256 have all been revalidated.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +64,54 @@ pub struct InputIdentity {
     pub sha256: String,
 }
 
+/// Hard byte and row ceilings used to form bounded input batches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchLimits {
+    /// Maximum catalog bytes assigned to one normal batch.
+    pub max_bytes: u64,
+    /// Maximum catalog rows assigned to one normal batch.
+    pub max_rows: u64,
+}
+
+/// One deterministic, ordered input batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputBatch {
+    /// Zero-based batch position in the frozen input order.
+    pub index: usize,
+    /// Exact ordered inputs assigned to the batch.
+    pub inputs: Vec<InputIdentity>,
+    /// Sum of catalog byte sizes in the batch.
+    pub byte_size: u64,
+    /// Sum of catalog row counts in the batch.
+    pub row_count: u64,
+    /// Whether one indivisible input exceeds at least one configured ceiling.
+    pub oversized_single_input: bool,
+}
+
+/// Fixed-width record and key representation used by streaming merges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedRecordLayout {
+    /// Total encoded bytes in one record.
+    pub record_bytes: usize,
+    /// Leading bytes that form the record's sorted key.
+    pub key_bytes: usize,
+}
+
+/// Accounting and deterministic memory-bound evidence from one merge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MergeStats {
+    /// Records consumed across all input runs.
+    pub input_records: u64,
+    /// Canonical records written after adjacent duplicate suppression.
+    pub output_records: u64,
+    /// Byte-identical records suppressed at equal keys.
+    pub duplicate_records: u64,
+    /// Maximum number of records simultaneously held by the merge heap.
+    pub peak_buffered_records: usize,
+    /// Maximum encoded record bytes simultaneously held by the merge heap.
+    pub peak_buffered_bytes: usize,
+}
+
 /// Exact identity and accounting for one completed immutable artifact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactIdentity {
@@ -92,6 +142,254 @@ pub struct RunCheckpoint {
     pub inputs: Vec<InputIdentity>,
     /// Completed output identity and accounting.
     pub artifact: ArtifactIdentity,
+}
+
+/// Partition frozen inputs by both byte and row ceilings.
+///
+/// Input order is preserved. Because catalog objects are indivisible, an
+/// object larger than either ceiling is emitted alone and explicitly marked.
+pub fn plan_input_batches(
+    inputs: &[InputIdentity],
+    limits: BatchLimits,
+) -> BoundedExecutionResult<Vec<InputBatch>> {
+    if limits.max_bytes == 0 || limits.max_rows == 0 {
+        return Err(BoundedExecutionError::Invalid(
+            "batch byte and row ceilings must both be non-zero".to_owned(),
+        ));
+    }
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_inputs(inputs)?;
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0_u64;
+    let mut current_rows = 0_u64;
+
+    for input in inputs {
+        let next_bytes = current_bytes.checked_add(input.byte_size).ok_or_else(|| {
+            BoundedExecutionError::Invalid("batch byte accounting overflowed u64".to_owned())
+        })?;
+        let next_rows = current_rows.checked_add(input.row_count).ok_or_else(|| {
+            BoundedExecutionError::Invalid("batch row accounting overflowed u64".to_owned())
+        })?;
+        if !current.is_empty() && (next_bytes > limits.max_bytes || next_rows > limits.max_rows) {
+            push_batch(
+                &mut batches,
+                std::mem::take(&mut current),
+                current_bytes,
+                current_rows,
+                limits,
+            );
+            current_bytes = 0;
+            current_rows = 0;
+        }
+        current_bytes = current_bytes.checked_add(input.byte_size).ok_or_else(|| {
+            BoundedExecutionError::Invalid("batch byte accounting overflowed u64".to_owned())
+        })?;
+        current_rows = current_rows.checked_add(input.row_count).ok_or_else(|| {
+            BoundedExecutionError::Invalid("batch row accounting overflowed u64".to_owned())
+        })?;
+        current.push(input.clone());
+    }
+    if !current.is_empty() {
+        push_batch(&mut batches, current, current_bytes, current_rows, limits);
+    }
+    Ok(batches)
+}
+
+/// Merge sorted fixed-width runs with one buffered record per input.
+///
+/// Records use their leading `key_bytes` as the comparison key. Exact
+/// duplicates are suppressed, while two different records with the same key
+/// fail closed. The caller chooses no more than `fan_in` inputs and receives a
+/// durable `.partial` output suitable for immutable checkpoint publication.
+pub fn merge_fixed_runs(
+    input_paths: &[PathBuf],
+    partial_output: impl AsRef<Path>,
+    layout: FixedRecordLayout,
+    fan_in: usize,
+) -> BoundedExecutionResult<MergeStats> {
+    validate_merge_config(input_paths, partial_output.as_ref(), layout, fan_in)?;
+    let mut readers = input_paths
+        .iter()
+        .map(|path| File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut previous_by_source = vec![None; readers.len()];
+    let mut heap = BinaryHeap::with_capacity(readers.len());
+    let mut stats = MergeStats::default();
+    for (source, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = read_fixed_record(reader, layout.record_bytes)? {
+            previous_by_source[source] = Some(record.clone());
+            heap.push(HeapRecord { record, source });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+        }
+    }
+    record_peak(&mut stats, heap.len(), layout.record_bytes)?;
+
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial_output.as_ref())?;
+    let mut writer = BufWriter::new(output);
+    let mut last_output: Option<Vec<u8>> = None;
+    while let Some(item) = heap.pop() {
+        match last_output.as_deref() {
+            Some(previous) if keys_equal(previous, &item.record, layout.key_bytes) => {
+                if previous != item.record {
+                    return Err(BoundedExecutionError::Invalid(
+                        "equal merge keys have conflicting record bytes".to_owned(),
+                    ));
+                }
+                stats.duplicate_records =
+                    checked_increment(stats.duplicate_records, "duplicate record count")?;
+            }
+            _ => {
+                writer.write_all(&item.record)?;
+                stats.output_records =
+                    checked_increment(stats.output_records, "output record count")?;
+                last_output = Some(item.record.clone());
+            }
+        }
+
+        if let Some(next) = read_fixed_record(&mut readers[item.source], layout.record_bytes)? {
+            let previous = previous_by_source[item.source]
+                .as_deref()
+                .expect("a source in the heap has a previous record");
+            if previous[..layout.key_bytes] > next[..layout.key_bytes] {
+                return Err(BoundedExecutionError::Invalid(format!(
+                    "input run {} is not sorted by its encoded key",
+                    input_paths[item.source].display()
+                )));
+            }
+            previous_by_source[item.source] = Some(next.clone());
+            heap.push(HeapRecord {
+                record: next,
+                source: item.source,
+            });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+            record_peak(&mut stats, heap.len(), layout.record_bytes)?;
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(stats)
+}
+
+fn push_batch(
+    batches: &mut Vec<InputBatch>,
+    inputs: Vec<InputIdentity>,
+    byte_size: u64,
+    row_count: u64,
+    limits: BatchLimits,
+) {
+    batches.push(InputBatch {
+        index: batches.len(),
+        oversized_single_input: inputs.len() == 1
+            && (byte_size > limits.max_bytes || row_count > limits.max_rows),
+        inputs,
+        byte_size,
+        row_count,
+    });
+}
+
+#[derive(Eq, PartialEq)]
+struct HeapRecord {
+    record: Vec<u8>,
+    source: usize,
+}
+
+impl Ord for HeapRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .record
+            .cmp(&self.record)
+            .then_with(|| other.source.cmp(&self.source))
+    }
+}
+
+impl PartialOrd for HeapRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn validate_merge_config(
+    input_paths: &[PathBuf],
+    partial_output: &Path,
+    layout: FixedRecordLayout,
+    fan_in: usize,
+) -> BoundedExecutionResult<()> {
+    require_partial_path(partial_output)?;
+    if input_paths.is_empty() {
+        return Err(BoundedExecutionError::Invalid(
+            "a merge must have at least one input run".to_owned(),
+        ));
+    }
+    if fan_in < 2 {
+        return Err(BoundedExecutionError::Invalid(
+            "merge fan-in must be at least two".to_owned(),
+        ));
+    }
+    if input_paths.len() > fan_in {
+        return Err(BoundedExecutionError::Invalid(format!(
+            "merge has {} inputs but configured fan-in is {fan_in}",
+            input_paths.len()
+        )));
+    }
+    if layout.record_bytes == 0 || layout.key_bytes == 0 || layout.key_bytes > layout.record_bytes {
+        return Err(BoundedExecutionError::Invalid(
+            "record and key widths must be non-zero and key width must not exceed record width"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_fixed_record(
+    reader: &mut impl Read,
+    record_bytes: usize,
+) -> BoundedExecutionResult<Option<Vec<u8>>> {
+    let mut record = vec![0_u8; record_bytes];
+    let mut offset = 0;
+    while offset < record_bytes {
+        let read = reader.read(&mut record[offset..])?;
+        if read == 0 {
+            if offset == 0 {
+                return Ok(None);
+            }
+            return Err(BoundedExecutionError::Invalid(
+                "fixed-width run ends with a truncated record".to_owned(),
+            ));
+        }
+        offset += read;
+    }
+    Ok(Some(record))
+}
+
+fn keys_equal(left: &[u8], right: &[u8], key_bytes: usize) -> bool {
+    left[..key_bytes] == right[..key_bytes]
+}
+
+fn checked_increment(value: u64, label: &str) -> BoundedExecutionResult<u64> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| BoundedExecutionError::Invalid(format!("{label} overflowed u64")))
+}
+
+fn record_peak(
+    stats: &mut MergeStats,
+    records: usize,
+    record_bytes: usize,
+) -> BoundedExecutionResult<()> {
+    stats.peak_buffered_records = stats.peak_buffered_records.max(records);
+    stats.peak_buffered_bytes = stats
+        .peak_buffered_records
+        .checked_mul(record_bytes)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("merge buffer accounting overflowed usize".to_owned())
+        })?;
+    Ok(())
 }
 
 /// Atomically publish a completed `.partial` artifact and immutable checkpoint.
@@ -426,6 +724,20 @@ mod tests {
         }
     }
 
+    fn numbered_input(number: u64, bytes: u64, rows: u64) -> InputIdentity {
+        InputIdentity {
+            identity: format!("object-{number:03}"),
+            byte_size: bytes,
+            row_count: rows,
+            sha256: format!("{number:064x}"),
+        }
+    }
+
+    fn write_records(path: &Path, records: &[[u8; 4]]) {
+        let bytes: Vec<_> = records.iter().flatten().copied().collect();
+        fs::write(path, bytes).expect("write records");
+    }
+
     fn publish(root: &Path, bytes: &[u8]) -> BoundedExecutionResult<RunCheckpoint> {
         let partial = root.join("run.bin.partial");
         fs::write(&partial, bytes)?;
@@ -521,5 +833,127 @@ mod tests {
         let compact = serde_json::to_vec(&checkpoint).expect("compact JSON");
         fs::write(&path, compact).expect("replace checkpoint in test");
         assert!(read_run_checkpoint(&path).is_err());
+    }
+
+    #[test]
+    fn batches_preserve_order_and_enforce_both_ceilings() {
+        let inputs = vec![
+            numbered_input(1, 6, 2),
+            numbered_input(2, 4, 3),
+            numbered_input(3, 7, 1),
+            numbered_input(4, 2, 8),
+        ];
+        let batches = plan_input_batches(
+            &inputs,
+            BatchLimits {
+                max_bytes: 10,
+                max_rows: 5,
+            },
+        )
+        .expect("plan");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].inputs, inputs[..2]);
+        assert_eq!((batches[0].byte_size, batches[0].row_count), (10, 5));
+        assert_eq!(batches[1].inputs, inputs[2..3]);
+        assert!(!batches[1].oversized_single_input);
+        assert_eq!(batches[2].inputs, inputs[3..]);
+        assert!(batches[2].oversized_single_input);
+        assert!(
+            plan_input_batches(
+                &[],
+                BatchLimits {
+                    max_bytes: 10,
+                    max_rows: 5,
+                },
+            )
+            .expect("empty plan")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn fixed_merge_is_invariant_to_input_order_and_fan_in() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.run");
+        let second = root.path().join("second.run");
+        let third = root.path().join("third.run");
+        write_records(&first, &[*b"a001", *b"c003", *b"e005"]);
+        write_records(&second, &[*b"b002", *b"c003", *b"f006"]);
+        write_records(&third, &[*b"a001", *b"d004", *b"g007"]);
+        let layout = FixedRecordLayout {
+            record_bytes: 4,
+            key_bytes: 1,
+        };
+        let output_a = root.path().join("a.partial");
+        let stats_a = merge_fixed_runs(
+            &[first.clone(), second.clone(), third.clone()],
+            &output_a,
+            layout,
+            3,
+        )
+        .expect("merge A");
+        let output_b = root.path().join("b.partial");
+        let stats_b =
+            merge_fixed_runs(&[third, first, second], &output_b, layout, 8).expect("merge B");
+        assert_eq!(
+            fs::read(output_a).expect("output A"),
+            b"a001b002c003d004e005f006g007"
+        );
+        assert_eq!(
+            fs::read(root.path().join("a.partial")).expect("output A"),
+            fs::read(output_b).expect("output B")
+        );
+        assert_eq!(stats_a, stats_b);
+        assert_eq!(stats_a.input_records, 9);
+        assert_eq!(stats_a.output_records, 7);
+        assert_eq!(stats_a.duplicate_records, 2);
+        assert_eq!(stats_a.peak_buffered_records, 3);
+        assert_eq!(stats_a.peak_buffered_bytes, 12);
+    }
+
+    #[test]
+    fn fixed_merge_fails_closed_on_conflicts_unsorted_and_truncated_runs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let valid = root.path().join("valid.run");
+        let conflict = root.path().join("conflict.run");
+        write_records(&valid, &[*b"a001", *b"b002"]);
+        write_records(&conflict, &[*b"a999"]);
+        let layout = FixedRecordLayout {
+            record_bytes: 4,
+            key_bytes: 1,
+        };
+        assert!(
+            merge_fixed_runs(
+                &[valid.clone(), conflict],
+                root.path().join("conflict.partial"),
+                layout,
+                2,
+            )
+            .is_err()
+        );
+
+        let unsorted = root.path().join("unsorted.run");
+        write_records(&unsorted, &[*b"b002", *b"a001"]);
+        assert!(
+            merge_fixed_runs(
+                &[valid.clone(), unsorted],
+                root.path().join("unsorted.partial"),
+                layout,
+                2,
+            )
+            .is_err()
+        );
+
+        let truncated = root.path().join("truncated.run");
+        fs::write(&truncated, b"a00").expect("truncated");
+        assert!(
+            merge_fixed_runs(
+                &[valid, truncated],
+                root.path().join("truncated.partial"),
+                layout,
+                2,
+            )
+            .is_err()
+        );
     }
 }
