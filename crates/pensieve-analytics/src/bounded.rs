@@ -5,7 +5,7 @@
 //! exact inputs, byte size, and SHA-256 have all been revalidated.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -112,6 +112,87 @@ pub struct MergeStats {
     pub peak_buffered_bytes: usize,
 }
 
+/// One immutable run available to the levelled compaction planner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunReference {
+    /// Content-derived immutable run identity.
+    pub identity: String,
+    /// Completed artifact path.
+    pub path: PathBuf,
+    /// Current compaction level, where new batch runs are level zero.
+    pub level: u32,
+    /// Exact completed artifact byte size.
+    pub byte_size: u64,
+    /// Exact logical record count.
+    pub row_count: u64,
+}
+
+/// Deterministic limits for levelled compaction planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionConfig {
+    /// Maximum inputs consumed by one streaming merge.
+    pub fan_in: usize,
+    /// Maximum uncompacted runs retained at any one level.
+    pub max_runs_per_level: usize,
+}
+
+/// One dependency-ordered merge in a levelled compaction plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionStep {
+    /// Zero-based execution order.
+    pub index: usize,
+    /// Content-derived identity of the planned output.
+    pub output_identity: String,
+    /// Level assigned to the planned output.
+    pub output_level: u32,
+    /// Sorted identities consumed by the merge.
+    pub input_identities: Vec<String>,
+    /// Conservative upper bound for output bytes before duplicate suppression.
+    pub max_output_bytes: u64,
+    /// Conservative upper bound for output rows before duplicate suppression.
+    pub max_output_rows: u64,
+}
+
+/// Disk requirements that must coexist before a bounded job starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskBudget {
+    /// Maximum bytes written by the current output.
+    pub output_bytes: u64,
+    /// Maximum additional temporary merge or sort bytes.
+    pub temporary_bytes: u64,
+    /// Existing input/evidence bytes retained until publication succeeds.
+    /// These are reported but already reflected in live filesystem usage.
+    pub retained_bytes: u64,
+    /// Free-space reserve that the job must leave untouched.
+    pub reserve_bytes: u64,
+}
+
+/// Successful filesystem capacity preflight evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskPreflight {
+    /// Bytes available to the current user at preflight time.
+    pub available_bytes: u64,
+    /// Existing protected bytes that must not be reclaimed to make the job fit.
+    pub retained_bytes: u64,
+    /// Sum of new output, temporary, and reserve requirements.
+    pub required_bytes: u64,
+    /// Available bytes remaining beyond the declared requirement.
+    pub headroom_bytes: u64,
+}
+
+/// Facts required before a superseded run may be considered for cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupEligibility {
+    /// A successor checkpoint and every artifact checksum have verified.
+    pub successor_verified: bool,
+    /// The successor generation has been atomically published.
+    pub successor_published: bool,
+    /// The explicit evidence-retention policy permits cleanup now.
+    pub retention_permits_cleanup: bool,
+    /// The candidate is still referenced by a current run or protected evidence.
+    pub candidate_is_protected: bool,
+}
+
 /// Exact identity and accounting for one completed immutable artifact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactIdentity {
@@ -142,6 +223,169 @@ pub struct RunCheckpoint {
     pub inputs: Vec<InputIdentity>,
     /// Completed output identity and accounting.
     pub artifact: ArtifactIdentity,
+}
+
+/// Load a completed checkpoint only when run and input identities match exactly.
+pub fn load_reusable_checkpoint(
+    checkpoint_path: impl AsRef<Path>,
+    completed_path: impl AsRef<Path>,
+    expected_run: &RunIdentity,
+    expected_inputs: &[InputIdentity],
+) -> BoundedExecutionResult<Option<RunCheckpoint>> {
+    let checkpoint_path = checkpoint_path.as_ref();
+    if !checkpoint_path.exists() {
+        return Ok(None);
+    }
+    let checkpoint = read_run_checkpoint(checkpoint_path)?;
+    if checkpoint.run != *expected_run || checkpoint.inputs != expected_inputs {
+        return Err(BoundedExecutionError::Invalid(
+            "completed checkpoint belongs to a different run or input sequence".to_owned(),
+        ));
+    }
+    validate_run_checkpoint(checkpoint_path, completed_path, &checkpoint).map(Some)
+}
+
+/// Produce a deterministic dependency-ordered levelled compaction plan.
+///
+/// Planning never mutates or deletes input runs. Intermediate identities are
+/// derived from the ordered input identities and destination level, so a retry
+/// produces the same merge tree regardless of filesystem enumeration order.
+pub fn plan_levelled_compaction(
+    runs: &[RunReference],
+    config: CompactionConfig,
+) -> BoundedExecutionResult<Vec<CompactionStep>> {
+    if config.fan_in < 2 || config.max_runs_per_level == 0 {
+        return Err(BoundedExecutionError::Invalid(
+            "compaction fan-in must be at least two and per-level limit must be non-zero"
+                .to_owned(),
+        ));
+    }
+    let mut levels: BTreeMap<u32, Vec<RunReference>> = BTreeMap::new();
+    let mut identities = BTreeSet::new();
+    for run in runs {
+        if run.identity.trim().is_empty() {
+            return Err(BoundedExecutionError::Invalid(
+                "compaction run identity must not be empty".to_owned(),
+            ));
+        }
+        if !identities.insert(run.identity.clone()) {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "compaction run identity {:?} is duplicated",
+                run.identity
+            )));
+        }
+        levels.entry(run.level).or_default().push(run.clone());
+    }
+    for level in levels.values_mut() {
+        level.sort_by(|left, right| left.identity.cmp(&right.identity));
+    }
+
+    let mut steps = Vec::new();
+    while let Some(level) = levels
+        .iter()
+        .find_map(|(level, runs)| (runs.len() > config.max_runs_per_level).then_some(*level))
+    {
+        let available = levels
+            .get_mut(&level)
+            .expect("selected compaction level exists");
+        let merge_count = available.len().min(config.fan_in);
+        let inputs: Vec<_> = available.drain(..merge_count).collect();
+        let output_level = level.checked_add(1).ok_or_else(|| {
+            BoundedExecutionError::Invalid("compaction level overflowed u32".to_owned())
+        })?;
+        let max_output_bytes = checked_sum(
+            inputs.iter().map(|run| run.byte_size),
+            "compaction output bytes",
+        )?;
+        let max_output_rows = checked_sum(
+            inputs.iter().map(|run| run.row_count),
+            "compaction output rows",
+        )?;
+        let input_identities: Vec<_> = inputs.iter().map(|run| run.identity.clone()).collect();
+        let output_identity = compaction_identity(output_level, &input_identities);
+        steps.push(CompactionStep {
+            index: steps.len(),
+            output_identity: output_identity.clone(),
+            output_level,
+            input_identities,
+            max_output_bytes,
+            max_output_rows,
+        });
+        let next = levels.entry(output_level).or_default();
+        next.push(RunReference {
+            identity: output_identity,
+            path: PathBuf::new(),
+            level: output_level,
+            byte_size: max_output_bytes,
+            row_count: max_output_rows,
+        });
+        next.sort_by(|left, right| left.identity.cmp(&right.identity));
+    }
+    Ok(steps)
+}
+
+/// Check live filesystem capacity against a conservative coexistence budget.
+pub fn preflight_disk(
+    path: impl AsRef<Path>,
+    budget: DiskBudget,
+) -> BoundedExecutionResult<DiskPreflight> {
+    let stat = rustix::fs::statvfs(path.as_ref()).map_err(std::io::Error::from)?;
+    let available_bytes = stat.f_bavail.checked_mul(stat.f_frsize).ok_or_else(|| {
+        BoundedExecutionError::Invalid("available disk byte accounting overflowed u64".to_owned())
+    })?;
+    evaluate_disk_budget(available_bytes, budget)
+}
+
+/// Return whether a candidate satisfies every conservative cleanup gate.
+pub fn cleanup_is_eligible(eligibility: CleanupEligibility) -> bool {
+    eligibility.successor_verified
+        && eligibility.successor_published
+        && eligibility.retention_permits_cleanup
+        && !eligibility.candidate_is_protected
+}
+
+fn evaluate_disk_budget(
+    available_bytes: u64,
+    budget: DiskBudget,
+) -> BoundedExecutionResult<DiskPreflight> {
+    let required_bytes = checked_sum(
+        [
+            budget.output_bytes,
+            budget.temporary_bytes,
+            budget.reserve_bytes,
+        ],
+        "disk preflight requirement",
+    )?;
+    let headroom_bytes = available_bytes.checked_sub(required_bytes).ok_or_else(|| {
+        BoundedExecutionError::Invalid(format!(
+            "disk preflight requires {required_bytes} bytes but only {available_bytes} are available"
+        ))
+    })?;
+    Ok(DiskPreflight {
+        available_bytes,
+        retained_bytes: budget.retained_bytes,
+        required_bytes,
+        headroom_bytes,
+    })
+}
+
+fn checked_sum(values: impl IntoIterator<Item = u64>, label: &str) -> BoundedExecutionResult<u64> {
+    values.into_iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| BoundedExecutionError::Invalid(format!("{label} overflowed u64")))
+    })
+}
+
+fn compaction_identity(level: u32, inputs: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pensieve-bounded-compaction-v1\0");
+    digest.update(level.to_be_bytes());
+    for input in inputs {
+        digest.update((input.len() as u64).to_be_bytes());
+        digest.update(input.as_bytes());
+    }
+    format!("sha256:{}", hex::encode(digest.finalize()))
 }
 
 /// Partition frozen inputs by both byte and row ceilings.
@@ -215,12 +459,10 @@ pub fn merge_fixed_runs(
         .iter()
         .map(|path| File::open(path).map(BufReader::new))
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut previous_by_source = vec![None; readers.len()];
     let mut heap = BinaryHeap::with_capacity(readers.len());
     let mut stats = MergeStats::default();
     for (source, reader) in readers.iter_mut().enumerate() {
         if let Some(record) = read_fixed_record(reader, layout.record_bytes)? {
-            previous_by_source[source] = Some(record.clone());
             heap.push(HeapRecord { record, source });
             stats.input_records = checked_increment(stats.input_records, "input record count")?;
         }
@@ -234,6 +476,8 @@ pub fn merge_fixed_runs(
     let mut writer = BufWriter::new(output);
     let mut last_output: Option<Vec<u8>> = None;
     while let Some(item) = heap.pop() {
+        let source = item.source;
+        let source_key = item.record[..layout.key_bytes].to_vec();
         match last_output.as_deref() {
             Some(previous) if keys_equal(previous, &item.record, layout.key_bytes) => {
                 if previous != item.record {
@@ -248,27 +492,27 @@ pub fn merge_fixed_runs(
                 writer.write_all(&item.record)?;
                 stats.output_records =
                     checked_increment(stats.output_records, "output record count")?;
-                last_output = Some(item.record.clone());
+                last_output = Some(item.record);
             }
         }
 
-        if let Some(next) = read_fixed_record(&mut readers[item.source], layout.record_bytes)? {
-            let previous = previous_by_source[item.source]
-                .as_deref()
-                .expect("a source in the heap has a previous record");
-            if previous[..layout.key_bytes] > next[..layout.key_bytes] {
+        if let Some(next) = read_fixed_record(&mut readers[source], layout.record_bytes)? {
+            if source_key.as_slice() > &next[..layout.key_bytes] {
                 return Err(BoundedExecutionError::Invalid(format!(
                     "input run {} is not sorted by its encoded key",
-                    input_paths[item.source].display()
+                    input_paths[source].display()
                 )));
             }
-            previous_by_source[item.source] = Some(next.clone());
             heap.push(HeapRecord {
                 record: next,
-                source: item.source,
+                source,
             });
             stats.input_records = checked_increment(stats.input_records, "input record count")?;
-            record_peak(&mut stats, heap.len(), layout.record_bytes)?;
+            record_peak(
+                &mut stats,
+                heap.len() + usize::from(last_output.is_some()),
+                layout.record_bytes,
+            )?;
         }
     }
     writer.flush()?;
@@ -412,6 +656,12 @@ pub fn publish_run_checkpoint(
     let completed_path = completed_path.as_ref();
     let checkpoint_path = checkpoint_path.as_ref();
     require_partial_path(partial_path)?;
+    if parent_directory(partial_path) != parent_directory(completed_path) {
+        return Err(BoundedExecutionError::Invalid(
+            "partial and completed artifacts must share one directory for atomic publication"
+                .to_owned(),
+        ));
+    }
     validate_run_identity(&run)?;
     validate_inputs(&inputs)?;
     validate_key_range(row_count, min_key.as_deref(), max_key.as_deref())?;
@@ -836,6 +1086,42 @@ mod tests {
     }
 
     #[test]
+    fn resumes_from_exact_checkpoint_partial_and_rejects_scope_drift() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = publish(root.path(), b"sorted run").expect("publish");
+        let loaded = load_reusable_checkpoint(
+            root.path().join("run.json"),
+            root.path().join("run.bin"),
+            &run_identity(),
+            &[input_identity()],
+        )
+        .expect("load")
+        .expect("checkpoint");
+        assert_eq!(loaded, first);
+
+        let mut different = run_identity();
+        different.as_of += 1;
+        assert!(
+            load_reusable_checkpoint(
+                root.path().join("run.json"),
+                root.path().join("run.bin"),
+                &different,
+                &[input_identity()],
+            )
+            .is_err()
+        );
+
+        let checkpoint_partial = root.path().join("run.json.partial");
+        let checkpoint_bytes = fs::read(root.path().join("run.json")).expect("checkpoint");
+        fs::remove_file(root.path().join("run.json")).expect("simulate interrupted link");
+        fs::write(&checkpoint_partial, checkpoint_bytes).expect("checkpoint partial");
+        fs::write(root.path().join("run.bin.partial"), b"sorted run").expect("artifact partial");
+        let resumed = publish(root.path(), b"sorted run").expect("resume checkpoint partial");
+        assert_eq!(resumed, first);
+        assert!(!checkpoint_partial.exists());
+    }
+
+    #[test]
     fn batches_preserve_order_and_enforce_both_ceilings() {
         let inputs = vec![
             numbered_input(1, 6, 2),
@@ -907,8 +1193,8 @@ mod tests {
         assert_eq!(stats_a.input_records, 9);
         assert_eq!(stats_a.output_records, 7);
         assert_eq!(stats_a.duplicate_records, 2);
-        assert_eq!(stats_a.peak_buffered_records, 3);
-        assert_eq!(stats_a.peak_buffered_bytes, 12);
+        assert_eq!(stats_a.peak_buffered_records, 4);
+        assert_eq!(stats_a.peak_buffered_bytes, 16);
     }
 
     #[test]
@@ -954,6 +1240,157 @@ mod tests {
                 2,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn levelled_compaction_plan_is_deterministic_and_respects_fan_in() {
+        let runs: Vec<_> = (0..11)
+            .rev()
+            .map(|number| RunReference {
+                identity: format!("run-{number:02}"),
+                path: PathBuf::from(format!("run-{number:02}.bin")),
+                level: 0,
+                byte_size: 10,
+                row_count: 2,
+            })
+            .collect();
+        let config = CompactionConfig {
+            fan_in: 3,
+            max_runs_per_level: 2,
+        };
+        let first = plan_levelled_compaction(&runs, config).expect("plan");
+        let mut reordered = runs.clone();
+        reordered.rotate_left(4);
+        let second = plan_levelled_compaction(&reordered, config).expect("replan");
+        assert_eq!(first, second);
+        assert!(
+            first
+                .iter()
+                .all(|step| (2..=3).contains(&step.input_identities.len()))
+        );
+        assert!(first.iter().any(|step| step.output_level > 1));
+        assert_eq!(
+            first.iter().map(|step| step.index).collect::<Vec<_>>(),
+            (0..first.len()).collect::<Vec<_>>()
+        );
+        let mut duplicated = runs.clone();
+        duplicated.push(runs[0].clone());
+        assert!(plan_levelled_compaction(&duplicated, config).is_err());
+    }
+
+    #[test]
+    fn disk_preflight_and_cleanup_policy_fail_closed() {
+        let budget = DiskBudget {
+            output_bytes: 20,
+            temporary_bytes: 30,
+            retained_bytes: 40,
+            reserve_bytes: 10,
+        };
+        assert_eq!(
+            evaluate_disk_budget(125, budget).expect("preflight"),
+            DiskPreflight {
+                available_bytes: 125,
+                retained_bytes: 40,
+                required_bytes: 60,
+                headroom_bytes: 65,
+            }
+        );
+        assert!(evaluate_disk_budget(59, budget).is_err());
+        let root = tempfile::tempdir().expect("tempdir");
+        let live = preflight_disk(
+            root.path(),
+            DiskBudget {
+                output_bytes: 0,
+                temporary_bytes: 0,
+                retained_bytes: 0,
+                reserve_bytes: 0,
+            },
+        )
+        .expect("live filesystem preflight");
+        assert_eq!(live.available_bytes, live.headroom_bytes);
+        let eligible = CleanupEligibility {
+            successor_verified: true,
+            successor_published: true,
+            retention_permits_cleanup: true,
+            candidate_is_protected: false,
+        };
+        assert!(cleanup_is_eligible(eligible));
+        for blocked in [
+            CleanupEligibility {
+                successor_verified: false,
+                ..eligible
+            },
+            CleanupEligibility {
+                successor_published: false,
+                ..eligible
+            },
+            CleanupEligibility {
+                retention_permits_cleanup: false,
+                ..eligible
+            },
+            CleanupEligibility {
+                candidate_is_protected: true,
+                ..eligible
+            },
+        ] {
+            assert!(!cleanup_is_eligible(blocked));
+        }
+    }
+
+    #[test]
+    fn merge_memory_plateaus_across_hundredfold_input_growth() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let layout = FixedRecordLayout {
+            record_bytes: 8,
+            key_bytes: 8,
+        };
+        let mut observed = Vec::new();
+        for cardinality in [100_u64, 1_000, 10_000] {
+            let paths: Vec<_> = (0..4)
+                .map(|shard| {
+                    let path = root.path().join(format!("{cardinality}-{shard}.run"));
+                    let mut file = File::create(&path).expect("run");
+                    for value in (shard..cardinality).step_by(4) {
+                        file.write_all(&value.to_be_bytes()).expect("record");
+                    }
+                    path
+                })
+                .collect();
+            let output = root.path().join(format!("{cardinality}.partial"));
+            let stats = merge_fixed_runs(&paths, output, layout, 4).expect("merge");
+            assert_eq!(stats.output_records, cardinality);
+            observed.push(stats.peak_buffered_bytes);
+        }
+        assert_eq!(observed, vec![40, 40, 40]);
+    }
+
+    #[test]
+    fn merge_tree_boundaries_produce_byte_identical_output() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let layout = FixedRecordLayout {
+            record_bytes: 4,
+            key_bytes: 4,
+        };
+        let paths: Vec<_> = (0..4)
+            .map(|shard| {
+                let path = root.path().join(format!("shard-{shard}.run"));
+                let records: Vec<_> = (shard..40_u32).step_by(4).map(u32::to_be_bytes).collect();
+                write_records(&path, &records);
+                path
+            })
+            .collect();
+        let direct = root.path().join("direct.partial");
+        merge_fixed_runs(&paths, &direct, layout, 4).expect("direct merge");
+        let left = root.path().join("left.partial");
+        let right = root.path().join("right.partial");
+        merge_fixed_runs(&paths[..2], &left, layout, 2).expect("left merge");
+        merge_fixed_runs(&paths[2..], &right, layout, 2).expect("right merge");
+        let tree = root.path().join("tree.partial");
+        merge_fixed_runs(&[left, right], &tree, layout, 2).expect("tree merge");
+        assert_eq!(
+            fs::read(direct).expect("direct"),
+            fs::read(tree).expect("tree")
         );
     }
 }

@@ -15,9 +15,11 @@ mod schema;
 
 pub use bounded::{
     ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
-    BoundedExecutionError, FixedRecordLayout, InputBatch, InputIdentity, MergeStats, RunCheckpoint,
-    RunIdentity, merge_fixed_runs, plan_input_batches, publish_run_checkpoint, read_run_checkpoint,
-    validate_run_checkpoint,
+    BoundedExecutionError, CleanupEligibility, CompactionConfig, CompactionStep, DiskBudget,
+    DiskPreflight, FixedRecordLayout, InputBatch, InputIdentity, MergeStats, RunCheckpoint,
+    RunIdentity, RunReference, cleanup_is_eligible, load_reusable_checkpoint, merge_fixed_runs,
+    plan_input_batches, plan_levelled_compaction, preflight_disk, publish_run_checkpoint,
+    read_run_checkpoint, validate_run_checkpoint,
 };
 pub use build::{
     AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime, Overview,

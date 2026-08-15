@@ -1,7 +1,7 @@
 # Bounded Analytics Migration Plan
 
-*Status: Slice 0 complete; Slice 1 is next*
-*Last updated: 2026-08-14*
+*Status: Slices 0 and 1 complete; Slice 2 is next*
+*Last updated: 2026-08-15*
 
 This document turns the
 [analytics endpoint migration ledger](analytics_endpoint_migration.md) into an
@@ -325,6 +325,23 @@ Goal: implement the reusable infrastructure without changing any metric.
 
 Gate: synthetic input growth of at least 10x stays inside the declared peak
 memory tolerance, and repeated/resumed output is byte-identical.
+
+Completed 2026-08-15:
+
+- added canonical immutable run checkpoints with exact snapshot, `as_of`,
+  product, key-space, input, output, byte, row, range, and SHA-256 identity;
+- made `.partial` artifact and checkpoint publication resumable across every
+  durability boundary without permitting identity reuse or replacement;
+- added deterministic byte/row batch planning and explicit oversized-object
+  accounting;
+- added conflict-detecting fixed-width streaming merge with one buffered
+  record per input and deterministic duplicate suppression;
+- added deterministic fixed-fan-in levelled compaction planning, live
+  filesystem capacity preflight, and conservative cleanup eligibility gates;
+- proved byte-identical output across input order, fan-in, merge-tree, retry,
+  and checkpoint-resume changes; and
+- exercised 100, 1,000, and 10,000-record fixtures with a constant 40-byte
+  encoded merge-buffer peak at fan-in four, including the fixed output record.
 
 ### Slice 2 — bounded canonical event facts
 
