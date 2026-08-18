@@ -1,7 +1,7 @@
 # Bounded Analytics Migration Plan
 
-*Status: Slices 0 and 1 complete; Slice 2 is next*
-*Last updated: 2026-08-15*
+*Status: Slices 0 and 1 complete; Slice 2 implementation ready for production canary*
+*Last updated: 2026-08-18*
 
 This document turns the
 [analytics endpoint migration ledger](analytics_endpoint_migration.md) into an
@@ -356,6 +356,30 @@ Goal: replace full-rebuild global event-ID `DISTINCT`.
 Gate: exact physical/logical/duplicate accounting and flat memory on a frozen
 production canary. Existing incremental publication remains available until
 the replacement checkpoint is proven.
+
+Implementation completed 2026-08-18; the production canary remains the final
+gate:
+
+- emits 42-byte `(event_id, created_at, kind)` facts from byte/row-bounded
+  DuckDB scans, using either authenticated immutable object-store reads or
+  local objects whose catalog size and SHA-256 are reverified;
+- checkpoints every batch and fixed-fan-in merge immutably, resumes exact
+  completed work, suppresses byte-identical IDs, and fails on committed-field
+  conflicts;
+- reconciles physical rows exactly into logical events plus batch/merge
+  duplicates and validates final fixed-width file accounting;
+- finalizes Slice A overview, daily, daily-kind, and all-time-kind products with
+  event-count-independent scalar/kind state plus explicit time/key counters;
+- performs a conservative disk preflight that includes retained intermediate
+  runs and an operator-selected free-space reserve;
+- produces canonical build and optional reference-comparison evidence; and
+- passes byte-identical Slice A fixtures across different batch/merge trees,
+  exact resume, empty snapshots, edge timestamps, and 100x fixed-domain scale.
+
+The canary command is `pensieve-analytics-event-facts`. It writes to dedicated
+work/evidence/database paths and cannot change the live incremental checkpoint
+or Postgres unless a later, separately authorized publication step uses its
+completed `AnalyticsBuild`.
 
 ### Slice 3 — B1 first-seen and new users
 

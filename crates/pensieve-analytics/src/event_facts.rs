@@ -20,10 +20,11 @@ use crate::build::{
     create_from_compact_rollups, sql_string,
 };
 use crate::{
-    AnalyticsBuild, ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, EventDaily,
-    EventDailyKind, FixedRecordLayout, InputIdentity, KindAllTime, MergeStats, ObjectLocation,
-    Overview, ResolvedSnapshot, Result, RunCheckpoint, RunIdentity, load_reusable_checkpoint,
-    merge_fixed_runs, plan_input_batches, publish_canonical_json, publish_run_checkpoint,
+    AnalyticsBuild, ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget,
+    EventDaily, EventDailyKind, FixedRecordLayout, InputIdentity, KindAllTime, MergeStats,
+    ObjectLocation, Overview, ResolvedSnapshot, Result, RunCheckpoint, RunIdentity,
+    load_reusable_checkpoint, merge_fixed_runs, plan_input_batches, preflight_disk,
+    publish_canonical_json, publish_run_checkpoint,
 };
 
 /// Encoded event-ID bytes at the start of every event fact.
@@ -53,6 +54,8 @@ pub struct EventFactsConfig {
     pub batch_limits: BatchLimits,
     /// Maximum immutable runs opened by one streaming merge.
     pub merge_fan_in: usize,
+    /// Free bytes left untouched on the work filesystem.
+    pub disk_reserve_bytes: u64,
 }
 
 /// Measured bounded-state maxima for one completed event-fact build.
@@ -105,6 +108,10 @@ pub struct EventFactsEvidence {
     pub final_artifact: ArtifactIdentity,
     /// SHA-256 of canonical Slice A metric bytes.
     pub metric_sha256: String,
+    /// Conservative total bytes for batch and merge run artifacts.
+    pub estimated_run_bytes: u64,
+    /// Configured free-space reserve enforced before work begins.
+    pub disk_reserve_bytes: u64,
     /// Bounded-state maxima and explicit time/key state.
     pub memory: EventFactsMemoryEvidence,
     /// Immutable batch checkpoint paths.
@@ -139,6 +146,22 @@ pub fn build_bounded_event_facts(
     fs::create_dir_all(&facts_config.work_root)?;
     let inputs = catalog_inputs(&snapshot)?;
     let batches = plan_input_batches(&inputs, facts_config.batch_limits)?;
+    let estimated_run_bytes = estimate_run_bytes(
+        snapshot.catalog.totals().physical_rows,
+        batches.len(),
+        facts_config.merge_fan_in,
+    )?;
+    let retained_bytes = completed_run_bytes(&facts_config.work_root)?;
+    let remaining_run_bytes = estimated_run_bytes.saturating_sub(retained_bytes);
+    preflight_disk(
+        &facts_config.work_root,
+        DiskBudget {
+            output_bytes: remaining_run_bytes,
+            temporary_bytes: 0,
+            retained_bytes,
+            reserve_bytes: facts_config.disk_reserve_bytes,
+        },
+    )?;
     let connection = Connection::open_in_memory()?;
     configure_execution(&connection, &build_config)?;
     connection.execute_batch("SET TimeZone = 'UTC'; SET preserve_insertion_order = false")?;
@@ -265,6 +288,8 @@ pub fn build_bounded_event_facts(
         merge_duplicate_rows: merge.duplicate_rows,
         final_artifact: final_run.checkpoint.artifact,
         metric_sha256,
+        estimated_run_bytes,
+        disk_reserve_bytes: facts_config.disk_reserve_bytes,
         memory: EventFactsMemoryEvidence {
             max_batch_bytes,
             max_batch_rows,
@@ -838,7 +863,7 @@ fn finalize_rollups(
     }
     let actual_bytes = facts_path.metadata()?.len();
     let expected_bytes = logical_events
-        .checked_mul(EVENT_FACT_BYTES as u64)
+        .checked_mul(u64::try_from(EVENT_FACT_BYTES).expect("event fact width fits u64"))
         .ok_or_else(|| {
             BoundedExecutionError::Invalid("event-fact byte accounting overflowed u64".to_owned())
         })?;
@@ -959,6 +984,48 @@ fn checked_sum(values: impl IntoIterator<Item = u64>, label: &str) -> Result<u64
 fn to_u64(value: usize, label: &str) -> Result<u64> {
     u64::try_from(value)
         .map_err(|_| BoundedExecutionError::Invalid(format!("{label} exceeds u64")).into())
+}
+
+fn estimate_run_bytes(physical_rows: u64, batch_count: usize, fan_in: usize) -> Result<u64> {
+    let fact_bytes = physical_rows
+        .checked_mul(u64::try_from(EVENT_FACT_BYTES).expect("event fact width fits u64"))
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("event-fact run estimate overflowed u64".to_owned())
+        })?;
+    let mut rounds = 0_u64;
+    let mut runs = batch_count.max(1);
+    while runs > 1 {
+        runs = runs.div_ceil(fan_in);
+        rounds = checked_add(rounds, 1, "merge round estimate")?;
+    }
+    fact_bytes
+        .checked_mul(checked_add(rounds, 1, "run generation count")?)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("total run byte estimate overflowed u64".to_owned())
+                .into()
+        })
+}
+
+fn completed_run_bytes(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut directories = vec![root.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "run")
+            {
+                total = checked_add(total, entry.metadata()?.len(), "retained work bytes")?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -1193,5 +1260,43 @@ mod tests {
             .expect("write truncated run");
         let mut reader = EventFactReader::open(path).expect("reader");
         assert!(reader.read_next().is_err());
+    }
+
+    #[test]
+    fn rollup_state_plateaus_across_hundredfold_event_growth() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut observed = Vec::new();
+        for cardinality in [100_u64, 1_000, 10_000] {
+            let path = root.path().join(format!("facts-{cardinality}.run"));
+            let mut file = BufWriter::new(File::create(&path).expect("facts file"));
+            for value in 0..cardinality {
+                let mut id = [0_u8; EVENT_FACT_KEY_BYTES];
+                id[EVENT_FACT_KEY_BYTES - 8..].copy_from_slice(&value.to_be_bytes());
+                file.write_all(
+                    &EventFact {
+                        id,
+                        created_at: 1_700_000_000,
+                        kind: 1,
+                    }
+                    .encode(),
+                )
+                .expect("fact");
+            }
+            file.flush().expect("flush");
+            let bytes = path.metadata().expect("metadata").len();
+            let artifact = ArtifactIdentity {
+                path: path.to_string_lossy().into_owned(),
+                byte_size: bytes,
+                row_count: cardinality,
+                min_key: Some(format!("{:064x}", 0)),
+                max_key: Some(format!("{:064x}", cardinality - 1)),
+                sha256: "0".repeat(64),
+            };
+            let finalized =
+                finalize_rollups(&path, &artifact, 1_700_000_000).expect("finalize rollups");
+            assert_eq!(finalized.rollups.logical_events, cardinality);
+            observed.push((finalized.daily_keys, finalized.daily_kind_keys));
+        }
+        assert_eq!(observed, vec![(1, 1), (1, 1), (1, 1)]);
     }
 }

@@ -230,6 +230,7 @@ fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
             max_rows: 4,
         },
         merge_fan_in: 2,
+        disk_reserve_bytes: 0,
     };
     let bounded = build_bounded_event_facts(
         &database,
@@ -257,8 +258,45 @@ fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
     assert_eq!(bounded.evidence.merge_duplicate_rows, 1);
     assert_eq!(bounded.evidence.final_artifact.byte_size, 6 * 42);
     assert_eq!(bounded.evidence.memory.max_merge_buffered_bytes, 3 * 42);
+    let final_artifact_sha256 = bounded.evidence.final_artifact.sha256.clone();
     let first_evidence_sha256 = bounded.evidence_sha256.clone();
     drop(bounded);
+
+    let single_batch_root = fixture._directory.path().join("bounded-single-batch");
+    let resolved = resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+        .expect("resolve single batch snapshot");
+    let single_batch = build_bounded_event_facts(
+        fixture._directory.path().join("bounded-single.duckdb"),
+        single_batch_root.join("evidence.json"),
+        resolved,
+        config.clone(),
+        EventFactsConfig {
+            work_root: single_batch_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 7,
+            },
+            merge_fan_in: 4,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("single batch bounded build");
+    assert_eq!(single_batch.evidence.batch_count, 1);
+    assert_eq!(single_batch.evidence.merge_count, 0);
+    assert_eq!(single_batch.evidence.batch_duplicate_rows, 1);
+    assert_eq!(single_batch.evidence.merge_duplicate_rows, 0);
+    assert_eq!(
+        single_batch.evidence.final_artifact.sha256,
+        final_artifact_sha256
+    );
+    assert_eq!(
+        single_batch
+            .analytics
+            .canonical_metric_bytes()
+            .expect("single batch metric bytes"),
+        reference_bytes
+    );
+    drop(single_batch);
 
     let resolved = resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
         .expect("resolve retry snapshot");
@@ -363,6 +401,49 @@ fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
     )
     .expect("reopen completed analytics");
     assert_eq!(reopened.summary, expected_summary);
+    let reference_bytes = reopened
+        .canonical_metric_bytes()
+        .expect("empty reference metrics");
+    drop(reopened);
+    let resolved = resolve_snapshot(&catalog_path, Some(directory.path()))
+        .expect("resolve empty bounded snapshot");
+    let bounded_root = directory.path().join("empty-bounded");
+    let bounded = build_bounded_event_facts(
+        directory.path().join("empty-bounded.duckdb"),
+        bounded_root.join("evidence.json"),
+        resolved,
+        BuildConfig {
+            as_of_epoch: AS_OF,
+            code_version: "empty-bounded-test".to_owned(),
+            s3_region: "test".to_owned(),
+            s3_force_path_style: false,
+            memory_limit: "256MB".to_owned(),
+            threads: 1,
+        },
+        EventFactsConfig {
+            work_root: bounded_root,
+            batch_limits: BatchLimits {
+                max_bytes: 1,
+                max_rows: 1,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build empty bounded analytics");
+    assert_eq!(bounded.evidence.object_count, 0);
+    assert_eq!(bounded.evidence.batch_count, 0);
+    assert_eq!(bounded.evidence.merge_count, 0);
+    assert_eq!(bounded.evidence.physical_rows, 0);
+    assert_eq!(bounded.evidence.logical_events, 0);
+    assert_eq!(bounded.evidence.final_artifact.byte_size, 0);
+    assert_eq!(
+        bounded
+            .analytics
+            .canonical_metric_bytes()
+            .expect("empty bounded metrics"),
+        reference_bytes
+    );
 }
 
 #[test]
