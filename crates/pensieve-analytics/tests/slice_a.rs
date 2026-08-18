@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
-    AnalyticsBuild, BuildConfig, CatalogDeltaPlan, PlannedRunKind, PublishOutcome,
-    apply_incremental, plan_catalog_delta, publish, resolve_delta_locations, resolve_snapshot,
+    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, PlannedRunKind,
+    PublishOutcome, apply_incremental, build_bounded_event_facts, plan_catalog_delta, publish,
+    resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -16,6 +17,8 @@ const AS_OF: u64 = 1_700_000_000;
 
 struct Fixture {
     _directory: tempfile::TempDir,
+    catalog_path: PathBuf,
+    lake_root: PathBuf,
     build: AnalyticsBuild,
 }
 
@@ -143,6 +146,8 @@ fn fixture() -> Fixture {
     .expect("build analytics");
     Fixture {
         _directory: directory,
+        catalog_path,
+        lake_root,
         build,
     }
 }
@@ -196,6 +201,77 @@ fn slice_a_deduplicates_and_reconciles_exact_rollups() {
         })
         .expect("kind rows");
     assert_eq!(kind_counts, vec![(1, 1), (2, 2), (3, 1), (4, 1), (5, 1)]);
+}
+
+#[test]
+fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
+    let fixture = fixture();
+    let reference_bytes = fixture
+        .build
+        .canonical_metric_bytes()
+        .expect("reference metric bytes");
+    let resolved = resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+        .expect("resolve bounded snapshot");
+    let root = fixture._directory.path().join("bounded-event-facts");
+    let database = fixture._directory.path().join("bounded.duckdb");
+    let evidence = root.join("evidence.json");
+    let config = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "bounded-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let facts_config = EventFactsConfig {
+        work_root: root.clone(),
+        batch_limits: BatchLimits {
+            max_bytes: u64::MAX,
+            max_rows: 4,
+        },
+        merge_fan_in: 2,
+    };
+    let bounded = build_bounded_event_facts(
+        &database,
+        &evidence,
+        resolved,
+        config.clone(),
+        facts_config.clone(),
+    )
+    .expect("bounded build");
+    assert_eq!(
+        bounded
+            .analytics
+            .canonical_metric_bytes()
+            .expect("bounded metric bytes"),
+        reference_bytes
+    );
+    assert_eq!(bounded.evidence.status, "completed");
+    assert_eq!(bounded.evidence.object_count, 2);
+    assert_eq!(bounded.evidence.batch_count, 2);
+    assert_eq!(bounded.evidence.merge_count, 1);
+    assert_eq!(bounded.evidence.physical_rows, 7);
+    assert_eq!(bounded.evidence.logical_events, 6);
+    assert_eq!(bounded.evidence.duplicate_rows, 1);
+    assert_eq!(bounded.evidence.batch_duplicate_rows, 0);
+    assert_eq!(bounded.evidence.merge_duplicate_rows, 1);
+    assert_eq!(bounded.evidence.final_artifact.byte_size, 6 * 42);
+    assert_eq!(bounded.evidence.memory.max_merge_buffered_bytes, 3 * 42);
+    let first_evidence_sha256 = bounded.evidence_sha256.clone();
+    drop(bounded);
+
+    let resolved = resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+        .expect("resolve retry snapshot");
+    let resumed = build_bounded_event_facts(&database, &evidence, resolved, config, facts_config)
+        .expect("resume bounded build");
+    assert_eq!(resumed.evidence_sha256, first_evidence_sha256);
+    assert_eq!(
+        resumed
+            .analytics
+            .canonical_metric_bytes()
+            .expect("resumed metric bytes"),
+        reference_bytes
+    );
 }
 
 #[test]

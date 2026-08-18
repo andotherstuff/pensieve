@@ -52,7 +52,7 @@ pub struct Overview {
 }
 
 /// One UTC date event-count row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventDaily {
     /// ISO-8601 UTC date.
     pub day: String,
@@ -61,7 +61,7 @@ pub struct EventDaily {
 }
 
 /// One UTC date and event-kind count row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EventDailyKind {
     /// ISO-8601 UTC date.
     pub day: String,
@@ -72,7 +72,7 @@ pub struct EventDailyKind {
 }
 
 /// One all-time event-kind count row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct KindAllTime {
     /// Unsigned Nostr event kind.
     pub kind: u16,
@@ -108,6 +108,25 @@ pub struct AnalyticsBuild {
     pub config: BuildConfig,
     /// Reconciled materialized relation counts.
     pub summary: BuildSummary,
+}
+
+#[derive(Serialize)]
+struct SliceAMetricOutput {
+    overview: Overview,
+    event_daily: Vec<EventDaily>,
+    event_daily_kind: Vec<EventDailyKind>,
+    kind_all_time: Vec<KindAllTime>,
+}
+
+pub(crate) struct CompactRollups {
+    pub overview: Overview,
+    pub event_daily: Vec<EventDaily>,
+    pub event_daily_kind: Vec<EventDailyKind>,
+    pub kind_all_time: Vec<KindAllTime>,
+    pub logical_events: u64,
+    pub facts_path: String,
+    pub facts_bytes: u64,
+    pub facts_sha256: String,
 }
 
 impl AnalyticsBuild {
@@ -166,6 +185,7 @@ impl AnalyticsBuild {
         let connection = Connection::open(work_database)?;
         configure_execution(&connection, &config)?;
         let summary = validate_rollups(&connection, &snapshot)?;
+        validate_build_identity(&connection, &snapshot, config.as_of_epoch)?;
 
         Ok(Self {
             connection,
@@ -264,6 +284,142 @@ impl AnalyticsBuild {
         }
         Ok(())
     }
+
+    /// Serialize every Slice A metric in canonical stable key order.
+    pub fn canonical_metric_bytes(&self) -> Result<Vec<u8>> {
+        let mut event_daily = Vec::new();
+        self.for_each_event_daily(|row| {
+            event_daily.push(row);
+            Ok(())
+        })?;
+        let mut event_daily_kind = Vec::new();
+        self.for_each_event_daily_kind(|row| {
+            event_daily_kind.push(row);
+            Ok(())
+        })?;
+        let mut kind_all_time = Vec::new();
+        self.for_each_kind_all_time(|row| {
+            kind_all_time.push(row);
+            Ok(())
+        })?;
+        let output = SliceAMetricOutput {
+            overview: self.overview()?,
+            event_daily,
+            event_daily_kind,
+            kind_all_time,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&output)
+            .map_err(|error| Error::Validation(format!("serialize Slice A metrics: {error}")))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+pub(crate) fn create_from_compact_rollups(
+    work_database: impl AsRef<Path>,
+    snapshot: ResolvedSnapshot,
+    config: BuildConfig,
+    rollups: CompactRollups,
+) -> Result<AnalyticsBuild> {
+    let connection = Connection::open(work_database)?;
+    configure_execution(&connection, &config)?;
+    connection.execute_batch(
+        "
+        SET TimeZone = 'UTC';
+        SET preserve_insertion_order = false;
+        DROP TABLE IF EXISTS rollup_overview;
+        DROP TABLE IF EXISTS rollup_event_daily;
+        DROP TABLE IF EXISTS rollup_event_daily_kind;
+        DROP TABLE IF EXISTS rollup_kind_all_time;
+        DROP TABLE IF EXISTS canonical_events;
+        DROP TABLE IF EXISTS bounded_event_facts_state;
+        CREATE TABLE rollup_overview (
+            total_events UBIGINT NOT NULL,
+            api_representable_events UBIGINT NOT NULL,
+            earliest_event UINTEGER NOT NULL,
+            latest_event UINTEGER NOT NULL,
+            events_7d UBIGINT NOT NULL,
+            events_per_hour_7d DOUBLE NOT NULL,
+            kinds_30d UBIGINT NOT NULL
+        );
+        CREATE TABLE rollup_event_daily (
+            day DATE NOT NULL,
+            event_count UBIGINT NOT NULL
+        );
+        CREATE TABLE rollup_event_daily_kind (
+            day DATE NOT NULL,
+            kind USMALLINT NOT NULL,
+            event_count UBIGINT NOT NULL
+        );
+        CREATE TABLE rollup_kind_all_time (
+            kind USMALLINT NOT NULL,
+            event_count UBIGINT NOT NULL
+        );
+        CREATE TABLE bounded_event_facts_state (
+            singleton BOOLEAN PRIMARY KEY CHECK (singleton),
+            snapshot_id VARCHAR NOT NULL,
+            as_of_epoch UBIGINT NOT NULL,
+            physical_rows UBIGINT NOT NULL,
+            logical_events UBIGINT NOT NULL,
+            facts_path VARCHAR NOT NULL,
+            facts_bytes UBIGINT NOT NULL,
+            facts_sha256 VARCHAR NOT NULL
+        );
+        ",
+    )?;
+    connection.execute(
+        "INSERT INTO rollup_overview VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![
+            rollups.overview.total_events,
+            rollups.overview.api_representable_events,
+            rollups.overview.earliest_event,
+            rollups.overview.latest_event,
+            rollups.overview.events_7d,
+            rollups.overview.events_per_hour_7d,
+            rollups.overview.kinds_30d,
+        ],
+    )?;
+    {
+        let mut appender = connection.appender("rollup_event_daily")?;
+        for row in &rollups.event_daily {
+            appender.append_row(params![row.day, row.event_count])?;
+        }
+        appender.flush()?;
+    }
+    {
+        let mut appender = connection.appender("rollup_event_daily_kind")?;
+        for row in &rollups.event_daily_kind {
+            appender.append_row(params![row.day, row.kind, row.event_count])?;
+        }
+        appender.flush()?;
+    }
+    {
+        let mut appender = connection.appender("rollup_kind_all_time")?;
+        for row in &rollups.kind_all_time {
+            appender.append_row(params![row.kind, row.event_count])?;
+        }
+        appender.flush()?;
+    }
+    connection.execute(
+        "INSERT INTO bounded_event_facts_state VALUES (true, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            snapshot.catalog.snapshot_id,
+            config.as_of_epoch,
+            snapshot.catalog.totals().physical_rows,
+            rollups.logical_events,
+            rollups.facts_path,
+            rollups.facts_bytes,
+            rollups.facts_sha256,
+        ],
+    )?;
+    let summary = validate_rollups(&connection, &snapshot)?;
+    validate_build_identity(&connection, &snapshot, config.as_of_epoch)?;
+    Ok(AnalyticsBuild {
+        connection,
+        snapshot,
+        config,
+        summary,
+    })
 }
 
 pub(crate) fn configure_execution(connection: &Connection, config: &BuildConfig) -> Result<()> {
@@ -281,7 +437,7 @@ pub(crate) fn configure_execution(connection: &Connection, config: &BuildConfig)
     Ok(())
 }
 
-fn configure_remote_access(
+pub(crate) fn configure_remote_access(
     connection: &Connection,
     snapshot: &ResolvedSnapshot,
     config: &BuildConfig,
@@ -466,7 +622,28 @@ pub(crate) fn validate_rollups_for_physical_rows(
     connection: &Connection,
     physical_rows: u64,
 ) -> Result<BuildSummary> {
-    let logical_events = scalar_u64(connection, "SELECT count(*) FROM canonical_events")?;
+    let bounded_state_exists: bool = connection.query_row(
+        "SELECT count(*) != 0 FROM information_schema.tables WHERE table_name = 'bounded_event_facts_state'",
+        [],
+        |row| row.get(0),
+    )?;
+    let logical_events = if bounded_state_exists {
+        let recorded_physical = scalar_u64(
+            connection,
+            "SELECT physical_rows FROM bounded_event_facts_state WHERE singleton = true",
+        )?;
+        if recorded_physical != physical_rows {
+            return Err(Error::Validation(format!(
+                "bounded facts record {recorded_physical} physical rows, expected {physical_rows}"
+            )));
+        }
+        scalar_u64(
+            connection,
+            "SELECT logical_events FROM bounded_event_facts_state WHERE singleton = true",
+        )?
+    } else {
+        scalar_u64(connection, "SELECT count(*) FROM canonical_events")?
+    };
     let duplicate_rows = physical_rows.checked_sub(logical_events).ok_or_else(|| {
         Error::Validation(format!(
             "catalog claims {physical_rows} physical rows but DuckDB produced {logical_events} logical rows"
@@ -496,6 +673,33 @@ pub(crate) fn validate_rollups_for_physical_rows(
         )?,
         kind_all_time_rows: scalar_u64(connection, "SELECT count(*) FROM rollup_kind_all_time")?,
     })
+}
+
+fn validate_build_identity(
+    connection: &Connection,
+    snapshot: &ResolvedSnapshot,
+    as_of_epoch: u64,
+) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT count(*) != 0 FROM information_schema.tables WHERE table_name = 'bounded_event_facts_state'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let (snapshot_id, recorded_as_of): (String, u64) = connection.query_row(
+        "SELECT snapshot_id, as_of_epoch FROM bounded_event_facts_state WHERE singleton = true",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if snapshot_id != snapshot.catalog.snapshot_id || recorded_as_of != as_of_epoch {
+        return Err(Error::Validation(format!(
+            "bounded facts identity is snapshot {snapshot_id} as_of {recorded_as_of}, expected {} as_of {as_of_epoch}",
+            snapshot.catalog.snapshot_id
+        )));
+    }
+    Ok(())
 }
 
 fn validate_sum(connection: &Connection, table: &str, expected: u64) -> Result<()> {

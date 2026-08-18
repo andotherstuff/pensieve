@@ -684,7 +684,7 @@ pub fn publish_run_checkpoint(
         artifact,
     };
     validate_checkpoint_fields(&checkpoint)?;
-    write_canonical_json_noclobber(checkpoint_path, &checkpoint)?;
+    publish_canonical_json(checkpoint_path, &checkpoint)?;
     validate_run_checkpoint(checkpoint_path, completed_path, &checkpoint)
 }
 
@@ -864,10 +864,8 @@ fn publish_file_noclobber(
     Ok(())
 }
 
-fn write_canonical_json_noclobber(
-    path: &Path,
-    value: &impl Serialize,
-) -> BoundedExecutionResult<()> {
+/// Publish canonical pretty JSON without replacing existing evidence.
+pub fn publish_canonical_json(path: &Path, value: &impl Serialize) -> BoundedExecutionResult<()> {
     let bytes = canonical_json(value)?;
     if path.exists() {
         if fs::read(path)? == bytes {

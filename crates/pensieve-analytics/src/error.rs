@@ -8,6 +8,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Failures that prevent a complete analytics run from being published.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Bounded run evidence or execution failed validation.
+    #[error("bounded analytics execution error: {0}")]
+    Bounded(#[from] crate::BoundedExecutionError),
     /// The active-file catalog is invalid or unreadable.
     #[error("active-file catalog error: {0}")]
     Catalog(#[from] pensieve_lake::Error),
