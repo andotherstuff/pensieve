@@ -520,6 +520,82 @@ pub fn merge_fixed_runs(
     Ok(stats)
 }
 
+/// Merge fixed-width runs by key, retaining the minimum big-endian `u64` value.
+///
+/// Every input must contain exactly one record per key and be strictly sorted
+/// by its encoded key. Records are `key_bytes` followed by one big-endian
+/// `u64`. The heap's full-record ordering makes the first record observed for
+/// a key its minimum value; later records for that key are reduced away.
+pub fn merge_fixed_min_u64_runs(
+    input_paths: &[PathBuf],
+    partial_output: impl AsRef<Path>,
+    key_bytes: usize,
+    fan_in: usize,
+) -> BoundedExecutionResult<MergeStats> {
+    let record_bytes = key_bytes.checked_add(8).ok_or_else(|| {
+        BoundedExecutionError::Invalid("minimum-u64 record width overflowed usize".to_owned())
+    })?;
+    let layout = FixedRecordLayout {
+        record_bytes,
+        key_bytes,
+    };
+    validate_merge_config(input_paths, partial_output.as_ref(), layout, fan_in)?;
+    let mut readers = input_paths
+        .iter()
+        .map(|path| File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::with_capacity(readers.len());
+    let mut stats = MergeStats::default();
+    for (source, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = read_fixed_record(reader, record_bytes)? {
+            heap.push(HeapRecord { record, source });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+        }
+    }
+    record_peak(&mut stats, heap.len(), record_bytes)?;
+
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial_output.as_ref())?;
+    let mut writer = BufWriter::new(output);
+    let mut last_key: Option<Vec<u8>> = None;
+    while let Some(item) = heap.pop() {
+        let source = item.source;
+        let source_key = item.record[..key_bytes].to_vec();
+        if last_key.as_deref() == Some(source_key.as_slice()) {
+            stats.duplicate_records =
+                checked_increment(stats.duplicate_records, "reduced record count")?;
+        } else {
+            writer.write_all(&item.record)?;
+            stats.output_records = checked_increment(stats.output_records, "output record count")?;
+            last_key = Some(source_key.clone());
+        }
+
+        if let Some(next) = read_fixed_record(&mut readers[source], record_bytes)? {
+            if source_key.as_slice() >= &next[..key_bytes] {
+                return Err(BoundedExecutionError::Invalid(format!(
+                    "input run {} is not strictly sorted and unique by its encoded key",
+                    input_paths[source].display()
+                )));
+            }
+            heap.push(HeapRecord {
+                record: next,
+                source,
+            });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+            record_peak(
+                &mut stats,
+                heap.len() + usize::from(last_key.is_some()),
+                record_bytes,
+            )?;
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(stats)
+}
+
 fn push_batch(
     batches: &mut Vec<InputBatch>,
     inputs: Vec<InputIdentity>,
@@ -986,6 +1062,15 @@ mod tests {
         fs::write(path, bytes).expect("write records");
     }
 
+    fn write_min_records(path: &Path, records: &[(u8, u64)]) {
+        let mut bytes = Vec::new();
+        for (key, value) in records {
+            bytes.push(*key);
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        fs::write(path, bytes).expect("write minimum records");
+    }
+
     fn publish(root: &Path, bytes: &[u8]) -> BoundedExecutionResult<RunCheckpoint> {
         let partial = root.join("run.bin.partial");
         fs::write(&partial, bytes)?;
@@ -1235,6 +1320,72 @@ mod tests {
                 &[valid, truncated],
                 root.path().join("truncated.partial"),
                 layout,
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn minimum_u64_merge_is_exact_bounded_and_order_invariant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.run");
+        let second = root.path().join("second.run");
+        let third = root.path().join("third.run");
+        write_min_records(&first, &[(b'a', 20), (b'c', 30)]);
+        write_min_records(&second, &[(b'a', 10), (b'b', 40)]);
+        write_min_records(&third, &[(b'b', 5), (b'd', 50)]);
+        let output_a = root.path().join("a.partial");
+        let stats_a = merge_fixed_min_u64_runs(
+            &[first.clone(), second.clone(), third.clone()],
+            &output_a,
+            1,
+            3,
+        )
+        .expect("merge A");
+        let output_b = root.path().join("b.partial");
+        let stats_b =
+            merge_fixed_min_u64_runs(&[third, first, second], &output_b, 1, 8).expect("merge B");
+        let mut expected = Vec::new();
+        for record in [(b'a', 10_u64), (b'b', 5), (b'c', 30), (b'd', 50)] {
+            expected.push(record.0);
+            expected.extend_from_slice(&record.1.to_be_bytes());
+        }
+        assert_eq!(fs::read(&output_a).expect("output A"), expected);
+        assert_eq!(
+            fs::read(output_a).expect("output A"),
+            fs::read(output_b).expect("output B")
+        );
+        assert_eq!(stats_a, stats_b);
+        assert_eq!(stats_a.input_records, 6);
+        assert_eq!(stats_a.output_records, 4);
+        assert_eq!(stats_a.duplicate_records, 2);
+        assert_eq!(stats_a.peak_buffered_bytes, 36);
+    }
+
+    #[test]
+    fn minimum_u64_merge_rejects_non_unique_truncated_runs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let valid = root.path().join("valid.run");
+        write_min_records(&valid, &[(b'a', 1), (b'b', 2)]);
+        let duplicate = root.path().join("duplicate.run");
+        write_min_records(&duplicate, &[(b'a', 3), (b'a', 2)]);
+        assert!(
+            merge_fixed_min_u64_runs(
+                &[valid.clone(), duplicate],
+                root.path().join("duplicate.partial"),
+                1,
+                2,
+            )
+            .is_err()
+        );
+        let truncated = root.path().join("truncated.run");
+        fs::write(&truncated, [b'a', 0, 0]).expect("truncated");
+        assert!(
+            merge_fixed_min_u64_runs(
+                &[valid, truncated],
+                root.path().join("truncated.partial"),
+                1,
                 2,
             )
             .is_err()
