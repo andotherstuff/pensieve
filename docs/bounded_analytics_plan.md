@@ -414,6 +414,18 @@ Implementation completed on the Slice 3 branch:
 Production canary, fixed-snapshot ClickHouse reconciliation, and API cutover
 remain required before Slice 3 is declared live.
 
+The production gate uses two explicit commands. First,
+`pensieve-analytics-identity-publish --dry-run` builds and revalidates the
+immutable B1 artifact without opening a Postgres publication transaction. The
+same command without `--dry-run` is reserved for the later authorized pointer
+change and requires the current Postgres Slice A snapshot and `as_of` to still
+match exactly. Second, `pensieve-analytics-identity-compare` compares the
+candidate by pubkey-prefix shard and UTC first-seen day with ClickHouse's exact
+`minMerge(first_seen_state)` semantics in one read-only query. It records that
+ClickHouse is a continuously advancing head; a mismatch is not accepted as a
+candidate bug or ignored as harmless until head-lag attribution or exact
+event-ID alignment explains it.
+
 ### Slice 4 — fixed-grain distinct and active users
 
 Goal: exact identity products for published periods.

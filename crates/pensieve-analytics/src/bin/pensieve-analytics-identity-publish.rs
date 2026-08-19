@@ -19,9 +19,9 @@ struct Args {
     /// Canonical active-file snapshot matching the current Slice A run.
     #[arg(long)]
     catalog: PathBuf,
-    /// Verified local object root used for the initial bounded scan.
+    /// Verified local object root; omit to read immutable objects from the catalog store.
     #[arg(long)]
-    local_object_root: PathBuf,
+    local_object_root: Option<PathBuf>,
     /// Existing completed Slice A DuckDB checkpoint.
     #[arg(long)]
     work_database: PathBuf,
@@ -43,6 +43,9 @@ struct Args {
     /// Postgres password supplied separately from the connection string.
     #[arg(long, env = "POSTGRES_ANALYTICS_PASSWORD")]
     postgres_password: Option<String>,
+    /// Build and validate immutable identity evidence without changing Postgres.
+    #[arg(long)]
+    dry_run: bool,
     /// DuckDB memory limit for each bounded input scan.
     #[arg(long, default_value = "4GB")]
     memory_limit: String,
@@ -67,8 +70,9 @@ struct Args {
 struct Output {
     snapshot_id: String,
     previous_run_id: String,
-    run_id: String,
+    run_id: Option<String>,
     publication_status: &'static str,
+    dry_run: bool,
     eligible_pubkeys: u64,
     new_users_daily_rows: usize,
     identity_evidence_sha256: String,
@@ -86,8 +90,8 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
     let started_at = Utc::now();
-    let snapshot = resolve_snapshot(&args.catalog, Some(&args.local_object_root))
-        .context("resolve verified local snapshot")?;
+    let snapshot = resolve_snapshot(&args.catalog, args.local_object_root.as_deref())
+        .context("resolve immutable snapshot")?;
     let build_config = BuildConfig {
         as_of_epoch: args.as_of,
         code_version: args.code_version,
@@ -145,18 +149,22 @@ fn run() -> Result<()> {
         );
     }
     let completed_at = Utc::now();
-    let outcome = publish_incremental_with_identity(
-        &mut client,
-        &build,
-        &identity,
-        &previous_run_id,
-        started_at,
-        completed_at,
-    )
-    .context("atomically publish identity products")?;
-    let (run_id, publication_status) = match outcome {
-        PublishOutcome::Published { run_id, .. } => (run_id, "published"),
-        PublishOutcome::AlreadyCurrent { run_id } => (run_id, "already_current"),
+    let (run_id, publication_status) = if args.dry_run {
+        (None, "not_published")
+    } else {
+        let outcome = publish_incremental_with_identity(
+            &mut client,
+            &build,
+            &identity,
+            &previous_run_id,
+            started_at,
+            completed_at,
+        )
+        .context("atomically publish identity products")?;
+        match outcome {
+            PublishOutcome::Published { run_id, .. } => (Some(run_id), "published"),
+            PublishOutcome::AlreadyCurrent { run_id } => (Some(run_id), "already_current"),
+        }
     };
     println!(
         "{}",
@@ -165,6 +173,7 @@ fn run() -> Result<()> {
             previous_run_id,
             run_id,
             publication_status,
+            dry_run: args.dry_run,
             eligible_pubkeys: identity.evidence.eligible_pubkeys,
             new_users_daily_rows: identity.evidence.new_users_daily.len(),
             identity_evidence_sha256: identity.evidence_sha256,
