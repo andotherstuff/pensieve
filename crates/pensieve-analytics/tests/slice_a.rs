@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
     AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, PlannedRunKind,
-    PublishOutcome, apply_incremental, build_bounded_event_facts, plan_catalog_delta, publish,
-    resolve_delta_locations, resolve_snapshot,
+    PubkeyFirstSeenConfig, PublishOutcome, apply_incremental, build_bounded_event_facts,
+    build_bounded_pubkey_first_seen, plan_catalog_delta, publish, resolve_delta_locations,
+    resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -31,6 +32,13 @@ fn event(created_at: u64, kind: u16, content: &str) -> Event {
     EventBuilder::new(Kind::from_u16(kind), content)
         .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(&test_keys())
+        .expect("test event should sign")
+}
+
+fn event_with_keys(keys: &Keys, created_at: u64, kind: u16, content: &str) -> Event {
+    EventBuilder::new(Kind::from_u16(kind), content)
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(keys)
         .expect("test event should sign")
 }
 
@@ -310,6 +318,95 @@ fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
             .expect("resumed metric bytes"),
         reference_bytes
     );
+}
+
+#[test]
+fn bounded_first_seen_is_exact_eligible_and_resumable() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let first = test_keys();
+    let second = Keys::generate();
+    let pre_genesis = Keys::generate();
+    let future = Keys::generate();
+    let day_one = AS_OF - 86_400;
+    let day_two = AS_OF - 10;
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "first-seen-a",
+        &[
+            event_with_keys(&first, day_one, 1, "first"),
+            event_with_keys(&second, day_one - 100, 445, "excluded"),
+            event_with_keys(&pre_genesis, 100, 1, "too old"),
+        ],
+    );
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "first-seen-b",
+        &[
+            event_with_keys(&first, day_two, 1, "later"),
+            event_with_keys(&second, day_two, 1, "eligible"),
+            event_with_keys(&pre_genesis, day_two, 1, "later but still ineligible"),
+            event_with_keys(&future, AS_OF + 10, 1, "future"),
+        ],
+    );
+    let fragment = ActiveRawFragment::export(
+        &mut inventory,
+        "first-seen-test",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("export catalog");
+    let snapshot = merge_active_raw_fragments([fragment]).expect("merge snapshot");
+    let catalog = directory.path().join("snapshot.json");
+    write_catalog_atomically(&catalog, &snapshot).expect("write snapshot");
+    let resolved = resolve_snapshot(&catalog, Some(&lake_root)).expect("resolve snapshot");
+    let root = directory.path().join("first-seen");
+    let evidence = root.join("evidence.json");
+    let build = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "first-seen-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let config = PubkeyFirstSeenConfig {
+        work_root: root.clone(),
+        batch_limits: BatchLimits {
+            max_bytes: u64::MAX,
+            max_rows: 4,
+        },
+        merge_fan_in: 2,
+        disk_reserve_bytes: 0,
+    };
+    let completed =
+        build_bounded_pubkey_first_seen(&evidence, resolved, build.clone(), config.clone())
+            .expect("bounded first seen");
+    assert_eq!(completed.evidence.batch_count, 2);
+    assert_eq!(completed.evidence.merge_count, 1);
+    assert_eq!(completed.evidence.first_seen_records, 4);
+    assert_eq!(completed.evidence.eligible_pubkeys, 2);
+    assert_eq!(completed.evidence.new_users_daily.len(), 2);
+    assert_eq!(
+        completed
+            .evidence
+            .new_users_daily
+            .iter()
+            .map(|row| row.new_pubkeys)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(completed.evidence.final_artifact.byte_size, 4 * 40);
+    let evidence_sha = completed.evidence_sha256.clone();
+    let artifact_sha = completed.evidence.final_artifact.sha256.clone();
+    drop(completed);
+    let resolved = resolve_snapshot(&catalog, Some(&lake_root)).expect("resolve retry");
+    let retried = build_bounded_pubkey_first_seen(&evidence, resolved, build, config)
+        .expect("resume first seen");
+    assert_eq!(retried.evidence_sha256, evidence_sha);
+    assert_eq!(retried.evidence.final_artifact.sha256, artifact_sha);
 }
 
 #[test]

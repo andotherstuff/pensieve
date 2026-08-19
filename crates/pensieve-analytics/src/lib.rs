@@ -10,6 +10,7 @@ mod event_facts;
 mod incremental;
 mod input;
 mod plan;
+mod pubkey_first_seen;
 mod publish;
 mod reconcile;
 mod schema;
@@ -36,6 +37,11 @@ pub use event_facts::{
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta};
+pub use pubkey_first_seen::{
+    BoundedPubkeyFirstSeen, NewUsersDaily, PUBKEY_FIRST_SEEN_BYTES, PUBKEY_FIRST_SEEN_KEY_BYTES,
+    PUBKEY_FIRST_SEEN_VERSION, PubkeyFirstSeenConfig, PubkeyFirstSeenEvidence,
+    build_bounded_pubkey_first_seen,
+};
 pub use publish::{PublishOutcome, acquire_publication_lock, publish, publish_incremental};
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
