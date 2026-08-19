@@ -25,8 +25,8 @@ pub use bounded::{
     validate_run_checkpoint,
 };
 pub use build::{
-    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, KindAllTime, Overview,
-    QUERY_VERSION,
+    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, IDENTITY_QUERY_VERSION,
+    KindAllTime, Overview, QUERY_VERSION,
 };
 pub use error::{Error, Result};
 pub use event_facts::{
@@ -36,13 +36,20 @@ pub use event_facts::{
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
-pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta};
+pub use plan::{
+    AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta,
+    plan_catalog_delta_for_query_version,
+};
 pub use pubkey_first_seen::{
     BoundedPubkeyFirstSeen, NewUsersDaily, PUBKEY_FIRST_SEEN_BYTES, PUBKEY_FIRST_SEEN_KEY_BYTES,
     PUBKEY_FIRST_SEEN_VERSION, PubkeyFirstSeenConfig, PubkeyFirstSeenEvidence,
-    build_bounded_pubkey_first_seen,
+    advance_bounded_pubkey_first_seen, build_bounded_pubkey_first_seen,
+    load_bounded_pubkey_first_seen,
 };
-pub use publish::{PublishOutcome, acquire_publication_lock, publish, publish_incremental};
+pub use publish::{
+    PublishOutcome, acquire_publication_lock, publish, publish_incremental,
+    publish_incremental_with_identity, publish_with_identity,
+};
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
     ReconciliationSummary, SeriesComparison, compare_metric, compare_series,

@@ -78,9 +78,23 @@ pub fn plan_catalog_delta(
     client: &mut Client,
     snapshot: &ActiveRawSnapshot,
 ) -> Result<CatalogDeltaPlan> {
+    plan_catalog_delta_for_query_version(client, snapshot, QUERY_VERSION)
+}
+
+/// Compare a catalog with the current run for an explicit product contract.
+pub fn plan_catalog_delta_for_query_version(
+    client: &mut Client,
+    snapshot: &ActiveRawSnapshot,
+    query_version: &str,
+) -> Result<CatalogDeltaPlan> {
+    if query_version.is_empty() {
+        return Err(Error::Validation(
+            "planned analytics query version must not be empty".to_owned(),
+        ));
+    }
     client.batch_execute(SCHEMA_SQL)?;
     let baseline = load_baseline(client)?;
-    plan_from_baseline(snapshot, baseline)
+    plan_from_baseline(snapshot, baseline, query_version)
 }
 
 #[derive(Debug)]
@@ -148,6 +162,7 @@ fn applied_object_from_row(row: &postgres::Row) -> Result<AppliedObject> {
 fn plan_from_baseline(
     snapshot: &ActiveRawSnapshot,
     baseline: Option<Baseline>,
+    query_version: &str,
 ) -> Result<CatalogDeltaPlan> {
     let Some(baseline) = baseline else {
         return finish_plan(
@@ -159,7 +174,7 @@ fn plan_from_baseline(
             0,
         );
     };
-    if baseline.query_version != QUERY_VERSION {
+    if baseline.query_version != query_version {
         return finish_plan(
             snapshot,
             None,
@@ -376,7 +391,7 @@ mod tests {
             query_version: QUERY_VERSION.to_owned(),
             objects: vec![applied(&selected.objects()[0])],
         };
-        let plan = plan_from_baseline(&selected, Some(baseline)).expect("plan");
+        let plan = plan_from_baseline(&selected, Some(baseline), QUERY_VERSION).expect("plan");
         assert_eq!(plan.run_kind, PlannedRunKind::Incremental);
         assert_eq!(plan.unchanged_objects, 1);
         assert_eq!(plan.added_objects.len(), 1);
@@ -398,7 +413,7 @@ mod tests {
             query_version: QUERY_VERSION.to_owned(),
             objects: vec![applied(&removed_catalog.objects()[0])],
         };
-        let plan = plan_from_baseline(&selected, Some(baseline)).expect("plan");
+        let plan = plan_from_baseline(&selected, Some(baseline), QUERY_VERSION).expect("plan");
         assert_eq!(plan.run_kind, PlannedRunKind::AffectedPeriodRebuild);
         assert_eq!(plan.added_objects.len(), 1);
         assert_eq!(plan.removed_objects.len(), 1);
@@ -419,6 +434,7 @@ mod tests {
                 query_version: QUERY_VERSION.to_owned(),
                 objects: vec![old],
             }),
+            QUERY_VERSION,
         )
         .expect_err("changed key must fail");
         assert!(matches!(error, Error::ImmutableObjectChanged { .. }));
@@ -435,6 +451,7 @@ mod tests {
                 query_version: "slice-b-identity-v1".to_owned(),
                 objects: vec![applied(&selected.objects()[0])],
             }),
+            QUERY_VERSION,
         )
         .expect("version upgrade plan");
         assert_eq!(plan.run_kind, PlannedRunKind::FullRebuild);

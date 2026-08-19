@@ -396,6 +396,24 @@ in memory.
 Gate: finalized daily rows sum to eligible pubkeys, all run/checkpoint hashes
 verify, and the production memory envelope remains flat.
 
+Implementation completed on the Slice 3 branch:
+
+- full initialization scans byte/row-bounded object batches and produces an
+  immutable sorted `(pubkey, first_seen)` artifact;
+- append-only refreshes scan only verified new objects and streaming-min merge
+  them with the prior artifact, including exact late historical movement;
+- publication revalidates the artifact bytes, SHA-256, ordering, row counts,
+  daily metrics, snapshot, and fixed `as_of` before opening Postgres staging;
+- Slice A and B1 metadata, overview totals, daily serving rows, validation
+  hashes, object ledger, and current-run pointer commit atomically;
+- deterministic run identity includes the B1 evidence, metric, and artifact
+  hashes, making a completed build safely retryable; and
+- the recurring refresh remains on `slice-a-v1` unless the operator explicitly
+  enables the `slice-b1-v1` lane after the initial publication gate.
+
+Production canary, fixed-snapshot ClickHouse reconciliation, and API cutover
+remain required before Slice 3 is declared live.
+
 ### Slice 4 — fixed-grain distinct and active users
 
 Goal: exact identity products for published periods.

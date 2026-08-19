@@ -6,8 +6,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    BuildConfig, CatalogDeltaPlan, PublishOutcome, acquire_publication_lock, apply_incremental,
-    plan_catalog_delta, publish_incremental, resolve_delta_locations, resolve_snapshot,
+    BatchLimits, BuildConfig, CatalogDeltaPlan, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig,
+    PublishOutcome, acquire_publication_lock, advance_bounded_pubkey_first_seen, apply_incremental,
+    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version, publish_incremental,
+    publish_incremental_with_identity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -56,6 +58,27 @@ struct Args {
     /// DuckDB worker threads.
     #[arg(long, env = "PENSIEVE_ANALYTICS_DUCKDB_THREADS", default_value_t = 2)]
     duckdb_threads: usize,
+    /// Current immutable first-seen evidence; enables Slice B1 publication.
+    #[arg(long, requires_all = ["identity_evidence", "identity_work_root"])]
+    identity_baseline_evidence: Option<PathBuf>,
+    /// Immutable first-seen successor evidence output.
+    #[arg(long)]
+    identity_evidence: Option<PathBuf>,
+    /// Dedicated immutable first-seen successor workspace.
+    #[arg(long)]
+    identity_work_root: Option<PathBuf>,
+    /// Maximum compressed delta bytes in one first-seen scan.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    identity_batch_bytes: u64,
+    /// Maximum physical delta rows in one first-seen scan.
+    #[arg(long, default_value_t = 5_000_000)]
+    identity_batch_rows: u64,
+    /// Maximum first-seen runs opened by one streaming merge.
+    #[arg(long, default_value_t = 16)]
+    identity_merge_fan_in: usize,
+    /// Free first-seen work-filesystem bytes left untouched.
+    #[arg(long, default_value_t = 53_687_091_200)]
+    identity_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -66,7 +89,19 @@ struct Output<'a> {
     dry_run: bool,
     incremental: &'a pensieve_analytics::IncrementalSummary,
     build: &'a pensieve_analytics::BuildSummary,
+    identity: Option<IdentityOutput<'a>>,
     publication: Option<PublicationOutput>,
+}
+
+#[derive(Serialize)]
+struct IdentityOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: Option<&'a str>,
+    first_seen_records: u64,
+    eligible_pubkeys: u64,
+    new_users_daily_rows: usize,
+    delta_object_count: u64,
+    max_merge_buffered_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -110,8 +145,15 @@ fn run() -> Result<()> {
         .connect(NoTls)
         .context("connect to Postgres without TLS")?;
     acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
-    let live_plan = plan_catalog_delta(&mut client, &target.catalog)
-        .context("re-plan target against current Postgres run")?;
+    let identity_enabled = args.identity_baseline_evidence.is_some();
+    let desired_query_version = if identity_enabled {
+        IDENTITY_QUERY_VERSION
+    } else {
+        pensieve_analytics::QUERY_VERSION
+    };
+    let live_plan =
+        plan_catalog_delta_for_query_version(&mut client, &target.catalog, desired_query_version)
+            .context("re-plan target against current Postgres run")?;
     if live_plan != persisted_plan && !target_is_already_current(&live_plan, &persisted_plan) {
         bail!("persisted staging plan no longer matches the live catalog plan");
     }
@@ -138,7 +180,7 @@ fn run() -> Result<()> {
     };
     let (build, incremental) = apply_incremental(
         &args.work_database,
-        target,
+        target.clone(),
         &persisted_plan,
         &delta_locations,
         config,
@@ -146,18 +188,59 @@ fn run() -> Result<()> {
         args.dry_run,
     )
     .context("advance DuckDB checkpoint")?;
+    let identity = if let (Some(baseline_path), Some(evidence_path), Some(work_root)) = (
+        args.identity_baseline_evidence.as_ref(),
+        args.identity_evidence.as_ref(),
+        args.identity_work_root.as_ref(),
+    ) {
+        let baseline = load_bounded_pubkey_first_seen(baseline_path)
+            .context("load baseline first-seen evidence")?;
+        Some(
+            advance_bounded_pubkey_first_seen(
+                evidence_path,
+                &baseline,
+                target,
+                &persisted_plan,
+                &delta_locations,
+                build.config.clone(),
+                PubkeyFirstSeenConfig {
+                    work_root: work_root.clone(),
+                    batch_limits: BatchLimits {
+                        max_bytes: args.identity_batch_bytes,
+                        max_rows: args.identity_batch_rows,
+                    },
+                    merge_fan_in: args.identity_merge_fan_in,
+                    disk_reserve_bytes: args.identity_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded first-seen state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
-            match publish_incremental(
-                &mut client,
-                &build,
-                previous_run_id,
-                started_at,
-                completed_at,
-            )? {
+            match if let Some(identity) = identity.as_ref() {
+                publish_incremental_with_identity(
+                    &mut client,
+                    &build,
+                    identity,
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else {
+                publish_incremental(
+                    &mut client,
+                    &build,
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            }? {
                 PublishOutcome::Published {
                     run_id,
                     previous_run_id,
@@ -180,6 +263,15 @@ fn run() -> Result<()> {
             dry_run: args.dry_run,
             incremental: &incremental,
             build: &build.summary,
+            identity: identity.as_ref().map(|identity| IdentityOutput {
+                evidence_sha256: &identity.evidence_sha256,
+                baseline_evidence_sha256: identity.evidence.baseline_evidence_sha256.as_deref(),
+                first_seen_records: identity.evidence.first_seen_records,
+                eligible_pubkeys: identity.evidence.eligible_pubkeys,
+                new_users_daily_rows: identity.evidence.new_users_daily.len(),
+                delta_object_count: identity.evidence.delta_object_count,
+                max_merge_buffered_bytes: identity.evidence.max_merge_buffered_bytes,
+            }),
             publication,
         })?
     );

@@ -26,6 +26,8 @@ retain_deltas="${PENSIEVE_ANALYTICS_RETAIN_DELTAS:-2}"
 min_archive_free_bytes="${PENSIEVE_ANALYTICS_MIN_ARCHIVE_FREE_BYTES:-536870912000}"
 require_ingest_active="${PENSIEVE_ANALYTICS_REQUIRE_INGEST_ACTIVE:-1}"
 additional_fragment_source="${PENSIEVE_ANALYTICS_ADDITIONAL_FRAGMENT:-}"
+identity_enabled="${PENSIEVE_ANALYTICS_IDENTITY_ENABLED:-0}"
+identity_root="${PENSIEVE_ANALYTICS_IDENTITY_ROOT:-/archive/analytics/pubkey-first-seen}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -75,6 +77,10 @@ if [ "$require_ingest_active" != "0" ] && [ "$require_ingest_active" != "1" ]; t
     echo "PENSIEVE_ANALYTICS_REQUIRE_INGEST_ACTIVE must be 0 or 1" >&2
     exit 2
 fi
+if [ "$identity_enabled" != "0" ] && [ "$identity_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_IDENTITY_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 
 install -d -m 0750 "$state_root" "$generations_root" "$runs_root" \
     "$deltas_root" "$backups_root" "$(dirname "$lock_file")"
@@ -117,6 +123,15 @@ for path in "$current_snapshot" "$previous_fragment"; do
         exit 2
     fi
 done
+identity_baseline_evidence=""
+if [ "$identity_enabled" = "1" ]; then
+    identity_baseline_evidence="$current_generation/identity-evidence.json"
+    if [ ! -s "$identity_baseline_evidence" ]; then
+        echo "Current identity evidence is missing: $identity_baseline_evidence" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$identity_root"
+fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -208,7 +223,11 @@ if [ "${PENSIEVE_ANALYTICS_S3_FORCE_PATH_STYLE:-1}" = "1" ]; then
 fi
 "$catalog_bin" "${publish_args[@]}" | tee "$run_dir/catalog-publication.txt"
 
-"$plan_bin" --catalog "$target_snapshot" >"$plan.new"
+plan_args=(--catalog "$target_snapshot")
+if [ "$identity_enabled" = "1" ]; then
+    plan_args+=(--query-version slice-b1-v1)
+fi
+"$plan_bin" "${plan_args[@]}" >"$plan.new"
 mv "$plan.new" "$plan"
 run_kind="$(jq -er '.run_kind' "$plan")"
 planned_snapshot_id="$(jq -er '.snapshot_id' "$plan")"
@@ -225,6 +244,9 @@ promote_generation() {
         if [ -n "$additional_fragment" ]; then
             cmp "$additional_fragment" "$generation/catalog-addition.json"
         fi
+        if [ "$identity_enabled" = "1" ] && [ -s "$run_dir/identity-evidence.json" ]; then
+            cmp "$run_dir/identity-evidence.json" "$generation/identity-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -236,6 +258,10 @@ promote_generation() {
         install -m 0640 "$plan" "$partial_generation/analytics-plan.json"
         if [ -s "$run_dir/apply.json" ]; then
             install -m 0640 "$run_dir/apply.json" "$partial_generation/apply.json"
+        fi
+        if [ "$identity_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/identity-evidence.json" \
+                "$partial_generation/identity-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         sync -f "$partial_generation/active-raw.json"
@@ -325,14 +351,23 @@ case "$run_kind" in
             partial_backup=""
         fi
 
-        "$incremental_bin" \
-            --catalog "$target_snapshot" \
-            --plan "$plan" \
-            --work-database "$work_database" \
-            --delta-object-root "$delta_root" \
-            --as-of "$as_of" \
-            --code-version "$code_version" \
-            >"$run_dir/apply.json.new"
+        incremental_args=(
+            --catalog "$target_snapshot"
+            --plan "$plan"
+            --work-database "$work_database"
+            --delta-object-root "$delta_root"
+            --as-of "$as_of"
+            --code-version "$code_version"
+        )
+        if [ "$identity_enabled" = "1" ]; then
+            identity_work_root="$identity_root/$snapshot_hex"
+            incremental_args+=(
+                --identity-baseline-evidence "$identity_baseline_evidence"
+                --identity-evidence "$run_dir/identity-evidence.json"
+                --identity-work-root "$identity_work_root"
+            )
+        fi
+        "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
             --arg snapshot_id "$snapshot_id" \
@@ -378,6 +413,9 @@ mv "$status_file.new" "$status_file"
 evidence_files=("$replacement_fragment" "$target_snapshot" "$plan" "$status_file")
 if [ -n "$additional_fragment" ]; then
     evidence_files+=("$additional_fragment")
+fi
+if [ "$identity_enabled" = "1" ] && [ -s "$run_dir/identity-evidence.json" ]; then
+    evidence_files+=("$run_dir/identity-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

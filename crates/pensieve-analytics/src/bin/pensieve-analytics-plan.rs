@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use pensieve_analytics::plan_catalog_delta;
+use pensieve_analytics::{QUERY_VERSION, plan_catalog_delta_for_query_version};
 use pensieve_lake::read_catalog_snapshot;
 use postgres::{Config as PostgresConfig, NoTls};
 
@@ -14,6 +14,9 @@ struct Args {
     /// Canonically encoded active-raw snapshot JSON.
     #[arg(long)]
     catalog: PathBuf,
+    /// Product contract expected for the current Postgres baseline.
+    #[arg(long, default_value = QUERY_VERSION)]
+    query_version: String,
     /// Postgres connection string for the analytics serving database.
     #[arg(long, env = "DATABASE_URL")]
     postgres_url: String,
@@ -42,7 +45,8 @@ fn run() -> Result<()> {
     let mut client = config
         .connect(NoTls)
         .context("connect to Postgres without TLS")?;
-    let plan = plan_catalog_delta(&mut client, &snapshot).context("plan catalog delta")?;
+    let plan = plan_catalog_delta_for_query_version(&mut client, &snapshot, &args.query_version)
+        .context("plan catalog delta")?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }

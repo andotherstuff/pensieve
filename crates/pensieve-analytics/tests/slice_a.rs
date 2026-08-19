@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, PlannedRunKind,
-    PubkeyFirstSeenConfig, PublishOutcome, apply_incremental, build_bounded_event_facts,
-    build_bounded_pubkey_first_seen, plan_catalog_delta, publish, resolve_delta_locations,
-    resolve_snapshot,
+    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, ObjectLocation,
+    PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, advance_bounded_pubkey_first_seen,
+    apply_incremental, build_bounded_event_facts, build_bounded_pubkey_first_seen,
+    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version, publish,
+    publish_with_identity, resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -110,7 +111,7 @@ fn fixture() -> Fixture {
     let duplicate = event(AS_OF - 10, 1, "duplicate");
     let lower_boundary = event(AS_OF - 7 * 24 * 60 * 60, 2, "lower");
     let recent = event(AS_OF - 100_000, 2, "recent");
-    let pre_genesis = event(100, 3, "old");
+    let pre_genesis = event_with_keys(&Keys::generate(), 100, 3, "old");
     let overflow = event(u64::from(u32::MAX) + 1, 4, "overflow");
     let future = event(AS_OF + 100, 5, "future");
 
@@ -410,6 +411,129 @@ fn bounded_first_seen_is_exact_eligible_and_resumable() {
 }
 
 #[test]
+fn bounded_first_seen_incremental_moves_late_pubkey_to_older_day() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let existing = test_keys();
+    let added = Keys::generate();
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "identity-baseline",
+        &[event_with_keys(&existing, AS_OF - 10, 1, "baseline")],
+    );
+    let baseline_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "identity-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("baseline fragment")])
+    .expect("baseline snapshot");
+    let baseline_catalog = directory.path().join("baseline.json");
+    write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
+    let baseline_config = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "identity-incremental-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let baseline_root = directory.path().join("identity-baseline-work");
+    let baseline_evidence = baseline_root.join("evidence.json");
+    let baseline = build_bounded_pubkey_first_seen(
+        &baseline_evidence,
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline"),
+        baseline_config.clone(),
+        PubkeyFirstSeenConfig {
+            work_root: baseline_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: u64::MAX,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline identity");
+    assert_eq!(baseline.evidence.eligible_pubkeys, 1);
+
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "identity-delta",
+        &[
+            event_with_keys(&existing, AS_OF - 2 * 86_400, 1, "late history"),
+            event_with_keys(&added, AS_OF - 20, 1, "new pubkey"),
+        ],
+    );
+    let target_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "identity-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("target fragment")])
+    .expect("target snapshot");
+    let target_catalog = directory.path().join("target.json");
+    write_catalog_atomically(&target_catalog, &target_snapshot).expect("target catalog");
+    let added_object = target_snapshot
+        .objects()
+        .iter()
+        .find(|object| object.work_unit_id == "identity-delta")
+        .expect("delta object")
+        .clone();
+    let plan = CatalogDeltaPlan {
+        snapshot_id: target_snapshot.snapshot_id.clone(),
+        previous_run_id: Some("baseline-run".to_owned()),
+        previous_snapshot_id: Some(baseline_snapshot.snapshot_id.clone()),
+        run_kind: PlannedRunKind::Incremental,
+        added_objects: vec![added_object.clone()],
+        removed_objects: Vec::new(),
+        unchanged_objects: 1,
+        added_bytes: added_object.byte_size,
+        added_physical_rows: added_object.row_count,
+        affected_min_created_at: added_object.min_created_at.clone(),
+        affected_max_created_at: added_object.max_created_at.clone(),
+        affected_range_complete: true,
+    };
+    let successor_root = directory.path().join("identity-successor-work");
+    let successor_evidence = successor_root.join("evidence.json");
+    let successor = advance_bounded_pubkey_first_seen(
+        &successor_evidence,
+        &baseline,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve target"),
+        &plan,
+        &[ObjectLocation::Local(
+            lake_root.join(&added_object.object_key),
+        )],
+        baseline_config,
+        PubkeyFirstSeenConfig {
+            work_root: successor_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: u64::MAX,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("advance identity");
+    assert_eq!(successor.evidence.eligible_pubkeys, 2);
+    assert_eq!(successor.evidence.delta_object_count, 1);
+    assert_eq!(
+        successor.evidence.baseline_evidence_sha256.as_deref(),
+        Some(baseline.evidence_sha256.as_str())
+    );
+    assert_eq!(successor.evidence.new_users_daily.len(), 2);
+    assert_eq!(successor.evidence.new_users_daily[0].new_pubkeys, 1);
+    assert_eq!(successor.evidence.new_users_daily[1].new_pubkeys, 1);
+    let reloaded = load_bounded_pubkey_first_seen(&successor_evidence)
+        .expect("reload immutable successor evidence");
+    assert_eq!(reloaded.evidence_sha256, successor.evidence_sha256);
+}
+
+#[test]
 fn slice_a_handles_a_snapshot_with_no_parquet_objects() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut inventory = Inventory::open_in_memory().expect("inventory");
@@ -678,11 +802,96 @@ fn slice_a_publication_is_atomic_and_idempotent() {
     .expect("connect to disposable Postgres");
     let started_at = chrono::Utc::now();
     let completed_at = chrono::Utc::now();
-    let first =
-        publish(&mut client, &fixture.build, started_at, completed_at).expect("publish first run");
-    let run_id = match first {
+    let first = publish(&mut client, &fixture.build, started_at, completed_at)
+        .expect("publish Slice A baseline");
+    let baseline_run_id = match first {
         PublishOutcome::Published { run_id, .. } => run_id,
         PublishOutcome::AlreadyCurrent { .. } => panic!("database must begin empty"),
+    };
+    let identity_root = fixture._directory.path().join("publication-identity");
+    let identity = build_bounded_pubkey_first_seen(
+        identity_root.join("evidence.json"),
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        PubkeyFirstSeenConfig {
+            work_root: identity_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build identity publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_identity_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected identity publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_identity_test
+            BEFORE INSERT ON pensieve_analytics.new_users_daily
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_identity_test();
+            ",
+        )
+        .expect("install failure injection");
+    publish_with_identity(
+        &mut client,
+        &fixture.build,
+        &identity,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected COPY failure must abort identity publication");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT run_id FROM pensieve_analytics.current_run_metadata",
+                &[],
+            )
+            .expect("read baseline after failed identity publication")
+            .get::<_, String>(0),
+        baseline_run_id
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.runs WHERE query_version = 'slice-b1-v1'",
+                &[],
+            )
+            .expect("count rolled-back identity runs")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_identity_test ON pensieve_analytics.new_users_daily;
+            DROP FUNCTION pensieve_analytics.reject_identity_test();
+            ",
+        )
+        .expect("remove failure injection");
+    let identity_publication = publish_with_identity(
+        &mut client,
+        &fixture.build,
+        &identity,
+        started_at,
+        completed_at,
+    )
+    .expect("publish identity run");
+    let run_id = match identity_publication {
+        PublishOutcome::Published {
+            run_id,
+            previous_run_id,
+        } => {
+            assert_eq!(previous_run_id.as_deref(), Some(baseline_run_id.as_str()));
+            run_id
+        }
+        PublishOutcome::AlreadyCurrent { .. } => panic!("identity run must be new"),
     };
     assert_eq!(
         client
@@ -704,8 +913,50 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             .get::<_, i64>(0),
         6
     );
+    let metadata = client
+        .query_one(
+            "SELECT query_version, eligible_pubkeys, new_users_daily_rows FROM pensieve_analytics.current_run_metadata",
+            &[],
+        )
+        .expect("read current identity metadata");
+    assert_eq!(metadata.get::<_, String>(0), "slice-b1-v1");
     assert_eq!(
-        publish(&mut client, &fixture.build, started_at, completed_at,).expect("retry current run"),
+        metadata.get::<_, i64>(1),
+        identity.evidence.eligible_pubkeys as i64
+    );
+    assert_eq!(
+        metadata.get::<_, i64>(2),
+        identity.evidence.new_users_daily.len() as i64
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT total_pubkeys FROM pensieve_analytics.current_overview",
+                &[],
+            )
+            .expect("read current pubkeys")
+            .get::<_, i64>(0),
+        identity.evidence.eligible_pubkeys as i64
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT coalesce(sum(new_pubkeys), 0)::BIGINT FROM pensieve_analytics.current_new_users_daily",
+                &[],
+            )
+            .expect("read daily new users")
+            .get::<_, i64>(0),
+        identity.evidence.eligible_pubkeys as i64
+    );
+    assert_eq!(
+        publish_with_identity(
+            &mut client,
+            &fixture.build,
+            &identity,
+            started_at,
+            completed_at,
+        )
+        .expect("retry current identity run"),
         PublishOutcome::AlreadyCurrent { run_id }
     );
     assert_eq!(
@@ -718,8 +969,12 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             .get::<_, i64>(0),
         2
     );
-    let plan = plan_catalog_delta(&mut client, &fixture.build.snapshot.catalog)
-        .expect("plan current snapshot");
+    let plan = plan_catalog_delta_for_query_version(
+        &mut client,
+        &fixture.build.snapshot.catalog,
+        pensieve_analytics::IDENTITY_QUERY_VERSION,
+    )
+    .expect("plan current identity snapshot");
     assert_eq!(plan.run_kind, PlannedRunKind::NoChange);
     assert_eq!(plan.unchanged_objects, 2);
     assert!(plan.added_objects.is_empty());

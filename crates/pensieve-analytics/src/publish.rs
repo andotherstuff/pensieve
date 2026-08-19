@@ -7,7 +7,10 @@ use postgres::{Client, GenericClient};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{AnalyticsBuild, Error, QUERY_VERSION, Result, schema::SCHEMA_SQL};
+use crate::{
+    AnalyticsBuild, BoundedPubkeyFirstSeen, Error, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
+    schema::SCHEMA_SQL,
+};
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
 
@@ -43,6 +46,10 @@ struct ValidationRecord {
     event_daily_sum: u64,
     event_daily_kind_sum: u64,
     kind_all_time_sum: u64,
+    eligible_pubkeys: u64,
+    new_users_daily_sum: u64,
+    identity_evidence_sha256: Option<String>,
+    identity_metric_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -64,6 +71,26 @@ pub fn publish(
         completed_at,
         "full_rebuild",
         None,
+        None,
+    )
+}
+
+/// Publish Slice A and one completed bounded identity product atomically.
+pub fn publish_with_identity(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    identity: &BoundedPubkeyFirstSeen,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "full_rebuild",
+        None,
+        Some(identity),
     )
 }
 
@@ -82,6 +109,27 @@ pub fn publish_incremental(
         completed_at,
         "incremental",
         Some(expected_previous_run_id),
+        None,
+    )
+}
+
+/// Publish an incremental Slice A build and bounded identity successor atomically.
+pub fn publish_incremental_with_identity(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    identity: &BoundedPubkeyFirstSeen,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        Some(identity),
     )
 }
 
@@ -92,9 +140,16 @@ fn publish_kind(
     completed_at: DateTime<Utc>,
     run_kind: &'static str,
     expected_previous_run_id: Option<&str>,
+    identity: Option<&BoundedPubkeyFirstSeen>,
 ) -> Result<PublishOutcome> {
+    if let Some(identity) = identity {
+        identity.validate_for_publication(
+            &build.snapshot.catalog.snapshot_id,
+            build.config.as_of_epoch,
+        )?;
+    }
     client.batch_execute(SCHEMA_SQL)?;
-    let run_id = run_id(build);
+    let run_id = run_id(build, identity);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
 
@@ -113,6 +168,7 @@ fn publish_kind(
     {
         if current_run_id.as_deref() == Some(run_id.as_str()) {
             reconcile_applied_objects(&mut transaction, &run_id, build)?;
+            reconcile_published_identity(&mut transaction, &run_id, identity)?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -128,10 +184,20 @@ fn publish_kind(
     }
 
     let overview = build.overview()?;
+    let eligible_pubkeys = identity
+        .map(|product| product.evidence.eligible_pubkeys)
+        .unwrap_or(0);
+    let new_users_daily_rows = identity
+        .map(|product| product.evidence.new_users_daily.len() as u64)
+        .unwrap_or(0);
     let validation = serde_json::to_value(ValidationRecord {
         event_daily_sum: build.summary.api_representable_events,
         event_daily_kind_sum: build.summary.api_representable_events,
         kind_all_time_sum: build.summary.logical_events,
+        eligible_pubkeys,
+        new_users_daily_sum: eligible_pubkeys,
+        identity_evidence_sha256: identity.map(|product| product.evidence_sha256.clone()),
+        identity_metric_sha256: identity.map(|product| product.evidence.metric_sha256.clone()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -155,11 +221,13 @@ fn publish_kind(
             event_daily_rows,
             event_daily_kind_rows,
             kind_all_time_rows,
+            eligible_pubkeys,
+            new_users_daily_rows,
             validation
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
-            $10, $11, $12, $13, $14, $15, $16, $17
+            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ",
         &[
@@ -167,7 +235,7 @@ fn publish_kind(
             &build.snapshot.catalog.snapshot_id,
             &current_run_id,
             &run_kind,
-            &QUERY_VERSION,
+            &query_version(identity),
             &build.config.code_version,
             &to_i64("as_of_epoch", build.config.as_of_epoch)?,
             &started_at,
@@ -182,6 +250,8 @@ fn publish_kind(
             &to_i64("event_daily_rows", build.summary.event_daily_rows)?,
             &to_i64("event_daily_kind_rows", build.summary.event_daily_kind_rows)?,
             &to_i64("kind_all_time_rows", build.summary.kind_all_time_rows)?,
+            &to_i64("eligible_pubkeys", eligible_pubkeys)?,
+            &to_i64("new_users_daily_rows", new_users_daily_rows)?,
             &validation,
         ],
     )?;
@@ -192,6 +262,7 @@ fn publish_kind(
         INSERT INTO pensieve_analytics.overview (
             run_id,
             total_events,
+            total_pubkeys,
             api_representable_events,
             earliest_event,
             latest_event,
@@ -199,11 +270,12 @@ fn publish_kind(
             events_per_hour_7d,
             kinds_30d
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ",
         &[
             &run_id,
             &to_i64("total_events", overview.total_events)?,
+            &to_i64("total_pubkeys", eligible_pubkeys)?,
             &to_i64(
                 "api_representable_events",
                 overview.api_representable_events,
@@ -219,6 +291,10 @@ fn publish_kind(
     copy_event_daily(&mut transaction, &run_id, build)?;
     copy_event_daily_kind(&mut transaction, &run_id, build)?;
     copy_kind_all_time(&mut transaction, &run_id, build)?;
+    if let Some(identity) = identity {
+        copy_new_users_daily(&mut transaction, &run_id, identity)?;
+    }
+    reconcile_published_identity(&mut transaction, &run_id, identity)?;
 
     transaction.execute(
         "
@@ -385,6 +461,77 @@ fn copy_kind_all_time(
     expect_copied("kind_all_time", inserted, build.summary.kind_all_time_rows)
 }
 
+fn copy_new_users_daily(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    identity: &BoundedPubkeyFirstSeen,
+) -> Result<()> {
+    let mut writer = transaction.copy_in(
+        "
+        COPY pensieve_analytics.new_users_daily (run_id, day, new_pubkeys)
+        FROM STDIN WITH (FORMAT csv)
+        ",
+    )?;
+    for row in &identity.evidence.new_users_daily {
+        writeln!(writer, "{run_id},{},{}", row.day, row.new_pubkeys)?;
+    }
+    let inserted = writer.finish()?;
+    expect_copied(
+        "new_users_daily",
+        inserted,
+        identity.evidence.new_users_daily.len() as u64,
+    )
+}
+
+fn reconcile_published_identity(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    identity: Option<&BoundedPubkeyFirstSeen>,
+) -> Result<()> {
+    let expected_pubkeys = identity
+        .map(|product| product.evidence.eligible_pubkeys)
+        .unwrap_or(0);
+    let expected_rows = identity
+        .map(|product| product.evidence.new_users_daily.len() as u64)
+        .unwrap_or(0);
+    let row = transaction.query_one(
+        "
+        SELECT runs.eligible_pubkeys, runs.new_users_daily_rows,
+               overview.total_pubkeys,
+               count(daily.day)::BIGINT,
+               coalesce(sum(daily.new_pubkeys), 0)::BIGINT
+        FROM pensieve_analytics.runs runs
+        JOIN pensieve_analytics.overview overview USING (run_id)
+        LEFT JOIN pensieve_analytics.new_users_daily daily USING (run_id)
+        WHERE runs.run_id = $1
+        GROUP BY runs.eligible_pubkeys, runs.new_users_daily_rows,
+                 overview.total_pubkeys
+        ",
+        &[&run_id],
+    )?;
+    let actual = [
+        from_i64("published eligible_pubkeys", row.get(0))?,
+        from_i64("published new_users_daily_rows", row.get(1))?,
+        from_i64("published total_pubkeys", row.get(2))?,
+        from_i64("published new users row count", row.get(3))?,
+        from_i64("published new users sum", row.get(4))?,
+    ];
+    if actual
+        != [
+            expected_pubkeys,
+            expected_rows,
+            expected_pubkeys,
+            expected_rows,
+            expected_pubkeys,
+        ]
+    {
+        return Err(Error::Validation(format!(
+            "published identity accounting {actual:?} does not match expected pubkeys {expected_pubkeys} and rows {expected_rows}"
+        )));
+    }
+    Ok(())
+}
+
 fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
     if actual != expected {
         return Err(Error::Validation(format!(
@@ -394,18 +541,38 @@ fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_id(build: &AnalyticsBuild) -> String {
+fn run_id(build: &AnalyticsBuild, identity: Option<&BoundedPubkeyFirstSeen>) -> String {
     let mut digest = Sha256::new();
     digest.update(build.snapshot.catalog.snapshot_id.as_bytes());
     digest.update([0]);
     digest.update(build.config.as_of_epoch.to_be_bytes());
     digest.update([0]);
-    digest.update(QUERY_VERSION.as_bytes());
+    digest.update(query_version(identity).as_bytes());
     digest.update([0]);
     digest.update(build.config.code_version.as_bytes());
+    if let Some(identity) = identity {
+        digest.update([0]);
+        digest.update(identity.evidence_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(identity.evidence.metric_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(identity.evidence.final_artifact.sha256.as_bytes());
+    }
     hex::encode(digest.finalize())
+}
+
+fn query_version(identity: Option<&BoundedPubkeyFirstSeen>) -> &'static str {
+    if identity.is_some() {
+        IDENTITY_QUERY_VERSION
+    } else {
+        QUERY_VERSION
+    }
 }
 
 fn to_i64(field: &'static str, value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| Error::NumericOverflow { field, value })
+}
+
+fn from_i64(field: &'static str, value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::Validation(format!("{field} is negative: {value}")))
 }

@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use crate::build::{API_TIMESTAMP_MAX, configure_execution, configure_remote_access, sql_string};
 use crate::event_facts::verify_local_batch_inputs;
 use crate::{
-    ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget, InputBatch,
-    InputIdentity, MergeStats, ObjectLocation, ResolvedSnapshot, Result, RunCheckpoint,
+    ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
+    BoundedExecutionError, BuildConfig, CatalogDeltaPlan, DiskBudget, InputBatch, InputIdentity,
+    MergeStats, ObjectLocation, PlannedRunKind, ResolvedSnapshot, Result, RunCheckpoint,
     RunIdentity, load_reusable_checkpoint, merge_fixed_min_u64_runs, plan_input_batches,
     preflight_disk, publish_canonical_json, publish_run_checkpoint,
 };
@@ -73,6 +74,11 @@ pub struct PubkeyFirstSeenEvidence {
     pub merge_count: u64,
     /// Catalog rows covered by the scan.
     pub physical_rows: u64,
+    /// Prior immutable evidence consumed by an incremental successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_evidence_sha256: Option<String>,
+    /// New catalog objects scanned for this generation.
+    pub delta_object_count: u64,
     /// Unique pubkeys across all eligible event kinds, before date filtering.
     pub first_seen_records: u64,
     /// Pubkeys whose minimum timestamp is within the API date domain.
@@ -96,11 +102,102 @@ pub struct PubkeyFirstSeenEvidence {
 }
 
 /// Completed first-seen products.
+#[derive(Clone, Debug)]
 pub struct BoundedPubkeyFirstSeen {
     /// Validated completion evidence.
     pub evidence: PubkeyFirstSeenEvidence,
     /// SHA-256 of canonical evidence JSON.
     pub evidence_sha256: String,
+}
+
+impl BoundedPubkeyFirstSeen {
+    /// Revalidate immutable identity products immediately before publication.
+    ///
+    /// Publication deliberately re-reads the high-cardinality artifact instead
+    /// of trusting an in-memory completion value. This keeps a transient
+    /// Postgres failure safely retryable and makes artifact replacement or
+    /// truncation fail before the current-run pointer can move.
+    pub fn validate_for_publication(&self, snapshot_id: &str, as_of_epoch: u64) -> Result<()> {
+        let evidence = &self.evidence;
+        if evidence.schema_version != 1
+            || evidence.runner_version != RUNNER_VERSION
+            || evidence.status != "completed"
+        {
+            return Err(BoundedExecutionError::Invalid(
+                "first-seen evidence is not a completed supported product".to_owned(),
+            )
+            .into());
+        }
+        if evidence.snapshot_id != snapshot_id || evidence.as_of_epoch != as_of_epoch {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "first-seen evidence targets {}/{} instead of {snapshot_id}/{as_of_epoch}",
+                evidence.snapshot_id, evidence.as_of_epoch
+            ))
+            .into());
+        }
+        let artifact_path = Path::new(&evidence.final_artifact.path);
+        let metadata = artifact_path.metadata()?;
+        if !metadata.is_file() || metadata.len() != evidence.final_artifact.byte_size {
+            return Err(BoundedExecutionError::Invalid(
+                "first-seen artifact byte accounting mismatch".to_owned(),
+            )
+            .into());
+        }
+        let artifact_sha256 = pensieve_lake::sha256_file(artifact_path)?;
+        if artifact_sha256 != evidence.final_artifact.sha256 {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "first-seen artifact SHA-256 {artifact_sha256} does not match evidence {}",
+                evidence.final_artifact.sha256
+            ))
+            .into());
+        }
+        let (eligible_pubkeys, new_users_daily) = finalize(
+            artifact_path,
+            &evidence.final_artifact,
+            evidence.as_of_epoch,
+        )?;
+        if eligible_pubkeys != evidence.eligible_pubkeys
+            || new_users_daily != evidence.new_users_daily
+        {
+            return Err(BoundedExecutionError::Invalid(
+                "first-seen serving metrics do not match the immutable artifact".to_owned(),
+            )
+            .into());
+        }
+        let mut metric_bytes = serde_json::to_vec_pretty(&new_users_daily).map_err(|error| {
+            BoundedExecutionError::Invalid(format!("serialize new users: {error}"))
+        })?;
+        metric_bytes.push(b'\n');
+        let metric_sha256 = hex::encode(Sha256::digest(&metric_bytes));
+        if metric_sha256 != evidence.metric_sha256 {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "first-seen metric SHA-256 {metric_sha256} does not match evidence {}",
+                evidence.metric_sha256
+            ))
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Load and fully revalidate a completed first-seen evidence file.
+pub fn load_bounded_pubkey_first_seen(
+    evidence_path: impl AsRef<Path>,
+) -> Result<BoundedPubkeyFirstSeen> {
+    let evidence_path = evidence_path.as_ref();
+    let evidence: PubkeyFirstSeenEvidence = serde_json::from_slice(&fs::read(evidence_path)?)
+        .map_err(|error| {
+            BoundedExecutionError::Invalid(format!("decode first-seen evidence: {error}"))
+        })?;
+    let completed = BoundedPubkeyFirstSeen {
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
+        evidence,
+    };
+    completed.validate_for_publication(
+        &completed.evidence.snapshot_id,
+        completed.evidence.as_of_epoch,
+    )?;
+    Ok(completed)
 }
 
 #[derive(Clone)]
@@ -201,10 +298,160 @@ pub fn build_bounded_pubkey_first_seen(
         batch_count: to_u64(batches.len())?,
         merge_count: merged.merge_count,
         physical_rows: snapshot.catalog.totals().physical_rows,
+        baseline_evidence_sha256: None,
+        delta_object_count: to_u64(snapshot.catalog.objects().len())?,
         first_seen_records: merged.final_run.checkpoint.artifact.row_count,
         eligible_pubkeys,
         new_users_daily,
         metric_sha256,
+        final_artifact: merged.final_run.checkpoint.artifact,
+        max_merge_buffered_bytes: merged.max_buffered_bytes,
+        estimated_run_bytes,
+        disk_reserve_bytes: config.disk_reserve_bytes,
+        batch_checkpoints: checkpoints,
+        merge_checkpoints: merged.checkpoints,
+    };
+    let evidence_path = evidence_path.as_ref();
+    publish_canonical_json(evidence_path, &evidence)?;
+    Ok(BoundedPubkeyFirstSeen {
+        evidence,
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
+    })
+}
+
+/// Advance exact first-seen state from one verified append-only catalog delta.
+///
+/// Only newly added Parquet objects are scanned. Their level-zero runs are
+/// streaming-min merged with the prior immutable state, so a late historical
+/// event can move exactly one pubkey from a newer daily bucket to an older one
+/// without loading cardinality-sized state into memory.
+pub fn advance_bounded_pubkey_first_seen(
+    evidence_path: impl AsRef<Path>,
+    baseline: &BoundedPubkeyFirstSeen,
+    target: ResolvedSnapshot,
+    plan: &CatalogDeltaPlan,
+    delta_locations: &[ObjectLocation],
+    build: BuildConfig,
+    config: PubkeyFirstSeenConfig,
+) -> Result<BoundedPubkeyFirstSeen> {
+    baseline.validate_for_publication(
+        &baseline.evidence.snapshot_id,
+        baseline.evidence.as_of_epoch,
+    )?;
+    if build.as_of_epoch > API_TIMESTAMP_MAX
+        || config.merge_fan_in < 2
+        || plan.run_kind != PlannedRunKind::Incremental
+        || plan.snapshot_id != target.catalog.snapshot_id
+        || plan.previous_snapshot_id.as_deref() != Some(&baseline.evidence.snapshot_id)
+        || !plan.removed_objects.is_empty()
+        || plan.added_objects.len() != delta_locations.len()
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "invalid incremental first-seen build configuration".to_owned(),
+        )
+        .into());
+    }
+    fs::create_dir_all(&config.work_root)?;
+    let inputs = plan
+        .added_objects
+        .iter()
+        .map(|object| InputIdentity {
+            identity: object.object_key.clone(),
+            byte_size: object.byte_size,
+            row_count: object.row_count,
+            sha256: object.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    let batches = plan_input_batches(&inputs, config.batch_limits)?;
+    let estimated_rows = baseline
+        .evidence
+        .first_seen_records
+        .checked_add(plan.added_physical_rows)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("first-seen row estimate overflow".to_owned())
+        })?;
+    let estimated_run_bytes = estimate_run_bytes(
+        estimated_rows,
+        batches.len().saturating_add(1),
+        config.merge_fan_in,
+    )?;
+    let retained_bytes = completed_run_bytes(&config.work_root)?;
+    preflight_disk(
+        &config.work_root,
+        DiskBudget {
+            output_bytes: estimated_run_bytes.saturating_sub(retained_bytes),
+            temporary_bytes: 0,
+            retained_bytes,
+            reserve_bytes: config.disk_reserve_bytes,
+        },
+    )?;
+
+    let connection = Connection::open_in_memory()?;
+    configure_execution(&connection, &build)?;
+    connection.execute_batch("SET TimeZone='UTC'; SET preserve_insertion_order=false")?;
+    configure_remote_access(&connection, &target, &build)?;
+    let batch_root = config.work_root.join("batches");
+    fs::create_dir_all(&batch_root)?;
+    let baseline_artifact = baseline.evidence.final_artifact.clone();
+    let baseline_path = PathBuf::from(&baseline_artifact.path);
+    let baseline_run = CompletedRun {
+        identity: format!("baseline-evidence:{}", baseline.evidence_sha256),
+        path: baseline_path,
+        checkpoint_path: PathBuf::new(),
+        checkpoint: RunCheckpoint {
+            schema_version: BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+            runner_version: BOUNDED_RUNNER_VERSION.to_owned(),
+            run: run_identity(&target, &build, "baseline"),
+            inputs: Vec::new(),
+            artifact: baseline_artifact,
+        },
+    };
+    let mut runs = vec![baseline_run];
+    let mut checkpoints = Vec::with_capacity(batches.len());
+    let mut offset = 0;
+    for batch in &batches {
+        let end = offset + batch.inputs.len();
+        let locations = delta_locations.get(offset..end).ok_or_else(|| {
+            BoundedExecutionError::Invalid("delta locations do not cover batches".to_owned())
+        })?;
+        let run = build_batch(&connection, &target, &build, batch, locations, &batch_root)?;
+        checkpoints.push(run.checkpoint_path.to_string_lossy().into_owned());
+        runs.push(run);
+        offset = end;
+    }
+    if offset != delta_locations.len() {
+        return Err(BoundedExecutionError::Invalid(
+            "unconsumed incremental first-seen locations".to_owned(),
+        )
+        .into());
+    }
+    let merge_root = config.work_root.join("merges");
+    fs::create_dir_all(&merge_root)?;
+    let merged = merge_all(runs, &target, &build, config.merge_fan_in, &merge_root)?;
+    let (eligible_pubkeys, new_users_daily) = finalize(
+        &merged.final_run.path,
+        &merged.final_run.checkpoint.artifact,
+        build.as_of_epoch,
+    )?;
+    let mut metric_bytes = serde_json::to_vec_pretty(&new_users_daily)
+        .map_err(|error| BoundedExecutionError::Invalid(format!("serialize new users: {error}")))?;
+    metric_bytes.push(b'\n');
+    let evidence = PubkeyFirstSeenEvidence {
+        schema_version: 1,
+        runner_version: RUNNER_VERSION.to_owned(),
+        status: "completed".to_owned(),
+        snapshot_id: target.catalog.snapshot_id.clone(),
+        as_of_epoch: build.as_of_epoch,
+        object_count: to_u64(target.catalog.objects().len())?,
+        batch_count: to_u64(batches.len())?,
+        merge_count: merged.merge_count,
+        physical_rows: target.catalog.totals().physical_rows,
+        baseline_evidence_sha256: Some(baseline.evidence_sha256.clone()),
+        delta_object_count: to_u64(plan.added_objects.len())?,
+        first_seen_records: merged.final_run.checkpoint.artifact.row_count,
+        eligible_pubkeys,
+        new_users_daily,
+        metric_sha256: hex::encode(Sha256::digest(&metric_bytes)),
         final_artifact: merged.final_run.checkpoint.artifact,
         max_merge_buffered_bytes: merged.max_buffered_bytes,
         estimated_run_bytes,
