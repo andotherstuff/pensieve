@@ -426,6 +426,13 @@ ClickHouse is a continuously advancing head; a mismatch is not accepted as a
 candidate bug or ignored as harmless until head-lag attribution or exact
 event-ID alignment explains it.
 
+If Slice A advances after a successful B1 canary, the identity publisher can
+accept the predecessor evidence together with the exact persisted append-only
+delta plan and verified delta-object root. It scans only the new objects,
+streaming-min merges them with the predecessor artifact, and still requires the
+successor snapshot and `as_of` to match the current Postgres baseline before
+publication.
+
 ### Slice 4 — fixed-grain distinct and active users
 
 Goal: exact identity products for published periods.

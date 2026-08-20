@@ -6,9 +6,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, PubkeyFirstSeenConfig, PublishOutcome,
-    acquire_publication_lock, build_bounded_pubkey_first_seen, publish_incremental_with_identity,
-    resolve_snapshot,
+    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, PubkeyFirstSeenConfig,
+    PublishOutcome, acquire_publication_lock, advance_bounded_pubkey_first_seen,
+    build_bounded_pubkey_first_seen, load_bounded_pubkey_first_seen,
+    publish_incremental_with_identity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -31,6 +32,15 @@ struct Args {
     /// Immutable first-seen completion evidence.
     #[arg(long)]
     identity_evidence: PathBuf,
+    /// Verified predecessor first-seen evidence; enables append-only advancement.
+    #[arg(long, requires_all = ["delta_plan", "delta_object_root"])]
+    identity_baseline_evidence: Option<PathBuf>,
+    /// Persisted append-only catalog delta plan used to stage successor objects.
+    #[arg(long)]
+    delta_plan: Option<PathBuf>,
+    /// Root containing only the delta plan's verified added objects.
+    #[arg(long)]
+    delta_object_root: Option<PathBuf>,
     /// Fixed as-of from the current Slice A run.
     #[arg(long)]
     as_of: u64,
@@ -103,21 +113,51 @@ fn run() -> Result<()> {
     let build =
         AnalyticsBuild::open_completed(&args.work_database, snapshot.clone(), build_config.clone())
             .context("open completed Slice A checkpoint")?;
-    let identity = build_bounded_pubkey_first_seen(
-        &args.identity_evidence,
-        snapshot,
-        build_config,
-        PubkeyFirstSeenConfig {
-            work_root: args.identity_work_root,
-            batch_limits: BatchLimits {
-                max_bytes: args.batch_bytes,
-                max_rows: args.batch_rows,
-            },
-            merge_fan_in: args.merge_fan_in,
-            disk_reserve_bytes: args.disk_reserve_bytes,
+    let identity_config = PubkeyFirstSeenConfig {
+        work_root: args.identity_work_root,
+        batch_limits: BatchLimits {
+            max_bytes: args.batch_bytes,
+            max_rows: args.batch_rows,
         },
-    )
-    .context("build bounded first-seen state")?;
+        merge_fan_in: args.merge_fan_in,
+        disk_reserve_bytes: args.disk_reserve_bytes,
+    };
+    let identity = match (
+        args.identity_baseline_evidence.as_ref(),
+        args.delta_plan.as_ref(),
+        args.delta_object_root.as_ref(),
+    ) {
+        (Some(baseline_path), Some(plan_path), Some(delta_root)) => {
+            let baseline = load_bounded_pubkey_first_seen(baseline_path)
+                .context("load baseline first-seen evidence")?;
+            let plan: CatalogDeltaPlan = serde_json::from_slice(
+                &std::fs::read(plan_path).context("read persisted identity delta plan")?,
+            )
+            .context("decode persisted identity delta plan")?;
+            let delta_locations = resolve_delta_locations(&plan, delta_root)
+                .context("resolve verified identity delta objects")?;
+            advance_bounded_pubkey_first_seen(
+                &args.identity_evidence,
+                &baseline,
+                snapshot,
+                &plan,
+                &delta_locations,
+                build_config,
+                identity_config,
+            )
+            .context("advance bounded first-seen state")?
+        }
+        (None, None, None) => build_bounded_pubkey_first_seen(
+            &args.identity_evidence,
+            snapshot,
+            build_config,
+            identity_config,
+        )
+        .context("build bounded first-seen state")?,
+        _ => bail!(
+            "identity baseline evidence, delta plan, and delta object root must be supplied together"
+        ),
+    };
 
     let mut postgres_config: PostgresConfig = args
         .postgres_url
