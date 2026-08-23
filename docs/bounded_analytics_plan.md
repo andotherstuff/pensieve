@@ -1,7 +1,7 @@
 # Bounded Analytics Migration Plan
 
-*Status: Slices 0 and 1 complete; Slice 2 implementation ready for production canary*
-*Last updated: 2026-08-18*
+*Status: Slices 0-4 implemented; Slice 4 ready for an operator-authorized production canary*
+*Last updated: 2026-08-23*
 
 This document turns the
 [analytics endpoint migration ledger](analytics_endpoint_migration.md) into an
@@ -470,8 +470,21 @@ Implementation foundation completed on the Slice 4 branch:
   into the deterministic run ID, checks copied row counts and sums, and rolls
   back the entire transaction on any staging failure.
 
-Recurring-lane integration, production canary, and route cutover remain
-separate fail-closed steps before Slice 4 is live.
+The recurring lane now has a fail-closed, opt-in Slice B2 path. When
+`PENSIEVE_ANALYTICS_ACTIVITY_ENABLED=1`, it also requires the B1 lane, requires
+both evidence files in the current generation, plans against `slice-b2-v1`,
+advances each product from the same verified delta, and publishes Slice A, B1,
+and B2 in one transaction. A failed build or publication leaves the prior
+generation current.
+
+The one-time canary command is `pensieve-analytics-activity-publish`. It builds
+and validates immutable activity state with one DuckDB worker and a 4 GB
+default scan limit, requires first-seen evidence for the same snapshot and
+`as_of`, and refuses publication unless Postgres is still on that exact B1
+run. Run it first with `--dry-run`; after a successful real publication,
+install its `activity-evidence.json` in the current analytics generation before
+enabling the recurring B2 flag. Production canary execution, evidence
+installation, and route cutover remain separate operator-authorized steps.
 
 ### Slice 5 — cohort retention
 

@@ -6,10 +6,12 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    BatchLimits, BuildConfig, CatalogDeltaPlan, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig,
-    PublishOutcome, acquire_publication_lock, advance_bounded_pubkey_first_seen, apply_incremental,
-    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version, publish_incremental,
-    publish_incremental_with_identity, resolve_delta_locations, resolve_snapshot,
+    BatchLimits, BuildConfig, CatalogDeltaPlan, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
+    IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome, acquire_publication_lock,
+    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
+    load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
+    plan_catalog_delta_for_query_version, publish_incremental, publish_incremental_with_identity,
+    publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -79,6 +81,27 @@ struct Args {
     /// Free first-seen work-filesystem bytes left untouched.
     #[arg(long, default_value_t = 53_687_091_200)]
     identity_disk_reserve_bytes: u64,
+    /// Current immutable fixed-activity evidence; enables Slice B2 publication.
+    #[arg(long)]
+    activity_baseline_evidence: Option<PathBuf>,
+    /// Immutable fixed-activity successor evidence output.
+    #[arg(long)]
+    activity_evidence: Option<PathBuf>,
+    /// Dedicated immutable fixed-activity successor workspace.
+    #[arg(long)]
+    activity_work_root: Option<PathBuf>,
+    /// Maximum compressed delta bytes in one fixed-activity scan.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    activity_batch_bytes: u64,
+    /// Maximum physical delta rows in one fixed-activity scan.
+    #[arg(long, default_value_t = 5_000_000)]
+    activity_batch_rows: u64,
+    /// Maximum fixed-activity runs opened by one streaming merge.
+    #[arg(long, default_value_t = 16)]
+    activity_merge_fan_in: usize,
+    /// Free fixed-activity work-filesystem bytes left untouched.
+    #[arg(long, default_value_t = 53_687_091_200)]
+    activity_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -90,6 +113,7 @@ struct Output<'a> {
     incremental: &'a pensieve_analytics::IncrementalSummary,
     build: &'a pensieve_analytics::BuildSummary,
     identity: Option<IdentityOutput<'a>>,
+    activity: Option<ActivityOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -102,6 +126,20 @@ struct IdentityOutput<'a> {
     new_users_daily_rows: usize,
     delta_object_count: u64,
     max_merge_buffered_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct ActivityOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: Option<&'a str>,
+    activity_records: u64,
+    pubkey_flag_records: u64,
+    distinct_period_rows: u64,
+    active_period_rows: u64,
+    delta_object_count: u64,
+    max_merge_buffered_bytes: usize,
+    max_week_kinds_buffered: usize,
+    max_month_kinds_buffered: usize,
 }
 
 #[derive(Serialize)]
@@ -146,7 +184,25 @@ fn run() -> Result<()> {
         .context("connect to Postgres without TLS")?;
     acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
     let identity_enabled = args.identity_baseline_evidence.is_some();
-    let desired_query_version = if identity_enabled {
+    let activity_enabled = args.activity_baseline_evidence.is_some();
+    require_complete_product_args(
+        "identity",
+        identity_enabled,
+        args.identity_evidence.is_some(),
+        args.identity_work_root.is_some(),
+    )?;
+    require_complete_product_args(
+        "activity",
+        activity_enabled,
+        args.activity_evidence.is_some(),
+        args.activity_work_root.is_some(),
+    )?;
+    if activity_enabled && !identity_enabled {
+        bail!("fixed-activity advancement requires identity advancement in the same run");
+    }
+    let desired_query_version = if activity_enabled {
+        FIXED_ACTIVITY_QUERY_VERSION
+    } else if identity_enabled {
         IDENTITY_QUERY_VERSION
     } else {
         pensieve_analytics::QUERY_VERSION
@@ -199,7 +255,7 @@ fn run() -> Result<()> {
             advance_bounded_pubkey_first_seen(
                 evidence_path,
                 &baseline,
-                target,
+                target.clone(),
                 &persisted_plan,
                 &delta_locations,
                 build.config.clone(),
@@ -218,12 +274,52 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let activity = if let (Some(baseline_path), Some(evidence_path), Some(work_root)) = (
+        args.activity_baseline_evidence.as_ref(),
+        args.activity_evidence.as_ref(),
+        args.activity_work_root.as_ref(),
+    ) {
+        let baseline = load_bounded_fixed_activity(baseline_path)
+            .context("load baseline fixed-activity evidence")?;
+        Some(
+            advance_bounded_fixed_activity(
+                evidence_path,
+                &baseline,
+                target,
+                &persisted_plan,
+                &delta_locations,
+                build.config.clone(),
+                FixedActivityConfig {
+                    work_root: work_root.clone(),
+                    batch_limits: BatchLimits {
+                        max_bytes: args.activity_batch_bytes,
+                        max_rows: args.activity_batch_rows,
+                    },
+                    merge_fan_in: args.activity_merge_fan_in,
+                    disk_reserve_bytes: args.activity_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded fixed-activity state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
-            match if let Some(identity) = identity.as_ref() {
+            match if let (Some(identity), Some(activity)) = (identity.as_ref(), activity.as_ref()) {
+                publish_incremental_with_identity_and_activity(
+                    &mut client,
+                    &build,
+                    identity,
+                    activity,
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let Some(identity) = identity.as_ref() {
                 publish_incremental_with_identity(
                     &mut client,
                     &build,
@@ -272,10 +368,34 @@ fn run() -> Result<()> {
                 delta_object_count: identity.evidence.delta_object_count,
                 max_merge_buffered_bytes: identity.evidence.max_merge_buffered_bytes,
             }),
+            activity: activity.as_ref().map(|activity| ActivityOutput {
+                evidence_sha256: &activity.evidence_sha256,
+                baseline_evidence_sha256: activity.evidence.baseline_evidence_sha256.as_deref(),
+                activity_records: activity.evidence.activity_artifact.row_count,
+                pubkey_flag_records: activity.evidence.flags_artifact.row_count,
+                distinct_period_rows: activity.evidence.distinct_period_rows,
+                active_period_rows: activity.evidence.active_period_rows,
+                delta_object_count: activity.evidence.delta_object_count,
+                max_merge_buffered_bytes: activity.evidence.max_merge_buffered_bytes,
+                max_week_kinds_buffered: activity.evidence.max_week_kinds_buffered,
+                max_month_kinds_buffered: activity.evidence.max_month_kinds_buffered,
+            }),
             publication,
         })?
     );
     Ok(())
+}
+
+fn require_complete_product_args(
+    product: &str,
+    baseline: bool,
+    evidence: bool,
+    work_root: bool,
+) -> Result<()> {
+    if baseline == evidence && evidence == work_root {
+        return Ok(());
+    }
+    bail!("{product} baseline evidence, output evidence, and work root must be supplied together")
 }
 
 fn target_is_already_current(

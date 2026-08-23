@@ -77,6 +77,10 @@ analytics-plan *ARGS:
 analytics-incremental *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-incremental -- {{ARGS}}
 
+# Build and optionally atomically add Slice B2 activity to current Slice B1.
+analytics-activity-publish *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-activity-publish -- {{ARGS}}
+
 # Compare current Postgres Slice A products with deduplicated ClickHouse values.
 analytics-compare *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-compare -- {{ARGS}}

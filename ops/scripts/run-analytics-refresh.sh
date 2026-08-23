@@ -28,6 +28,8 @@ require_ingest_active="${PENSIEVE_ANALYTICS_REQUIRE_INGEST_ACTIVE:-1}"
 additional_fragment_source="${PENSIEVE_ANALYTICS_ADDITIONAL_FRAGMENT:-}"
 identity_enabled="${PENSIEVE_ANALYTICS_IDENTITY_ENABLED:-0}"
 identity_root="${PENSIEVE_ANALYTICS_IDENTITY_ROOT:-/archive/analytics/pubkey-first-seen}"
+activity_enabled="${PENSIEVE_ANALYTICS_ACTIVITY_ENABLED:-0}"
+activity_root="${PENSIEVE_ANALYTICS_ACTIVITY_ROOT:-/archive/analytics/fixed-activity}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -81,6 +83,14 @@ if [ "$identity_enabled" != "0" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_IDENTITY_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$activity_enabled" != "0" ] && [ "$activity_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
+if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
+    exit 2
+fi
 
 install -d -m 0750 "$state_root" "$generations_root" "$runs_root" \
     "$deltas_root" "$backups_root" "$(dirname "$lock_file")"
@@ -131,6 +141,15 @@ if [ "$identity_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$identity_root"
+fi
+activity_baseline_evidence=""
+if [ "$activity_enabled" = "1" ]; then
+    activity_baseline_evidence="$current_generation/activity-evidence.json"
+    if [ ! -s "$activity_baseline_evidence" ]; then
+        echo "Current activity evidence is missing: $activity_baseline_evidence" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$activity_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -224,7 +243,9 @@ fi
 "$catalog_bin" "${publish_args[@]}" | tee "$run_dir/catalog-publication.txt"
 
 plan_args=(--catalog "$target_snapshot")
-if [ "$identity_enabled" = "1" ]; then
+if [ "$activity_enabled" = "1" ]; then
+    plan_args+=(--query-version slice-b2-v1)
+elif [ "$identity_enabled" = "1" ]; then
     plan_args+=(--query-version slice-b1-v1)
 fi
 "$plan_bin" "${plan_args[@]}" >"$plan.new"
@@ -247,6 +268,9 @@ promote_generation() {
         if [ "$identity_enabled" = "1" ] && [ -s "$run_dir/identity-evidence.json" ]; then
             cmp "$run_dir/identity-evidence.json" "$generation/identity-evidence.json"
         fi
+        if [ "$activity_enabled" = "1" ] && [ -s "$run_dir/activity-evidence.json" ]; then
+            cmp "$run_dir/activity-evidence.json" "$generation/activity-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -262,6 +286,10 @@ promote_generation() {
         if [ "$identity_enabled" = "1" ]; then
             install -m 0640 "$run_dir/identity-evidence.json" \
                 "$partial_generation/identity-evidence.json"
+        fi
+        if [ "$activity_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/activity-evidence.json" \
+                "$partial_generation/activity-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         sync -f "$partial_generation/active-raw.json"
@@ -367,6 +395,14 @@ case "$run_kind" in
                 --identity-work-root "$identity_work_root"
             )
         fi
+        if [ "$activity_enabled" = "1" ]; then
+            activity_work_root="$activity_root/$snapshot_hex"
+            incremental_args+=(
+                --activity-baseline-evidence "$activity_baseline_evidence"
+                --activity-evidence "$run_dir/activity-evidence.json"
+                --activity-work-root "$activity_work_root"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -416,6 +452,9 @@ if [ -n "$additional_fragment" ]; then
 fi
 if [ "$identity_enabled" = "1" ] && [ -s "$run_dir/identity-evidence.json" ]; then
     evidence_files+=("$run_dir/identity-evidence.json")
+fi
+if [ "$activity_enabled" = "1" ] && [ -s "$run_dir/activity-evidence.json" ]; then
+    evidence_files+=("$run_dir/activity-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"
