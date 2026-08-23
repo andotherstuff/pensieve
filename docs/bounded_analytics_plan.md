@@ -446,6 +446,27 @@ Goal: exact identity products for published periods.
 Gate: set-union fixtures prove weekly/monthly counts are not sums of daily
 counts, and all excluded-kind/time-domain rules reconcile.
 
+Implementation foundation completed on the Slice 4 branch:
+
+- one immutable record per canonical `(pubkey, UTC day, kind, event ID)` keeps
+  cross-object duplicate suppression exact while retaining the identities
+  needed for every fixed grain;
+- byte/row-bounded DuckDB batches and fixed-fan-in streaming merges make peak
+  merge memory independent of archive cardinality;
+- a streaming finalizer derives exact daily, calendar-week, and
+  calendar-month all-kind and per-kind distinct populations without summing
+  daily distinct counts;
+- exact ever-observed kind-0/profile and kind-3/follows flags are retained in
+  a separate immutable pubkey artifact and joined without a population-sized
+  in-memory map;
+- active-user products consistently exclude kinds 445 and 1059 while event
+  distinct products continue to represent all API-domain kinds; and
+- append-only successors scan only verified new objects, union identities with
+  the predecessor artifact, and revalidate every artifact and serving metric.
+
+Postgres DDL/publication, recurring-lane integration, production canary, and
+route cutover remain separate fail-closed steps before Slice 4 is live.
+
 ### Slice 5 — cohort retention
 
 Goal: exact bounded-memory retention from Slice 3 and Slice 4 state.

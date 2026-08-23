@@ -596,6 +596,105 @@ pub fn merge_fixed_min_u64_runs(
     Ok(stats)
 }
 
+/// Merge fixed-width runs by key, checked-summing a big-endian `u64` value.
+///
+/// Every input must contain exactly one record per key and be strictly sorted
+/// by its encoded key. Records are `key_bytes` followed by one big-endian
+/// `u64`. Peak memory depends on fan-in rather than input cardinality.
+pub fn merge_fixed_sum_u64_runs(
+    input_paths: &[PathBuf],
+    partial_output: impl AsRef<Path>,
+    key_bytes: usize,
+    fan_in: usize,
+) -> BoundedExecutionResult<MergeStats> {
+    let record_bytes = key_bytes.checked_add(8).ok_or_else(|| {
+        BoundedExecutionError::Invalid("sum-u64 record width overflowed usize".to_owned())
+    })?;
+    let layout = FixedRecordLayout {
+        record_bytes,
+        key_bytes,
+    };
+    validate_merge_config(input_paths, partial_output.as_ref(), layout, fan_in)?;
+    let mut readers = input_paths
+        .iter()
+        .map(|path| File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::with_capacity(readers.len());
+    let mut stats = MergeStats::default();
+    for (source, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = read_fixed_record(reader, record_bytes)? {
+            heap.push(HeapRecord { record, source });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+        }
+    }
+    record_peak(&mut stats, heap.len(), record_bytes)?;
+
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial_output.as_ref())?;
+    let mut writer = BufWriter::new(output);
+    let mut pending_key: Option<Vec<u8>> = None;
+    let mut pending_sum = 0_u64;
+    while let Some(item) = heap.pop() {
+        let source = item.source;
+        let source_key = item.record[..key_bytes].to_vec();
+        let value = u64::from_be_bytes(
+            item.record[key_bytes..]
+                .try_into()
+                .expect("validated fixed-width sum record"),
+        );
+        match pending_key.as_deref() {
+            Some(key) if key == source_key.as_slice() => {
+                pending_sum = pending_sum.checked_add(value).ok_or_else(|| {
+                    BoundedExecutionError::Invalid("sum-u64 merge overflowed u64".to_owned())
+                })?;
+                stats.duplicate_records =
+                    checked_increment(stats.duplicate_records, "reduced record count")?;
+            }
+            Some(_) => {
+                writer.write_all(pending_key.as_deref().expect("pending key"))?;
+                writer.write_all(&pending_sum.to_be_bytes())?;
+                stats.output_records =
+                    checked_increment(stats.output_records, "output record count")?;
+                pending_key = Some(source_key.clone());
+                pending_sum = value;
+            }
+            None => {
+                pending_key = Some(source_key.clone());
+                pending_sum = value;
+            }
+        }
+
+        if let Some(next) = read_fixed_record(&mut readers[source], record_bytes)? {
+            if source_key.as_slice() >= &next[..key_bytes] {
+                return Err(BoundedExecutionError::Invalid(format!(
+                    "input run {} is not strictly sorted and unique by its encoded key",
+                    input_paths[source].display()
+                )));
+            }
+            heap.push(HeapRecord {
+                record: next,
+                source,
+            });
+            stats.input_records = checked_increment(stats.input_records, "input record count")?;
+            record_peak(
+                &mut stats,
+                heap.len() + usize::from(pending_key.is_some()),
+                record_bytes,
+            )?;
+        }
+    }
+    if let Some(key) = pending_key {
+        writer.write_all(&key)?;
+        writer.write_all(&pending_sum.to_be_bytes())?;
+        stats.output_records = checked_increment(stats.output_records, "output record count")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(stats)
+}
+
 fn push_batch(
     batches: &mut Vec<InputBatch>,
     inputs: Vec<InputIdentity>,
@@ -1385,6 +1484,80 @@ mod tests {
             merge_fixed_min_u64_runs(
                 &[valid, truncated],
                 root.path().join("truncated.partial"),
+                1,
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sum_u64_merge_is_exact_bounded_and_order_invariant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.run");
+        let second = root.path().join("second.run");
+        let third = root.path().join("third.run");
+        write_min_records(&first, &[(b'a', 20), (b'c', 30)]);
+        write_min_records(&second, &[(b'a', 10), (b'b', 40)]);
+        write_min_records(&third, &[(b'b', 5), (b'd', 50)]);
+        let output_a = root.path().join("sum-a.partial");
+        let stats_a = merge_fixed_sum_u64_runs(
+            &[first.clone(), second.clone(), third.clone()],
+            &output_a,
+            1,
+            3,
+        )
+        .expect("merge A");
+        let output_b = root.path().join("sum-b.partial");
+        let stats_b =
+            merge_fixed_sum_u64_runs(&[third, first, second], &output_b, 1, 8).expect("merge B");
+        let mut expected = Vec::new();
+        for record in [(b'a', 30_u64), (b'b', 45), (b'c', 30), (b'd', 50)] {
+            expected.push(record.0);
+            expected.extend_from_slice(&record.1.to_be_bytes());
+        }
+        assert_eq!(fs::read(&output_a).expect("output A"), expected);
+        assert_eq!(
+            fs::read(output_a).expect("output A"),
+            fs::read(output_b).expect("output B")
+        );
+        assert_eq!(stats_a, stats_b);
+        assert_eq!(stats_a.input_records, 6);
+        assert_eq!(stats_a.output_records, 4);
+        assert_eq!(stats_a.duplicate_records, 2);
+        assert_eq!(stats_a.peak_buffered_bytes, 36);
+    }
+
+    #[test]
+    fn sum_u64_merge_fails_closed_on_overflow_and_malformed_runs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let maximum = root.path().join("maximum.run");
+        let one = root.path().join("one.run");
+        write_min_records(&maximum, &[(b'a', u64::MAX)]);
+        write_min_records(&one, &[(b'a', 1)]);
+        assert!(
+            merge_fixed_sum_u64_runs(&[maximum, one], root.path().join("overflow.partial"), 1, 2,)
+                .is_err()
+        );
+        let valid = root.path().join("valid.run");
+        let duplicate = root.path().join("duplicate.run");
+        write_min_records(&valid, &[(b'a', 1), (b'b', 2)]);
+        write_min_records(&duplicate, &[(b'a', 3), (b'a', 2)]);
+        assert!(
+            merge_fixed_sum_u64_runs(
+                &[valid.clone(), duplicate],
+                root.path().join("duplicate.partial"),
+                1,
+                2,
+            )
+            .is_err()
+        );
+        let truncated = root.path().join("truncated.run");
+        fs::write(&truncated, [b'a', 0, 0]).expect("truncated");
+        assert!(
+            merge_fixed_sum_u64_runs(
+                &[valid, truncated],
+                root.path().join("truncated-sum.partial"),
                 1,
                 2,
             )

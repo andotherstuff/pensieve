@@ -7,6 +7,7 @@ mod bounded;
 mod build;
 mod error;
 mod event_facts;
+mod fixed_activity;
 mod incremental;
 mod input;
 mod plan;
@@ -20,9 +21,9 @@ pub use bounded::{
     BoundedExecutionError, CleanupEligibility, CompactionConfig, CompactionStep, DiskBudget,
     DiskPreflight, FixedRecordLayout, InputBatch, InputIdentity, MergeStats, RunCheckpoint,
     RunIdentity, RunReference, cleanup_is_eligible, load_reusable_checkpoint,
-    merge_fixed_min_u64_runs, merge_fixed_runs, plan_input_batches, plan_levelled_compaction,
-    preflight_disk, publish_canonical_json, publish_run_checkpoint, read_run_checkpoint,
-    validate_run_checkpoint,
+    merge_fixed_min_u64_runs, merge_fixed_runs, merge_fixed_sum_u64_runs, plan_input_batches,
+    plan_levelled_compaction, preflight_disk, publish_canonical_json, publish_run_checkpoint,
+    read_run_checkpoint, validate_run_checkpoint,
 };
 pub use build::{
     AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, IDENTITY_QUERY_VERSION,
@@ -33,6 +34,12 @@ pub use event_facts::{
     BoundedEventBuild, EVENT_FACT_BYTES, EVENT_FACT_KEY_BYTES, EventFact, EventFactBatchStats,
     EventFactReader, EventFactsConfig, EventFactsEvidence, EventFactsMemoryEvidence,
     build_bounded_event_facts,
+};
+pub use fixed_activity::{
+    ActiveUsersPeriod, BoundedFixedActivity, DistinctPubkeysPeriod, FIXED_ACTIVITY_KEY_BYTES,
+    FIXED_ACTIVITY_RECORD_BYTES, FIXED_ACTIVITY_VERSION, FixedActivityConfig,
+    FixedActivityEvidence, PUBKEY_FLAGS_RECORD_BYTES, advance_bounded_fixed_activity,
+    build_bounded_fixed_activity, load_bounded_fixed_activity,
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};

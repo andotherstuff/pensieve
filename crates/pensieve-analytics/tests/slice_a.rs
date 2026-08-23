@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, ObjectLocation,
-    PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, advance_bounded_pubkey_first_seen,
-    apply_incremental, build_bounded_event_facts, build_bounded_pubkey_first_seen,
-    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version, publish,
-    publish_with_identity, resolve_delta_locations, resolve_snapshot,
+    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig,
+    FixedActivityConfig, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
+    build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_pubkey_first_seen,
+    load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
+    plan_catalog_delta_for_query_version, publish, publish_with_identity, resolve_delta_locations,
+    resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -408,6 +410,258 @@ fn bounded_first_seen_is_exact_eligible_and_resumable() {
         .expect("resume first seen");
     assert_eq!(retried.evidence_sha256, evidence_sha);
     assert_eq!(retried.evidence.final_artifact.sha256, artifact_sha);
+}
+
+#[test]
+fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let profile = test_keys();
+    let follows = Keys::generate();
+    let both = Keys::generate();
+    let excluded = Keys::generate();
+    let day_a = 1_699_833_600_u64; // 2023-11-13 UTC
+    let day_b = day_a + 86_400;
+    let duplicate = event_with_keys(&profile, day_a + 2, 1, "note one");
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "activity-a",
+        &[
+            event_with_keys(&profile, day_a + 1, 0, "profile"),
+            duplicate.clone(),
+            event_with_keys(&follows, day_a + 3, 3, "follows"),
+            event_with_keys(&both, day_a + 4, 0, "profile"),
+            event_with_keys(&excluded, day_a + 5, 445, "excluded active kind"),
+        ],
+    );
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "activity-b",
+        &[
+            duplicate,
+            event_with_keys(&profile, day_b + 1, 1, "note two"),
+            event_with_keys(&profile, day_b + 2, 1, "note three"),
+            event_with_keys(&both, day_b + 3, 3, "follows"),
+            event_with_keys(&both, day_b + 4, 1, "note"),
+            event_with_keys(&follows, day_b + 5, 1, "note"),
+        ],
+    );
+    let snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "fixed-activity-test",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("export fragment")])
+    .expect("snapshot");
+    let catalog = directory.path().join("snapshot.json");
+    write_catalog_atomically(&catalog, &snapshot).expect("write snapshot");
+    let root = directory.path().join("fixed-activity");
+    let evidence = root.join("evidence.json");
+    let completed = build_bounded_fixed_activity(
+        &evidence,
+        resolve_snapshot(&catalog, Some(&lake_root)).expect("resolve snapshot"),
+        BuildConfig {
+            as_of_epoch: AS_OF,
+            code_version: "fixed-activity-test".to_owned(),
+            s3_region: "test".to_owned(),
+            s3_force_path_style: false,
+            memory_limit: "256MB".to_owned(),
+            threads: 1,
+        },
+        FixedActivityConfig {
+            work_root: root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 5,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build fixed activity");
+    assert_eq!(completed.evidence.batch_count, 2);
+    assert_eq!(completed.evidence.merge_count, 1);
+    assert_eq!(completed.evidence.flags_artifact.row_count, 4);
+    assert_eq!(completed.evidence.max_merge_buffered_bytes, 3 * 70);
+
+    let daily = completed
+        .evidence
+        .active_users
+        .iter()
+        .find(|row| row.grain == "day" && row.period_start == "2023-11-14")
+        .expect("second daily row");
+    assert_eq!(daily.active_users, 3);
+    assert_eq!(daily.has_profile, 2);
+    assert_eq!(daily.has_follows_list, 2);
+    assert_eq!(daily.has_profile_and_follows_list, 1);
+    assert_eq!(daily.total_events, 5);
+
+    let daily_all: Vec<_> = completed
+        .evidence
+        .distinct_pubkeys
+        .iter()
+        .filter(|row| row.grain == "day" && row.kind.is_none())
+        .collect();
+    assert_eq!(daily_all.len(), 2);
+    assert_eq!(
+        daily_all.iter().map(|row| row.unique_pubkeys).sum::<u64>(),
+        7
+    );
+    let weekly = completed
+        .evidence
+        .distinct_pubkeys
+        .iter()
+        .find(|row| row.grain == "week" && row.kind.is_none())
+        .expect("weekly all-kind row");
+    assert_eq!(weekly.unique_pubkeys, 4);
+    assert!(daily_all.iter().map(|row| row.unique_pubkeys).sum::<u64>() > weekly.unique_pubkeys);
+    let kind_one_weekly = completed
+        .evidence
+        .distinct_pubkeys
+        .iter()
+        .find(|row| row.grain == "week" && row.kind == Some(1))
+        .expect("weekly kind-one row");
+    assert_eq!(kind_one_weekly.unique_pubkeys, 3);
+
+    let evidence_sha = completed.evidence_sha256.clone();
+    drop(completed);
+    let loaded = load_bounded_fixed_activity(&evidence).expect("reload evidence");
+    assert_eq!(loaded.evidence_sha256, evidence_sha);
+}
+
+#[test]
+fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let existing = test_keys();
+    let added = Keys::generate();
+    let day_a = 1_699_833_600_u64;
+    let day_b = day_a + 86_400;
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "activity-baseline",
+        &[event_with_keys(&existing, day_b + 1, 1, "baseline")],
+    );
+    let baseline_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "activity-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("baseline fragment")])
+    .expect("baseline snapshot");
+    let baseline_catalog = directory.path().join("activity-baseline.json");
+    write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
+    let build = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "activity-incremental-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let baseline_root = directory.path().join("activity-baseline-work");
+    let baseline = build_bounded_fixed_activity(
+        baseline_root.join("evidence.json"),
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline"),
+        build.clone(),
+        FixedActivityConfig {
+            work_root: baseline_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: u64::MAX,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline activity");
+
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "activity-delta",
+        &[
+            event_with_keys(&existing, day_b + 2, 1, "same key increments count"),
+            event_with_keys(&existing, day_a + 1, 1, "late earlier day"),
+            event_with_keys(&added, day_b + 3, 0, "new profile"),
+        ],
+    );
+    let target_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "activity-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("target fragment")])
+    .expect("target snapshot");
+    let target_catalog = directory.path().join("activity-target.json");
+    write_catalog_atomically(&target_catalog, &target_snapshot).expect("target catalog");
+    let added_object = target_snapshot
+        .objects()
+        .iter()
+        .find(|object| object.work_unit_id == "activity-delta")
+        .expect("delta object")
+        .clone();
+    let plan = CatalogDeltaPlan {
+        snapshot_id: target_snapshot.snapshot_id.clone(),
+        previous_run_id: Some("baseline-run".to_owned()),
+        previous_snapshot_id: Some(baseline_snapshot.snapshot_id.clone()),
+        run_kind: PlannedRunKind::Incremental,
+        added_objects: vec![added_object.clone()],
+        removed_objects: Vec::new(),
+        unchanged_objects: 1,
+        added_bytes: added_object.byte_size,
+        added_physical_rows: added_object.row_count,
+        affected_min_created_at: added_object.min_created_at.clone(),
+        affected_max_created_at: added_object.max_created_at.clone(),
+        affected_range_complete: true,
+    };
+    let successor_root = directory.path().join("activity-successor-work");
+    let successor = advance_bounded_fixed_activity(
+        successor_root.join("evidence.json"),
+        &baseline,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve target"),
+        &plan,
+        &[ObjectLocation::Local(
+            lake_root.join(&added_object.object_key),
+        )],
+        build,
+        FixedActivityConfig {
+            work_root: successor_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: u64::MAX,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("advance activity");
+    assert_eq!(successor.evidence.delta_object_count, 1);
+    assert_eq!(
+        successor.evidence.baseline_evidence_sha256.as_deref(),
+        Some(baseline.evidence_sha256.as_str())
+    );
+    let day_b_row = successor
+        .evidence
+        .active_users
+        .iter()
+        .find(|row| row.grain == "day" && row.period_start == "2023-11-14")
+        .expect("target daily row");
+    assert_eq!(day_b_row.active_users, 2);
+    assert_eq!(day_b_row.has_profile, 1);
+    assert_eq!(day_b_row.total_events, 3);
+    let week_kind = successor
+        .evidence
+        .distinct_pubkeys
+        .iter()
+        .find(|row| row.grain == "week" && row.kind == Some(1))
+        .expect("weekly kind row");
+    assert_eq!(week_kind.unique_pubkeys, 1);
 }
 
 #[test]
