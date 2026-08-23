@@ -481,7 +481,9 @@ The one-time canary command is `pensieve-analytics-activity-publish`. It builds
 and validates immutable activity state with one DuckDB worker and a 4 GB
 default scan limit, requires first-seen evidence for the same snapshot and
 `as_of`, and refuses publication unless Postgres is still on that exact B1
-run. Run it first with `--dry-run`; after a successful real publication,
+run. Remote snapshots use DuckDB's environment credential chain with an
+explicit region and optional path-style addressing. Run it first with
+`--dry-run`; after a successful real publication,
 install its `activity-evidence.json` in the current analytics generation before
 enabling the recurring B2 flag. Production canary execution, evidence
 installation, and route cutover remain separate operator-authorized steps.

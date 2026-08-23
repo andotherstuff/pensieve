@@ -47,6 +47,12 @@ struct Args {
     /// Postgres password supplied separately from the connection string.
     #[arg(long, env = "POSTGRES_ANALYTICS_PASSWORD")]
     postgres_password: Option<String>,
+    /// AWS region used by DuckDB's environment credential chain.
+    #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
+    s3_region: String,
+    /// Use path-style S3 addressing.
+    #[arg(long)]
+    s3_force_path_style: bool,
     /// Build and validate immutable activity evidence without changing Postgres.
     #[arg(long)]
     dry_run: bool,
@@ -104,8 +110,8 @@ fn run() -> Result<()> {
     let build_config = BuildConfig {
         as_of_epoch: args.as_of,
         code_version: args.code_version,
-        s3_region: String::new(),
-        s3_force_path_style: false,
+        s3_region: args.s3_region,
+        s3_force_path_style: args.s3_force_path_style,
         memory_limit: args.memory_limit,
         threads: args.threads,
     };
