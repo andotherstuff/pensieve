@@ -462,10 +462,16 @@ Implementation foundation completed on the Slice 4 branch:
 - active-user products consistently exclude kinds 445 and 1059 while event
   distinct products continue to represent all API-domain kinds; and
 - append-only successors scan only verified new objects, union identities with
-  the predecessor artifact, and revalidate every artifact and serving metric.
+  the predecessor artifact, and revalidate every artifact and serving metric;
+- versioned Postgres relations expose all-kind/per-kind distinct populations
+  and active-user period rows behind the same atomic current-run pointer as
+  Slice A and first-seen products; and
+- publication revalidates both high-cardinality artifacts, binds their hashes
+  into the deterministic run ID, checks copied row counts and sums, and rolls
+  back the entire transaction on any staging failure.
 
-Postgres DDL/publication, recurring-lane integration, production canary, and
-route cutover remain separate fail-closed steps before Slice 4 is live.
+Recurring-lane integration, production canary, and route cutover remain
+separate fail-closed steps before Slice 4 is live.
 
 ### Slice 5 — cohort retention
 

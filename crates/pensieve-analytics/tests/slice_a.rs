@@ -8,8 +8,8 @@ use pensieve_analytics::{
     advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
     build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_pubkey_first_seen,
     load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, publish, publish_with_identity, resolve_delta_locations,
-    resolve_snapshot,
+    plan_catalog_delta_for_query_version, publish, publish_with_identity,
+    publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -1211,7 +1211,135 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             completed_at,
         )
         .expect("retry current identity run"),
-        PublishOutcome::AlreadyCurrent { run_id }
+        PublishOutcome::AlreadyCurrent {
+            run_id: run_id.clone()
+        }
+    );
+    let activity_root = fixture._directory.path().join("publication-activity");
+    let activity = build_bounded_fixed_activity(
+        activity_root.join("evidence.json"),
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        FixedActivityConfig {
+            work_root: activity_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build activity publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_activity_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected activity publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_activity_test
+            BEFORE INSERT ON pensieve_analytics.active_users_period
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_activity_test();
+            ",
+        )
+        .expect("install activity failure injection");
+    publish_with_identity_and_activity(
+        &mut client,
+        &fixture.build,
+        &identity,
+        &activity,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected activity COPY failure must abort publication");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT run_id FROM pensieve_analytics.current_run_metadata",
+                &[],
+            )
+            .expect("read identity run after failed activity publication")
+            .get::<_, String>(0),
+        run_id
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_activity_test ON pensieve_analytics.active_users_period;
+            DROP FUNCTION pensieve_analytics.reject_activity_test();
+            ",
+        )
+        .expect("remove activity failure injection");
+    let activity_run_id = match publish_with_identity_and_activity(
+        &mut client,
+        &fixture.build,
+        &identity,
+        &activity,
+        started_at,
+        completed_at,
+    )
+    .expect("publish activity run")
+    {
+        PublishOutcome::Published {
+            run_id: activity_run_id,
+            previous_run_id,
+        } => {
+            assert_eq!(previous_run_id.as_deref(), Some(run_id.as_str()));
+            activity_run_id
+        }
+        PublishOutcome::AlreadyCurrent { .. } => panic!("activity run must be new"),
+    };
+    let activity_metadata = client
+        .query_one(
+            "SELECT query_version, distinct_pubkeys_period_rows, active_users_period_rows FROM pensieve_analytics.current_run_metadata",
+            &[],
+        )
+        .expect("read current activity metadata");
+    assert_eq!(activity_metadata.get::<_, String>(0), "slice-b2-v1");
+    assert_eq!(
+        activity_metadata.get::<_, i64>(1),
+        activity.evidence.distinct_period_rows as i64
+    );
+    assert_eq!(
+        activity_metadata.get::<_, i64>(2),
+        activity.evidence.active_period_rows as i64
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.current_distinct_pubkeys_period",
+                &[],
+            )
+            .expect("count current distinct rows")
+            .get::<_, i64>(0),
+        activity.evidence.distinct_period_rows as i64
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.current_active_users_period",
+                &[],
+            )
+            .expect("count current active rows")
+            .get::<_, i64>(0),
+        activity.evidence.active_period_rows as i64
+    );
+    assert_eq!(
+        publish_with_identity_and_activity(
+            &mut client,
+            &fixture.build,
+            &identity,
+            &activity,
+            started_at,
+            completed_at,
+        )
+        .expect("retry current activity run"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: activity_run_id
+        }
     );
     assert_eq!(
         client
@@ -1226,7 +1354,7 @@ fn slice_a_publication_is_atomic_and_idempotent() {
     let plan = plan_catalog_delta_for_query_version(
         &mut client,
         &fixture.build.snapshot.catalog,
-        pensieve_analytics::IDENTITY_QUERY_VERSION,
+        pensieve_analytics::FIXED_ACTIVITY_QUERY_VERSION,
     )
     .expect("plan current identity snapshot");
     assert_eq!(plan.run_kind, PlannedRunKind::NoChange);

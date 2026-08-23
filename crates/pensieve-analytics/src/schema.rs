@@ -6,4 +6,6 @@ pub(crate) const SCHEMA_SQL: &str = concat!(
     include_str!("../../../docs/postgres/002_analytics_applied_objects.sql"),
     "\n",
     include_str!("../../../docs/postgres/003_analytics_slice_b_identity.sql"),
+    "\n",
+    include_str!("../../../docs/postgres/004_analytics_slice_b_activity.sql"),
 );

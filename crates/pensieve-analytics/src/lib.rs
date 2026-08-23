@@ -26,8 +26,8 @@ pub use bounded::{
     read_run_checkpoint, validate_run_checkpoint,
 };
 pub use build::{
-    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind, IDENTITY_QUERY_VERSION,
-    KindAllTime, Overview, QUERY_VERSION,
+    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind,
+    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, KindAllTime, Overview, QUERY_VERSION,
 };
 pub use error::{Error, Result};
 pub use event_facts::{
@@ -55,7 +55,8 @@ pub use pubkey_first_seen::{
 };
 pub use publish::{
     PublishOutcome, acquire_publication_lock, publish, publish_incremental,
-    publish_incremental_with_identity, publish_with_identity,
+    publish_incremental_with_identity, publish_incremental_with_identity_and_activity,
+    publish_with_identity, publish_with_identity_and_activity,
 };
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,

@@ -8,11 +8,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AnalyticsBuild, BoundedPubkeyFirstSeen, Error, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
+    AnalyticsBuild, BoundedFixedActivity, BoundedPubkeyFirstSeen, Error,
+    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
     schema::SCHEMA_SQL,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
+
+#[derive(Clone, Copy, Default)]
+struct PublicationProducts<'a> {
+    identity: Option<&'a BoundedPubkeyFirstSeen>,
+    activity: Option<&'a BoundedFixedActivity>,
+}
 
 /// Hold the analytics publication lock for the lifetime of `client`.
 ///
@@ -50,6 +57,10 @@ struct ValidationRecord {
     new_users_daily_sum: u64,
     identity_evidence_sha256: Option<String>,
     identity_metric_sha256: Option<String>,
+    fixed_activity_evidence_sha256: Option<String>,
+    fixed_activity_metric_sha256: Option<String>,
+    distinct_pubkeys_period_rows: u64,
+    active_users_period_rows: u64,
     result: &'static str,
 }
 
@@ -71,7 +82,7 @@ pub fn publish(
         completed_at,
         "full_rebuild",
         None,
-        None,
+        PublicationProducts::default(),
     )
 }
 
@@ -90,7 +101,33 @@ pub fn publish_with_identity(
         completed_at,
         "full_rebuild",
         None,
-        Some(identity),
+        PublicationProducts {
+            identity: Some(identity),
+            activity: None,
+        },
+    )
+}
+
+/// Publish Slice A, first-seen, and fixed-grain activity products atomically.
+pub fn publish_with_identity_and_activity(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    identity: &BoundedPubkeyFirstSeen,
+    activity: &BoundedFixedActivity,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "full_rebuild",
+        None,
+        PublicationProducts {
+            identity: Some(identity),
+            activity: Some(activity),
+        },
     )
 }
 
@@ -109,7 +146,7 @@ pub fn publish_incremental(
         completed_at,
         "incremental",
         Some(expected_previous_run_id),
-        None,
+        PublicationProducts::default(),
     )
 }
 
@@ -129,7 +166,34 @@ pub fn publish_incremental_with_identity(
         completed_at,
         "incremental",
         Some(expected_previous_run_id),
-        Some(identity),
+        PublicationProducts {
+            identity: Some(identity),
+            activity: None,
+        },
+    )
+}
+
+/// Publish incremental Slice A, first-seen, and activity successors atomically.
+pub fn publish_incremental_with_identity_and_activity(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    identity: &BoundedPubkeyFirstSeen,
+    activity: &BoundedFixedActivity,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(identity),
+            activity: Some(activity),
+        },
     )
 }
 
@@ -140,16 +204,29 @@ fn publish_kind(
     completed_at: DateTime<Utc>,
     run_kind: &'static str,
     expected_previous_run_id: Option<&str>,
-    identity: Option<&BoundedPubkeyFirstSeen>,
+    products: PublicationProducts<'_>,
 ) -> Result<PublishOutcome> {
+    let identity = products.identity;
+    let activity = products.activity;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
             build.config.as_of_epoch,
         )?;
     }
+    if let Some(activity) = activity {
+        if identity.is_none() {
+            return Err(Error::Validation(
+                "fixed activity publication requires first-seen identity".to_owned(),
+            ));
+        }
+        activity.validate_for_publication(
+            &build.snapshot.catalog.snapshot_id,
+            build.config.as_of_epoch,
+        )?;
+    }
     client.batch_execute(SCHEMA_SQL)?;
-    let run_id = run_id(build, identity);
+    let run_id = run_id(build, identity, activity);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
 
@@ -169,6 +246,7 @@ fn publish_kind(
         if current_run_id.as_deref() == Some(run_id.as_str()) {
             reconcile_applied_objects(&mut transaction, &run_id, build)?;
             reconcile_published_identity(&mut transaction, &run_id, identity)?;
+            reconcile_published_activity(&mut transaction, &run_id, activity)?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -190,6 +268,12 @@ fn publish_kind(
     let new_users_daily_rows = identity
         .map(|product| product.evidence.new_users_daily.len() as u64)
         .unwrap_or(0);
+    let distinct_pubkeys_period_rows = activity
+        .map(|product| product.evidence.distinct_period_rows)
+        .unwrap_or(0);
+    let active_users_period_rows = activity
+        .map(|product| product.evidence.active_period_rows)
+        .unwrap_or(0);
     let validation = serde_json::to_value(ValidationRecord {
         event_daily_sum: build.summary.api_representable_events,
         event_daily_kind_sum: build.summary.api_representable_events,
@@ -198,6 +282,11 @@ fn publish_kind(
         new_users_daily_sum: eligible_pubkeys,
         identity_evidence_sha256: identity.map(|product| product.evidence_sha256.clone()),
         identity_metric_sha256: identity.map(|product| product.evidence.metric_sha256.clone()),
+        fixed_activity_evidence_sha256: activity.map(|product| product.evidence_sha256.clone()),
+        fixed_activity_metric_sha256: activity
+            .map(|product| product.evidence.metric_sha256.clone()),
+        distinct_pubkeys_period_rows,
+        active_users_period_rows,
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -223,11 +312,13 @@ fn publish_kind(
             kind_all_time_rows,
             eligible_pubkeys,
             new_users_daily_rows,
+            distinct_pubkeys_period_rows,
+            active_users_period_rows,
             validation
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
-            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
         )
         ",
         &[
@@ -235,7 +326,7 @@ fn publish_kind(
             &build.snapshot.catalog.snapshot_id,
             &current_run_id,
             &run_kind,
-            &query_version(identity),
+            &query_version(identity, activity),
             &build.config.code_version,
             &to_i64("as_of_epoch", build.config.as_of_epoch)?,
             &started_at,
@@ -252,6 +343,8 @@ fn publish_kind(
             &to_i64("kind_all_time_rows", build.summary.kind_all_time_rows)?,
             &to_i64("eligible_pubkeys", eligible_pubkeys)?,
             &to_i64("new_users_daily_rows", new_users_daily_rows)?,
+            &to_i64("distinct_pubkeys_period_rows", distinct_pubkeys_period_rows)?,
+            &to_i64("active_users_period_rows", active_users_period_rows)?,
             &validation,
         ],
     )?;
@@ -294,7 +387,12 @@ fn publish_kind(
     if let Some(identity) = identity {
         copy_new_users_daily(&mut transaction, &run_id, identity)?;
     }
+    if let Some(activity) = activity {
+        copy_distinct_pubkeys_period(&mut transaction, &run_id, activity)?;
+        copy_active_users_period(&mut transaction, &run_id, activity)?;
+    }
     reconcile_published_identity(&mut transaction, &run_id, identity)?;
+    reconcile_published_activity(&mut transaction, &run_id, activity)?;
 
     transaction.execute(
         "
@@ -483,6 +581,70 @@ fn copy_new_users_daily(
     )
 }
 
+fn copy_distinct_pubkeys_period(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    activity: &BoundedFixedActivity,
+) -> Result<()> {
+    let mut writer = transaction.copy_in(
+        "
+        COPY pensieve_analytics.distinct_pubkeys_period (
+            run_id, grain, period_start, kind_key, unique_pubkeys
+        ) FROM STDIN WITH (FORMAT csv)
+        ",
+    )?;
+    for row in &activity.evidence.distinct_pubkeys {
+        writeln!(
+            writer,
+            "{run_id},{},{},{},{}",
+            row.grain,
+            row.period_start,
+            row.kind.map_or(-1_i32, i32::from),
+            row.unique_pubkeys
+        )?;
+    }
+    let inserted = writer.finish()?;
+    expect_copied(
+        "distinct_pubkeys_period",
+        inserted,
+        activity.evidence.distinct_period_rows,
+    )
+}
+
+fn copy_active_users_period(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    activity: &BoundedFixedActivity,
+) -> Result<()> {
+    let mut writer = transaction.copy_in(
+        "
+        COPY pensieve_analytics.active_users_period (
+            run_id, grain, period_start, active_users, has_profile,
+            has_follows_list, has_profile_and_follows_list, total_events
+        ) FROM STDIN WITH (FORMAT csv)
+        ",
+    )?;
+    for row in &activity.evidence.active_users {
+        writeln!(
+            writer,
+            "{run_id},{},{},{},{},{},{},{}",
+            row.grain,
+            row.period_start,
+            row.active_users,
+            row.has_profile,
+            row.has_follows_list,
+            row.has_profile_and_follows_list,
+            row.total_events
+        )?;
+    }
+    let inserted = writer.finish()?;
+    expect_copied(
+        "active_users_period",
+        inserted,
+        activity.evidence.active_period_rows,
+    )
+}
+
 fn reconcile_published_identity(
     transaction: &mut impl GenericClient,
     run_id: &str,
@@ -532,6 +694,85 @@ fn reconcile_published_identity(
     Ok(())
 }
 
+fn reconcile_published_activity(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    activity: Option<&BoundedFixedActivity>,
+) -> Result<()> {
+    let expected_distinct_rows = activity
+        .map(|product| product.evidence.distinct_period_rows)
+        .unwrap_or(0);
+    let expected_active_rows = activity
+        .map(|product| product.evidence.active_period_rows)
+        .unwrap_or(0);
+    let expected_distinct_sum = activity.map_or(Ok(0), |product| {
+        product
+            .evidence
+            .distinct_pubkeys
+            .iter()
+            .try_fold(0_u64, |sum, row| {
+                sum.checked_add(row.unique_pubkeys)
+                    .ok_or(Error::NumericOverflow {
+                        field: "distinct pubkey sum",
+                        value: row.unique_pubkeys,
+                    })
+            })
+    })?;
+    let expected_active_sum = activity.map_or(Ok(0), |product| {
+        product
+            .evidence
+            .active_users
+            .iter()
+            .try_fold(0_u64, |sum, row| {
+                sum.checked_add(row.active_users)
+                    .ok_or(Error::NumericOverflow {
+                        field: "active user sum",
+                        value: row.active_users,
+                    })
+            })
+    })?;
+    let row = transaction.query_one(
+        "
+        SELECT runs.distinct_pubkeys_period_rows,
+               runs.active_users_period_rows,
+               (SELECT count(*)::BIGINT
+                  FROM pensieve_analytics.distinct_pubkeys_period WHERE run_id = $1),
+               (SELECT coalesce(sum(unique_pubkeys), 0)::BIGINT
+                  FROM pensieve_analytics.distinct_pubkeys_period WHERE run_id = $1),
+               (SELECT count(*)::BIGINT
+                  FROM pensieve_analytics.active_users_period WHERE run_id = $1),
+               (SELECT coalesce(sum(active_users), 0)::BIGINT
+                  FROM pensieve_analytics.active_users_period WHERE run_id = $1)
+        FROM pensieve_analytics.runs runs
+        WHERE runs.run_id = $1
+        ",
+        &[&run_id],
+    )?;
+    let actual = [
+        from_i64("published distinct metadata rows", row.get(0))?,
+        from_i64("published active metadata rows", row.get(1))?,
+        from_i64("published distinct row count", row.get(2))?,
+        from_i64("published distinct sum", row.get(3))?,
+        from_i64("published active row count", row.get(4))?,
+        from_i64("published active sum", row.get(5))?,
+    ];
+    if actual
+        != [
+            expected_distinct_rows,
+            expected_active_rows,
+            expected_distinct_rows,
+            expected_distinct_sum,
+            expected_active_rows,
+            expected_active_sum,
+        ]
+    {
+        return Err(Error::Validation(format!(
+            "published fixed-activity accounting {actual:?} does not match expected rows/sums"
+        )));
+    }
+    Ok(())
+}
+
 fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
     if actual != expected {
         return Err(Error::Validation(format!(
@@ -541,13 +782,17 @@ fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_id(build: &AnalyticsBuild, identity: Option<&BoundedPubkeyFirstSeen>) -> String {
+fn run_id(
+    build: &AnalyticsBuild,
+    identity: Option<&BoundedPubkeyFirstSeen>,
+    activity: Option<&BoundedFixedActivity>,
+) -> String {
     let mut digest = Sha256::new();
     digest.update(build.snapshot.catalog.snapshot_id.as_bytes());
     digest.update([0]);
     digest.update(build.config.as_of_epoch.to_be_bytes());
     digest.update([0]);
-    digest.update(query_version(identity).as_bytes());
+    digest.update(query_version(identity, activity).as_bytes());
     digest.update([0]);
     digest.update(build.config.code_version.as_bytes());
     if let Some(identity) = identity {
@@ -558,11 +803,26 @@ fn run_id(build: &AnalyticsBuild, identity: Option<&BoundedPubkeyFirstSeen>) -> 
         digest.update([0]);
         digest.update(identity.evidence.final_artifact.sha256.as_bytes());
     }
+    if let Some(activity) = activity {
+        digest.update([0]);
+        digest.update(activity.evidence_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(activity.evidence.metric_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(activity.evidence.activity_artifact.sha256.as_bytes());
+        digest.update([0]);
+        digest.update(activity.evidence.flags_artifact.sha256.as_bytes());
+    }
     hex::encode(digest.finalize())
 }
 
-fn query_version(identity: Option<&BoundedPubkeyFirstSeen>) -> &'static str {
-    if identity.is_some() {
+fn query_version(
+    identity: Option<&BoundedPubkeyFirstSeen>,
+    activity: Option<&BoundedFixedActivity>,
+) -> &'static str {
+    if activity.is_some() {
+        FIXED_ACTIVITY_QUERY_VERSION
+    } else if identity.is_some() {
         IDENTITY_QUERY_VERSION
     } else {
         QUERY_VERSION
