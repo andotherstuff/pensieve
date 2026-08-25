@@ -8,8 +8,9 @@ use pensieve_analytics::{
     advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
     build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_pubkey_first_seen,
     load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, publish, publish_with_identity,
-    publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
+    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
+    publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
+    resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -538,6 +539,7 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
     let lake_root = directory.path().join("lake");
     let existing = test_keys();
     let added = Keys::generate();
+    let maturing = Keys::generate();
     let day_a = 1_699_833_600_u64;
     let day_b = day_a + 86_400;
     let mut inventory = Inventory::open_in_memory().expect("inventory");
@@ -545,7 +547,10 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         &mut inventory,
         &lake_root,
         "activity-baseline",
-        &[event_with_keys(&existing, day_b + 1, 1, "baseline")],
+        &[
+            event_with_keys(&existing, day_b + 1, 1, "baseline"),
+            event_with_keys(&maturing, AS_OF + 50, 1, "future at baseline"),
+        ],
     );
     let baseline_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
         &mut inventory,
@@ -580,6 +585,16 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         },
     )
     .expect("build baseline activity");
+    assert_eq!(baseline.evidence.activity_artifact.row_count, 2);
+    assert_eq!(
+        baseline
+            .evidence
+            .active_users
+            .iter()
+            .map(|row| row.total_events)
+            .sum::<u64>(),
+        3
+    );
 
     publish_object(
         &mut inventory,
@@ -629,7 +644,10 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         &[ObjectLocation::Local(
             lake_root.join(&added_object.object_key),
         )],
-        build,
+        BuildConfig {
+            as_of_epoch: AS_OF + 100,
+            ..build
+        },
         FixedActivityConfig {
             work_root: successor_root,
             batch_limits: BatchLimits {
@@ -652,16 +670,16 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         .iter()
         .find(|row| row.grain == "day" && row.period_start == "2023-11-14")
         .expect("target daily row");
-    assert_eq!(day_b_row.active_users, 2);
+    assert_eq!(day_b_row.active_users, 3);
     assert_eq!(day_b_row.has_profile, 1);
-    assert_eq!(day_b_row.total_events, 3);
+    assert_eq!(day_b_row.total_events, 4);
     let week_kind = successor
         .evidence
         .distinct_pubkeys
         .iter()
         .find(|row| row.grain == "week" && row.kind == Some(1))
         .expect("weekly kind row");
-    assert_eq!(week_kind.unique_pubkeys, 1);
+    assert_eq!(week_kind.unique_pubkeys, 2);
 }
 
 #[test]
@@ -1298,7 +1316,7 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             &[],
         )
         .expect("read current activity metadata");
-    assert_eq!(activity_metadata.get::<_, String>(0), "slice-b2-v1");
+    assert_eq!(activity_metadata.get::<_, String>(0), "slice-b2-v2");
     assert_eq!(
         activity_metadata.get::<_, i64>(1),
         activity.evidence.distinct_period_rows as i64
@@ -1358,6 +1376,22 @@ fn slice_a_publication_is_atomic_and_idempotent() {
     )
     .expect("plan current identity snapshot");
     assert_eq!(plan.run_kind, PlannedRunKind::NoChange);
+    let historical_plan = plan_catalog_delta_from_run(
+        &mut client,
+        &fixture.build.snapshot.catalog,
+        &run_id,
+        pensieve_analytics::IDENTITY_QUERY_VERSION,
+    )
+    .expect("plan from historical identity run");
+    assert_eq!(historical_plan.run_kind, PlannedRunKind::NoChange);
+    assert_eq!(
+        historical_plan.previous_run_id.as_deref(),
+        Some(run_id.as_str())
+    );
+    assert_eq!(
+        historical_plan.previous_snapshot_id.as_deref(),
+        Some(fixture.build.snapshot.catalog.snapshot_id.as_str())
+    );
     assert_eq!(plan.unchanged_objects, 2);
     assert!(plan.added_objects.is_empty());
     assert!(plan.removed_objects.is_empty());

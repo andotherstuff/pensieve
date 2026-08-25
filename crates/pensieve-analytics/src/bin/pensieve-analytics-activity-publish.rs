@@ -6,10 +6,11 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, FixedActivityConfig, IDENTITY_QUERY_VERSION,
-    PublishOutcome, acquire_publication_lock, build_bounded_fixed_activity,
+    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, FixedActivityConfig,
+    IDENTITY_QUERY_VERSION, PublishOutcome, acquire_publication_lock,
+    advance_bounded_fixed_activity, build_bounded_fixed_activity, load_bounded_fixed_activity,
     load_bounded_pubkey_first_seen, publish_incremental_with_identity_and_activity,
-    resolve_snapshot,
+    resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -35,6 +36,15 @@ struct Args {
     /// Immutable fixed-activity completion evidence.
     #[arg(long)]
     activity_evidence: PathBuf,
+    /// Verified predecessor activity evidence; enables append-only advancement.
+    #[arg(long, requires_all = ["delta_plan", "delta_object_root"])]
+    activity_baseline_evidence: Option<PathBuf>,
+    /// Persisted historical-run catalog delta plan used to stage successor objects.
+    #[arg(long)]
+    delta_plan: Option<PathBuf>,
+    /// Root containing only the delta plan's verified added objects.
+    #[arg(long)]
+    delta_object_root: Option<PathBuf>,
     /// Fixed as-of from the current Slice B1 run.
     #[arg(long)]
     as_of: u64,
@@ -88,6 +98,8 @@ struct Output {
     distinct_period_rows: u64,
     active_period_rows: u64,
     activity_evidence_sha256: String,
+    baseline_evidence_sha256: Option<String>,
+    delta_object_count: u64,
     activity_artifact_sha256: String,
     flags_artifact_sha256: String,
     max_merge_buffered_bytes: usize,
@@ -123,21 +135,51 @@ fn run() -> Result<()> {
     identity
         .validate_for_publication(&snapshot.catalog.snapshot_id, args.as_of)
         .context("validate first-seen evidence")?;
-    let activity = build_bounded_fixed_activity(
-        &args.activity_evidence,
-        snapshot,
-        build_config,
-        FixedActivityConfig {
-            work_root: args.activity_work_root,
-            batch_limits: BatchLimits {
-                max_bytes: args.batch_bytes,
-                max_rows: args.batch_rows,
-            },
-            merge_fan_in: args.merge_fan_in,
-            disk_reserve_bytes: args.disk_reserve_bytes,
+    let activity_config = FixedActivityConfig {
+        work_root: args.activity_work_root,
+        batch_limits: BatchLimits {
+            max_bytes: args.batch_bytes,
+            max_rows: args.batch_rows,
         },
-    )
-    .context("build bounded fixed-activity state")?;
+        merge_fan_in: args.merge_fan_in,
+        disk_reserve_bytes: args.disk_reserve_bytes,
+    };
+    let activity = match (
+        args.activity_baseline_evidence.as_ref(),
+        args.delta_plan.as_ref(),
+        args.delta_object_root.as_ref(),
+    ) {
+        (Some(baseline_path), Some(plan_path), Some(delta_root)) => {
+            let baseline = load_bounded_fixed_activity(baseline_path)
+                .context("load baseline fixed-activity evidence")?;
+            let plan: CatalogDeltaPlan = serde_json::from_slice(
+                &std::fs::read(plan_path).context("read persisted activity delta plan")?,
+            )
+            .context("decode persisted activity delta plan")?;
+            let delta_locations = resolve_delta_locations(&plan, delta_root)
+                .context("resolve verified activity delta objects")?;
+            advance_bounded_fixed_activity(
+                &args.activity_evidence,
+                &baseline,
+                snapshot,
+                &plan,
+                &delta_locations,
+                build_config,
+                activity_config,
+            )
+            .context("advance bounded fixed-activity state")?
+        }
+        (None, None, None) => build_bounded_fixed_activity(
+            &args.activity_evidence,
+            snapshot,
+            build_config,
+            activity_config,
+        )
+        .context("build bounded fixed-activity state")?,
+        _ => bail!(
+            "activity baseline evidence, delta plan, and delta object root must be supplied together"
+        ),
+    };
 
     let mut postgres_config: PostgresConfig = args
         .postgres_url
@@ -200,6 +242,8 @@ fn run() -> Result<()> {
             distinct_period_rows: activity.evidence.distinct_period_rows,
             active_period_rows: activity.evidence.active_period_rows,
             activity_evidence_sha256: activity.evidence_sha256,
+            baseline_evidence_sha256: activity.evidence.baseline_evidence_sha256,
+            delta_object_count: activity.evidence.delta_object_count,
             activity_artifact_sha256: activity.evidence.activity_artifact.sha256,
             flags_artifact_sha256: activity.evidence.flags_artifact.sha256,
             max_merge_buffered_bytes: activity.evidence.max_merge_buffered_bytes,

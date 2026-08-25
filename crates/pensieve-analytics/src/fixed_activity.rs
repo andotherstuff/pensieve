@@ -1,11 +1,12 @@
 //! Bounded exact fixed-grain pubkey activity products.
 //!
-//! The durable state is one sorted `(pubkey, UTC day, kind, event ID)` record.
+//! The durable state is one sorted `(pubkey, timestamp, kind, event ID)` record.
 //! Retaining the committed event ID suppresses duplicates across Parquet
-//! objects before any count is finalized. Daily records are sufficient to derive exact day, calendar-week,
-//! and calendar-month distinct populations without duplicating identities for
-//! every grain. Finalization streams by pubkey and retains at most two
-//! 65,536-kind sets plus compact time/key counters.
+//! objects before any count is finalized. Retaining the exact timestamp lets
+//! append-only successors advance `as_of` without rescanning unchanged objects:
+//! newly eligible records are filtered during finalization. Finalization
+//! streams by pubkey and retains at most two 65,536-kind sets plus compact
+//! time/key counters.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -29,15 +30,15 @@ use crate::{
     plan_input_batches, preflight_disk, publish_canonical_json, publish_run_checkpoint,
 };
 
-/// Pubkey, UTC-day, kind, and committed event-ID bytes in each activity record.
+/// Pubkey, exact timestamp, kind, and committed event-ID bytes in each record.
 pub const FIXED_ACTIVITY_KEY_BYTES: usize = 32 + 4 + 2 + 32;
 /// Every activity record is entirely key material.
 pub const FIXED_ACTIVITY_RECORD_BYTES: usize = FIXED_ACTIVITY_KEY_BYTES;
 /// Pubkey plus exact ever-observed profile/follows flags.
 pub const PUBKEY_FLAGS_RECORD_BYTES: usize = 33;
 /// Semantic product version.
-pub const FIXED_ACTIVITY_VERSION: &str = "fixed-activity-v1";
-const RUNNER_VERSION: &str = "pensieve-analytics-fixed-activity-v1";
+pub const FIXED_ACTIVITY_VERSION: &str = "fixed-activity-v2";
+const RUNNER_VERSION: &str = "pensieve-analytics-fixed-activity-v2";
 const PROFILE_FLAG: u8 = 1;
 const FOLLOWS_FLAG: u8 = 2;
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -174,6 +175,7 @@ impl BoundedFixedActivity {
             Path::new(&evidence.flags_artifact.path),
             &evidence.activity_artifact,
             &evidence.flags_artifact,
+            evidence.as_of_epoch,
         )?;
         if finalized.distinct_pubkeys != evidence.distinct_pubkeys
             || finalized.active_users != evidence.active_users
@@ -402,6 +404,7 @@ fn build_from_inputs(
         &flags.path,
         &merged.final_run.checkpoint.artifact,
         &flags.checkpoint.artifact,
+        build.as_of_epoch,
     )?;
     let evidence = FixedActivityEvidence {
         schema_version: 1,
@@ -462,8 +465,7 @@ fn build_batch(
             .create_new(true)
             .open(&partial)?,
     );
-    let (rows, min_key, max_key) =
-        scan_batch(connection, locations, build.as_of_epoch, &mut writer)?;
+    let (rows, min_key, max_key) = scan_batch(connection, locations, &mut writer)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -483,17 +485,23 @@ fn build_batch(
 fn scan_batch(
     connection: &Connection,
     locations: &[ObjectLocation],
-    as_of: u64,
     writer: &mut impl Write,
 ) -> Result<(u64, Option<String>, Option<String>)> {
+    // DuckDB 1.5's compressed-materialization optimizer can abort while
+    // deriving integral statistics when an unsigned Parquet column contains
+    // values just outside a narrowed projection, even when the WHERE clause
+    // excludes them. Activity scans must safely tolerate pre-genesis and
+    // post-API timestamps, so disable that one optimizer on this dedicated
+    // bounded-build connection rather than risking a process abort.
+    connection.execute_batch("SET disabled_optimizers = 'compressed_materialization'")?;
     let paths = locations
         .iter()
         .map(|location| sql_string(&location.duckdb_path()))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT pubkey, floor(created_at / 86400)::UINTEGER AS day, kind::USMALLINT, id FROM read_parquet([{paths}], union_by_name=false) WHERE created_at >= {} AND created_at <= {as_of} GROUP BY pubkey, day, kind, id ORDER BY pubkey, day, kind, id",
-        NOSTR_GENESIS_TIMESTAMP
+        "SELECT pubkey, TRY_CAST(created_at AS UINTEGER), kind::USMALLINT, id FROM read_parquet([{paths}], union_by_name=false) WHERE created_at >= {} AND created_at <= {} GROUP BY pubkey, created_at, kind, id ORDER BY pubkey, created_at, kind, id",
+        NOSTR_GENESIS_TIMESTAMP, API_TIMESTAMP_MAX
     );
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query([])?;
@@ -650,6 +658,9 @@ fn build_flags(
     let mut min_key = None;
     let mut max_key = None;
     while let Some(record) = reader.next()? {
+        if u64::from(record.created_at) > build.as_of_epoch {
+            continue;
+        }
         if current.is_some_and(|pubkey| pubkey != record.pubkey) {
             let pubkey = current.expect("current pubkey");
             writer.write_all(&pubkey)?;
@@ -703,7 +714,7 @@ fn build_flags(
 #[derive(Clone, Copy)]
 struct ActivityRecord {
     pubkey: [u8; 32],
-    day: u32,
+    created_at: u32,
     kind: u16,
 }
 
@@ -737,7 +748,7 @@ impl ActivityReader {
         self.previous = Some(key);
         Ok(Some(ActivityRecord {
             pubkey: key[..32].try_into().expect("fixed pubkey"),
-            day: u32::from_be_bytes(key[32..36].try_into().expect("fixed day")),
+            created_at: u32::from_be_bytes(key[32..36].try_into().expect("fixed timestamp")),
             kind: u16::from_be_bytes(key[36..38].try_into().expect("fixed kind")),
         }))
     }
@@ -764,6 +775,7 @@ fn finalize(
     flags_path: &Path,
     activity_artifact: &ArtifactIdentity,
     flags_artifact: &ArtifactIdentity,
+    as_of_epoch: u64,
 ) -> Result<FinalizedActivity> {
     let mut activity = ActivityReader::open(activity_path)?;
     let mut flags = BufReader::new(File::open(flags_path)?);
@@ -786,6 +798,9 @@ fn finalize(
 
     while let Some(record) = activity.next()? {
         activity_rows = checked_add(activity_rows, 1, "finalized activity rows")?;
+        if u64::from(record.created_at) > as_of_epoch {
+            continue;
+        }
         if current_pubkey != Some(record.pubkey) {
             let (flag_pubkey, value) = read_flag_record(&mut flags)?.ok_or_else(|| {
                 BoundedExecutionError::Invalid("flags end before activity state".to_owned())
@@ -808,15 +823,16 @@ fn finalize(
             week_kinds.clear();
             month_kinds.clear();
         }
-        let week = week_start(record.day);
-        let month = month_start(record.day)?;
-        if last_day != Some(record.day) {
-            increment_map(&mut distinct, (0, record.day, None), 1, "daily distinct")?;
-            last_day = Some(record.day);
+        let day = record.created_at / 86_400;
+        let week = week_start(day);
+        let month = month_start(day)?;
+        if last_day != Some(day) {
+            increment_map(&mut distinct, (0, day, None), 1, "daily distinct")?;
+            last_day = Some(day);
         }
         increment_map(
             &mut distinct,
-            (0, record.day, Some(record.kind)),
+            (0, day, Some(record.kind)),
             1,
             "daily kind distinct",
         )?;
@@ -850,12 +866,12 @@ fn finalize(
         }
 
         if !matches!(record.kind, 445 | 1059) {
-            add_active_events(&mut active, (0, record.day), 1)?;
+            add_active_events(&mut active, (0, day), 1)?;
             add_active_events(&mut active, (1, week), 1)?;
             add_active_events(&mut active, (2, month), 1)?;
-            if active_day != Some(record.day) {
-                add_active_pubkey(&mut active, (0, record.day), current_flags)?;
-                active_day = Some(record.day);
+            if active_day != Some(day) {
+                add_active_pubkey(&mut active, (0, day), current_flags)?;
+                active_day = Some(day);
             }
             if active_week != Some(week) {
                 add_active_pubkey(&mut active, (1, week), current_flags)?;
@@ -1103,7 +1119,7 @@ fn run_identity(snapshot: &ResolvedSnapshot, build: &BuildConfig, phase: &str) -
         as_of: build.as_of_epoch,
         product: format!("fixed-activity-{phase}"),
         product_version: FIXED_ACTIVITY_VERSION.to_owned(),
-        key_space: "pubkey-32-day-u32-kind-u16-event-id-32-v1".to_owned(),
+        key_space: "pubkey-32-created-at-u32-kind-u16-event-id-32-v2".to_owned(),
     }
 }
 

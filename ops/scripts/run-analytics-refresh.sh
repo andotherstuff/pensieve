@@ -244,7 +244,7 @@ fi
 
 plan_args=(--catalog "$target_snapshot")
 if [ "$activity_enabled" = "1" ]; then
-    plan_args+=(--query-version slice-b2-v1)
+    plan_args+=(--query-version slice-b2-v2)
 elif [ "$identity_enabled" = "1" ]; then
     plan_args+=(--query-version slice-b1-v1)
 fi

@@ -97,6 +97,37 @@ pub fn plan_catalog_delta_for_query_version(
     plan_from_baseline(snapshot, baseline, query_version)
 }
 
+/// Compare a target catalog with one specific previously published run.
+///
+/// This supports a bounded artifact canary whose publication baseline advances
+/// while the canary is running. The historical run remains immutable in
+/// `run_inputs`, so only objects added since that exact snapshot are selected.
+pub fn plan_catalog_delta_from_run(
+    client: &mut Client,
+    snapshot: &ActiveRawSnapshot,
+    baseline_run_id: &str,
+    expected_query_version: &str,
+) -> Result<CatalogDeltaPlan> {
+    if baseline_run_id.is_empty() || expected_query_version.is_empty() {
+        return Err(Error::Validation(
+            "historical baseline run and query version must not be empty".to_owned(),
+        ));
+    }
+    client.batch_execute(SCHEMA_SQL)?;
+    let baseline = load_baseline_run(client, baseline_run_id)?.ok_or_else(|| {
+        Error::Validation(format!(
+            "historical analytics run does not exist: {baseline_run_id}"
+        ))
+    })?;
+    if baseline.query_version != expected_query_version {
+        return Err(Error::Validation(format!(
+            "historical analytics run query version is {}, expected {expected_query_version}",
+            baseline.query_version
+        )));
+    }
+    plan_against_baseline(snapshot, baseline)
+}
+
 #[derive(Debug)]
 struct Baseline {
     run_id: String,
@@ -106,16 +137,28 @@ struct Baseline {
 }
 
 fn load_baseline(client: &mut impl GenericClient) -> Result<Option<Baseline>> {
+    let Some(run_id) = client
+        .query_opt(
+            "SELECT run_id FROM pensieve_analytics.current_run_metadata",
+            &[],
+        )?
+        .map(|row| row.get::<_, String>(0))
+    else {
+        return Ok(None);
+    };
+    load_baseline_run(client, &run_id)
+}
+
+fn load_baseline_run(client: &mut impl GenericClient, run_id: &str) -> Result<Option<Baseline>> {
     let Some(run) = client.query_opt(
-        "SELECT run_id, snapshot_id, query_version FROM pensieve_analytics.current_run_metadata",
-        &[],
+        "SELECT snapshot_id, query_version FROM pensieve_analytics.runs WHERE run_id = $1",
+        &[&run_id],
     )?
     else {
         return Ok(None);
     };
-    let run_id = run.get::<_, String>(0);
-    let snapshot_id = run.get::<_, String>(1);
-    let query_version = run.get::<_, String>(2);
+    let snapshot_id = run.get::<_, String>(0);
+    let query_version = run.get::<_, String>(1);
     let objects = client
         .query(
             "
@@ -140,7 +183,7 @@ fn load_baseline(client: &mut impl GenericClient) -> Result<Option<Baseline>> {
         .map(applied_object_from_row)
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(Baseline {
-        run_id,
+        run_id: run_id.to_owned(),
         snapshot_id,
         query_version,
         objects,
@@ -184,6 +227,13 @@ fn plan_from_baseline(
             0,
         );
     }
+    plan_against_baseline(snapshot, baseline)
+}
+
+fn plan_against_baseline(
+    snapshot: &ActiveRawSnapshot,
+    baseline: Baseline,
+) -> Result<CatalogDeltaPlan> {
     let mut previous: BTreeMap<_, _> = baseline
         .objects
         .into_iter()

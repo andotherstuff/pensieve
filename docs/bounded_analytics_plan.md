@@ -448,9 +448,10 @@ counts, and all excluded-kind/time-domain rules reconcile.
 
 Implementation foundation completed on the Slice 4 branch:
 
-- one immutable record per canonical `(pubkey, UTC day, kind, event ID)` keeps
+- one immutable record per canonical `(pubkey, exact timestamp, kind, event ID)` keeps
   cross-object duplicate suppression exact while retaining the identities
-  needed for every fixed grain;
+  needed for every fixed grain and for future events to become eligible as the
+  publication `as_of` advances without rescanning unchanged objects;
 - byte/row-bounded DuckDB batches and fixed-fan-in streaming merges make peak
   merge memory independent of archive cardinality;
 - a streaming finalizer derives exact daily, calendar-week, and
@@ -461,8 +462,10 @@ Implementation foundation completed on the Slice 4 branch:
   in-memory map;
 - active-user products consistently exclude kinds 445 and 1059 while event
   distinct products continue to represent all API-domain kinds; and
-- append-only successors scan only verified new objects, union identities with
-  the predecessor artifact, and revalidate every artifact and serving metric;
+- every object scan retains the full API timestamp domain, while finalization
+  applies the run's exact `as_of`; append-only successors therefore scan only
+  verified new objects, union identities with the predecessor artifact, and
+  revalidate every artifact and serving metric;
 - versioned Postgres relations expose all-kind/per-kind distinct populations
   and active-user period rows behind the same atomic current-run pointer as
   Slice A and first-seen products; and
@@ -472,10 +475,18 @@ Implementation foundation completed on the Slice 4 branch:
 
 The recurring lane now has a fail-closed, opt-in Slice B2 path. When
 `PENSIEVE_ANALYTICS_ACTIVITY_ENABLED=1`, it also requires the B1 lane, requires
-both evidence files in the current generation, plans against `slice-b2-v1`,
+both evidence files in the current generation, plans against `slice-b2-v2`,
 advances each product from the same verified delta, and publishes Slice A, B1,
 and B2 in one transaction. A failed build or publication leaves the prior
 generation current.
+
+The first full production canary (`fixed-activity-v1`) completed successfully
+and remains immutable evidence, but was deliberately not published: its
+day-level state filtered at scan time, so an advancing `as_of` could miss a
+future-dated event in an unchanged object when that event later became
+eligible. Version 2 keeps the same 70-byte record size while retaining the
+exact timestamp and filtering only during finalization. Query version
+`slice-b2-v2` prevents accidental reuse or publication of the v1 state.
 
 The one-time canary command is `pensieve-analytics-activity-publish`. It builds
 and validates immutable activity state with one DuckDB worker and a 4 GB
@@ -487,6 +498,9 @@ explicit region and optional path-style addressing. Run it first with
 install its `activity-evidence.json` in the current analytics generation before
 enabling the recurring B2 flag. Production canary execution, evidence
 installation, and route cutover remain separate operator-authorized steps.
+The planner can also bind a delta to an exact historical run ID, allowing a
+verified frozen baseline to catch up to a newer append-only catalog without
+depending on whichever generation is current when the build begins.
 
 ### Slice 5 — cohort retention
 

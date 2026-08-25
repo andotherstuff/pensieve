@@ -45,7 +45,7 @@ pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locat
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use plan::{
     AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta,
-    plan_catalog_delta_for_query_version,
+    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
 };
 pub use pubkey_first_seen::{
     BoundedPubkeyFirstSeen, NewUsersDaily, PUBKEY_FIRST_SEEN_BYTES, PUBKEY_FIRST_SEEN_KEY_BYTES,

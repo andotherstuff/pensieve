@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use pensieve_analytics::{QUERY_VERSION, plan_catalog_delta_for_query_version};
+use pensieve_analytics::{
+    QUERY_VERSION, plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
+};
 use pensieve_lake::read_catalog_snapshot;
 use postgres::{Config as PostgresConfig, NoTls};
 
@@ -17,6 +19,9 @@ struct Args {
     /// Product contract expected for the current Postgres baseline.
     #[arg(long, default_value = QUERY_VERSION)]
     query_version: String,
+    /// Specific historical run to compare against instead of the current run.
+    #[arg(long)]
+    baseline_run_id: Option<String>,
     /// Postgres connection string for the analytics serving database.
     #[arg(long, env = "DATABASE_URL")]
     postgres_url: String,
@@ -45,8 +50,13 @@ fn run() -> Result<()> {
     let mut client = config
         .connect(NoTls)
         .context("connect to Postgres without TLS")?;
-    let plan = plan_catalog_delta_for_query_version(&mut client, &snapshot, &args.query_version)
-        .context("plan catalog delta")?;
+    let plan = if let Some(baseline_run_id) = args.baseline_run_id.as_deref() {
+        plan_catalog_delta_from_run(&mut client, &snapshot, baseline_run_id, &args.query_version)
+            .context("plan catalog delta from historical run")?
+    } else {
+        plan_catalog_delta_for_query_version(&mut client, &snapshot, &args.query_version)
+            .context("plan catalog delta")?
+    };
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }
