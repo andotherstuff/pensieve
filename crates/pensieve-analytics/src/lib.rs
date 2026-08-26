@@ -5,6 +5,7 @@
 
 mod bounded;
 mod build;
+mod cohort_retention;
 mod error;
 mod event_facts;
 mod fixed_activity;
@@ -28,6 +29,10 @@ pub use bounded::{
 pub use build::{
     AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind,
     FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, KindAllTime, Overview, QUERY_VERSION,
+};
+pub use cohort_retention::{
+    BoundedCohortRetention, CohortRetentionEvidence, CohortRetentionPeriod,
+    build_bounded_cohort_retention, load_bounded_cohort_retention,
 };
 pub use error::{Error, Result};
 pub use event_facts::{
