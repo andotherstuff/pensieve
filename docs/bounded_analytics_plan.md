@@ -548,14 +548,53 @@ one Postgres transaction.
 
 Goal: serve dynamic event, kind, hourly, zap, and long-form identity counts.
 
-- select one sketch library and serialization version;
-- deterministic build and union tests;
+- [x] Select Apache DataSketches Rust HLL, `lg_k=12`, `Hll8`, library
+  serialization version 1 inside Pensieve envelope version 1. The dependency
+  is locked by `Cargo.lock`; serialized artifacts additionally record their
+  own format, precision, target type, and payload length.
+- [x] Add deterministic leaf and union rules plus sparse, dense, adversarial,
+  duplicate, repeated-rebuild, envelope, and order-independent union tests.
 - daily/hour/kind sketch products as required;
 - absolute/relative tolerance evidence against exact samples; and
 - builder-side merge into Postgres final counts.
 
 Gate: errors remain within the accepted per-field tolerance across sparse,
 dense, adversarial, and repeated rebuild fixtures.
+
+#### Slice 6 sketch contract v1
+
+The shared primitive is `pensieve_analytics::DistinctSketch`. Leaf builders
+must stream identities in ascending raw 32-byte order. Adjacent duplicates are
+ignored and descending input fails closed. Merge callers may discover immutable
+leaf checkpoints in any order: the primitive sorts the bounded list of
+serialized leaves before union so the resulting bytes are reproducible.
+
+The accepted dense-fixture relative error is at most 2%. Sparse fixtures must
+remain exact while Apache DataSketches is in its coupon modes. Postgres receives
+rounded final counts; estimates are never used as event, zap, or article row
+counts. Exact additive counts and fixed-grain distinct products remain on their
+existing exact paths.
+
+| API field | Sketch identity | Leaf key | Upstream fact gate |
+|---|---|---|---|
+| Event `unique_pubkeys` | event author pubkey | UTC day, optional kind | canonical event facts |
+| Hourly `unique_pubkeys` | event author pubkey | UTC day, hour-of-day, optional kind | canonical event facts |
+| Zap `unique_senders` / `unique_recipients` | validated sender / recipient pubkey | UTC day and role | Slice 7 zap parsing parity |
+| Long-form `unique_authors` | kind-30023 author pubkey | UTC day | canonical event facts |
+
+Zap sketch publication is deliberately blocked until Slice 7 proves the
+canonical parsed-zap fact domain. The HLL primitive can land first because it
+does not assign zap semantics.
+
+Before the product-builder commit, the current sliding-second `days` behavior
+must be classified explicitly. Whole UTC-day sketches compose exactly at the
+bucket boundary, whereas the current raw ClickHouse paths use `now() - N DAY`
+and therefore include a partial boundary day. The implementation must either
+publish a documented UTC-day correction or add a bounded edge-bucket strategy;
+it must not silently treat those contracts as equivalent. Likewise, truly
+arbitrary request-time windows require either versioned sketch blobs in the
+serving relation for Rust-side union or a finite declared set of builder-side
+windows. This is the next Slice 6 design gate before Postgres DDL is accepted.
 
 ### Slice 7 — additive semantic products
 

@@ -6,6 +6,7 @@
 mod bounded;
 mod build;
 mod cohort_retention;
+mod distinct_sketch;
 mod error;
 mod event_facts;
 mod fixed_activity;
@@ -34,6 +35,10 @@ pub use build::{
 pub use cohort_retention::{
     BoundedCohortRetention, CohortRetentionEvidence, CohortRetentionPeriod,
     build_bounded_cohort_retention, load_bounded_cohort_retention,
+};
+pub use distinct_sketch::{
+    DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
+    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchError,
 };
 pub use error::{Error, Result};
 pub use event_facts::{
