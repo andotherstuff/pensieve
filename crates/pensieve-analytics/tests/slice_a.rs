@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig,
-    FixedActivityConfig, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
-    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
-    build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_pubkey_first_seen,
-    load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
-    publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
-    resolve_snapshot,
+    AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
+    EventFactsConfig, FixedActivityConfig, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig,
+    PublishOutcome, advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen,
+    apply_incremental, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_pubkey_first_seen, load_bounded_fixed_activity,
+    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version,
+    plan_catalog_delta_from_run, publish, publish_with_all_bounded_products, publish_with_identity,
+    publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -1356,7 +1356,120 @@ fn slice_a_publication_is_atomic_and_idempotent() {
         )
         .expect("retry current activity run"),
         PublishOutcome::AlreadyCurrent {
-            run_id: activity_run_id
+            run_id: activity_run_id.clone()
+        }
+    );
+    let cohort_root = fixture._directory.path().join("publication-cohort");
+    let cohort = build_bounded_cohort_retention(
+        cohort_root.join("evidence.json"),
+        &identity,
+        &activity,
+        128,
+    )
+    .expect("build cohort publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_cohort_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected cohort publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_cohort_test
+            BEFORE INSERT ON pensieve_analytics.cohort_retention_period
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_cohort_test();
+            ",
+        )
+        .expect("install cohort failure injection");
+    publish_with_all_bounded_products(
+        &mut client,
+        &fixture.build,
+        AllBoundedProducts {
+            identity: &identity,
+            activity: &activity,
+            cohort: &cohort,
+        },
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected cohort COPY failure must abort publication");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT run_id FROM pensieve_analytics.current_run_metadata",
+                &[],
+            )
+            .expect("read activity run after failed cohort publication")
+            .get::<_, String>(0),
+        activity_run_id
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_cohort_test ON pensieve_analytics.cohort_retention_period;
+            DROP FUNCTION pensieve_analytics.reject_cohort_test();
+            ",
+        )
+        .expect("remove cohort failure injection");
+    let cohort_run_id = match publish_with_all_bounded_products(
+        &mut client,
+        &fixture.build,
+        AllBoundedProducts {
+            identity: &identity,
+            activity: &activity,
+            cohort: &cohort,
+        },
+        started_at,
+        completed_at,
+    )
+    .expect("publish cohort run")
+    {
+        PublishOutcome::Published {
+            run_id: cohort_run_id,
+            previous_run_id,
+        } => {
+            assert_eq!(previous_run_id.as_deref(), Some(activity_run_id.as_str()));
+            cohort_run_id
+        }
+        PublishOutcome::AlreadyCurrent { .. } => panic!("cohort run must be new"),
+    };
+    let cohort_metadata = client
+        .query_one(
+            "SELECT query_version, cohort_retention_rows FROM pensieve_analytics.current_run_metadata",
+            &[],
+        )
+        .expect("read current cohort metadata");
+    assert_eq!(cohort_metadata.get::<_, String>(0), "slice-b3-v1");
+    assert_eq!(
+        cohort_metadata.get::<_, i64>(1),
+        cohort.evidence.period_rows as i64
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.current_cohort_retention_period",
+                &[],
+            )
+            .expect("count current cohort rows")
+            .get::<_, i64>(0),
+        cohort.evidence.period_rows as i64
+    );
+    assert_eq!(
+        publish_with_all_bounded_products(
+            &mut client,
+            &fixture.build,
+            AllBoundedProducts {
+                identity: &identity,
+                activity: &activity,
+                cohort: &cohort,
+            },
+            started_at,
+            completed_at,
+        )
+        .expect("retry current cohort run"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id
         }
     );
     assert_eq!(
@@ -1372,9 +1485,9 @@ fn slice_a_publication_is_atomic_and_idempotent() {
     let plan = plan_catalog_delta_for_query_version(
         &mut client,
         &fixture.build.snapshot.catalog,
-        pensieve_analytics::FIXED_ACTIVITY_QUERY_VERSION,
+        pensieve_analytics::COHORT_RETENTION_QUERY_VERSION,
     )
-    .expect("plan current identity snapshot");
+    .expect("plan current cohort snapshot");
     assert_eq!(plan.run_kind, PlannedRunKind::NoChange);
     let historical_plan = plan_catalog_delta_from_run(
         &mut client,

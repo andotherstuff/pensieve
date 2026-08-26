@@ -27,8 +27,9 @@ pub use bounded::{
     read_run_checkpoint, validate_run_checkpoint,
 };
 pub use build::{
-    AnalyticsBuild, BuildConfig, BuildSummary, EventDaily, EventDailyKind,
-    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, KindAllTime, Overview, QUERY_VERSION,
+    AnalyticsBuild, BuildConfig, BuildSummary, COHORT_RETENTION_QUERY_VERSION, EventDaily,
+    EventDailyKind, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, KindAllTime, Overview,
+    QUERY_VERSION,
 };
 pub use cohort_retention::{
     BoundedCohortRetention, CohortRetentionEvidence, CohortRetentionPeriod,
@@ -59,8 +60,9 @@ pub use pubkey_first_seen::{
     load_bounded_pubkey_first_seen,
 };
 pub use publish::{
-    PublishOutcome, acquire_publication_lock, publish, publish_incremental,
-    publish_incremental_with_identity, publish_incremental_with_identity_and_activity,
+    AllBoundedProducts, PublishOutcome, acquire_publication_lock, publish, publish_incremental,
+    publish_incremental_with_all_bounded_products, publish_incremental_with_identity,
+    publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity,
 };
 pub use reconcile::{

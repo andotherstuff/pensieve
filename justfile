@@ -84,6 +84,9 @@ analytics-activity-publish *ARGS:
 analytics-cohort-retention *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-retention -- {{ARGS}}
 
+analytics-cohort-publish *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-publish -- {{ARGS}}
+
 # Compare current Postgres Slice A products with deduplicated ClickHouse values.
 analytics-compare *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-compare -- {{ARGS}}

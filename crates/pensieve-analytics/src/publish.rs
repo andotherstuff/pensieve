@@ -8,9 +8,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AnalyticsBuild, BoundedFixedActivity, BoundedPubkeyFirstSeen, Error,
-    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
-    schema::SCHEMA_SQL,
+    AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedPubkeyFirstSeen,
+    COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION,
+    QUERY_VERSION, Result, schema::SCHEMA_SQL,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
@@ -19,6 +19,7 @@ const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
 struct PublicationProducts<'a> {
     identity: Option<&'a BoundedPubkeyFirstSeen>,
     activity: Option<&'a BoundedFixedActivity>,
+    cohort: Option<&'a BoundedCohortRetention>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -48,6 +49,17 @@ pub enum PublishOutcome {
     },
 }
 
+/// Exact bounded Slice B products that must publish as one generation.
+#[derive(Clone, Copy)]
+pub struct AllBoundedProducts<'a> {
+    /// Eligible-pubkey first-seen state.
+    pub identity: &'a BoundedPubkeyFirstSeen,
+    /// Fixed-grain pubkey activity state.
+    pub activity: &'a BoundedFixedActivity,
+    /// Exact weekly and monthly cohort-retention matrix.
+    pub cohort: &'a BoundedCohortRetention,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -61,6 +73,9 @@ struct ValidationRecord {
     fixed_activity_metric_sha256: Option<String>,
     distinct_pubkeys_period_rows: u64,
     active_users_period_rows: u64,
+    cohort_retention_evidence_sha256: Option<String>,
+    cohort_retention_metric_sha256: Option<String>,
+    cohort_retention_rows: u64,
     result: &'static str,
 }
 
@@ -104,6 +119,7 @@ pub fn publish_with_identity(
         PublicationProducts {
             identity: Some(identity),
             activity: None,
+            cohort: None,
         },
     )
 }
@@ -127,6 +143,30 @@ pub fn publish_with_identity_and_activity(
         PublicationProducts {
             identity: Some(identity),
             activity: Some(activity),
+            cohort: None,
+        },
+    )
+}
+
+/// Publish Slice A and every completed bounded Slice B product atomically.
+pub fn publish_with_all_bounded_products(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllBoundedProducts<'_>,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "full_rebuild",
+        None,
+        PublicationProducts {
+            identity: Some(products.identity),
+            activity: Some(products.activity),
+            cohort: Some(products.cohort),
         },
     )
 }
@@ -169,6 +209,7 @@ pub fn publish_incremental_with_identity(
         PublicationProducts {
             identity: Some(identity),
             activity: None,
+            cohort: None,
         },
     )
 }
@@ -193,6 +234,31 @@ pub fn publish_incremental_with_identity_and_activity(
         PublicationProducts {
             identity: Some(identity),
             activity: Some(activity),
+            cohort: None,
+        },
+    )
+}
+
+/// Publish an incremental run and every bounded Slice B successor atomically.
+pub fn publish_incremental_with_all_bounded_products(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllBoundedProducts<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.identity),
+            activity: Some(products.activity),
+            cohort: Some(products.cohort),
         },
     )
 }
@@ -208,6 +274,7 @@ fn publish_kind(
 ) -> Result<PublishOutcome> {
     let identity = products.identity;
     let activity = products.activity;
+    let cohort = products.cohort;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -225,8 +292,25 @@ fn publish_kind(
             build.config.as_of_epoch,
         )?;
     }
+    if let Some(cohort) = cohort {
+        let (Some(identity), Some(activity)) = (identity, activity) else {
+            return Err(Error::Validation(
+                "cohort-retention publication requires identity and fixed activity".to_owned(),
+            ));
+        };
+        if cohort.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || cohort.evidence.as_of_epoch != build.config.as_of_epoch
+            || cohort.evidence.identity_evidence_sha256 != identity.evidence_sha256
+            || cohort.evidence.activity_evidence_sha256 != activity.evidence_sha256
+        {
+            return Err(Error::Validation(
+                "cohort-retention evidence does not match its publication inputs".to_owned(),
+            ));
+        }
+        cohort.validate_for_publication()?;
+    }
     client.batch_execute(SCHEMA_SQL)?;
-    let run_id = run_id(build, identity, activity);
+    let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
 
@@ -247,6 +331,7 @@ fn publish_kind(
             reconcile_applied_objects(&mut transaction, &run_id, build)?;
             reconcile_published_identity(&mut transaction, &run_id, identity)?;
             reconcile_published_activity(&mut transaction, &run_id, activity)?;
+            reconcile_published_cohort(&mut transaction, &run_id, cohort)?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -274,6 +359,9 @@ fn publish_kind(
     let active_users_period_rows = activity
         .map(|product| product.evidence.active_period_rows)
         .unwrap_or(0);
+    let cohort_retention_rows = cohort
+        .map(|product| product.evidence.period_rows)
+        .unwrap_or(0);
     let validation = serde_json::to_value(ValidationRecord {
         event_daily_sum: build.summary.api_representable_events,
         event_daily_kind_sum: build.summary.api_representable_events,
@@ -287,6 +375,10 @@ fn publish_kind(
             .map(|product| product.evidence.metric_sha256.clone()),
         distinct_pubkeys_period_rows,
         active_users_period_rows,
+        cohort_retention_evidence_sha256: cohort.map(|product| product.evidence_sha256.clone()),
+        cohort_retention_metric_sha256: cohort
+            .map(|product| product.evidence.metric_sha256.clone()),
+        cohort_retention_rows,
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -314,11 +406,12 @@ fn publish_kind(
             new_users_daily_rows,
             distinct_pubkeys_period_rows,
             active_users_period_rows,
+            cohort_retention_rows,
             validation
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
-            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         )
         ",
         &[
@@ -326,7 +419,7 @@ fn publish_kind(
             &build.snapshot.catalog.snapshot_id,
             &current_run_id,
             &run_kind,
-            &query_version(identity, activity),
+            &query_version(identity, activity, cohort),
             &build.config.code_version,
             &to_i64("as_of_epoch", build.config.as_of_epoch)?,
             &started_at,
@@ -345,6 +438,7 @@ fn publish_kind(
             &to_i64("new_users_daily_rows", new_users_daily_rows)?,
             &to_i64("distinct_pubkeys_period_rows", distinct_pubkeys_period_rows)?,
             &to_i64("active_users_period_rows", active_users_period_rows)?,
+            &to_i64("cohort_retention_rows", cohort_retention_rows)?,
             &validation,
         ],
     )?;
@@ -391,8 +485,12 @@ fn publish_kind(
         copy_distinct_pubkeys_period(&mut transaction, &run_id, activity)?;
         copy_active_users_period(&mut transaction, &run_id, activity)?;
     }
+    if let Some(cohort) = cohort {
+        copy_cohort_retention(&mut transaction, &run_id, cohort)?;
+    }
     reconcile_published_identity(&mut transaction, &run_id, identity)?;
     reconcile_published_activity(&mut transaction, &run_id, activity)?;
+    reconcile_published_cohort(&mut transaction, &run_id, cohort)?;
 
     transaction.execute(
         "
@@ -645,6 +743,33 @@ fn copy_active_users_period(
     )
 }
 
+fn copy_cohort_retention(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    cohort: &BoundedCohortRetention,
+) -> Result<()> {
+    let mut writer = transaction.copy_in(
+        "
+        COPY pensieve_analytics.cohort_retention_period (
+            run_id, grain, cohort_start, activity_period, active_pubkeys
+        ) FROM STDIN WITH (FORMAT csv)
+        ",
+    )?;
+    for row in &cohort.evidence.periods {
+        writeln!(
+            writer,
+            "{run_id},{},{},{},{}",
+            row.grain, row.cohort_start, row.activity_period, row.active_pubkeys
+        )?;
+    }
+    let inserted = writer.finish()?;
+    expect_copied(
+        "cohort_retention_period",
+        inserted,
+        cohort.evidence.period_rows,
+    )
+}
+
 fn reconcile_published_identity(
     transaction: &mut impl GenericClient,
     run_id: &str,
@@ -773,6 +898,59 @@ fn reconcile_published_activity(
     Ok(())
 }
 
+fn reconcile_published_cohort(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    cohort: Option<&BoundedCohortRetention>,
+) -> Result<()> {
+    let expected_rows = cohort
+        .map(|product| product.evidence.period_rows)
+        .unwrap_or(0);
+    let expected_sum = cohort
+        .map(|product| product.evidence.active_pubkeys_sum)
+        .unwrap_or(0);
+    let row = transaction.query_one(
+        "
+        SELECT runs.cohort_retention_rows,
+               (SELECT count(*)::BIGINT
+                  FROM pensieve_analytics.cohort_retention_period WHERE run_id = $1),
+               (SELECT coalesce(sum(active_pubkeys), 0)::BIGINT
+                  FROM pensieve_analytics.cohort_retention_period WHERE run_id = $1),
+               (SELECT count(*)::BIGINT
+                  FROM pensieve_analytics.cohort_retention_period
+                  WHERE run_id = $1 AND activity_period = cohort_start)
+        FROM pensieve_analytics.runs runs
+        WHERE runs.run_id = $1
+        ",
+        &[&run_id],
+    )?;
+    let actual_rows = from_i64("published cohort metadata rows", row.get(0))?;
+    let actual_table_rows = from_i64("published cohort row count", row.get(1))?;
+    let actual_sum = from_i64("published cohort active sum", row.get(2))?;
+    let period_zero_rows = from_i64("published cohort period-zero rows", row.get(3))?;
+    let expected_period_zero_rows = cohort.map_or(0, |product| {
+        product
+            .evidence
+            .periods
+            .iter()
+            .filter(|period| period.activity_period == period.cohort_start)
+            .count() as u64
+    });
+    if [actual_rows, actual_table_rows, actual_sum, period_zero_rows]
+        != [
+            expected_rows,
+            expected_rows,
+            expected_sum,
+            expected_period_zero_rows,
+        ]
+    {
+        return Err(Error::Validation(format!(
+            "published cohort accounting [{actual_rows}, {actual_table_rows}, {actual_sum}, {period_zero_rows}] does not match expected rows/sum/period-zero"
+        )));
+    }
+    Ok(())
+}
+
 fn expect_copied(table: &str, actual: u64, expected: u64) -> Result<()> {
     if actual != expected {
         return Err(Error::Validation(format!(
@@ -786,13 +964,14 @@ fn run_id(
     build: &AnalyticsBuild,
     identity: Option<&BoundedPubkeyFirstSeen>,
     activity: Option<&BoundedFixedActivity>,
+    cohort: Option<&BoundedCohortRetention>,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(build.snapshot.catalog.snapshot_id.as_bytes());
     digest.update([0]);
     digest.update(build.config.as_of_epoch.to_be_bytes());
     digest.update([0]);
-    digest.update(query_version(identity, activity).as_bytes());
+    digest.update(query_version(identity, activity, cohort).as_bytes());
     digest.update([0]);
     digest.update(build.config.code_version.as_bytes());
     if let Some(identity) = identity {
@@ -813,14 +992,27 @@ fn run_id(
         digest.update([0]);
         digest.update(activity.evidence.flags_artifact.sha256.as_bytes());
     }
+    if let Some(cohort) = cohort {
+        digest.update([0]);
+        digest.update(cohort.evidence_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(cohort.evidence.metric_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(cohort.evidence.identity_evidence_sha256.as_bytes());
+        digest.update([0]);
+        digest.update(cohort.evidence.activity_evidence_sha256.as_bytes());
+    }
     hex::encode(digest.finalize())
 }
 
 fn query_version(
     identity: Option<&BoundedPubkeyFirstSeen>,
     activity: Option<&BoundedFixedActivity>,
+    cohort: Option<&BoundedCohortRetention>,
 ) -> &'static str {
-    if activity.is_some() {
+    if cohort.is_some() {
+        COHORT_RETENTION_QUERY_VERSION
+    } else if activity.is_some() {
         FIXED_ACTIVITY_QUERY_VERSION
     } else if identity.is_some() {
         IDENTITY_QUERY_VERSION
