@@ -30,6 +30,7 @@ identity_enabled="${PENSIEVE_ANALYTICS_IDENTITY_ENABLED:-0}"
 identity_root="${PENSIEVE_ANALYTICS_IDENTITY_ROOT:-/archive/analytics/pubkey-first-seen}"
 activity_enabled="${PENSIEVE_ANALYTICS_ACTIVITY_ENABLED:-0}"
 activity_root="${PENSIEVE_ANALYTICS_ACTIVITY_ROOT:-/archive/analytics/fixed-activity}"
+cohort_enabled="${PENSIEVE_ANALYTICS_COHORT_ENABLED:-0}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -87,8 +88,16 @@ if [ "$activity_enabled" != "0" ] && [ "$activity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$cohort_enabled" != "0" ] && [ "$cohort_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_COHORT_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$cohort_enabled" = "1" ] && [ "$activity_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_COHORT_ENABLED requires PENSIEVE_ANALYTICS_ACTIVITY_ENABLED=1" >&2
     exit 2
 fi
 
@@ -150,6 +159,14 @@ if [ "$activity_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$activity_root"
+fi
+cohort_baseline_evidence=""
+if [ "$cohort_enabled" = "1" ]; then
+    cohort_baseline_evidence="$current_generation/cohort-evidence.json"
+    if [ ! -s "$cohort_baseline_evidence" ]; then
+        echo "Current cohort evidence is missing: $cohort_baseline_evidence" >&2
+        exit 2
+    fi
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -243,7 +260,9 @@ fi
 "$catalog_bin" "${publish_args[@]}" | tee "$run_dir/catalog-publication.txt"
 
 plan_args=(--catalog "$target_snapshot")
-if [ "$activity_enabled" = "1" ]; then
+if [ "$cohort_enabled" = "1" ]; then
+    plan_args+=(--query-version slice-b3-v1)
+elif [ "$activity_enabled" = "1" ]; then
     plan_args+=(--query-version slice-b2-v2)
 elif [ "$identity_enabled" = "1" ]; then
     plan_args+=(--query-version slice-b1-v1)
@@ -271,6 +290,9 @@ promote_generation() {
         if [ "$activity_enabled" = "1" ] && [ -s "$run_dir/activity-evidence.json" ]; then
             cmp "$run_dir/activity-evidence.json" "$generation/activity-evidence.json"
         fi
+        if [ "$cohort_enabled" = "1" ] && [ -s "$run_dir/cohort-evidence.json" ]; then
+            cmp "$run_dir/cohort-evidence.json" "$generation/cohort-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -291,10 +313,23 @@ promote_generation() {
             install -m 0640 "$run_dir/activity-evidence.json" \
                 "$partial_generation/activity-evidence.json"
         fi
+        if [ "$cohort_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/cohort-evidence.json" \
+                "$partial_generation/cohort-evidence.json"
+        fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
+        mapfile -t generation_files < <(
+            find "$partial_generation" -maxdepth 1 -type f \
+                ! -name SHA256SUMS -printf '%f\n' | sort
+        )
+        (
+            cd "$partial_generation"
+            sha256sum "${generation_files[@]}" >SHA256SUMS
+        )
         sync -f "$partial_generation/active-raw.json"
         sync -f "$partial_generation/production-live.json"
         sync -f "$partial_generation/APPLIED"
+        sync -f "$partial_generation/SHA256SUMS"
         sync -f "$partial_generation"
         mv "$partial_generation" "$generation"
         sync -f "$generations_root"
@@ -403,6 +438,12 @@ case "$run_kind" in
                 --activity-work-root "$activity_work_root"
             )
         fi
+        if [ "$cohort_enabled" = "1" ]; then
+            incremental_args+=(
+                --cohort-baseline-evidence "$cohort_baseline_evidence"
+                --cohort-evidence "$run_dir/cohort-evidence.json"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -455,6 +496,9 @@ if [ "$identity_enabled" = "1" ] && [ -s "$run_dir/identity-evidence.json" ]; th
 fi
 if [ "$activity_enabled" = "1" ] && [ -s "$run_dir/activity-evidence.json" ]; then
     evidence_files+=("$run_dir/activity-evidence.json")
+fi
+if [ "$cohort_enabled" = "1" ] && [ -s "$run_dir/cohort-evidence.json" ]; then
+    evidence_files+=("$run_dir/cohort-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

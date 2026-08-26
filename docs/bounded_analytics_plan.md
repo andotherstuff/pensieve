@@ -537,6 +537,13 @@ week/month identities. The compact matrix has an explicit hard row ceiling and
 fails closed at that ceiling, so neither event nor pubkey cardinality can cause
 unbounded memory growth.
 
+The recurring refresh lane is fail-closed and opt-in via
+`PENSIEVE_ANALYTICS_COHORT_ENABLED=1`. It requires the identity and activity
+lanes, verifies that the current generation's cohort evidence is the exact
+artifact recorded by the published B3 baseline, rebuilds the compact matrix
+from the successor immutable artifacts, and publishes Slice A through B3 in
+one Postgres transaction.
+
 ### Slice 6 — flexible-window distinct sketches
 
 Goal: serve dynamic event, kind, hourly, zap, and long-form identity counts.

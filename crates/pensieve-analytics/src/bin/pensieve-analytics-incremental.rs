@@ -6,11 +6,13 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    BatchLimits, BuildConfig, CatalogDeltaPlan, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
+    AllBoundedProducts, BatchLimits, BuildConfig, COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan,
+    CohortRetentionEvidence, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
     IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome, acquire_publication_lock,
     advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
-    load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, publish_incremental, publish_incremental_with_identity,
+    build_bounded_cohort_retention, load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
+    plan_catalog_delta_for_query_version, publish_incremental,
+    publish_incremental_with_all_bounded_products, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
@@ -102,6 +104,15 @@ struct Args {
     /// Free fixed-activity work-filesystem bytes left untouched.
     #[arg(long, default_value_t = 53_687_091_200)]
     activity_disk_reserve_bytes: u64,
+    /// Current immutable cohort evidence; enables Slice B3 publication.
+    #[arg(long)]
+    cohort_baseline_evidence: Option<PathBuf>,
+    /// Immutable cohort-retention successor evidence output.
+    #[arg(long)]
+    cohort_evidence: Option<PathBuf>,
+    /// Hard ceiling for compact cohort-retention matrix rows.
+    #[arg(long, default_value_t = 2_000_000)]
+    cohort_matrix_row_limit: usize,
 }
 
 #[derive(Serialize)]
@@ -114,6 +125,7 @@ struct Output<'a> {
     build: &'a pensieve_analytics::BuildSummary,
     identity: Option<IdentityOutput<'a>>,
     activity: Option<ActivityOutput<'a>>,
+    cohort: Option<CohortOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -140,6 +152,17 @@ struct ActivityOutput<'a> {
     max_merge_buffered_bytes: usize,
     max_week_kinds_buffered: usize,
     max_month_kinds_buffered: usize,
+}
+
+#[derive(Serialize)]
+struct CohortOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    period_rows: u64,
+    active_pubkeys_sum: u64,
+    metric_sha256: &'a str,
+    matrix_row_limit: usize,
+    max_pubkey_periods_buffered: usize,
 }
 
 #[derive(Serialize)]
@@ -185,6 +208,7 @@ fn run() -> Result<()> {
     acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
     let identity_enabled = args.identity_baseline_evidence.is_some();
     let activity_enabled = args.activity_baseline_evidence.is_some();
+    let cohort_enabled = args.cohort_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -197,10 +221,18 @@ fn run() -> Result<()> {
         args.activity_evidence.is_some(),
         args.activity_work_root.is_some(),
     )?;
+    require_complete_cohort_args(cohort_enabled, args.cohort_evidence.is_some())?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
-    let desired_query_version = if activity_enabled {
+    if cohort_enabled && !activity_enabled {
+        bail!(
+            "cohort-retention advancement requires identity and activity advancement in the same run"
+        );
+    }
+    let desired_query_version = if cohort_enabled {
+        COHORT_RETENTION_QUERY_VERSION
+    } else if activity_enabled {
         FIXED_ACTIVITY_QUERY_VERSION
     } else if identity_enabled {
         IDENTITY_QUERY_VERSION
@@ -226,6 +258,26 @@ fn run() -> Result<()> {
         .get(0);
     let baseline_as_of_epoch =
         u64::try_from(baseline_as_of_epoch).context("baseline as_of_epoch must be non-negative")?;
+    let cohort_baseline_sha256 = if let Some(path) = args.cohort_baseline_evidence.as_ref() {
+        Some(validate_cohort_baseline(
+            &mut client,
+            previous_run_id,
+            path,
+            args.identity_baseline_evidence
+                .as_deref()
+                .expect("cohort requires identity baseline"),
+            args.activity_baseline_evidence
+                .as_deref()
+                .expect("cohort requires activity baseline"),
+            persisted_plan
+                .previous_snapshot_id
+                .as_deref()
+                .expect("incremental cohort plan has a baseline snapshot"),
+            baseline_as_of_epoch,
+        )?)
+    } else {
+        None
+    };
     let config = BuildConfig {
         as_of_epoch,
         code_version: args.code_version,
@@ -285,7 +337,7 @@ fn run() -> Result<()> {
             advance_bounded_fixed_activity(
                 evidence_path,
                 &baseline,
-                target,
+                target.clone(),
                 &persisted_plan,
                 &delta_locations,
                 build.config.clone(),
@@ -304,12 +356,45 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let cohort = if let (Some(evidence_path), Some(identity), Some(activity)) = (
+        args.cohort_evidence.as_ref(),
+        identity.as_ref(),
+        activity.as_ref(),
+    ) {
+        Some(
+            build_bounded_cohort_retention(
+                evidence_path,
+                identity,
+                activity,
+                args.cohort_matrix_row_limit,
+            )
+            .context("build bounded cohort-retention state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
-            match if let (Some(identity), Some(activity)) = (identity.as_ref(), activity.as_ref()) {
+            match if let (Some(identity), Some(activity), Some(cohort)) =
+                (identity.as_ref(), activity.as_ref(), cohort.as_ref())
+            {
+                publish_incremental_with_all_bounded_products(
+                    &mut client,
+                    &build,
+                    AllBoundedProducts {
+                        identity,
+                        activity,
+                        cohort,
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (Some(identity), Some(activity)) = (identity.as_ref(), activity.as_ref())
+            {
                 publish_incremental_with_identity_and_activity(
                     &mut client,
                     &build,
@@ -380,10 +465,67 @@ fn run() -> Result<()> {
                 max_week_kinds_buffered: activity.evidence.max_week_kinds_buffered,
                 max_month_kinds_buffered: activity.evidence.max_month_kinds_buffered,
             }),
+            cohort: cohort.as_ref().map(|cohort| CohortOutput {
+                evidence_sha256: &cohort.evidence_sha256,
+                baseline_evidence_sha256: cohort_baseline_sha256
+                    .as_deref()
+                    .expect("cohort output has baseline evidence"),
+                period_rows: cohort.evidence.period_rows,
+                active_pubkeys_sum: cohort.evidence.active_pubkeys_sum,
+                metric_sha256: &cohort.evidence.metric_sha256,
+                matrix_row_limit: cohort.evidence.matrix_row_limit,
+                max_pubkey_periods_buffered: cohort.evidence.max_pubkey_periods_buffered,
+            }),
             publication,
         })?
     );
     Ok(())
+}
+
+fn require_complete_cohort_args(baseline: bool, evidence: bool) -> Result<()> {
+    if baseline == evidence {
+        return Ok(());
+    }
+    bail!("cohort baseline evidence and output evidence must be supplied together")
+}
+
+fn validate_cohort_baseline(
+    client: &mut postgres::Client,
+    previous_run_id: &str,
+    cohort_path: &std::path::Path,
+    identity_path: &std::path::Path,
+    activity_path: &std::path::Path,
+    expected_snapshot_id: &str,
+    expected_as_of_epoch: u64,
+) -> Result<String> {
+    let evidence: CohortRetentionEvidence = serde_json::from_slice(
+        &std::fs::read(cohort_path).context("read baseline cohort evidence")?,
+    )
+    .context("decode baseline cohort evidence")?;
+    let evidence_sha256 = pensieve_lake::sha256_file(cohort_path)?;
+    let identity_sha256 = pensieve_lake::sha256_file(identity_path)?;
+    let activity_sha256 = pensieve_lake::sha256_file(activity_path)?;
+    let published_sha256: Option<String> = client
+        .query_one(
+            "SELECT validation ->> 'cohort_retention_evidence_sha256' FROM pensieve_analytics.runs WHERE run_id = $1",
+            &[&previous_run_id],
+        )
+        .context("read published baseline cohort identity")?
+        .get(0);
+    if evidence.schema_version != 1
+        || evidence.runner_version != "pensieve-analytics-cohort-retention-v1"
+        || evidence.status != "completed"
+        || evidence.snapshot_id != expected_snapshot_id
+        || evidence.as_of_epoch != expected_as_of_epoch
+        || evidence.identity_evidence_sha256 != identity_sha256
+        || evidence.activity_evidence_sha256 != activity_sha256
+        || evidence.period_rows != u64::try_from(evidence.periods.len())?
+        || evidence.periods.len() > evidence.matrix_row_limit
+        || published_sha256.as_deref() != Some(evidence_sha256.as_str())
+    {
+        bail!("baseline cohort evidence does not match the current published B3 run");
+    }
+    Ok(evidence_sha256)
 }
 
 fn require_complete_product_args(
@@ -462,5 +604,13 @@ mod tests {
 
         assert!(!target_is_already_current(&different, &persisted));
         assert!(!target_is_already_current(&partial, &persisted));
+    }
+
+    #[test]
+    fn cohort_arguments_are_all_or_nothing() {
+        require_complete_cohort_args(false, false).expect("disabled cohort is valid");
+        require_complete_cohort_args(true, true).expect("complete cohort arguments are valid");
+        assert!(require_complete_cohort_args(true, false).is_err());
+        assert!(require_complete_cohort_args(false, true).is_err());
     }
 }
