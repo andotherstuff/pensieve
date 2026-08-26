@@ -515,6 +515,28 @@ Goal: exact bounded-memory retention from Slice 3 and Slice 4 state.
 Gate: cohort size, period-zero behavior, percentages, and old/new ordering are
 explicitly classified and reconciled.
 
+The settled v1 contract is:
+
+- cohort membership uses the same eligible-kind first-seen identity as Slice 3;
+- activity excludes kinds 445 and 1059, matching Slice 4 active-user semantics;
+- weekly periods start Monday UTC and monthly periods start on day one UTC;
+- period zero is an ordinary exact matrix cell and therefore equals cohort size;
+- percentages are derived by the API as `active_pubkeys / cohort_size * 100`,
+  with zero used only when a malformed or legacy row set lacks period zero;
+- canonical evidence rows are ascending by grain, cohort, and activity period;
+  the API returns the newest qualifying cohorts first before applying `limit`;
+  this intentionally fixes the ClickHouse route's oldest-first `BTreeMap::take`
+  behavior; and
+- late historical first-seen events move the pubkey to the older cohort on the
+  next complete matrix build. No additive correction is permitted for this
+  non-monotonic identity change.
+
+The builder performs a streaming sort-merge join over the immutable Slice 3
+and Slice 4 artifacts. It buffers only the current pubkey and its last emitted
+week/month identities. The compact matrix has an explicit hard row ceiling and
+fails closed at that ceiling, so neither event nor pubkey cardinality can cause
+unbounded memory growth.
+
 ### Slice 6 — flexible-window distinct sketches
 
 Goal: serve dynamic event, kind, hourly, zap, and long-form identity counts.
