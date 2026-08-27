@@ -324,6 +324,73 @@ pub fn build_bounded_semantic_facts(
     })
 }
 
+/// Load and fully revalidate a completed semantic product from immutable evidence.
+pub fn load_bounded_semantic_facts(
+    evidence_path: impl AsRef<Path>,
+    artifact_path: impl AsRef<Path>,
+) -> Result<BoundedSemanticFacts> {
+    let evidence_path = evidence_path.as_ref();
+    let artifact_path = artifact_path.as_ref();
+    let evidence: SemanticFactsEvidence =
+        serde_json::from_slice(&fs::read(evidence_path)?).map_err(BoundedExecutionError::from)?;
+    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION
+        || evidence.runner_version != RUNNER_VERSION
+        || evidence.status != "completed"
+        || evidence.as_of_epoch == 0
+        || !evidence.snapshot_id.starts_with("sha256:")
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "semantic completion evidence has an unsupported identity".to_owned(),
+        )
+        .into());
+    }
+    let metadata = fs::metadata(artifact_path)?;
+    if metadata.len() != evidence.final_artifact.byte_size
+        || pensieve_lake::sha256_file(artifact_path)? != evidence.final_artifact.sha256
+        || evidence.final_artifact.byte_size
+            != evidence
+                .final_artifact
+                .row_count
+                .checked_mul(SEMANTIC_FACT_BYTES as u64)
+                .ok_or_else(|| {
+                    BoundedExecutionError::Invalid(
+                        "semantic artifact byte accounting overflowed".to_owned(),
+                    )
+                })?
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "semantic fact artifact does not match completion evidence".to_owned(),
+        )
+        .into());
+    }
+    let (rollups, domain_counts) = finalize(artifact_path)?;
+    let rollup_sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&rollups).map_err(BoundedExecutionError::from)?,
+    ));
+    if rollups != evidence.rollups
+        || domain_counts != evidence.domain_counts
+        || domain_counts.total()? != evidence.logical_relevant_events
+        || evidence.logical_relevant_events != evidence.final_artifact.row_count
+        || rollup_sha256 != evidence.rollup_sha256
+        || checked_add(
+            evidence.logical_relevant_events,
+            evidence.duplicate_relevant_rows,
+            "loaded semantic reconciliation",
+        )? != evidence.physical_relevant_rows
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "semantic completion evidence does not reconcile to its artifact".to_owned(),
+        )
+        .into());
+    }
+    let evidence_sha256 = pensieve_lake::sha256_file(evidence_path)?;
+    Ok(BoundedSemanticFacts {
+        artifact_path: artifact_path.to_owned(),
+        evidence,
+        evidence_sha256,
+    })
+}
+
 struct BuiltBatch {
     run: CompletedRun,
     physical_relevant_rows: u64,

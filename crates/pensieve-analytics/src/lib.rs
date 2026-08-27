@@ -21,6 +21,7 @@ mod reconcile;
 mod schema;
 mod semantic_build;
 mod semantic_facts;
+mod semantic_publish;
 
 pub use bounded::{
     ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
@@ -93,6 +94,7 @@ pub use reconcile::{
 pub use semantic_build::{
     BoundedSemanticFacts, SEMANTIC_FACTS_VERSION, SemanticDomainCounts, SemanticFactsConfig,
     SemanticFactsEvidence, SemanticMemoryEvidence, build_bounded_semantic_facts,
+    load_bounded_semantic_facts,
 };
 pub use semantic_facts::{
     EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,
@@ -101,3 +103,4 @@ pub use semantic_facts::{
     ZapRejection, classify_engagement, classify_longform, classify_zap, scan_semantic_facts,
     write_semantic_facts, zap_histogram_bucket,
 };
+pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};

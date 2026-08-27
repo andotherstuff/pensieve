@@ -11,9 +11,9 @@ use pensieve_analytics::{
     build_bounded_flexible_distinct, build_bounded_pubkey_first_seen, build_bounded_semantic_facts,
     estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
     load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
-    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
-    resolve_delta_locations, resolve_snapshot,
+    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
+    publish, publish_with_all_bounded_products, publish_with_identity,
+    publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -255,6 +255,10 @@ fn bounded_semantic_facts_are_resumable_and_reconcile_relevant_ids() {
         .expect("resume semantic facts");
     assert_eq!(retry.evidence, first.evidence);
     assert_eq!(retry.evidence_sha256, first.evidence_sha256);
+    let loaded =
+        load_bounded_semantic_facts(&evidence, &first.artifact_path).expect("load semantic facts");
+    assert_eq!(loaded.evidence, first.evidence);
+    assert_eq!(loaded.evidence_sha256, first.evidence_sha256);
 }
 
 #[test]

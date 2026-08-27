@@ -642,6 +642,8 @@ pub struct ZapDay {
     pub validated_recipients: u64,
     /// Exact counts in the 17 fixed histogram buckets.
     pub histogram: [u64; 17],
+    /// Exact millisatoshi sums in the 17 fixed histogram buckets.
+    pub histogram_amount_msats: [u64; 17],
     /// Rejected kind-9735 events, indexed by [`ZapRejection`].
     pub rejected: [u64; ZapRejection::COUNT],
 }
@@ -715,6 +717,10 @@ impl SemanticRollups {
                         &mut day.histogram[usize::from(fact.histogram_bucket)],
                         "zap histogram count overflowed",
                     )?;
+                    let bucket = usize::from(fact.histogram_bucket);
+                    day.histogram_amount_msats[bucket] = day.histogram_amount_msats[bucket]
+                        .checked_add(fact.amount_msats)
+                        .ok_or("zap histogram amount overflowed")?;
                 }
                 Err(rejection) => checked_increment(
                     &mut day.rejected[rejection.ordinal()],
@@ -777,7 +783,12 @@ impl SemanticRollups {
                 checked_increment(
                     &mut day.histogram[usize::from(*histogram_bucket)],
                     "zap histogram count overflowed",
-                )
+                )?;
+                let bucket = usize::from(*histogram_bucket);
+                day.histogram_amount_msats[bucket] = day.histogram_amount_msats[bucket]
+                    .checked_add(*amount_msats)
+                    .ok_or("zap histogram amount overflowed")?;
+                Ok(())
             }
             SemanticPayload::RejectedZap(rejection) => checked_increment(
                 &mut self.zap_day(day_epoch).rejected[rejection.ordinal()],
@@ -972,6 +983,7 @@ mod tests {
         assert_eq!(zaps.validated_recipients, 1);
         assert_eq!(zaps.validated_senders, 0);
         assert_eq!(zaps.histogram.iter().sum::<u64>(), 1);
+        assert_eq!(zaps.histogram_amount_msats.iter().sum::<u64>(), 100_000);
         assert_eq!(zaps.rejected[ZapRejection::MissingBolt11Value.ordinal()], 1);
     }
 
