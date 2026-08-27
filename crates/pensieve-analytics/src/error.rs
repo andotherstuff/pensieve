@@ -20,6 +20,9 @@ pub enum Error {
     /// Postgres could not stage or atomically publish the run.
     #[error("Postgres error: {0}")]
     Postgres(#[from] postgres::Error),
+    /// SQLite could not persist bounded current-state facts.
+    #[error("SQLite state error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     /// A local object does not exist under the configured lake root.
     #[error("catalog object is missing locally: {0}")]
     MissingLocalObject(PathBuf),

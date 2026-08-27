@@ -25,6 +25,7 @@ pensieve-core = { path = "../pensieve-core" }
 pensieve-lake = { path = "../pensieve-lake" }
 pensieve-parquet = { path = "../pensieve-parquet" }
 postgres.workspace = true
+rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

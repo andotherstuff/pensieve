@@ -18,6 +18,8 @@ mod plan;
 mod pubkey_first_seen;
 mod publish;
 mod reconcile;
+mod relay_build;
+mod relay_distribution;
 mod schema;
 mod semantic_build;
 mod semantic_facts;
@@ -92,6 +94,14 @@ pub use publish::{
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
     ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
+};
+pub use relay_build::{
+    BoundedRelayDistribution, RelayDistributionConfig, RelayDistributionEvidence,
+    build_bounded_relay_distribution, load_bounded_relay_distribution,
+};
+pub use relay_distribution::{
+    RELAY_DISTRIBUTION_VERSION, RelayDistributionRow, RelayListIdentity, RelayMembership,
+    relay_list_wins, relay_memberships,
 };
 pub use semantic_build::{
     BoundedSemanticFacts, SEMANTIC_FACTS_VERSION, SemanticDomainCounts, SemanticFactsConfig,

@@ -666,6 +666,31 @@ Goal: exact latest-by-pubkey replacement semantics.
 
 Gate: winning event IDs and final relay counts reconcile independently.
 
+The version-1 replacement contract is now fixed as follows:
+
+- the winning list for each pubkey is the maximum canonical
+  `(created_at, event_id)` pair at or before the run's fixed as-of boundary;
+- every kind-10002 candidate is retained in capped disk-backed state, including
+  candidates beyond the current boundary, so advancing only the boundary is
+  correct without rescanning immutable objects;
+- URLs use the shared `pensieve_core::relay_url` normalizer: secure WebSocket
+  only, canonical scheme/host/default-port/trailing-slash handling, and no
+  local, private, reserved, onion, whitespace, control, or comma-bearing URL;
+- duplicate normalized `r` tags inside one winning event create one user
+  membership and union their read/write modes; missing or empty markers mean
+  both modes, exact lowercase `read`/`write` mean one mode, and unknown markers
+  count the user but neither mode; and
+- serving rows require at least ten distinct winning pubkeys and order by
+  descending user count with canonical URL as the deterministic tie-breaker.
+
+Implementation status:
+
+- [x] Shared normalization and positional marker fixtures.
+- [x] Resumable append-only candidate ledger with deterministic replacement,
+  fixed SQLite cache, hard database byte ceiling, exact source accounting, and
+  canonical completion evidence.
+- [ ] Dormant atomic Postgres publication and independent winner/count canary.
+
 ### Slice 9 — publisher benchmark and contract
 
 Goal: choose a product that is correct, bounded, and fast enough to serve.

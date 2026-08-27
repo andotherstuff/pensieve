@@ -11,6 +11,7 @@ mod error;
 mod event;
 pub mod metrics;
 pub mod proto;
+pub mod relay_url;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants

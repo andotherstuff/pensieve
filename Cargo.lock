@@ -3597,6 +3597,7 @@ dependencies = [
  "pensieve-lake",
  "pensieve-parquet",
  "postgres",
+ "rusqlite",
  "rustix 1.1.2",
  "serde",
  "serde_json",
