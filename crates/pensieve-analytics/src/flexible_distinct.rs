@@ -161,6 +161,27 @@ pub fn load_bounded_flexible_distinct(path: impl AsRef<Path>) -> Result<BoundedF
     Ok(completed)
 }
 
+/// Visit every validated leaf in canonical `(hour, kind)` order.
+///
+/// Callers must obtain `product` from [`load_bounded_flexible_distinct`] or a
+/// successful builder. The visitor receives only one bounded sketch blob at a
+/// time, so publication does not retain leaf-cardinality state in memory.
+pub fn visit_flexible_distinct_leaves(
+    product: &BoundedFlexibleDistinct,
+    mut visitor: impl FnMut(u32, u16, &[u8]) -> Result<()>,
+) -> Result<u64> {
+    let mut reader = LeafReader::open(Path::new(&product.evidence.leaf_artifact.path))?;
+    let mut rows = 0_u64;
+    while let Some(leaf) = reader.next()? {
+        visitor(leaf.hour, leaf.kind, &leaf.sketch)?;
+        rows = checked_add(rows, 1, "visited flexible leaf rows")?;
+    }
+    if rows != product.evidence.leaf_artifact.row_count {
+        return invalid("visited flexible leaf row count mismatch");
+    }
+    Ok(rows)
+}
+
 #[derive(Clone)]
 struct CompletedRun {
     identity: String,

@@ -11,6 +11,7 @@ mod error;
 mod event_facts;
 mod fixed_activity;
 mod flexible_distinct;
+mod flexible_distinct_publish;
 mod incremental;
 mod input;
 mod plan;
@@ -59,7 +60,11 @@ pub use flexible_distinct::{
     FlexibleDistinctConfig, FlexibleDistinctEvidence, FlexibleDistinctWindow,
     build_bounded_flexible_distinct, estimate_flexible_distinct_window,
     estimate_flexible_distinct_windows, load_and_estimate_flexible_distinct_windows,
-    load_bounded_flexible_distinct,
+    load_bounded_flexible_distinct, visit_flexible_distinct_leaves,
+};
+pub use flexible_distinct_publish::{
+    FlexibleDistinctPublishOutcome, estimate_published_flexible_distinct,
+    publish_flexible_distinct_leaves,
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};

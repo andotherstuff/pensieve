@@ -566,8 +566,15 @@ remains blocked until corrected exact reference evidence is rebuilt and the
 - [x] Add the bounded complete-hour/per-kind leaf builder from the validated
   Slice 5 activity artifact, with immutable source batches, fixed-fan-in
   external merge, resumable checkpoints, and exact leaf-to-identity validation.
-- absolute/relative tolerance evidence against exact samples; and
-- fixed-memory Rust-side union over versioned Postgres leaf blobs.
+- [x] Preserve absolute/relative tolerance evidence against deterministic
+  sparse, median, and dense exact samples. The corrected frozen production
+  gate passed all nine samples at a maximum 19,587 ppm error against the
+  accepted 20,000 ppm ceiling.
+- [ ] Publish the validated leaves into the dormant versioned Postgres
+  relation tied to the exact corrected B3 run. Publication must reconcile all
+  rows and bytes in one transaction and must not change `current_run`.
+- [x] Add a fixed-memory Rust-side union over streamed versioned Postgres leaf
+  blobs. No Postgres function interprets the sketch payload.
 
 Gate: errors remain within the accepted per-field tolerance across sparse,
 dense, adversarial, and repeated rebuild fixtures.
