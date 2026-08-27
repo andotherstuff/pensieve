@@ -13,4 +13,6 @@ pub(crate) const SCHEMA_SQL: &str = concat!(
     "\n",
     include_str!("../../../docs/postgres/006_analytics_flexible_distinct.sql"),
     include_str!("../../../docs/postgres/007_analytics_semantic_products.sql"),
+    "\n",
+    include_str!("../../../docs/postgres/008_analytics_relay_distribution.sql"),
 );

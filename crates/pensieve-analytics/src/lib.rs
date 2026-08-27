@@ -20,6 +20,7 @@ mod publish;
 mod reconcile;
 mod relay_build;
 mod relay_distribution;
+mod relay_publish;
 mod schema;
 mod semantic_build;
 mod semantic_facts;
@@ -102,6 +103,9 @@ pub use relay_build::{
 pub use relay_distribution::{
     RELAY_DISTRIBUTION_VERSION, RelayDistributionRow, RelayListIdentity, RelayMembership,
     relay_list_wins, relay_memberships,
+};
+pub use relay_publish::{
+    RelayDistributionPublishOutcome, publish_relay_distribution, query_published_relay_distribution,
 };
 pub use semantic_build::{
     BoundedSemanticFacts, SEMANTIC_FACTS_VERSION, SemanticDomainCounts, SemanticFactsConfig,

@@ -689,7 +689,9 @@ Implementation status:
 - [x] Resumable append-only candidate ledger with deterministic replacement,
   fixed SQLite cache, hard database byte ceiling, exact source accounting, and
   canonical completion evidence.
-- [ ] Dormant atomic Postgres publication and independent winner/count canary.
+- [x] Dormant atomic Postgres publication with exact row reconciliation,
+  rollback/retry safety, deterministic serving order, and no pointer change.
+- [ ] Independent production winner/count comparison canary.
 
 ### Slice 9 — publisher benchmark and contract
 
