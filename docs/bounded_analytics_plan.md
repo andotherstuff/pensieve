@@ -651,7 +651,7 @@ state.
 Gate: parsed fact counts reconcile to canonical input IDs and every semantic
 difference from ClickHouse is classified.
 
-The version-1 semantic contract is deliberately positional and byte exact:
+The version-2 semantic contract is deliberately positional and byte exact:
 
 - a reply is a kind-1 event with any tag whose first element is exactly `e`;
 - long-form length is UTF-8 bytes (ClickHouse `length(String)`), and estimated
@@ -669,6 +669,25 @@ Malformed or missing participant tags still contribute to exact additive zap
 count/sum products, but never invent an empty participant for distinct counts.
 The comparison report must quantify this intentional difference from
 ClickHouse `uniq(String)`, which treats its empty fallback as a value.
+
+Recurring correctness additionally requires the compact event-ID-keyed fact
+artifact to retain relevant future-dated events. Final rollups and domain
+counts apply the fixed run as-of boundary, while an append-only successor
+merges the validated baseline artifact with facts scanned only from new catalog
+objects and then re-finalizes at the successor boundary. This lets retained
+facts mature without rescanning immutable objects. Zap-distinct v2 applies the
+same as-of boundary while reading that retained artifact and fails closed on
+older semantic evidence.
+
+Implementation status:
+
+- [x] Resumable bounded v2 fact construction, exact event-ID deduplication,
+  future-fact retention, rollup reconciliation, and immutable evidence.
+- [x] Append-only successor construction from the baseline plus delta objects,
+  including future-fact maturation and retry-safe checkpoints.
+- [x] Zap-distinct v2 as-of filtering and semantic-evidence version gate.
+- [ ] Atomic recurring Postgres publication for semantic and zap products.
+- [ ] Independent production comparison canary and recurring publication gate.
 
 ### Slice 8 — current NIP-65 relay distribution
 

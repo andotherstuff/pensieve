@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::schema::SCHEMA_SQL;
 use crate::{
-    BoundedSemanticFacts, COHORT_RETENTION_QUERY_VERSION, Error, Result, SEMANTIC_FACTS_VERSION,
+    BoundedSemanticFacts, COHORT_RETENTION_QUERY_VERSION, Error, Result,
+    SEMANTIC_FACTS_RUNNER_VERSION, SEMANTIC_FACTS_VERSION,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 0x5045_4e53_4945_5645;
@@ -312,8 +313,8 @@ fn reconcile(
 
 fn validate_product(product: &BoundedSemanticFacts) -> Result<()> {
     if product.evidence.status != "completed"
-        || product.evidence.runner_version != "pensieve-analytics-semantic-facts-v1"
-        || product.evidence.final_artifact.row_count != product.evidence.logical_relevant_events
+        || product.evidence.runner_version != SEMANTIC_FACTS_RUNNER_VERSION
+        || product.evidence.final_artifact.row_count != product.evidence.retained_relevant_events
         || pensieve_lake::sha256_file(&product.artifact_path)?
             != product.evidence.final_artifact.sha256
     {
@@ -326,7 +327,7 @@ fn validate_product(product: &BoundedSemanticFacts) -> Result<()> {
 
 fn semantic_product_id(baseline_run_id: &str, product: &BoundedSemanticFacts) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pensieve-semantic-product-v1\0");
+    digest.update(b"pensieve-semantic-product-v2\0");
     digest.update(baseline_run_id.as_bytes());
     digest.update([0]);
     digest.update(product.evidence_sha256.as_bytes());

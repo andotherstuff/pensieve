@@ -122,9 +122,9 @@ pub use relay_publish::{
     RelayDistributionPublishOutcome, publish_relay_distribution, query_published_relay_distribution,
 };
 pub use semantic_build::{
-    BoundedSemanticFacts, SEMANTIC_FACTS_VERSION, SemanticDomainCounts, SemanticFactsConfig,
-    SemanticFactsEvidence, SemanticMemoryEvidence, build_bounded_semantic_facts,
-    load_bounded_semantic_facts,
+    BoundedSemanticFacts, SEMANTIC_FACTS_RUNNER_VERSION, SEMANTIC_FACTS_VERSION,
+    SemanticDomainCounts, SemanticFactsConfig, SemanticFactsEvidence, SemanticMemoryEvidence,
+    advance_bounded_semantic_facts, build_bounded_semantic_facts, load_bounded_semantic_facts,
 };
 pub use semantic_facts::{
     EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,

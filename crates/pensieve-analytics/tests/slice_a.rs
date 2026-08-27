@@ -8,9 +8,9 @@ use pensieve_analytics::{
     FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
     PublisherBenchmarkConfig, RelayDistributionConfig, SemanticFactsConfig, ZapDistinctConfig,
     advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, apply_incremental, benchmark_publishers,
-    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
-    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    advance_bounded_pubkey_first_seen, advance_bounded_semantic_facts, apply_incremental,
+    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
     estimate_flexible_distinct_windows, load_bounded_fixed_activity,
@@ -64,6 +64,18 @@ fn relay_event(keys: &Keys, created_at: u64, tags: &[&[&str]]) -> Event {
         .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(keys)
         .expect("relay event should sign")
+}
+
+fn zap_event(created_at: u64, recipient: &Keys) -> Event {
+    let recipient = recipient.public_key().to_hex();
+    EventBuilder::new(Kind::from_u16(9_735), "")
+        .tags([
+            Tag::parse(["bolt11", "lnbc100n1test"]).expect("valid invoice tag"),
+            Tag::parse(["p", recipient.as_str()]).expect("valid recipient tag"),
+        ])
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(&test_keys())
+        .expect("zap event should sign")
 }
 
 fn publish_object(inventory: &mut Inventory, lake_root: &Path, work_id: &str, events: &[Event]) {
@@ -260,6 +272,7 @@ fn bounded_semantic_facts_are_resumable_and_reconcile_relevant_ids() {
     .expect("build semantic facts");
     assert_eq!(first.evidence.physical_rows, 7);
     assert_eq!(first.evidence.physical_relevant_rows, 2);
+    assert_eq!(first.evidence.retained_relevant_events, 1);
     assert_eq!(first.evidence.logical_relevant_events, 1);
     assert_eq!(first.evidence.duplicate_relevant_rows, 1);
     assert_eq!(first.evidence.domain_counts.original_notes, 1);
@@ -297,6 +310,163 @@ fn bounded_semantic_facts_are_resumable_and_reconcile_relevant_ids() {
         .expect("load zap-distinct product");
     assert_eq!(loaded_zap.evidence, zap.evidence);
     assert_eq!(loaded_zap.evidence_sha256, zap.evidence_sha256);
+}
+
+#[test]
+fn bounded_semantic_successor_retains_future_facts_and_scans_only_delta() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let existing = event(AS_OF - 10, 1, "existing");
+    let future = event(AS_OF + 50, 7, "future reaction");
+    let recipient = Keys::generate();
+    let future_zap = zap_event(AS_OF + 60, &recipient);
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "semantic-baseline",
+        &[existing.clone(), future, future_zap],
+    );
+    let baseline_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "semantic-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("baseline fragment")])
+    .expect("baseline snapshot");
+    let baseline_catalog = directory.path().join("semantic-baseline.json");
+    write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
+    let build = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "semantic-incremental-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let baseline_root = directory.path().join("semantic-baseline-work");
+    let baseline = build_bounded_semantic_facts(
+        baseline_root.join("evidence.json"),
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline"),
+        build.clone(),
+        SemanticFactsConfig {
+            work_root: baseline_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 2,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline semantic facts");
+    assert_eq!(baseline.evidence.retained_relevant_events, 3);
+    assert_eq!(baseline.evidence.logical_relevant_events, 1);
+    assert_eq!(baseline.evidence.domain_counts.reactions, 0);
+    assert_eq!(baseline.evidence.domain_counts.accepted_zaps, 0);
+    let baseline_zap_root = directory.path().join("semantic-baseline-zap");
+    let baseline_zap = build_bounded_zap_distinct(
+        &baseline,
+        baseline_zap_root.join("evidence.json"),
+        ZapDistinctConfig {
+            work_root: baseline_zap_root,
+            chunk_records: 2,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline zap distinct");
+    assert_eq!(baseline_zap.evidence.physical_identities, 0);
+
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "semantic-delta",
+        &[existing, event(AS_OF - 20, 30_023, "article")],
+    );
+    let target_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "semantic-incremental",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("target fragment")])
+    .expect("target snapshot");
+    let target_catalog = directory.path().join("semantic-target.json");
+    write_catalog_atomically(&target_catalog, &target_snapshot).expect("target catalog");
+    let added_object = target_snapshot
+        .objects()
+        .iter()
+        .find(|object| object.work_unit_id == "semantic-delta")
+        .expect("delta object")
+        .clone();
+    let plan = CatalogDeltaPlan {
+        snapshot_id: target_snapshot.snapshot_id.clone(),
+        previous_run_id: Some("baseline-run".to_owned()),
+        previous_snapshot_id: Some(baseline_snapshot.snapshot_id),
+        run_kind: PlannedRunKind::Incremental,
+        added_objects: vec![added_object.clone()],
+        removed_objects: Vec::new(),
+        unchanged_objects: 1,
+        added_bytes: added_object.byte_size,
+        added_physical_rows: added_object.row_count,
+        affected_min_created_at: added_object.min_created_at.clone(),
+        affected_max_created_at: added_object.max_created_at.clone(),
+        affected_range_complete: true,
+    };
+    let successor_root = directory.path().join("semantic-successor-work");
+    let successor_evidence = successor_root.join("evidence.json");
+    let successor = advance_bounded_semantic_facts(
+        &successor_evidence,
+        &baseline,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve target"),
+        &plan,
+        &[ObjectLocation::Local(
+            lake_root.join(&added_object.object_key),
+        )],
+        BuildConfig {
+            as_of_epoch: AS_OF + 100,
+            ..build
+        },
+        SemanticFactsConfig {
+            work_root: successor_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 2,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("advance semantic facts");
+    assert_eq!(
+        successor.evidence.baseline_evidence_sha256.as_deref(),
+        Some(baseline.evidence_sha256.as_str())
+    );
+    assert_eq!(successor.evidence.delta_object_count, 1);
+    assert_eq!(successor.evidence.physical_relevant_rows, 5);
+    assert_eq!(successor.evidence.retained_relevant_events, 4);
+    assert_eq!(successor.evidence.logical_relevant_events, 4);
+    assert_eq!(successor.evidence.duplicate_relevant_rows, 1);
+    assert_eq!(successor.evidence.domain_counts.reactions, 1);
+    assert_eq!(successor.evidence.domain_counts.longform_articles, 1);
+    assert_eq!(successor.evidence.domain_counts.accepted_zaps, 1);
+    let successor_zap_root = directory.path().join("semantic-successor-zap");
+    let successor_zap = build_bounded_zap_distinct(
+        &successor,
+        successor_zap_root.join("evidence.json"),
+        ZapDistinctConfig {
+            work_root: successor_zap_root,
+            chunk_records: 2,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build successor zap distinct");
+    assert_eq!(successor_zap.evidence.physical_identities, 1);
+    assert_eq!(successor_zap.evidence.logical_identities, 1);
+    let reloaded = load_bounded_semantic_facts(&successor_evidence, &successor.artifact_path)
+        .expect("reload semantic successor");
+    assert_eq!(reloaded.evidence_sha256, successor.evidence_sha256);
 }
 
 #[test]

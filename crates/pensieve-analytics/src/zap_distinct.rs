@@ -12,19 +12,19 @@ use sha2::{Digest, Sha256};
 use crate::{
     ArtifactIdentity, BoundedExecutionError, BoundedSemanticFacts, DiskBudget, DistinctSketch,
     DistinctSketchBuilder, FixedRecordLayout, InputIdentity, Result, RunCheckpoint, RunIdentity,
-    SemanticFactReader, SemanticPayload, load_reusable_checkpoint, merge_fixed_runs,
-    preflight_disk, publish_canonical_json, publish_run_checkpoint, read_run_checkpoint,
-    validate_run_checkpoint,
+    SEMANTIC_FACTS_RUNNER_VERSION, SemanticFactReader, SemanticPayload, load_reusable_checkpoint,
+    merge_fixed_runs, preflight_disk, publish_canonical_json, publish_run_checkpoint,
+    read_run_checkpoint, validate_run_checkpoint,
 };
 
 /// Encoded bytes for `day_epoch`, participant role, and pubkey.
 pub const ZAP_IDENTITY_BYTES: usize = 8 + 1 + 32;
 
 /// Stable product version.
-pub const ZAP_DISTINCT_VERSION: &str = "zap-distinct-daily-v1";
+pub const ZAP_DISTINCT_VERSION: &str = "zap-distinct-daily-v2";
 
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const RUNNER_VERSION: &str = "pensieve-analytics-zap-distinct-v1";
+const RUNNER_VERSION: &str = "pensieve-analytics-zap-distinct-v2";
 const MAX_RELATIVE_ERROR_PPM: u64 = 20_000;
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -212,6 +212,9 @@ pub fn build_bounded_zap_distinct(
     let mut chunk_checkpoints = Vec::new();
     let mut reader = SemanticFactReader::new(BufReader::new(File::open(&semantic.artifact_path)?));
     while let Some(record) = reader.next_record()? {
+        if record.created_at > semantic.evidence.as_of_epoch {
+            continue;
+        }
         if let SemanticPayload::Zap {
             sender_pubkey,
             recipient_pubkey,
@@ -781,7 +784,7 @@ fn validate_checkpoint_set(
 
 fn validate_config(semantic: &BoundedSemanticFacts, config: &ZapDistinctConfig) -> Result<()> {
     if semantic.evidence.status != "completed"
-        || semantic.evidence.runner_version != "pensieve-analytics-semantic-facts-v1"
+        || semantic.evidence.runner_version != SEMANTIC_FACTS_RUNNER_VERSION
         || config.chunk_records == 0
         || config.merge_fan_in < 2
     {

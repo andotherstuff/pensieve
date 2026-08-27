@@ -387,7 +387,7 @@ pub fn write_semantic_facts(
 pub fn scan_semantic_facts(
     connection: &Connection,
     locations: &[ObjectLocation],
-    as_of_epoch: u64,
+    _as_of_epoch: u64,
     writer: &mut impl Write,
 ) -> crate::Result<SemanticScanStats> {
     if locations.is_empty() {
@@ -413,7 +413,7 @@ pub fn scan_semantic_facts(
     while let Some(row) = rows.next()? {
         let created_at: u64 = row.get(1)?;
         let kind: u16 = row.get(2)?;
-        if created_at > as_of_epoch || !matches!(kind, 1 | 7 | 9_735 | 30_023) {
+        if !matches!(kind, 1 | 7 | 9_735 | 30_023) {
             continue;
         }
         stats.physical_relevant_rows =
@@ -1111,17 +1111,29 @@ mod tests {
         assert_eq!(
             stats,
             SemanticScanStats {
-                physical_relevant_rows: 1,
-                logical_relevant_events: 1,
+                physical_relevant_rows: 2,
+                logical_relevant_events: 2,
                 duplicate_relevant_rows: 0,
-                min_event_id: Some(*reply.id.as_bytes()),
-                max_event_id: Some(*reply.id.as_bytes()),
+                min_event_id: Some(*reply.id.as_bytes().min(future_reply.id.as_bytes())),
+                max_event_id: Some(*reply.id.as_bytes().max(future_reply.id.as_bytes())),
             }
         );
         let mut reader = SemanticFactReader::new(bytes.as_slice());
-        let record = reader.next_record().expect("read").expect("fact");
-        assert_eq!(record.id, *reply.id.as_bytes());
+        let records = [
+            reader.next_record().expect("read").expect("fact"),
+            reader.next_record().expect("read future").expect("fact"),
+        ];
+        let record = records
+            .iter()
+            .find(|record| record.id == *reply.id.as_bytes())
+            .expect("eligible reply");
         assert_eq!(record.created_at, 1_700_000_000);
+        assert_eq!(record.payload, SemanticPayload::Reply);
+        let record = records
+            .iter()
+            .find(|record| record.id == *future_reply.id.as_bytes())
+            .expect("future reply");
+        assert_eq!(record.created_at, 1_700_000_101);
         assert_eq!(record.payload, SemanticPayload::Reply);
         assert_eq!(reader.next_record().expect("eof"), None);
     }

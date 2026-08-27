@@ -12,18 +12,21 @@ use sha2::{Digest, Sha256};
 use crate::build::{configure_execution, configure_remote_access};
 use crate::event_facts::verify_local_batch_inputs;
 use crate::{
-    ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget,
-    FixedRecordLayout, InputIdentity, ObjectLocation, ResolvedSnapshot, Result, RunCheckpoint,
+    ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
+    BoundedExecutionError, BuildConfig, CatalogDeltaPlan, DiskBudget, FixedRecordLayout,
+    InputIdentity, ObjectLocation, PlannedRunKind, ResolvedSnapshot, Result, RunCheckpoint,
     RunIdentity, SEMANTIC_FACT_BYTES, SEMANTIC_FACT_KEY_BYTES, SemanticFactReader, SemanticPayload,
     SemanticRollups, load_reusable_checkpoint, merge_fixed_runs, plan_input_batches,
     preflight_disk, publish_canonical_json, publish_run_checkpoint, scan_semantic_facts,
 };
 
 /// Stable semantic version of the compact fact product.
-pub const SEMANTIC_FACTS_VERSION: &str = "canonical-semantic-facts-v1";
+pub const SEMANTIC_FACTS_VERSION: &str = "canonical-semantic-facts-v2";
+/// Stable runner identity for canonical semantic completion evidence.
+pub const SEMANTIC_FACTS_RUNNER_VERSION: &str = "pensieve-analytics-semantic-facts-v2";
 
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const RUNNER_VERSION: &str = "pensieve-analytics-semantic-facts-v1";
+const RUNNER_VERSION: &str = SEMANTIC_FACTS_RUNNER_VERSION;
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Resource and workspace settings for one bounded Slice 7 build.
@@ -107,11 +110,19 @@ pub struct SemanticFactsEvidence {
     pub as_of_epoch: u64,
     /// Catalog objects scanned.
     pub object_count: u64,
+    /// Prior evidence consumed by an incremental successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_evidence_sha256: Option<String>,
+    /// New catalog objects scanned for this generation.
+    #[serde(default)]
+    pub delta_object_count: u64,
     /// Catalog physical rows covered by immutable inputs.
     pub physical_rows: u64,
     /// Relevant physical rows before ID deduplication.
     pub physical_relevant_rows: u64,
-    /// Unique relevant semantic event IDs.
+    /// Unique relevant event IDs retained, including future-dated facts.
+    pub retained_relevant_events: u64,
+    /// Unique relevant semantic event IDs eligible at the fixed as-of.
     pub logical_relevant_events: u64,
     /// Relevant duplicate rows suppressed across all stages.
     pub duplicate_relevant_rows: u64,
@@ -253,9 +264,9 @@ pub fn build_bounded_semantic_facts(
         config.merge_fan_in,
         &merge_root,
     )?;
-    let logical_relevant_events = merged.final_run.checkpoint.artifact.row_count;
+    let retained_relevant_events = merged.final_run.checkpoint.artifact.row_count;
     let duplicate_relevant_rows = physical_relevant_rows
-        .checked_sub(logical_relevant_events)
+        .checked_sub(retained_relevant_events)
         .ok_or_else(|| {
             BoundedExecutionError::Invalid(
                 "semantic logical rows exceed relevant physical rows".to_owned(),
@@ -273,7 +284,8 @@ pub fn build_bounded_semantic_facts(
         .into());
     }
 
-    let (rollups, domain_counts) = finalize(&merged.final_run.path)?;
+    let (rollups, domain_counts) = finalize(&merged.final_run.path, build_config.as_of_epoch)?;
+    let logical_relevant_events = domain_counts.total()?;
     if domain_counts.total()? != logical_relevant_events {
         return Err(BoundedExecutionError::Invalid(
             "semantic domain counts do not reconcile to unique facts".to_owned(),
@@ -291,8 +303,13 @@ pub fn build_bounded_semantic_facts(
         object_count: snapshot.catalog.objects().len().try_into().map_err(|_| {
             BoundedExecutionError::Invalid("semantic object count exceeds u64".to_owned())
         })?,
+        baseline_evidence_sha256: None,
+        delta_object_count: snapshot.catalog.objects().len().try_into().map_err(|_| {
+            BoundedExecutionError::Invalid("semantic object count exceeds u64".to_owned())
+        })?,
         physical_rows: snapshot.catalog.totals().physical_rows,
         physical_relevant_rows,
+        retained_relevant_events,
         logical_relevant_events,
         duplicate_relevant_rows,
         batch_count: batches.len().try_into().map_err(|_| {
@@ -324,6 +341,220 @@ pub fn build_bounded_semantic_facts(
     })
 }
 
+/// Advance canonical semantic facts from one verified append-only delta.
+///
+/// The v2 artifact retains future-dated relevant facts, so a later as-of can
+/// re-finalize the exact prior state while scanning only newly added objects.
+pub fn advance_bounded_semantic_facts(
+    evidence_path: impl AsRef<Path>,
+    baseline: &BoundedSemanticFacts,
+    target: ResolvedSnapshot,
+    plan: &CatalogDeltaPlan,
+    delta_locations: &[ObjectLocation],
+    build_config: BuildConfig,
+    config: SemanticFactsConfig,
+) -> Result<BoundedSemanticFacts> {
+    validate_loaded_product(baseline)?;
+    if plan.run_kind != PlannedRunKind::Incremental
+        || plan.snapshot_id != target.catalog.snapshot_id
+        || plan.previous_snapshot_id.as_deref() != Some(&baseline.evidence.snapshot_id)
+        || !plan.removed_objects.is_empty()
+        || plan.added_objects.len() != delta_locations.len()
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "invalid incremental semantic-facts plan".to_owned(),
+        )
+        .into());
+    }
+    validate_config(&target, &build_config, &config)?;
+    fs::create_dir_all(&config.work_root)?;
+    let inputs = plan
+        .added_objects
+        .iter()
+        .map(|object| InputIdentity {
+            identity: object.object_key.clone(),
+            byte_size: object.byte_size,
+            row_count: object.row_count,
+            sha256: object.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    let batches = plan_input_batches(&inputs, config.batch_limits)?;
+    let estimated_rows = baseline
+        .evidence
+        .retained_relevant_events
+        .checked_add(plan.added_physical_rows)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("semantic successor row estimate overflowed".to_owned())
+        })?;
+    let estimated_bytes = estimate_run_bytes(
+        estimated_rows,
+        batches.len().saturating_add(1),
+        config.merge_fan_in,
+    )?;
+    preflight_disk(
+        &config.work_root,
+        DiskBudget {
+            output_bytes: estimated_bytes,
+            temporary_bytes: 0,
+            retained_bytes: 0,
+            reserve_bytes: config.disk_reserve_bytes,
+        },
+    )?;
+
+    let connection = Connection::open_in_memory()?;
+    configure_execution(&connection, &build_config)?;
+    connection.execute_batch("SET TimeZone='UTC'; SET preserve_insertion_order=false")?;
+    configure_remote_access(&connection, &target, &build_config)?;
+    let batch_root = config.work_root.join("batches");
+    fs::create_dir_all(&batch_root)?;
+    let mut runs = vec![CompletedRun {
+        path: baseline.artifact_path.clone(),
+        checkpoint_path: PathBuf::new(),
+        checkpoint: RunCheckpoint {
+            schema_version: BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+            runner_version: BOUNDED_RUNNER_VERSION.to_owned(),
+            run: run_identity(&target, &build_config, "baseline"),
+            inputs: Vec::new(),
+            artifact: baseline.evidence.final_artifact.clone(),
+        },
+    }];
+    let mut delta_physical_relevant = 0_u64;
+    let mut delta_batch_duplicates = 0_u64;
+    let mut max_batch_bytes = baseline.evidence.memory.max_batch_bytes;
+    let mut max_batch_rows = baseline.evidence.memory.max_batch_rows;
+    let mut batch_checkpoints = Vec::with_capacity(batches.len());
+    let mut offset = 0_usize;
+    for batch in &batches {
+        let end = offset.checked_add(batch.inputs.len()).ok_or_else(|| {
+            BoundedExecutionError::Invalid("semantic delta offset overflowed".to_owned())
+        })?;
+        let locations = delta_locations.get(offset..end).ok_or_else(|| {
+            BoundedExecutionError::Invalid("semantic delta locations are incomplete".to_owned())
+        })?;
+        let built = build_batch(
+            &connection,
+            &target,
+            &build_config,
+            batch,
+            locations,
+            &batch_root,
+        )?;
+        delta_physical_relevant = checked_add(
+            delta_physical_relevant,
+            built.physical_relevant_rows,
+            "semantic delta physical rows",
+        )?;
+        delta_batch_duplicates = checked_add(
+            delta_batch_duplicates,
+            built.duplicate_relevant_rows,
+            "semantic delta duplicates",
+        )?;
+        max_batch_bytes = max_batch_bytes.max(batch.byte_size);
+        max_batch_rows = max_batch_rows.max(batch.row_count);
+        batch_checkpoints.push(built.run.checkpoint_path.to_string_lossy().into_owned());
+        runs.push(built.run);
+        offset = end;
+    }
+    if offset != delta_locations.len() {
+        return Err(BoundedExecutionError::Invalid(
+            "semantic successor did not consume all delta locations".to_owned(),
+        )
+        .into());
+    }
+    let merge_root = config.work_root.join("merges");
+    fs::create_dir_all(&merge_root)?;
+    let merged = merge_to_single(
+        runs,
+        &target,
+        &build_config,
+        config.merge_fan_in,
+        &merge_root,
+    )?;
+    let retained_relevant_events = merged.final_run.checkpoint.artifact.row_count;
+    let physical_relevant_rows = checked_add(
+        baseline.evidence.physical_relevant_rows,
+        delta_physical_relevant,
+        "semantic successor physical rows",
+    )?;
+    let duplicate_relevant_rows = physical_relevant_rows
+        .checked_sub(retained_relevant_events)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid(
+                "semantic successor retained rows exceed physical rows".to_owned(),
+            )
+        })?;
+    if [
+        baseline.evidence.duplicate_relevant_rows,
+        delta_batch_duplicates,
+        merged.duplicate_rows,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |sum, value| {
+        checked_add(sum, value, "semantic successor duplicate reconciliation")
+    })? != duplicate_relevant_rows
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "semantic successor duplicates do not reconcile".to_owned(),
+        )
+        .into());
+    }
+    let (rollups, domain_counts) = finalize(&merged.final_run.path, build_config.as_of_epoch)?;
+    let logical_relevant_events = domain_counts.total()?;
+    let rollup_sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&rollups).map_err(BoundedExecutionError::from)?,
+    ));
+    let evidence = SemanticFactsEvidence {
+        schema_version: EVIDENCE_SCHEMA_VERSION,
+        runner_version: RUNNER_VERSION.to_owned(),
+        status: "completed".to_owned(),
+        snapshot_id: target.catalog.snapshot_id.clone(),
+        as_of_epoch: build_config.as_of_epoch,
+        object_count: target.catalog.objects().len().try_into().map_err(|_| {
+            BoundedExecutionError::Invalid("semantic object count exceeds u64".to_owned())
+        })?,
+        baseline_evidence_sha256: Some(baseline.evidence_sha256.clone()),
+        delta_object_count: plan.added_objects.len().try_into().map_err(|_| {
+            BoundedExecutionError::Invalid("semantic delta count exceeds u64".to_owned())
+        })?,
+        physical_rows: target.catalog.totals().physical_rows,
+        physical_relevant_rows,
+        retained_relevant_events,
+        logical_relevant_events,
+        duplicate_relevant_rows,
+        batch_count: batches.len().try_into().map_err(|_| {
+            BoundedExecutionError::Invalid("semantic batch count exceeds u64".to_owned())
+        })?,
+        merge_count: merged.merge_count,
+        final_artifact: merged.final_run.checkpoint.artifact.clone(),
+        domain_counts,
+        memory: SemanticMemoryEvidence {
+            max_batch_bytes,
+            max_batch_rows,
+            max_merge_buffered_bytes: baseline
+                .evidence
+                .memory
+                .max_merge_buffered_bytes
+                .max(merged.max_buffered_bytes),
+            engagement_days: rollups.engagement.len(),
+            longform_days: rollups.longform.len(),
+            zap_days: rollups.zaps.len(),
+        },
+        rollups,
+        rollup_sha256,
+        disk_reserve_bytes: config.disk_reserve_bytes,
+        batch_checkpoints,
+        merge_checkpoints: merged.checkpoints,
+    };
+    publish_canonical_json(evidence_path.as_ref(), &evidence)?;
+    let completed = BoundedSemanticFacts {
+        artifact_path: merged.final_run.path,
+        evidence,
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path.as_ref())?,
+    };
+    validate_loaded_product(&completed)?;
+    Ok(completed)
+}
+
 /// Load and fully revalidate a completed semantic product from immutable evidence.
 pub fn load_bounded_semantic_facts(
     evidence_path: impl AsRef<Path>,
@@ -333,6 +564,18 @@ pub fn load_bounded_semantic_facts(
     let artifact_path = artifact_path.as_ref();
     let evidence: SemanticFactsEvidence =
         serde_json::from_slice(&fs::read(evidence_path)?).map_err(BoundedExecutionError::from)?;
+    let completed = BoundedSemanticFacts {
+        artifact_path: artifact_path.to_owned(),
+        evidence,
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
+    };
+    validate_loaded_product(&completed)?;
+    Ok(completed)
+}
+
+fn validate_loaded_product(product: &BoundedSemanticFacts) -> Result<()> {
+    let evidence = &product.evidence;
+    let artifact_path = &product.artifact_path;
     if evidence.schema_version != EVIDENCE_SCHEMA_VERSION
         || evidence.runner_version != RUNNER_VERSION
         || evidence.status != "completed"
@@ -363,17 +606,18 @@ pub fn load_bounded_semantic_facts(
         )
         .into());
     }
-    let (rollups, domain_counts) = finalize(artifact_path)?;
+    let (rollups, domain_counts) = finalize(artifact_path, evidence.as_of_epoch)?;
     let rollup_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&rollups).map_err(BoundedExecutionError::from)?,
     ));
     if rollups != evidence.rollups
         || domain_counts != evidence.domain_counts
         || domain_counts.total()? != evidence.logical_relevant_events
-        || evidence.logical_relevant_events != evidence.final_artifact.row_count
+        || evidence.retained_relevant_events != evidence.final_artifact.row_count
+        || evidence.logical_relevant_events > evidence.retained_relevant_events
         || rollup_sha256 != evidence.rollup_sha256
         || checked_add(
-            evidence.logical_relevant_events,
+            evidence.retained_relevant_events,
             evidence.duplicate_relevant_rows,
             "loaded semantic reconciliation",
         )? != evidence.physical_relevant_rows
@@ -383,12 +627,7 @@ pub fn load_bounded_semantic_facts(
         )
         .into());
     }
-    let evidence_sha256 = pensieve_lake::sha256_file(evidence_path)?;
-    Ok(BoundedSemanticFacts {
-        artifact_path: artifact_path.to_owned(),
-        evidence,
-        evidence_sha256,
-    })
+    Ok(())
 }
 
 struct BuiltBatch {
@@ -705,11 +944,14 @@ fn merge_group(
     })
 }
 
-fn finalize(path: &Path) -> Result<(SemanticRollups, SemanticDomainCounts)> {
+fn finalize(path: &Path, as_of_epoch: u64) -> Result<(SemanticRollups, SemanticDomainCounts)> {
     let mut reader = SemanticFactReader::new(BufReader::new(File::open(path)?));
     let mut rollups = SemanticRollups::default();
     let mut counts = SemanticDomainCounts::default();
     while let Some(record) = reader.next_record()? {
+        if record.created_at > as_of_epoch {
+            continue;
+        }
         rollups.observe_record(&record).map_err(|message| {
             BoundedExecutionError::Invalid(format!("semantic rollup failed: {message}"))
         })?;
