@@ -576,6 +576,18 @@ baseline.
   rows and bytes in one transaction and must not change `current_run`.
 - [x] Add a fixed-memory Rust-side union over streamed versioned Postgres leaf
   blobs. No Postgres function interprets the sketch payload.
+- [x] Add a resumable append-only successor builder. It reuses the prior exact
+  `(hour, kind, pubkey)` identity artifact, transforms only the fixed-activity
+  delta checkpoints, and rescans the prior activity artifact only for records
+  that crossed from the old incomplete-hour boundary into newly complete
+  hours. A fixed-fan-in merge deduplicates both inputs before rebuilding leaves;
+  evidence records the exact flexible predecessor, prior boundary, and activity
+  checkpoints. This is the recurring Slice 6 state transition and avoids a
+  fresh external sort of the full event history on every refresh.
+- [ ] Integrate the successor build, tolerance check, dormant leaf publication,
+  and generation evidence promotion into the locked recurring refresh. A
+  refresh must not expose a new generation as complete unless its Slice 6
+  product is bound to that same B3 run.
 
 Gate: errors remain within the accepted per-field tolerance across sparse,
 dense, adversarial, and repeated rebuild fixtures.

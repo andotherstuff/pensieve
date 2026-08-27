@@ -7,9 +7,10 @@ use pensieve_analytics::{
     EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
     ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
     PublisherBenchmarkConfig, RelayDistributionConfig, SemanticFactsConfig, ZapDistinctConfig,
-    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
-    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
-    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, apply_incremental, benchmark_publishers,
+    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
+    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
     estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
     load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
@@ -948,6 +949,28 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
             .sum::<u64>(),
         3
     );
+    let baseline_flexible_root = directory.path().join("flexible-baseline-work");
+    let baseline_flexible = build_bounded_flexible_distinct(
+        baseline_flexible_root.join("evidence.json"),
+        &baseline,
+        FlexibleDistinctConfig {
+            work_root: baseline_flexible_root,
+            source_records_per_batch: 1,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline flexible distinct");
+    assert_eq!(
+        estimate_flexible_distinct_window(
+            &baseline_flexible,
+            day_a,
+            baseline_flexible.evidence.complete_through_epoch,
+            None,
+        )
+        .expect("estimate baseline flexible distinct"),
+        1
+    );
 
     publish_object(
         &mut inventory,
@@ -998,7 +1021,7 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
             lake_root.join(&added_object.object_key),
         )],
         BuildConfig {
-            as_of_epoch: AS_OF + 100,
+            as_of_epoch: AS_OF + 3_700,
             ..build
         },
         FixedActivityConfig {
@@ -1033,6 +1056,69 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         .find(|row| row.grain == "week" && row.kind == Some(1))
         .expect("weekly kind row");
     assert_eq!(week_kind.unique_pubkeys, 2);
+
+    let successor_flexible_root = directory.path().join("flexible-successor-work");
+    let successor_flexible = advance_bounded_flexible_distinct(
+        successor_flexible_root.join("evidence.json"),
+        &baseline_flexible,
+        &baseline,
+        &successor,
+        FlexibleDistinctConfig {
+            work_root: successor_flexible_root,
+            source_records_per_batch: 1,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("advance flexible distinct");
+    assert_eq!(
+        successor_flexible
+            .evidence
+            .baseline_evidence_sha256
+            .as_deref(),
+        Some(baseline_flexible.evidence_sha256.as_str())
+    );
+    assert_eq!(
+        successor_flexible.evidence.baseline_complete_through_epoch,
+        Some(baseline_flexible.evidence.complete_through_epoch)
+    );
+    assert_eq!(
+        estimate_flexible_distinct_window(
+            &successor_flexible,
+            day_a,
+            successor_flexible.evidence.complete_through_epoch,
+            None,
+        )
+        .expect("estimate successor all-kind distinct"),
+        3
+    );
+    assert_eq!(
+        estimate_flexible_distinct_window(
+            &successor_flexible,
+            day_a,
+            successor_flexible.evidence.complete_through_epoch,
+            Some(1),
+        )
+        .expect("estimate successor kind distinct"),
+        2
+    );
+    let reloaded = load_bounded_flexible_distinct(
+        directory
+            .path()
+            .join("flexible-successor-work/evidence.json"),
+    )
+    .expect("reload flexible successor");
+    assert_eq!(reloaded.evidence_sha256, successor_flexible.evidence_sha256);
+    let mut incomplete_lineage = reloaded.clone();
+    incomplete_lineage.evidence.baseline_complete_through_epoch = None;
+    assert!(
+        incomplete_lineage
+            .validate_for_publication(
+                &incomplete_lineage.evidence.snapshot_id,
+                incomplete_lineage.evidence.as_of_epoch,
+            )
+            .is_err()
+    );
 }
 
 #[test]

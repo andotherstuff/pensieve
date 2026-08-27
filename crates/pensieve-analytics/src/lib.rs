@@ -67,9 +67,10 @@ pub use fixed_activity::{
 pub use flexible_distinct::{
     BoundedFlexibleDistinct, FLEXIBLE_DISTINCT_IDENTITY_BYTES, FLEXIBLE_DISTINCT_VERSION,
     FlexibleDistinctConfig, FlexibleDistinctEvidence, FlexibleDistinctWindow,
-    build_bounded_flexible_distinct, estimate_flexible_distinct_window,
-    estimate_flexible_distinct_windows, load_and_estimate_flexible_distinct_windows,
-    load_bounded_flexible_distinct, visit_flexible_distinct_leaves,
+    advance_bounded_flexible_distinct, build_bounded_flexible_distinct,
+    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
+    load_and_estimate_flexible_distinct_windows, load_bounded_flexible_distinct,
+    visit_flexible_distinct_leaves,
 };
 pub use flexible_distinct_publish::{
     FlexibleDistinctPublishOutcome, estimate_published_flexible_distinct,

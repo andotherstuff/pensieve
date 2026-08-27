@@ -18,7 +18,7 @@ use crate::{
     ArtifactIdentity, BoundedExecutionError, BoundedFixedActivity, DiskBudget, DistinctSketch,
     DistinctSketchBuilder, DistinctSketchUnion, FixedRecordLayout, InputIdentity, MergeStats,
     Result, RunCheckpoint, RunIdentity, load_reusable_checkpoint, merge_fixed_runs, preflight_disk,
-    publish_canonical_json, publish_run_checkpoint,
+    publish_canonical_json, publish_run_checkpoint, read_run_checkpoint, validate_run_checkpoint,
 };
 
 /// Hour key, kind, and raw pubkey bytes in each exact intermediate identity.
@@ -65,6 +65,15 @@ pub struct FlexibleDistinctEvidence {
     pub complete_through_epoch: u64,
     /// SHA-256 of the validated Slice 5 activity evidence.
     pub activity_evidence_sha256: String,
+    /// Prior flexible evidence consumed by an incremental successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_evidence_sha256: Option<String>,
+    /// Prior complete-hour boundary advanced by an incremental successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_complete_through_epoch: Option<u64>,
+    /// Successor activity batch checkpoints transformed into new identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incremental_activity_checkpoints: Vec<String>,
     /// Exact Slice 5 activity artifact consumed.
     pub activity_artifact: ArtifactIdentity,
     /// Activity records considered, including the incomplete trailing hour.
@@ -127,6 +136,21 @@ impl BoundedFlexibleDistinct {
             || evidence.complete_through_epoch != floor_hour(as_of_epoch)
         {
             return invalid("flexible-distinct evidence is not a completed matching product");
+        }
+        match (
+            evidence.baseline_evidence_sha256.as_deref(),
+            evidence.baseline_complete_through_epoch,
+        ) {
+            (None, None) if evidence.incremental_activity_checkpoints.is_empty() => {}
+            (Some(sha256), Some(baseline_complete))
+                if is_sha256(sha256)
+                    && baseline_complete.is_multiple_of(SECONDS_PER_HOUR)
+                    && baseline_complete <= evidence.complete_through_epoch
+                    && evidence
+                        .incremental_activity_checkpoints
+                        .iter()
+                        .all(|path| !path.is_empty()) => {}
+            _ => return invalid("flexible-distinct incremental lineage is incomplete"),
         }
         validate_fixed_artifact(&evidence.activity_artifact, ACTIVITY_RECORD_BYTES)?;
         validate_fixed_artifact(
@@ -281,9 +305,218 @@ pub fn build_bounded_flexible_distinct(
         as_of_epoch: activity.evidence.as_of_epoch,
         complete_through_epoch,
         activity_evidence_sha256: activity.evidence_sha256.clone(),
+        baseline_evidence_sha256: None,
+        baseline_complete_through_epoch: None,
+        incremental_activity_checkpoints: Vec::new(),
         activity_artifact: source.clone(),
         source_activity_rows: source.row_count,
         batch_count,
+        merge_count: merged.merge_count,
+        identity_artifact: merged.final_run.checkpoint.artifact,
+        leaf_artifact: leaf_run.checkpoint.artifact,
+        max_batch_buffered_bytes,
+        max_merge_buffered_bytes: merged.max_buffered_bytes,
+        max_leaf_bytes,
+        estimated_run_bytes,
+        disk_reserve_bytes: config.disk_reserve_bytes,
+        batch_checkpoints,
+        merge_checkpoints: merged.checkpoints,
+        leaf_checkpoint: leaf_run.checkpoint_path.to_string_lossy().into_owned(),
+    };
+    publish_canonical_json(evidence_path.as_ref(), &evidence)?;
+    let completed = BoundedFlexibleDistinct {
+        evidence,
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path.as_ref())?,
+    };
+    completed.validate_for_publication(
+        &completed.evidence.snapshot_id,
+        completed.evidence.as_of_epoch,
+    )?;
+    Ok(completed)
+}
+
+/// Advance complete-hour identities from an append-only fixed-activity successor.
+///
+/// The prior exact identity artifact is reused as one immutable merge input.
+/// Only successor activity batch checkpoints and baseline events whose
+/// timestamps crossed the complete-hour boundary are transformed into new
+/// identity runs. This keeps write amplification proportional to the exact
+/// identity state plus the append-only delta rather than the full event
+/// history.
+pub fn advance_bounded_flexible_distinct(
+    evidence_path: impl AsRef<Path>,
+    baseline: &BoundedFlexibleDistinct,
+    baseline_activity: &BoundedFixedActivity,
+    successor_activity: &BoundedFixedActivity,
+    config: FlexibleDistinctConfig,
+) -> Result<BoundedFlexibleDistinct> {
+    baseline.validate_for_publication(
+        &baseline_activity.evidence.snapshot_id,
+        baseline_activity.evidence.as_of_epoch,
+    )?;
+    baseline_activity.validate_for_publication(
+        &baseline_activity.evidence.snapshot_id,
+        baseline_activity.evidence.as_of_epoch,
+    )?;
+    successor_activity.validate_for_publication(
+        &successor_activity.evidence.snapshot_id,
+        successor_activity.evidence.as_of_epoch,
+    )?;
+    validate_config(&config)?;
+    if baseline.evidence.activity_evidence_sha256 != baseline_activity.evidence_sha256
+        || successor_activity
+            .evidence
+            .baseline_evidence_sha256
+            .as_deref()
+            != Some(baseline_activity.evidence_sha256.as_str())
+        || successor_activity.evidence.as_of_epoch < baseline_activity.evidence.as_of_epoch
+    {
+        return invalid("flexible successor is not an exact append-only activity advance");
+    }
+    let baseline_complete = baseline.evidence.complete_through_epoch;
+    let complete_through_epoch = floor_hour(successor_activity.evidence.as_of_epoch);
+    if complete_through_epoch < baseline_complete {
+        return invalid("flexible successor complete-hour boundary regressed");
+    }
+
+    fs::create_dir_all(&config.work_root)?;
+    let activity_checkpoints = successor_activity.evidence.batch_checkpoints.clone();
+    let mut delta_artifacts = Vec::with_capacity(activity_checkpoints.len());
+    for checkpoint_path in &activity_checkpoints {
+        let checkpoint = read_run_checkpoint(checkpoint_path)?;
+        validate_run_checkpoint(
+            checkpoint_path,
+            Path::new(&checkpoint.artifact.path),
+            &checkpoint,
+        )?;
+        validate_fixed_artifact(&checkpoint.artifact, ACTIVITY_RECORD_BYTES)?;
+        delta_artifacts.push(checkpoint.artifact);
+    }
+    if to_u64(delta_artifacts.len())? != successor_activity.evidence.batch_count {
+        return invalid("successor activity batch checkpoints do not reconcile");
+    }
+
+    let activation_batches = baseline_activity
+        .evidence
+        .activity_artifact
+        .row_count
+        .div_ceil(config.source_records_per_batch);
+    let delta_batches = delta_artifacts.iter().try_fold(0_u64, |sum, artifact| {
+        checked_add(
+            sum,
+            artifact.row_count.div_ceil(config.source_records_per_batch),
+            "flexible delta batches",
+        )
+    })?;
+    let new_batch_count = checked_add(
+        activation_batches,
+        delta_batches,
+        "flexible successor batches",
+    )?;
+    let worst_new_rows = delta_artifacts.iter().try_fold(
+        baseline_activity.evidence.activity_artifact.row_count,
+        |sum, artifact| checked_add(sum, artifact.row_count, "flexible successor rows"),
+    )?;
+    let estimated_rows = checked_add(
+        baseline.evidence.identity_artifact.row_count,
+        worst_new_rows,
+        "flexible successor estimated rows",
+    )?;
+    let estimated_run_bytes = estimate_run_bytes(
+        estimated_rows,
+        usize::try_from(checked_add(
+            new_batch_count,
+            1,
+            "flexible successor run count",
+        )?)
+        .map_err(|_| {
+            BoundedExecutionError::Invalid("flexible successor run count exceeds usize".to_owned())
+        })?,
+        config.merge_fan_in,
+    )?;
+    let retained = completed_run_bytes(&config.work_root)?;
+    preflight_disk(
+        &config.work_root,
+        DiskBudget {
+            output_bytes: estimated_run_bytes.saturating_sub(retained),
+            temporary_bytes: 0,
+            retained_bytes: retained,
+            reserve_bytes: config.disk_reserve_bytes,
+        },
+    )?;
+
+    let mut runs = vec![CompletedRun {
+        identity: format!("baseline-evidence:{}", baseline.evidence_sha256),
+        path: PathBuf::from(&baseline.evidence.identity_artifact.path),
+        checkpoint_path: PathBuf::new(),
+        checkpoint: RunCheckpoint {
+            schema_version: crate::BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+            runner_version: crate::BOUNDED_RUNNER_VERSION.to_owned(),
+            run: run_identity(successor_activity, "baseline"),
+            inputs: Vec::new(),
+            artifact: baseline.evidence.identity_artifact.clone(),
+        },
+    }];
+    let mut batch_checkpoints = Vec::new();
+    let mut max_batch_buffered_bytes = 0_u64;
+    let mut index = 0_u64;
+    let activation_root = config.work_root.join("activation-batches");
+    fs::create_dir_all(&activation_root)?;
+    append_filtered_batches(
+        successor_activity,
+        &baseline_activity.evidence.activity_artifact,
+        Some(baseline_complete),
+        complete_through_epoch,
+        "activation",
+        &activation_root,
+        &config,
+        &mut index,
+        &mut runs,
+        &mut batch_checkpoints,
+        &mut max_batch_buffered_bytes,
+    )?;
+    let delta_root = config.work_root.join("delta-batches");
+    fs::create_dir_all(&delta_root)?;
+    for artifact in &delta_artifacts {
+        append_filtered_batches(
+            successor_activity,
+            artifact,
+            None,
+            complete_through_epoch,
+            "delta",
+            &delta_root,
+            &config,
+            &mut index,
+            &mut runs,
+            &mut batch_checkpoints,
+            &mut max_batch_buffered_bytes,
+        )?;
+    }
+    if to_u64(batch_checkpoints.len())? != new_batch_count {
+        return invalid("flexible successor transformed batch count mismatch");
+    }
+
+    let merge_root = config.work_root.join("merges");
+    fs::create_dir_all(&merge_root)?;
+    let merged = merge_all(runs, successor_activity, config.merge_fan_in, &merge_root)?;
+    let leaf_root = config.work_root.join("leaves");
+    fs::create_dir_all(&leaf_root)?;
+    let (leaf_run, max_leaf_bytes) =
+        build_leaves(successor_activity, &merged.final_run, &leaf_root)?;
+    let evidence = FlexibleDistinctEvidence {
+        schema_version: 1,
+        runner_version: RUNNER_VERSION.to_owned(),
+        status: "completed".to_owned(),
+        snapshot_id: successor_activity.evidence.snapshot_id.clone(),
+        as_of_epoch: successor_activity.evidence.as_of_epoch,
+        complete_through_epoch,
+        activity_evidence_sha256: successor_activity.evidence_sha256.clone(),
+        baseline_evidence_sha256: Some(baseline.evidence_sha256.clone()),
+        baseline_complete_through_epoch: Some(baseline_complete),
+        incremental_activity_checkpoints: activity_checkpoints,
+        activity_artifact: successor_activity.evidence.activity_artifact.clone(),
+        source_activity_rows: successor_activity.evidence.activity_artifact.row_count,
+        batch_count: new_batch_count,
         merge_count: merged.merge_count,
         identity_artifact: merged.final_run.checkpoint.artifact,
         leaf_artifact: leaf_run.checkpoint.artifact,
@@ -399,11 +632,35 @@ fn build_batch(
     index: u64,
     root: &Path,
 ) -> Result<CompletedRun> {
-    let stem = format!("batch-{index:08}");
+    build_filtered_batch(
+        activity,
+        &activity.evidence.activity_artifact,
+        None,
+        complete_through_epoch,
+        offset,
+        rows,
+        index,
+        root,
+        "batch",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_filtered_batch(
+    activity: &BoundedFixedActivity,
+    source: &ArtifactIdentity,
+    lower_epoch: Option<u64>,
+    upper_epoch: u64,
+    offset: u64,
+    rows: u64,
+    index: u64,
+    root: &Path,
+    phase: &str,
+) -> Result<CompletedRun> {
+    let stem = format!("{phase}-{index:08}");
     let completed = root.join(format!("{stem}.run"));
     let checkpoint_path = root.join(format!("{stem}.json"));
-    let identity = run_identity(activity, "batch");
-    let source = &activity.evidence.activity_artifact;
+    let identity = run_identity(activity, phase);
     let inputs = vec![source_chunk_input(source, offset, rows)?];
     if let Some(checkpoint) =
         load_reusable_checkpoint(&checkpoint_path, &completed, &identity, &inputs)?
@@ -437,7 +694,10 @@ fn build_batch(
                 .try_into()
                 .expect("fixed activity timestamp"),
         );
-        if u64::from(created_at) >= complete_through_epoch {
+        let created_at_epoch = u64::from(created_at);
+        if created_at_epoch >= upper_epoch
+            || lower_epoch.is_some_and(|lower| created_at_epoch < lower)
+        {
             continue;
         }
         let mut identity = [0_u8; FLEXIBLE_DISTINCT_IDENTITY_BYTES];
@@ -473,6 +733,54 @@ fn build_batch(
         max_key,
     )?;
     Ok(completed_run(stem, completed, checkpoint_path, checkpoint))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_filtered_batches(
+    activity: &BoundedFixedActivity,
+    source: &ArtifactIdentity,
+    lower_epoch: Option<u64>,
+    upper_epoch: u64,
+    phase: &str,
+    root: &Path,
+    config: &FlexibleDistinctConfig,
+    index: &mut u64,
+    runs: &mut Vec<CompletedRun>,
+    checkpoints: &mut Vec<String>,
+    max_batch_buffered_bytes: &mut u64,
+) -> Result<()> {
+    let mut offset = 0_u64;
+    while offset < source.row_count {
+        let rows = config
+            .source_records_per_batch
+            .min(source.row_count - offset);
+        let run = build_filtered_batch(
+            activity,
+            source,
+            lower_epoch,
+            upper_epoch,
+            offset,
+            rows,
+            *index,
+            root,
+            phase,
+        )?;
+        *max_batch_buffered_bytes = (*max_batch_buffered_bytes).max(
+            rows.checked_mul(FLEXIBLE_DISTINCT_IDENTITY_BYTES as u64)
+                .ok_or_else(|| {
+                    BoundedExecutionError::Invalid(
+                        "flexible incremental batch memory evidence overflow".to_owned(),
+                    )
+                })?,
+        );
+        checkpoints.push(run.checkpoint_path.to_string_lossy().into_owned());
+        if run.checkpoint.artifact.row_count != 0 {
+            runs.push(run);
+        }
+        offset = checked_add(offset, rows, "flexible incremental source offset")?;
+        *index = checked_add(*index, 1, "flexible incremental batch index")?;
+    }
+    Ok(())
 }
 
 fn merge_all(
@@ -1038,6 +1346,14 @@ fn sketch_error(error: crate::DistinctSketchError) -> crate::Error {
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(BoundedExecutionError::Invalid(message.into()).into())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 #[cfg(test)]
