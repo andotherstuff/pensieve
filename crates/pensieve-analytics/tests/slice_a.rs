@@ -3,28 +3,30 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
-    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithRelay, AnalyticsBuild,
-    BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, FixedActivityConfig,
-    FlexibleDistinctConfig, FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation,
-    PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig,
-    RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ZapDistinctConfig,
-    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, advance_bounded_relay_distribution,
+    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
+    AllRecurringProductsWithRelay, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
+    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctPublication,
+    FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    PublisherBenchmarkConfig, PublisherRankingConfig, RelayDistributionConfig, SemanticFactsConfig,
+    SemanticPublication, ZapDistinctConfig, advance_bounded_fixed_activity,
+    advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
+    advance_bounded_publisher_ranking, advance_bounded_relay_distribution,
     advance_bounded_semantic_facts, apply_incremental, benchmark_publishers,
     build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
     build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
-    build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
-    build_flexible_distinct_validation, estimate_flexible_distinct_window,
-    estimate_flexible_distinct_windows, load_bounded_fixed_activity,
-    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    build_bounded_publisher_ranking, build_bounded_relay_distribution,
+    build_bounded_semantic_facts, build_bounded_zap_distinct, build_flexible_distinct_validation,
+    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
+    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     load_bounded_relay_distribution, load_bounded_relay_distribution_for_advance,
     load_bounded_semantic_facts, load_bounded_zap_distinct, plan_catalog_delta_for_query_version,
     plan_catalog_delta_from_run, publish,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
+    publish_incremental_with_all_recurring_products_and_publisher,
     publish_incremental_with_all_recurring_products_and_relay, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
-    resolve_snapshot,
+    resolve_snapshot, visit_publisher_ranking_rows,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -1081,6 +1083,100 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
     assert_eq!(publisher.all_kind_publishers_by_window, vec![4, 5]);
     assert_eq!(publisher.representative_top_rows.len(), 10);
     assert!(publisher.materialized_top_rows >= publisher.representative_top_rows.len() as u64);
+    let ranking_evidence = directory.path().join("publisher-ranking.json");
+    let ranking_config = PublisherRankingConfig {
+        state_database: directory.path().join("publisher-ranking.sqlite"),
+        artifact_path: directory.path().join("publisher-ranking.bin"),
+        windows_days: vec![1, 7],
+        top_limit: 2,
+        publisher_batch_size: 2,
+        max_state_bytes: 64 * 1024 * 1024,
+        sqlite_cache_bytes: 1024 * 1024,
+        disk_reserve_bytes: 0,
+    };
+    let ranking =
+        build_bounded_publisher_ranking(&ranking_evidence, &completed, ranking_config.clone())
+            .expect("build exact publisher rankings");
+    assert_eq!(ranking.evidence.source_records, 11);
+    assert_eq!(
+        ranking.evidence.ranking_artifact.row_count,
+        publisher.materialized_top_rows
+    );
+    let mut rows = Vec::new();
+    visit_publisher_ranking_rows(&ranking, |row| {
+        rows.push(row);
+        Ok(())
+    })
+    .expect("visit exact publisher rankings");
+    assert_eq!(
+        rows.len() as u64,
+        ranking.evidence.ranking_artifact.row_count
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.event_count > 0 && row.first_event <= row.last_event)
+    );
+    let representative = publisher
+        .representative_top_rows
+        .iter()
+        .map(|row| {
+            (
+                row.days,
+                row.kind,
+                row.pubkey.clone(),
+                row.event_count,
+                row.kinds_count,
+                row.first_event,
+                row.last_event,
+            )
+        })
+        .collect::<Vec<_>>();
+    let materialized = rows
+        .iter()
+        .filter(|row| row.kind.is_none() || matches!(row.kind, Some(0 | 1)))
+        .map(|row| {
+            (
+                row.days,
+                row.kind,
+                hex::encode(row.pubkey),
+                row.event_count,
+                row.kinds_count,
+                row.first_event,
+                row.last_event,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(materialized, representative);
+    let ranking_sha = ranking.evidence_sha256.clone();
+    drop(ranking);
+    let retried = build_bounded_publisher_ranking(&ranking_evidence, &completed, ranking_config)
+        .expect("resume exact publisher rankings");
+    assert_eq!(retried.evidence_sha256, ranking_sha);
+    let successor_evidence = directory.path().join("publisher-ranking-successor.json");
+    let successor_config = PublisherRankingConfig {
+        state_database: directory.path().join("publisher-ranking-successor.sqlite"),
+        artifact_path: directory.path().join("publisher-ranking-successor.bin"),
+        windows_days: vec![1, 7],
+        top_limit: 2,
+        publisher_batch_size: 2,
+        max_state_bytes: 64 * 1024 * 1024,
+        sqlite_cache_bytes: 1024 * 1024,
+        disk_reserve_bytes: 0,
+    };
+    let successor = advance_bounded_publisher_ranking(
+        &successor_evidence,
+        &retried,
+        &completed,
+        successor_config.clone(),
+    )
+    .expect("build publisher successor with explicit lineage");
+    assert_eq!(
+        successor.evidence.baseline_evidence_sha256.as_deref(),
+        Some(ranking_sha.as_str())
+    );
+    assert!(
+        build_bounded_publisher_ranking(&successor_evidence, &completed, successor_config).is_err()
+    );
 
     drop(completed);
     let loaded = load_bounded_fixed_activity(&evidence).expect("reload evidence");
@@ -2432,6 +2528,101 @@ fn slice_a_publication_is_atomic_and_idempotent() {
                 &[],
             )
             .expect("count committed relay products")
+            .get::<_, i64>(0),
+        1
+    );
+    let publisher = build_bounded_publisher_ranking(
+        fixture
+            ._directory
+            .path()
+            .join("publication-publisher-evidence.json"),
+        &activity,
+        PublisherRankingConfig {
+            state_database: fixture
+                ._directory
+                .path()
+                .join("publication-publisher-state.sqlite"),
+            artifact_path: fixture
+                ._directory
+                .path()
+                .join("publication-publisher-ranking.bin"),
+            windows_days: vec![1, 7],
+            top_limit: 2,
+            publisher_batch_size: 2,
+            max_state_bytes: 64 * 1024 * 1024,
+            sqlite_cache_bytes: 1024 * 1024,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build publisher publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_publisher_product_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected publisher product publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_publisher_product_test
+            BEFORE INSERT ON pensieve_analytics.publisher_ranking_products
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_publisher_product_test();
+            ",
+        )
+        .expect("install publisher failure injection");
+    let recurring_with_publisher = AllRecurringProductsWithPublisher {
+        recurring: recurring_with_relay,
+        publisher: &publisher,
+    };
+    publish_incremental_with_all_recurring_products_and_publisher(
+        &mut client,
+        &fixture.build,
+        recurring_with_publisher,
+        &cohort_run_id,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected publisher failure must roll back the complete generation");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.publisher_ranking_products",
+                &[],
+            )
+            .expect("count rolled-back publisher products")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_publisher_product_test
+                ON pensieve_analytics.publisher_ranking_products;
+            DROP FUNCTION pensieve_analytics.reject_publisher_product_test();
+            ",
+        )
+        .expect("remove publisher failure injection");
+    assert_eq!(
+        publish_incremental_with_all_recurring_products_and_publisher(
+            &mut client,
+            &fixture.build,
+            recurring_with_publisher,
+            &cohort_run_id,
+            started_at,
+            completed_at,
+        )
+        .expect("atomically attach publisher product to current generation"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id.clone()
+        }
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.publisher_ranking_products",
+                &[],
+            )
+            .expect("count committed publisher products")
             .get::<_, i64>(0),
         1
     );

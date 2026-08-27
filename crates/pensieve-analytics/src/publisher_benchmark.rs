@@ -50,7 +50,7 @@ pub struct PublisherBenchmarkRow {
     pub kind: Option<u16>,
     /// Raw 32-byte pubkey as lowercase hex.
     pub pubkey: String,
-    /// Exact events in the half-open lower / inclusive upper boundary.
+    /// Exact events in the inclusive lower and upper boundaries.
     pub event_count: u64,
     /// Exact distinct kinds; one for kind-filtered rows.
     pub kinds_count: u64,

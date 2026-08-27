@@ -10,11 +10,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedFlexibleDistinct,
-    BoundedPubkeyFirstSeen, BoundedRelayDistribution, BoundedSemanticFacts, BoundedZapDistinct,
-    COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION,
-    QUERY_VERSION, Result,
+    BoundedPubkeyFirstSeen, BoundedPublisherRanking, BoundedRelayDistribution,
+    BoundedSemanticFacts, BoundedZapDistinct, COHORT_RETENTION_QUERY_VERSION, Error,
+    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
     flexible_distinct_publish::{
         publish_flexible_distinct_leaves_in_transaction, validate_flexible_distinct_publication,
+    },
+    publisher_publish::{
+        PublisherRankingPublishOutcome, ValidatedPublisherRankingPublication,
+        publish_publisher_ranking_in_transaction, validate_publisher_ranking_publication,
     },
     relay_publish::{
         RelayDistributionPublishOutcome, ValidatedRelayDistributionPublication,
@@ -41,6 +45,7 @@ struct PublicationProducts<'a> {
     flexible: Option<FlexibleDistinctPublication<'a>>,
     semantic: Option<SemanticPublication<'a>>,
     relay: Option<&'a BoundedRelayDistribution>,
+    publisher: Option<&'a BoundedPublisherRanking>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -121,6 +126,15 @@ pub struct AllRecurringProductsWithRelay<'a> {
     pub relay: &'a BoundedRelayDistribution,
 }
 
+/// Every validated bounded product through Slice 9.
+#[derive(Clone, Copy)]
+pub struct AllRecurringProductsWithPublisher<'a> {
+    /// Recurring products through Slice 8.
+    pub recurring: AllRecurringProductsWithRelay<'a>,
+    /// Exact predefined-window publisher rankings.
+    pub publisher: &'a BoundedPublisherRanking,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -142,6 +156,7 @@ struct ValidationRecord {
     semantic_evidence_sha256: Option<String>,
     zap_distinct_evidence_sha256: Option<String>,
     relay_distribution_evidence_sha256: Option<String>,
+    publisher_ranking_evidence_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -189,6 +204,7 @@ pub fn publish_with_identity(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -216,6 +232,7 @@ pub fn publish_with_identity_and_activity(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -242,6 +259,7 @@ pub fn publish_with_all_bounded_products(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -288,6 +306,7 @@ pub fn publish_incremental_with_identity(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -316,6 +335,7 @@ pub fn publish_incremental_with_identity_and_activity(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -343,6 +363,7 @@ pub fn publish_incremental_with_all_bounded_products(
             flexible: None,
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -371,6 +392,7 @@ pub fn publish_incremental_with_all_bounded_products_and_flexible(
             flexible: Some(flexible),
             semantic: None,
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -398,6 +420,7 @@ pub fn publish_incremental_with_all_bounded_products_flexible_and_semantic(
             flexible: Some(products.flexible),
             semantic: Some(products.semantic),
             relay: None,
+            publisher: None,
         },
     )
 }
@@ -425,6 +448,35 @@ pub fn publish_incremental_with_all_recurring_products_and_relay(
             flexible: Some(products.recurring.flexible),
             semantic: Some(products.recurring.semantic),
             relay: Some(products.relay),
+            publisher: None,
+        },
+    )
+}
+
+/// Publish one incremental generation containing every product through Slice 9.
+pub fn publish_incremental_with_all_recurring_products_and_publisher(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllRecurringProductsWithPublisher<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.recurring.recurring.bounded.identity),
+            activity: Some(products.recurring.recurring.bounded.activity),
+            cohort: Some(products.recurring.recurring.bounded.cohort),
+            flexible: Some(products.recurring.recurring.flexible),
+            semantic: Some(products.recurring.recurring.semantic),
+            relay: Some(products.recurring.relay),
+            publisher: Some(products.publisher),
         },
     )
 }
@@ -444,6 +496,7 @@ fn publish_kind(
     let flexible = products.flexible;
     let semantic = products.semantic;
     let relay = products.relay;
+    let publisher = products.publisher;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -533,6 +586,27 @@ fn publish_kind(
     } else {
         None
     };
+    let validated_publisher = if let Some(publisher) = publisher {
+        let Some(activity) = activity else {
+            return Err(Error::Validation(
+                "publisher ranking publication requires fixed activity".to_owned(),
+            ));
+        };
+        if relay.is_none()
+            || publisher.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || publisher.evidence.as_of_epoch != build.config.as_of_epoch
+            || publisher.evidence.activity_evidence_sha256 != activity.evidence_sha256
+            || publisher.evidence.activity_artifact_sha256
+                != activity.evidence.activity_artifact.sha256
+        {
+            return Err(Error::Validation(
+                "publisher ranking evidence does not match its publication generation".to_owned(),
+            ));
+        }
+        Some(validate_publisher_ranking_publication(publisher)?)
+    } else {
+        None
+    };
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
@@ -571,6 +645,12 @@ fn publish_kind(
                 validated_semantic.as_ref(),
             )?;
             publish_relay_product(&mut transaction, &run_id, relay, validated_relay.as_ref())?;
+            publish_publisher_product(
+                &mut transaction,
+                &run_id,
+                publisher,
+                validated_publisher.as_ref(),
+            )?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -627,6 +707,7 @@ fn publish_kind(
         zap_distinct_evidence_sha256: semantic
             .map(|publication| publication.zap_distinct.evidence_sha256.clone()),
         relay_distribution_evidence_sha256: relay.map(|product| product.evidence_sha256.clone()),
+        publisher_ranking_evidence_sha256: publisher.map(|product| product.evidence_sha256.clone()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -754,6 +835,12 @@ fn publish_kind(
         validated_semantic.as_ref(),
     )?;
     publish_relay_product(&mut transaction, &run_id, relay, validated_relay.as_ref())?;
+    publish_publisher_product(
+        &mut transaction,
+        &run_id,
+        publisher,
+        validated_publisher.as_ref(),
+    )?;
 
     transaction.execute(
         "
@@ -787,6 +874,26 @@ fn publish_relay_product(
     match publish_relay_distribution_in_transaction(transaction, run_id, relay, validated)? {
         RelayDistributionPublishOutcome::Published { .. }
         | RelayDistributionPublishOutcome::AlreadyPublished { .. } => Ok(()),
+    }
+}
+
+fn publish_publisher_product(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    publisher: Option<&BoundedPublisherRanking>,
+    validated: Option<&ValidatedPublisherRankingPublication>,
+) -> Result<()> {
+    let Some(publisher) = publisher else {
+        return Ok(());
+    };
+    let Some(validated) = validated else {
+        return Err(Error::Validation(
+            "publisher publication is missing pre-transaction validation".to_owned(),
+        ));
+    };
+    match publish_publisher_ranking_in_transaction(transaction, run_id, publisher, validated)? {
+        PublisherRankingPublishOutcome::Published { .. }
+        | PublisherRankingPublishOutcome::AlreadyPublished { .. } => Ok(()),
     }
 }
 

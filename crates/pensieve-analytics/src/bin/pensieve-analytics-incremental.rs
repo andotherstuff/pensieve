@@ -6,21 +6,23 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithRelay, BatchLimits,
-    BuildConfig, COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
-    FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig, FlexibleDistinctConfig,
-    FlexibleDistinctPublication, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome,
-    RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ZapDistinctConfig,
-    acquire_publication_lock, advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, advance_bounded_relay_distribution,
-    advance_bounded_semantic_facts, apply_incremental, build_bounded_cohort_retention,
-    build_bounded_zap_distinct, build_flexible_distinct_validation, load_bounded_fixed_activity,
-    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    load_bounded_relay_distribution_for_advance, load_bounded_semantic_facts,
-    plan_catalog_delta_for_query_version, publish_incremental,
+    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
+    AllRecurringProductsWithRelay, BatchLimits, BuildConfig, COHORT_RETENTION_QUERY_VERSION,
+    CatalogDeltaPlan, CohortRetentionEvidence, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
+    FlexibleDistinctConfig, FlexibleDistinctPublication, IDENTITY_QUERY_VERSION,
+    PubkeyFirstSeenConfig, PublishOutcome, PublisherRankingConfig, RelayDistributionConfig,
+    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, acquire_publication_lock,
+    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, advance_bounded_publisher_ranking,
+    advance_bounded_relay_distribution, advance_bounded_semantic_facts, apply_incremental,
+    build_bounded_cohort_retention, build_bounded_zap_distinct, build_flexible_distinct_validation,
+    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    load_bounded_publisher_ranking, load_bounded_relay_distribution_for_advance,
+    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, publish_incremental,
     publish_incremental_with_all_bounded_products,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
+    publish_incremental_with_all_recurring_products_and_publisher,
     publish_incremental_with_all_recurring_products_and_relay, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
@@ -212,6 +214,39 @@ struct Args {
     /// Free relay-state filesystem bytes left untouched.
     #[arg(long, default_value_t = 107_374_182_400)]
     relay_disk_reserve_bytes: u64,
+    /// Current immutable publisher evidence; enables recurring Slice 9.
+    #[arg(long)]
+    publisher_baseline_evidence: Option<PathBuf>,
+    /// Current publisher ledger named by predecessor evidence.
+    #[arg(long)]
+    publisher_baseline_state_database: Option<PathBuf>,
+    /// Target generation's durable publisher ledger.
+    #[arg(long)]
+    publisher_state_database: Option<PathBuf>,
+    /// Target generation's canonical ranking artifact.
+    #[arg(long)]
+    publisher_artifact: Option<PathBuf>,
+    /// Immutable publisher successor evidence output.
+    #[arg(long)]
+    publisher_evidence: Option<PathBuf>,
+    /// Exact supported publisher windows.
+    #[arg(long, value_delimiter = ',', default_value = "1,7,30,90,365")]
+    publisher_windows_days: Vec<u32>,
+    /// Maximum served publishers per exact window/filter.
+    #[arg(long, default_value_t = 1_000)]
+    publisher_top_limit: usize,
+    /// Pubkeys committed in one publisher-ledger transaction.
+    #[arg(long, default_value_t = 10_000)]
+    publisher_batch_size: usize,
+    /// Hard target publisher-ledger ceiling.
+    #[arg(long, default_value_t = 536_870_912_000_u64)]
+    publisher_max_state_bytes: u64,
+    /// Fixed target publisher-ledger page cache.
+    #[arg(long, default_value_t = 536_870_912_u64)]
+    publisher_sqlite_cache_bytes: u64,
+    /// Free publisher-ledger filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400_u64)]
+    publisher_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -228,6 +263,7 @@ struct Output<'a> {
     flexible: Option<FlexibleOutput<'a>>,
     semantic: Option<SemanticOutput<'a>>,
     relay: Option<RelayOutput<'a>>,
+    publisher: Option<PublisherOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -301,6 +337,16 @@ struct RelayOutput<'a> {
 }
 
 #[derive(Serialize)]
+struct PublisherOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    ledger_rows: u64,
+    ranking_groups: u64,
+    ranking_rows: u64,
+    ranking_bytes: u64,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum PublicationOutput {
     Published {
@@ -347,6 +393,7 @@ fn run() -> Result<()> {
     let flexible_enabled = args.flexible_baseline_evidence.is_some();
     let semantic_enabled = args.semantic_baseline_evidence.is_some();
     let relay_enabled = args.relay_baseline_evidence.is_some();
+    let publisher_enabled = args.publisher_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -379,6 +426,13 @@ fn run() -> Result<()> {
         args.relay_state_database.is_some(),
         args.relay_evidence.is_some(),
     ])?;
+    require_complete_publisher_args([
+        publisher_enabled,
+        args.publisher_baseline_state_database.is_some(),
+        args.publisher_state_database.is_some(),
+        args.publisher_artifact.is_some(),
+        args.publisher_evidence.is_some(),
+    ])?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
@@ -395,6 +449,9 @@ fn run() -> Result<()> {
     }
     if relay_enabled && !semantic_enabled {
         bail!("relay advancement requires the complete Slice 7 lane in the same run");
+    }
+    if publisher_enabled && !relay_enabled {
+        bail!("publisher advancement requires the complete Slice 8 lane in the same run");
     }
     let desired_query_version = if cohort_enabled {
         COHORT_RETENTION_QUERY_VERSION
@@ -688,12 +745,102 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let publisher = if let (
+        Some(baseline_evidence),
+        Some(baseline_state),
+        Some(state_database),
+        Some(artifact),
+        Some(evidence_path),
+        Some(activity),
+    ) = (
+        args.publisher_baseline_evidence.as_ref(),
+        args.publisher_baseline_state_database.as_ref(),
+        args.publisher_state_database.as_ref(),
+        args.publisher_artifact.as_ref(),
+        args.publisher_evidence.as_ref(),
+        activity.as_ref(),
+    ) {
+        let baseline = load_bounded_publisher_ranking(baseline_evidence, baseline_state)
+            .context("load baseline publisher ranking evidence and state")?;
+        Some(
+            advance_bounded_publisher_ranking(
+                evidence_path,
+                &baseline,
+                activity,
+                PublisherRankingConfig {
+                    state_database: state_database.clone(),
+                    artifact_path: artifact.clone(),
+                    windows_days: args.publisher_windows_days.clone(),
+                    top_limit: args.publisher_top_limit,
+                    publisher_batch_size: args.publisher_batch_size,
+                    max_state_bytes: args.publisher_max_state_bytes,
+                    sqlite_cache_bytes: args.publisher_sqlite_cache_bytes,
+                    disk_reserve_bytes: args.publisher_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded publisher ranking state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
             match if let (
+                Some(identity),
+                Some(activity),
+                Some(cohort),
+                Some(flexible),
+                Some(validation_path),
+                Some(validation_sha256),
+                Some(semantic),
+                Some(zap_distinct),
+                Some(relay),
+                Some(publisher),
+            ) = (
+                identity.as_ref(),
+                activity.as_ref(),
+                cohort.as_ref(),
+                flexible.as_ref(),
+                args.flexible_validation_evidence.as_deref(),
+                flexible_validation_sha256.as_deref(),
+                semantic.as_ref(),
+                zap_distinct.as_ref(),
+                relay.as_ref(),
+                publisher.as_ref(),
+            ) {
+                publish_incremental_with_all_recurring_products_and_publisher(
+                    &mut client,
+                    &build,
+                    AllRecurringProductsWithPublisher {
+                        recurring: AllRecurringProductsWithRelay {
+                            recurring: AllRecurringProducts {
+                                bounded: AllBoundedProducts {
+                                    identity,
+                                    activity,
+                                    cohort,
+                                },
+                                flexible: FlexibleDistinctPublication {
+                                    product: flexible,
+                                    validation_evidence_path: validation_path,
+                                    validation_evidence_sha256: validation_sha256,
+                                },
+                                semantic: SemanticPublication {
+                                    product: semantic,
+                                    zap_distinct,
+                                },
+                            },
+                            relay,
+                        },
+                        publisher,
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (
                 Some(identity),
                 Some(activity),
                 Some(cohort),
@@ -968,6 +1115,18 @@ fn run() -> Result<()> {
                 winning_pubkeys: relay.evidence.winning_pubkeys,
                 relay_rows: relay.evidence.rows.len(),
             }),
+            publisher: publisher.as_ref().map(|publisher| PublisherOutput {
+                evidence_sha256: &publisher.evidence_sha256,
+                baseline_evidence_sha256: publisher
+                    .evidence
+                    .baseline_evidence_sha256
+                    .as_deref()
+                    .expect("publisher successor has baseline evidence"),
+                ledger_rows: publisher.evidence.ledger_rows,
+                ranking_groups: publisher.evidence.ranking_groups,
+                ranking_rows: publisher.evidence.ranking_artifact.row_count,
+                ranking_bytes: publisher.evidence.ranking_artifact.byte_size,
+            }),
             publication,
         })?
     );
@@ -1011,6 +1170,15 @@ fn require_complete_relay_args(present: [bool; 3]) -> Result<()> {
     }
     bail!(
         "relay baseline evidence, state database, and successor evidence must be supplied together"
+    )
+}
+
+fn require_complete_publisher_args(present: [bool; 5]) -> Result<()> {
+    if present.into_iter().all(|value| value == present[0]) {
+        return Ok(());
+    }
+    bail!(
+        "publisher baseline evidence/state and successor state/artifact/evidence must be supplied together"
     )
 }
 
@@ -1163,5 +1331,13 @@ mod tests {
         require_complete_relay_args([true; 3]).expect("complete relay lane is valid");
         assert!(require_complete_relay_args([true, true, false]).is_err());
         assert!(require_complete_relay_args([false, true, true]).is_err());
+    }
+
+    #[test]
+    fn publisher_arguments_are_all_or_nothing() {
+        require_complete_publisher_args([false; 5]).expect("disabled publisher lane is valid");
+        require_complete_publisher_args([true; 5]).expect("complete publisher lane is valid");
+        assert!(require_complete_publisher_args([true, true, true, true, false]).is_err());
+        assert!(require_complete_publisher_args([false, true, true, true, true]).is_err());
     }
 }
