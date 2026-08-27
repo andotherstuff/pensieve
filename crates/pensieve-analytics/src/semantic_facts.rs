@@ -8,7 +8,11 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
+use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+
+use crate::build::sql_string;
+use crate::{BoundedExecutionError, ObjectLocation};
 
 /// Maximum accepted zap amount, matching the current production safety gate.
 pub const MAX_ZAP_AMOUNT_MSATS: u64 = 1_000_000_000;
@@ -289,6 +293,17 @@ pub struct SemanticFactReader<R> {
     previous_id: Option<[u8; 32]>,
 }
 
+/// Exact accounting from one bounded Parquet semantic scan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SemanticScanStats {
+    /// Relevant physical rows returned before event-ID deduplication.
+    pub physical_relevant_rows: u64,
+    /// Unique canonical semantic facts written.
+    pub logical_relevant_events: u64,
+    /// Exact duplicate relevant rows suppressed.
+    pub duplicate_relevant_rows: u64,
+}
+
 impl<R: Read> SemanticFactReader<R> {
     /// Construct a strict reader. The artifact must be sorted and unique by ID.
     pub fn new(reader: R) -> Self {
@@ -358,6 +373,120 @@ pub fn write_semantic_facts(
         })?;
     }
     Ok(count)
+}
+
+/// Scan one bounded set of immutable Parquet objects into a sorted compact run.
+///
+/// DuckDB performs the external sort under its configured memory/temp limits.
+/// Rust owns all tag, content, and zap semantics and retains only one compact
+/// record while streaming the result.
+pub fn scan_semantic_facts(
+    connection: &Connection,
+    locations: &[ObjectLocation],
+    as_of_epoch: u64,
+    writer: &mut impl Write,
+) -> crate::Result<SemanticScanStats> {
+    if locations.is_empty() {
+        return Err(BoundedExecutionError::Invalid(
+            "a semantic-fact batch must include at least one Parquet object".to_owned(),
+        )
+        .into());
+    }
+    let paths = locations
+        .iter()
+        .map(|location| sql_string(&location.duckdb_path()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, created_at, kind, to_json(tags), content \
+         FROM read_parquet([{paths}], union_by_name=false) \
+         ORDER BY id, created_at, kind"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query([])?;
+    let mut stats = SemanticScanStats::default();
+    let mut pending: Option<SemanticFactRecord> = None;
+    while let Some(row) = rows.next()? {
+        let created_at: u64 = row.get(1)?;
+        let kind: u16 = row.get(2)?;
+        if created_at > as_of_epoch || !matches!(kind, 1 | 7 | 9_735 | 30_023) {
+            continue;
+        }
+        stats.physical_relevant_rows =
+            stats.physical_relevant_rows.checked_add(1).ok_or_else(|| {
+                BoundedExecutionError::Invalid("semantic row count overflowed".into())
+            })?;
+        let id: Vec<u8> = row.get(0)?;
+        let id: [u8; 32] = id.try_into().map_err(|id: Vec<u8>| {
+            BoundedExecutionError::Invalid(format!(
+                "Parquet event ID has {} bytes, expected 32",
+                id.len()
+            ))
+        })?;
+        let tags_json: String = row.get(3)?;
+        let tags: Vec<Vec<String>> = serde_json::from_str(&tags_json).map_err(|error| {
+            BoundedExecutionError::Invalid(format!("DuckDB returned invalid tag JSON: {error}"))
+        })?;
+        let record = SemanticFactRecord::classify(
+            id,
+            created_at,
+            kind,
+            &tags,
+            row.get::<_, String>(4)?.as_str(),
+        )
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid(
+                "semantic SQL returned a kind outside the classified domain".to_owned(),
+            )
+        })?;
+        match pending.take() {
+            Some(previous) if previous.id == record.id => {
+                if previous != record {
+                    return Err(BoundedExecutionError::Invalid(
+                        "duplicate event ID has conflicting semantic facts".to_owned(),
+                    )
+                    .into());
+                }
+                stats.duplicate_relevant_rows = stats
+                    .duplicate_relevant_rows
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BoundedExecutionError::Invalid(
+                            "semantic duplicate count overflowed".to_owned(),
+                        )
+                    })?;
+                pending = Some(previous);
+            }
+            Some(previous) if previous.id > record.id => {
+                return Err(BoundedExecutionError::Invalid(
+                    "semantic query is not ordered by event ID".to_owned(),
+                )
+                .into());
+            }
+            Some(previous) => {
+                writer.write_all(&previous.encode())?;
+                stats.logical_relevant_events = stats
+                    .logical_relevant_events
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BoundedExecutionError::Invalid("semantic fact count overflowed".to_owned())
+                    })?;
+                pending = Some(record);
+            }
+            None => pending = Some(record),
+        }
+    }
+    if let Some(record) = pending {
+        writer.write_all(&record.encode())?;
+        stats.logical_relevant_events =
+            stats
+                .logical_relevant_events
+                .checked_add(1)
+                .ok_or_else(|| {
+                    BoundedExecutionError::Invalid("semantic fact count overflowed".to_owned())
+                })?;
+    }
+    Ok(stats)
 }
 
 fn optional_key(bytes: &[u8]) -> Option<[u8; 32]> {
@@ -622,6 +751,11 @@ fn parse_pubkey(value: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    use pensieve_parquet::write_events;
+
     use super::*;
 
     fn tags(values: &[&[&str]]) -> Vec<Vec<String>> {
@@ -856,5 +990,48 @@ mod tests {
             reader.next_record().expect_err("duplicate").kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn duckdb_scan_decodes_nested_tags_and_writes_sorted_compact_facts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("semantic.parquet");
+        let keys = Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+            .expect("keys");
+        let reply = EventBuilder::new(Kind::TextNote, "reply")
+            .tags([Tag::parse(["e", &"11".repeat(32)]).expect("tag")])
+            .custom_created_at(Timestamp::from(1_700_000_000_u64))
+            .sign_with_keys(&keys)
+            .expect("reply");
+        let unrelated = EventBuilder::new(Kind::Metadata, "metadata")
+            .custom_created_at(Timestamp::from(1_700_000_001_u64))
+            .sign_with_keys(&keys)
+            .expect("metadata");
+        write_events(File::create(&path).expect("create"), [&reply, &unrelated])
+            .expect("write parquet");
+
+        let connection = Connection::open_in_memory().expect("DuckDB");
+        let mut bytes = Vec::new();
+        let stats = scan_semantic_facts(
+            &connection,
+            &[ObjectLocation::Local(path)],
+            1_700_000_100,
+            &mut bytes,
+        )
+        .expect("scan");
+        assert_eq!(
+            stats,
+            SemanticScanStats {
+                physical_relevant_rows: 1,
+                logical_relevant_events: 1,
+                duplicate_relevant_rows: 0,
+            }
+        );
+        let mut reader = SemanticFactReader::new(bytes.as_slice());
+        let record = reader.next_record().expect("read").expect("fact");
+        assert_eq!(record.id, *reply.id.as_bytes());
+        assert_eq!(record.created_at, 1_700_000_000);
+        assert_eq!(record.payload, SemanticPayload::Reply);
+        assert_eq!(reader.next_record().expect("eof"), None);
     }
 }
