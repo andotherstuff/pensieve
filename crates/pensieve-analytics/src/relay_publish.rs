@@ -13,6 +13,10 @@ use crate::{
 
 const PUBLICATION_LOCK_ID: i64 = 0x5045_4e53_4945_5645;
 
+/// Proof that the complete immutable relay product was validated before the
+/// short Postgres transaction began.
+pub(crate) struct ValidatedRelayDistributionPublication;
+
 /// Result of atomically publishing one dormant Slice 8 product.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RelayDistributionPublishOutcome {
@@ -28,9 +32,8 @@ pub fn publish_relay_distribution(
     baseline_run_id: &str,
     product: &BoundedRelayDistribution,
 ) -> Result<RelayDistributionPublishOutcome> {
-    validate_product(product)?;
+    let validated = validate_relay_distribution_publication(product)?;
     client.batch_execute(SCHEMA_SQL)?;
-    let product_id = relay_product_id(baseline_run_id, product);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
     let current = transaction.query_one(
@@ -47,6 +50,24 @@ pub fn publish_relay_distribution(
             "current Postgres run is not the exact corrected B3 Slice 8 baseline".to_owned(),
         ));
     }
+    let outcome = publish_relay_distribution_in_transaction(
+        &mut transaction,
+        baseline_run_id,
+        product,
+        &validated,
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+/// Publish one prevalidated relay product inside its generation transaction.
+pub(crate) fn publish_relay_distribution_in_transaction(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    product: &BoundedRelayDistribution,
+    _validated: &ValidatedRelayDistributionPublication,
+) -> Result<RelayDistributionPublishOutcome> {
+    let product_id = relay_product_id(run_id, product);
     if transaction
         .query_opt(
             "SELECT product_id FROM pensieve_analytics.relay_distribution_products
@@ -55,8 +76,7 @@ pub fn publish_relay_distribution(
         )?
         .is_some()
     {
-        reconcile(&mut transaction, &product_id, product)?;
-        transaction.commit()?;
+        reconcile(transaction, &product_id, product)?;
         return Ok(RelayDistributionPublishOutcome::AlreadyPublished { product_id });
     }
     transaction.execute(
@@ -67,7 +87,7 @@ pub fn publish_relay_distribution(
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())",
         &[
             &product_id,
-            &baseline_run_id,
+            &run_id,
             &product.evidence.snapshot_id,
             &to_i64("relay as-of", product.evidence.as_of_epoch)?,
             &RELAY_DISTRIBUTION_VERSION,
@@ -79,9 +99,8 @@ pub fn publish_relay_distribution(
             &to_i64("relay row count", product.evidence.rows.len() as u64)?,
         ],
     )?;
-    copy_rows(&mut transaction, &product_id, product)?;
-    reconcile(&mut transaction, &product_id, product)?;
-    transaction.commit()?;
+    copy_rows(transaction, &product_id, product)?;
+    reconcile(transaction, &product_id, product)?;
     Ok(RelayDistributionPublishOutcome::Published { product_id })
 }
 
@@ -197,12 +216,16 @@ fn reconcile(
     Ok(())
 }
 
-fn validate_product(product: &BoundedRelayDistribution) -> Result<()> {
+pub(crate) fn validate_relay_distribution_publication(
+    product: &BoundedRelayDistribution,
+) -> Result<ValidatedRelayDistributionPublication> {
     let rows_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&product.evidence.rows)
             .map_err(|error| Error::Validation(format!("encode relay rows: {error}")))?,
     ));
-    if product.evidence.status != "completed"
+    if product.evidence.schema_version != 1
+        || product.evidence.runner_version != "pensieve-analytics-relay-distribution-v2"
+        || product.evidence.status != "completed"
         || product.evidence.product_version != RELAY_DISTRIBUTION_VERSION
         || product.evidence.rows_sha256 != rows_sha256
         || product.evidence.rows.iter().any(|row| {
@@ -215,7 +238,7 @@ fn validate_product(product: &BoundedRelayDistribution) -> Result<()> {
             "relay distribution failed immutable publication validation".to_owned(),
         ));
     }
-    Ok(())
+    Ok(ValidatedRelayDistributionPublication)
 }
 
 fn relay_product_id(baseline_run_id: &str, product: &BoundedRelayDistribution) -> String {
@@ -369,11 +392,13 @@ mod tests {
         BoundedRelayDistribution {
             evidence: RelayDistributionEvidence {
                 schema_version: 1,
-                runner_version: "pensieve-analytics-relay-distribution-v1".to_owned(),
+                runner_version: "pensieve-analytics-relay-distribution-v2".to_owned(),
                 status: "completed".to_owned(),
                 product_version: RELAY_DISTRIBUTION_VERSION.to_owned(),
                 snapshot_id: "sha256:relay-test".to_owned(),
                 as_of_epoch: 1_700_000_000,
+                baseline_evidence_sha256: None,
+                delta_object_count: 0,
                 object_count: 0,
                 applied_objects: 0,
                 physical_rows_scanned: 0,

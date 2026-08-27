@@ -17,7 +17,7 @@ use crate::{
 };
 
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const RUNNER_VERSION: &str = "pensieve-analytics-relay-distribution-v1";
+const RUNNER_VERSION: &str = "pensieve-analytics-relay-distribution-v2";
 
 /// Bounded workspace and serving thresholds for current relay distribution.
 #[derive(Clone, Debug)]
@@ -51,6 +51,10 @@ pub struct RelayDistributionEvidence {
     pub snapshot_id: String,
     /// Fixed analytics boundary.
     pub as_of_epoch: u64,
+    /// SHA-256 of the fully validated predecessor evidence, when advanced.
+    pub baseline_evidence_sha256: Option<String>,
+    /// Exact immutable objects added after the predecessor snapshot.
+    pub delta_object_count: u64,
     /// Active immutable catalog objects covered.
     pub object_count: u64,
     /// Exact active objects applied to resumable state.
@@ -112,6 +116,64 @@ pub fn build_bounded_relay_distribution(
     snapshot: ResolvedSnapshot,
     build: BuildConfig,
     config: RelayDistributionConfig,
+) -> Result<BoundedRelayDistribution> {
+    build_relay_distribution(evidence_path, snapshot, build, config, None)
+}
+
+/// Advance an exact relay ledger after validating its immutable predecessor.
+pub fn advance_bounded_relay_distribution(
+    evidence_path: impl AsRef<Path>,
+    baseline: &BoundedRelayDistribution,
+    snapshot: ResolvedSnapshot,
+    build: BuildConfig,
+    config: RelayDistributionConfig,
+) -> Result<BoundedRelayDistribution> {
+    let target_inputs = catalog_inputs(&snapshot)?;
+    let target_by_key = target_inputs
+        .iter()
+        .map(|input| (input.identity.as_str(), input))
+        .collect::<BTreeMap<_, _>>();
+    for input in &baseline.evidence.inputs {
+        if target_by_key.get(input.identity.as_str()).copied() != Some(input) {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "relay target does not retain immutable baseline object {}",
+                input.identity
+            ))
+            .into());
+        }
+    }
+    if build.as_of_epoch < baseline.evidence.as_of_epoch {
+        return Err(BoundedExecutionError::Invalid(
+            "relay successor as-of precedes its baseline".to_owned(),
+        )
+        .into());
+    }
+    let delta_object_count = u64::try_from(
+        target_inputs
+            .len()
+            .checked_sub(baseline.evidence.inputs.len())
+            .ok_or_else(|| {
+                BoundedExecutionError::Invalid(
+                    "relay target has fewer objects than its baseline".to_owned(),
+                )
+            })?,
+    )
+    .map_err(|_| BoundedExecutionError::Invalid("relay delta count exceeds u64".to_owned()))?;
+    build_relay_distribution(
+        evidence_path,
+        snapshot,
+        build,
+        config,
+        Some((baseline.evidence_sha256.clone(), delta_object_count)),
+    )
+}
+
+fn build_relay_distribution(
+    evidence_path: impl AsRef<Path>,
+    snapshot: ResolvedSnapshot,
+    build: BuildConfig,
+    config: RelayDistributionConfig,
+    lineage: Option<(String, u64)>,
 ) -> Result<BoundedRelayDistribution> {
     validate_config(&snapshot, &build, &config)?;
     let state_parent = config.state_database.parent().ok_or_else(|| {
@@ -188,6 +250,13 @@ pub fn build_bounded_relay_distribution(
         product_version: RELAY_DISTRIBUTION_VERSION.to_owned(),
         snapshot_id: snapshot.catalog.snapshot_id.clone(),
         as_of_epoch: build.as_of_epoch,
+        baseline_evidence_sha256: lineage.as_ref().map(|value| value.0.clone()),
+        delta_object_count: lineage.map_or(
+            u64::try_from(inputs.len()).map_err(|_| {
+                BoundedExecutionError::Invalid("relay object count exceeds u64".to_owned())
+            })?,
+            |value| value.1,
+        ),
         object_count: u64::try_from(inputs.len()).map_err(|_| {
             BoundedExecutionError::Invalid("relay object count exceeds u64".to_owned())
         })?,
@@ -234,6 +303,52 @@ pub fn load_bounded_relay_distribution(
     )?;
     validate_applied_inputs(&state, &evidence.inputs)?;
     validate_evidence(&evidence, &state)?;
+    Ok(BoundedRelayDistribution {
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
+        evidence,
+    })
+}
+
+/// Load predecessor evidence for a resumable successor whose ledger may
+/// already contain a validated prefix of the declared target.
+pub fn load_bounded_relay_distribution_for_advance(
+    evidence_path: impl AsRef<Path>,
+    state_database: impl AsRef<Path>,
+    target: &ResolvedSnapshot,
+) -> Result<BoundedRelayDistribution> {
+    let evidence_path = evidence_path.as_ref();
+    let evidence: RelayDistributionEvidence =
+        serde_json::from_slice(&std::fs::read(evidence_path)?)
+            .map_err(BoundedExecutionError::from)?;
+    validate_static_evidence(&evidence)?;
+    let state = SqliteConnection::open_with_flags(
+        state_database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let applied_objects = count(&state, "SELECT count(*) FROM applied_objects", [])?;
+    let state_snapshot: Option<String> = state
+        .query_row(
+            "SELECT value FROM metadata WHERE key='snapshot_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied_objects == evidence.applied_objects
+        && state_snapshot.as_deref() == Some(evidence.snapshot_id.as_str())
+    {
+        validate_applied_inputs(&state, &evidence.inputs)?;
+        validate_evidence(&evidence, &state)?;
+    } else {
+        validate_inputs_present(&state, &evidence.inputs)?;
+        let target_inputs = catalog_inputs(target)?;
+        validate_applied_inputs(&state, &target_inputs)?;
+        if applied_objects < evidence.applied_objects || state_snapshot.is_none() {
+            return Err(BoundedExecutionError::Invalid(
+                "relay resumable state is not an exact predecessor-to-target prefix".to_owned(),
+            )
+            .into());
+        }
+    }
     Ok(BoundedRelayDistribution {
         evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
         evidence,
@@ -521,6 +636,7 @@ fn count<const N: usize>(state: &SqliteConnection, sql: &str, parameters: [i64; 
 }
 
 fn validate_evidence(evidence: &RelayDistributionEvidence, state: &SqliteConnection) -> Result<()> {
+    validate_static_evidence(evidence)?;
     let rows = materialize_rows(state, evidence.as_of_epoch, evidence.minimum_users)?;
     let rows_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&rows).map_err(BoundedExecutionError::from)?,
@@ -538,14 +654,13 @@ fn validate_evidence(evidence: &RelayDistributionEvidence, state: &SqliteConnect
     let input_rows = evidence.inputs.iter().try_fold(0_u64, |sum, input| {
         checked_add(sum, input.row_count, "relay input physical rows")
     })?;
-    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION
-        || evidence.runner_version != RUNNER_VERSION
-        || evidence.status != "completed"
-        || evidence.product_version != RELAY_DISTRIBUTION_VERSION
-        || snapshot_id.as_deref() != Some(evidence.snapshot_id.as_str())
+    if snapshot_id.as_deref() != Some(evidence.snapshot_id.as_str())
         || evidence.rows != rows
         || evidence.rows_sha256 != rows_sha256
         || evidence.object_count != evidence.inputs.len() as u64
+        || evidence.delta_object_count > evidence.object_count
+        || (evidence.baseline_evidence_sha256.is_none()
+            && evidence.delta_object_count != evidence.object_count)
         || evidence.applied_objects != evidence.object_count
         || applied_objects != evidence.object_count
         || input_rows != evidence.physical_rows_scanned
@@ -577,6 +692,39 @@ fn validate_evidence(evidence: &RelayDistributionEvidence, state: &SqliteConnect
     Ok(())
 }
 
+fn validate_static_evidence(evidence: &RelayDistributionEvidence) -> Result<()> {
+    let rows_sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&evidence.rows).map_err(BoundedExecutionError::from)?,
+    ));
+    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION
+        || evidence.runner_version != RUNNER_VERSION
+        || evidence.status != "completed"
+        || evidence.product_version != RELAY_DISTRIBUTION_VERSION
+        || evidence.rows_sha256 != rows_sha256
+        || evidence.object_count != evidence.inputs.len() as u64
+        || evidence.applied_objects != evidence.object_count
+        || evidence.delta_object_count > evidence.object_count
+        || (evidence.baseline_evidence_sha256.is_none()
+            && evidence.delta_object_count != evidence.object_count)
+        || evidence.rows.iter().any(|row| {
+            row.user_count < evidence.minimum_users
+                || row.read_count > row.user_count
+                || row.write_count > row.user_count
+        })
+        || evidence.rows.windows(2).any(|rows| {
+            rows[0].user_count < rows[1].user_count
+                || (rows[0].user_count == rows[1].user_count
+                    && rows[0].relay_url >= rows[1].relay_url)
+        })
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "relay distribution static evidence is invalid".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_applied_inputs(state: &SqliteConnection, inputs: &[InputIdentity]) -> Result<()> {
     let expected = inputs
         .iter()
@@ -600,6 +748,36 @@ fn validate_applied_inputs(state: &SqliteConnection, inputs: &[InputIdentity]) -
         {
             return Err(BoundedExecutionError::Invalid(format!(
                 "relay applied object {key} changed immutable identity"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_inputs_present(state: &SqliteConnection, inputs: &[InputIdentity]) -> Result<()> {
+    for input in inputs {
+        let stored: Option<(i64, i64, String)> = state
+            .query_row(
+                "SELECT byte_size,row_count,sha256 FROM applied_objects WHERE object_key=?1",
+                [&input.identity],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((bytes, rows, sha256)) = stored else {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "relay state is missing baseline object {}",
+                input.identity
+            ))
+            .into());
+        };
+        if from_i64("relay baseline bytes", bytes)? != input.byte_size
+            || from_i64("relay baseline rows", rows)? != input.row_count
+            || sha256 != input.sha256
+        {
+            return Err(BoundedExecutionError::Invalid(format!(
+                "relay baseline object {} changed immutable identity",
+                input.identity
             ))
             .into());
         }

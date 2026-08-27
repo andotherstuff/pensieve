@@ -727,6 +727,10 @@ Implementation status:
   canonical completion evidence.
 - [x] Dormant atomic Postgres publication with exact row reconciliation,
   rollback/retry safety, deterministic serving order, and no pointer change.
+- [x] Versioned append-only successor lineage, including predecessor evidence
+  identity, exact delta-object accounting, and future-candidate maturation.
+- [x] Recurring generation integration with pre-transaction validation and
+  all-or-nothing publication alongside B3, Slice 6, and Slice 7.
 - [ ] Independent production winner/count comparison canary.
 
 ### Slice 9 — publisher benchmark and contract

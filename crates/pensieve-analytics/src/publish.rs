@@ -10,11 +10,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedFlexibleDistinct,
-    BoundedPubkeyFirstSeen, BoundedSemanticFacts, BoundedZapDistinct,
+    BoundedPubkeyFirstSeen, BoundedRelayDistribution, BoundedSemanticFacts, BoundedZapDistinct,
     COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION,
     QUERY_VERSION, Result,
     flexible_distinct_publish::{
         publish_flexible_distinct_leaves_in_transaction, validate_flexible_distinct_publication,
+    },
+    relay_publish::{
+        RelayDistributionPublishOutcome, ValidatedRelayDistributionPublication,
+        publish_relay_distribution_in_transaction, validate_relay_distribution_publication,
     },
     schema::SCHEMA_SQL,
     semantic_publish::{
@@ -36,6 +40,7 @@ struct PublicationProducts<'a> {
     cohort: Option<&'a BoundedCohortRetention>,
     flexible: Option<FlexibleDistinctPublication<'a>>,
     semantic: Option<SemanticPublication<'a>>,
+    relay: Option<&'a BoundedRelayDistribution>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -107,6 +112,15 @@ pub struct AllRecurringProducts<'a> {
     pub semantic: SemanticPublication<'a>,
 }
 
+/// Every validated bounded product through Slice 8.
+#[derive(Clone, Copy)]
+pub struct AllRecurringProductsWithRelay<'a> {
+    /// Recurring products through Slice 7.
+    pub recurring: AllRecurringProducts<'a>,
+    /// Exact current NIP-65 relay distribution.
+    pub relay: &'a BoundedRelayDistribution,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -127,6 +141,7 @@ struct ValidationRecord {
     flexible_distinct_validation_sha256: Option<String>,
     semantic_evidence_sha256: Option<String>,
     zap_distinct_evidence_sha256: Option<String>,
+    relay_distribution_evidence_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -173,6 +188,7 @@ pub fn publish_with_identity(
             cohort: None,
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -199,6 +215,7 @@ pub fn publish_with_identity_and_activity(
             cohort: None,
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -224,6 +241,7 @@ pub fn publish_with_all_bounded_products(
             cohort: Some(products.cohort),
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -269,6 +287,7 @@ pub fn publish_incremental_with_identity(
             cohort: None,
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -296,6 +315,7 @@ pub fn publish_incremental_with_identity_and_activity(
             cohort: None,
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -322,6 +342,7 @@ pub fn publish_incremental_with_all_bounded_products(
             cohort: Some(products.cohort),
             flexible: None,
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -349,6 +370,7 @@ pub fn publish_incremental_with_all_bounded_products_and_flexible(
             cohort: Some(products.cohort),
             flexible: Some(flexible),
             semantic: None,
+            relay: None,
         },
     )
 }
@@ -375,6 +397,34 @@ pub fn publish_incremental_with_all_bounded_products_flexible_and_semantic(
             cohort: Some(products.bounded.cohort),
             flexible: Some(products.flexible),
             semantic: Some(products.semantic),
+            relay: None,
+        },
+    )
+}
+
+/// Publish one incremental generation containing every product through Slice 8.
+pub fn publish_incremental_with_all_recurring_products_and_relay(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllRecurringProductsWithRelay<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.recurring.bounded.identity),
+            activity: Some(products.recurring.bounded.activity),
+            cohort: Some(products.recurring.bounded.cohort),
+            flexible: Some(products.recurring.flexible),
+            semantic: Some(products.recurring.semantic),
+            relay: Some(products.relay),
         },
     )
 }
@@ -393,6 +443,7 @@ fn publish_kind(
     let cohort = products.cohort;
     let flexible = products.flexible;
     let semantic = products.semantic;
+    let relay = products.relay;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -465,6 +516,23 @@ fn publish_kind(
     } else {
         None
     };
+    let validated_relay = if let Some(relay) = relay {
+        if semantic.is_none() {
+            return Err(Error::Validation(
+                "relay publication requires the complete Slice 7 lane".to_owned(),
+            ));
+        }
+        if relay.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || relay.evidence.as_of_epoch != build.config.as_of_epoch
+        {
+            return Err(Error::Validation(
+                "relay evidence does not match its publication generation".to_owned(),
+            ));
+        }
+        Some(validate_relay_distribution_publication(relay)?)
+    } else {
+        None
+    };
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
@@ -502,6 +570,7 @@ fn publish_kind(
                 semantic,
                 validated_semantic.as_ref(),
             )?;
+            publish_relay_product(&mut transaction, &run_id, relay, validated_relay.as_ref())?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -557,6 +626,7 @@ fn publish_kind(
             .map(|publication| publication.product.evidence_sha256.clone()),
         zap_distinct_evidence_sha256: semantic
             .map(|publication| publication.zap_distinct.evidence_sha256.clone()),
+        relay_distribution_evidence_sha256: relay.map(|product| product.evidence_sha256.clone()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -683,6 +753,7 @@ fn publish_kind(
         semantic,
         validated_semantic.as_ref(),
     )?;
+    publish_relay_product(&mut transaction, &run_id, relay, validated_relay.as_ref())?;
 
     transaction.execute(
         "
@@ -697,6 +768,26 @@ fn publish_kind(
         run_id,
         previous_run_id: current_run_id,
     })
+}
+
+fn publish_relay_product(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    relay: Option<&BoundedRelayDistribution>,
+    validated: Option<&ValidatedRelayDistributionPublication>,
+) -> Result<()> {
+    let Some(relay) = relay else {
+        return Ok(());
+    };
+    let Some(validated) = validated else {
+        return Err(Error::Validation(
+            "relay publication is missing pre-transaction validation".to_owned(),
+        ));
+    };
+    match publish_relay_distribution_in_transaction(transaction, run_id, relay, validated)? {
+        RelayDistributionPublishOutcome::Published { .. }
+        | RelayDistributionPublishOutcome::AlreadyPublished { .. } => Ok(()),
+    }
 }
 
 fn publish_semantic_products(

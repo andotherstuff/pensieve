@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
-    AllBoundedProducts, AllRecurringProducts, AnalyticsBuild, BatchLimits, BuildConfig,
-    CatalogDeltaPlan, EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig,
-    FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation, PlannedRunKind,
-    PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig, RelayDistributionConfig,
-    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, advance_bounded_fixed_activity,
-    advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
+    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithRelay, AnalyticsBuild,
+    BatchLimits, BuildConfig, CatalogDeltaPlan, EventFactsConfig, FixedActivityConfig,
+    FlexibleDistinctConfig, FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation,
+    PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig,
+    RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ZapDistinctConfig,
+    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, advance_bounded_relay_distribution,
     advance_bounded_semantic_facts, apply_incremental, benchmark_publishers,
     build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
     build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
@@ -16,12 +17,14 @@ use pensieve_analytics::{
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
     estimate_flexible_distinct_windows, load_bounded_fixed_activity,
     load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    load_bounded_relay_distribution, load_bounded_semantic_facts, load_bounded_zap_distinct,
-    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
+    load_bounded_relay_distribution, load_bounded_relay_distribution_for_advance,
+    load_bounded_semantic_facts, load_bounded_zap_distinct, plan_catalog_delta_for_query_version,
+    plan_catalog_delta_from_run, publish,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
-    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
-    resolve_delta_locations, resolve_snapshot,
+    publish_incremental_with_all_recurring_products_and_relay, publish_with_all_bounded_products,
+    publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
+    resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -603,13 +606,19 @@ fn relay_distribution_advances_replacement_state_without_rescanning_objects() {
     let target_catalog = directory.path().join("relay-target.json");
     write_catalog_atomically(&target_catalog, &target).expect("write target catalog");
     let target_evidence = directory.path().join("relay-target-evidence.json");
-    let target_product = build_bounded_relay_distribution(
+    let target_product = advance_bounded_relay_distribution(
         &target_evidence,
+        &baseline_product,
         resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve target"),
         build_config.clone(),
         config.clone(),
     )
     .expect("advance relay product");
+    assert_eq!(target_product.evidence.delta_object_count, 1);
+    assert_eq!(
+        target_product.evidence.baseline_evidence_sha256.as_deref(),
+        Some(baseline_product.evidence_sha256.as_str())
+    );
     assert_eq!(target_product.evidence.applied_objects, 2);
     assert_eq!(target_product.evidence.candidate_events, 4);
     assert_eq!(
@@ -621,9 +630,25 @@ fn relay_distribution_advances_replacement_state_without_rescanning_objects() {
             .collect::<Vec<_>>(),
         vec!["wss://new.example", "wss://shared.example"]
     );
+    let retry_baseline = load_bounded_relay_distribution_for_advance(
+        &evidence,
+        &state,
+        &resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve retry target"),
+    )
+    .expect("load exact baseline from partially or fully advanced state");
+    let retried_target = advance_bounded_relay_distribution(
+        directory.path().join("relay-target-retry-evidence.json"),
+        &retry_baseline,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve target retry"),
+        build_config.clone(),
+        config.clone(),
+    )
+    .expect("resume target from committed relay batches");
+    assert_eq!(retried_target.evidence, target_product.evidence);
 
-    let future_product = build_bounded_relay_distribution(
+    let future_product = advance_bounded_relay_distribution(
         directory.path().join("relay-future-evidence.json"),
+        &target_product,
         resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve future target"),
         BuildConfig {
             as_of_epoch: AS_OF + 100,
@@ -632,6 +657,7 @@ fn relay_distribution_advances_replacement_state_without_rescanning_objects() {
         config,
     )
     .expect("advance only the as-of boundary");
+    assert_eq!(future_product.evidence.delta_object_count, 0);
     assert_eq!(future_product.evidence.physical_rows_scanned, 4);
     assert_eq!(
         future_product
@@ -2311,6 +2337,101 @@ fn slice_a_publication_is_atomic_and_idempotent() {
                 &[],
             )
             .expect("count committed semantic product pair")
+            .get::<_, i64>(0),
+        1
+    );
+    let relay_state = fixture
+        ._directory
+        .path()
+        .join("publication-relay-state.sqlite");
+    let relay = build_bounded_relay_distribution(
+        fixture
+            ._directory
+            .path()
+            .join("publication-relay-evidence.json"),
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        RelayDistributionConfig {
+            state_database: relay_state,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            max_state_bytes: 64 * 1024 * 1024,
+            sqlite_cache_bytes: 1024 * 1024,
+            minimum_users: 1,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build relay publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_relay_product_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected relay product publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_relay_product_test
+            BEFORE INSERT ON pensieve_analytics.relay_distribution_products
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_relay_product_test();
+            ",
+        )
+        .expect("install relay failure injection");
+    let recurring_with_relay = AllRecurringProductsWithRelay {
+        recurring,
+        relay: &relay,
+    };
+    publish_incremental_with_all_recurring_products_and_relay(
+        &mut client,
+        &fixture.build,
+        recurring_with_relay,
+        &cohort_run_id,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected relay failure must roll back the complete generation");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.relay_distribution_products",
+                &[],
+            )
+            .expect("count rolled-back relay products")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_relay_product_test
+                ON pensieve_analytics.relay_distribution_products;
+            DROP FUNCTION pensieve_analytics.reject_relay_product_test();
+            ",
+        )
+        .expect("remove relay failure injection");
+    assert_eq!(
+        publish_incremental_with_all_recurring_products_and_relay(
+            &mut client,
+            &fixture.build,
+            recurring_with_relay,
+            &cohort_run_id,
+            started_at,
+            completed_at,
+        )
+        .expect("atomically attach relay product to current generation"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id.clone()
+        }
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.relay_distribution_products",
+                &[],
+            )
+            .expect("count committed relay products")
             .get::<_, i64>(0),
         1
     );

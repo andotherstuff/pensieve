@@ -36,6 +36,9 @@ flexible_root="${PENSIEVE_ANALYTICS_FLEXIBLE_ROOT:-/archive/analytics/flexible-d
 semantic_enabled="${PENSIEVE_ANALYTICS_SEMANTIC_ENABLED:-0}"
 semantic_root="${PENSIEVE_ANALYTICS_SEMANTIC_ROOT:-/archive/analytics/semantic-facts}"
 zap_distinct_root="${PENSIEVE_ANALYTICS_ZAP_DISTINCT_ROOT:-/archive/analytics/zap-distinct}"
+relay_enabled="${PENSIEVE_ANALYTICS_RELAY_ENABLED:-0}"
+relay_root="${PENSIEVE_ANALYTICS_RELAY_ROOT:-/archive/analytics/relay-distribution}"
+relay_state_database="${PENSIEVE_ANALYTICS_RELAY_STATE_DATABASE:-$relay_root/state.sqlite}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -105,6 +108,10 @@ if [ "$semantic_enabled" != "0" ] && [ "$semantic_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_SEMANTIC_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$relay_enabled" != "0" ] && [ "$relay_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_RELAY_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
     exit 2
@@ -119,6 +126,10 @@ if [ "$flexible_enabled" = "1" ] && [ "$cohort_enabled" != "1" ]; then
 fi
 if [ "$semantic_enabled" = "1" ] && [ "$flexible_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_SEMANTIC_ENABLED requires PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$relay_enabled" = "1" ] && [ "$semantic_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_RELAY_ENABLED requires PENSIEVE_ANALYTICS_SEMANTIC_ENABLED=1" >&2
     exit 2
 fi
 
@@ -220,6 +231,19 @@ if [ "$semantic_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$semantic_root" "$zap_distinct_root"
+fi
+relay_baseline_evidence=""
+if [ "$relay_enabled" = "1" ]; then
+    relay_baseline_evidence="$current_generation/relay-distribution-evidence.json"
+    if [ ! -s "$relay_baseline_evidence" ]; then
+        echo "Current relay-distribution evidence is missing: $relay_baseline_evidence" >&2
+        exit 2
+    fi
+    if [ ! -s "$relay_state_database" ]; then
+        echo "Relay-distribution state is missing: $relay_state_database" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$relay_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -359,6 +383,11 @@ promote_generation() {
             cmp "$run_dir/zap-distinct-evidence.json" \
                 "$generation/zap-distinct-evidence.json"
         fi
+        if [ "$relay_enabled" = "1" ] \
+            && [ -s "$run_dir/relay-distribution-evidence.json" ]; then
+            cmp "$run_dir/relay-distribution-evidence.json" \
+                "$generation/relay-distribution-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -394,6 +423,10 @@ promote_generation() {
                 "$partial_generation/semantic-evidence.json"
             install -m 0640 "$run_dir/zap-distinct-evidence.json" \
                 "$partial_generation/zap-distinct-evidence.json"
+        fi
+        if [ "$relay_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/relay-distribution-evidence.json" \
+                "$partial_generation/relay-distribution-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         mapfile -t generation_files < <(
@@ -544,6 +577,13 @@ case "$run_kind" in
                 --zap-distinct-work-root "$zap_work_root"
             )
         fi
+        if [ "$relay_enabled" = "1" ]; then
+            incremental_args+=(
+                --relay-baseline-evidence "$relay_baseline_evidence"
+                --relay-state-database "$relay_state_database"
+                --relay-evidence "$run_dir/relay-distribution-evidence.json"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -613,6 +653,10 @@ if [ "$semantic_enabled" = "1" ] \
         "$run_dir/semantic-evidence.json"
         "$run_dir/zap-distinct-evidence.json"
     )
+fi
+if [ "$relay_enabled" = "1" ] \
+    && [ -s "$run_dir/relay-distribution-evidence.json" ]; then
+    evidence_files+=("$run_dir/relay-distribution-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

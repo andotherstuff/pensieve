@@ -6,21 +6,23 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AllBoundedProducts, AllRecurringProducts, BatchLimits, BuildConfig,
-    COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
+    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithRelay, BatchLimits,
+    BuildConfig, COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
     FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig, FlexibleDistinctConfig,
     FlexibleDistinctPublication, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome,
-    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, acquire_publication_lock,
-    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, advance_bounded_semantic_facts, apply_incremental,
-    build_bounded_cohort_retention, build_bounded_zap_distinct, build_flexible_distinct_validation,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, publish_incremental,
+    RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ZapDistinctConfig,
+    acquire_publication_lock, advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, advance_bounded_relay_distribution,
+    advance_bounded_semantic_facts, apply_incremental, build_bounded_cohort_retention,
+    build_bounded_zap_distinct, build_flexible_distinct_validation, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    load_bounded_relay_distribution_for_advance, load_bounded_semantic_facts,
+    plan_catalog_delta_for_query_version, publish_incremental,
     publish_incremental_with_all_bounded_products,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
-    publish_incremental_with_identity, publish_incremental_with_identity_and_activity,
-    resolve_delta_locations, resolve_snapshot,
+    publish_incremental_with_all_recurring_products_and_relay, publish_incremental_with_identity,
+    publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -183,6 +185,33 @@ struct Args {
     /// Free zap work-filesystem bytes left untouched.
     #[arg(long, default_value_t = 107_374_182_400)]
     zap_distinct_disk_reserve_bytes: u64,
+    /// Current immutable relay-distribution evidence; enables recurring Slice 8.
+    #[arg(long)]
+    relay_baseline_evidence: Option<PathBuf>,
+    /// Durable append-only relay candidate ledger shared across generations.
+    #[arg(long)]
+    relay_state_database: Option<PathBuf>,
+    /// Immutable relay-distribution successor evidence output.
+    #[arg(long)]
+    relay_evidence: Option<PathBuf>,
+    /// Maximum compressed object bytes in one relay scan.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    relay_batch_bytes: u64,
+    /// Maximum physical rows in one relay scan.
+    #[arg(long, default_value_t = 5_000_000)]
+    relay_batch_rows: u64,
+    /// Hard ceiling for the durable relay candidate ledger.
+    #[arg(long, default_value_t = 53_687_091_200)]
+    relay_max_state_bytes: u64,
+    /// SQLite page-cache bound for relay candidate state.
+    #[arg(long, default_value_t = 268_435_456)]
+    relay_sqlite_cache_bytes: u64,
+    /// Minimum winning pubkeys required for a served relay row.
+    #[arg(long, default_value_t = 10)]
+    relay_minimum_users: u64,
+    /// Free relay-state filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400)]
+    relay_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -198,6 +227,7 @@ struct Output<'a> {
     cohort: Option<CohortOutput<'a>>,
     flexible: Option<FlexibleOutput<'a>>,
     semantic: Option<SemanticOutput<'a>>,
+    relay: Option<RelayOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -261,6 +291,16 @@ struct SemanticOutput<'a> {
 }
 
 #[derive(Serialize)]
+struct RelayOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    delta_object_count: u64,
+    candidate_events: u64,
+    winning_pubkeys: u64,
+    relay_rows: usize,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum PublicationOutput {
     Published {
@@ -306,6 +346,7 @@ fn run() -> Result<()> {
     let cohort_enabled = args.cohort_baseline_evidence.is_some();
     let flexible_enabled = args.flexible_baseline_evidence.is_some();
     let semantic_enabled = args.semantic_baseline_evidence.is_some();
+    let relay_enabled = args.relay_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -333,6 +374,11 @@ fn run() -> Result<()> {
         args.zap_distinct_evidence.is_some(),
         args.zap_distinct_work_root.is_some(),
     ])?;
+    require_complete_relay_args([
+        relay_enabled,
+        args.relay_state_database.is_some(),
+        args.relay_evidence.is_some(),
+    ])?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
@@ -346,6 +392,9 @@ fn run() -> Result<()> {
     }
     if semantic_enabled && !flexible_enabled {
         bail!("semantic advancement requires the complete Slice 6 lane in the same run");
+    }
+    if relay_enabled && !semantic_enabled {
+        bail!("relay advancement requires the complete Slice 7 lane in the same run");
     }
     let desired_query_version = if cohort_enabled {
         COHORT_RETENTION_QUERY_VERSION
@@ -608,12 +657,90 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let relay = if let (Some(baseline_path), Some(state_database), Some(evidence_path)) = (
+        args.relay_baseline_evidence.as_ref(),
+        args.relay_state_database.as_ref(),
+        args.relay_evidence.as_ref(),
+    ) {
+        let baseline =
+            load_bounded_relay_distribution_for_advance(baseline_path, state_database, &target)
+                .context("load baseline relay-distribution evidence and state")?;
+        Some(
+            advance_bounded_relay_distribution(
+                evidence_path,
+                &baseline,
+                target.clone(),
+                build.config.clone(),
+                RelayDistributionConfig {
+                    state_database: state_database.clone(),
+                    batch_limits: BatchLimits {
+                        max_bytes: args.relay_batch_bytes,
+                        max_rows: args.relay_batch_rows,
+                    },
+                    max_state_bytes: args.relay_max_state_bytes,
+                    sqlite_cache_bytes: args.relay_sqlite_cache_bytes,
+                    minimum_users: args.relay_minimum_users,
+                    disk_reserve_bytes: args.relay_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded relay-distribution state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
             match if let (
+                Some(identity),
+                Some(activity),
+                Some(cohort),
+                Some(flexible),
+                Some(validation_path),
+                Some(validation_sha256),
+                Some(semantic),
+                Some(zap_distinct),
+                Some(relay),
+            ) = (
+                identity.as_ref(),
+                activity.as_ref(),
+                cohort.as_ref(),
+                flexible.as_ref(),
+                args.flexible_validation_evidence.as_deref(),
+                flexible_validation_sha256.as_deref(),
+                semantic.as_ref(),
+                zap_distinct.as_ref(),
+                relay.as_ref(),
+            ) {
+                publish_incremental_with_all_recurring_products_and_relay(
+                    &mut client,
+                    &build,
+                    AllRecurringProductsWithRelay {
+                        recurring: AllRecurringProducts {
+                            bounded: AllBoundedProducts {
+                                identity,
+                                activity,
+                                cohort,
+                            },
+                            flexible: FlexibleDistinctPublication {
+                                product: flexible,
+                                validation_evidence_path: validation_path,
+                                validation_evidence_sha256: validation_sha256,
+                            },
+                            semantic: SemanticPublication {
+                                product: semantic,
+                                zap_distinct,
+                            },
+                        },
+                        relay,
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (
                 Some(identity),
                 Some(activity),
                 Some(cohort),
@@ -829,6 +956,18 @@ fn run() -> Result<()> {
                     .leaves
                     .len(),
             }),
+            relay: relay.as_ref().map(|relay| RelayOutput {
+                evidence_sha256: &relay.evidence_sha256,
+                baseline_evidence_sha256: relay
+                    .evidence
+                    .baseline_evidence_sha256
+                    .as_deref()
+                    .expect("relay successor has baseline evidence"),
+                delta_object_count: relay.evidence.delta_object_count,
+                candidate_events: relay.evidence.candidate_events,
+                winning_pubkeys: relay.evidence.winning_pubkeys,
+                relay_rows: relay.evidence.rows.len(),
+            }),
             publication,
         })?
     );
@@ -863,6 +1002,15 @@ fn require_complete_semantic_args(present: [bool; 6]) -> Result<()> {
     }
     bail!(
         "semantic baseline evidence/artifact, successor evidence/work root, and zap evidence/work root must be supplied together"
+    )
+}
+
+fn require_complete_relay_args(present: [bool; 3]) -> Result<()> {
+    if present.into_iter().all(|value| value == present[0]) {
+        return Ok(());
+    }
+    bail!(
+        "relay baseline evidence, state database, and successor evidence must be supplied together"
     )
 }
 
@@ -1007,5 +1155,13 @@ mod tests {
         require_complete_semantic_args([true; 6]).expect("complete semantic lane is valid");
         assert!(require_complete_semantic_args([true, true, true, true, true, false]).is_err());
         assert!(require_complete_semantic_args([false, true, true, true, true, true]).is_err());
+    }
+
+    #[test]
+    fn relay_arguments_are_all_or_nothing() {
+        require_complete_relay_args([false; 3]).expect("disabled relay lane is valid");
+        require_complete_relay_args([true; 3]).expect("complete relay lane is valid");
+        assert!(require_complete_relay_args([true, true, false]).is_err());
+        assert!(require_complete_relay_args([false, true, true]).is_err());
     }
 }
