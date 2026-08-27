@@ -72,12 +72,52 @@ CREATE TABLE IF NOT EXISTS pensieve_analytics.semantic_zap_rejections_daily (
     PRIMARY KEY (product_id, day_epoch, reason)
 );
 
+CREATE TABLE IF NOT EXISTS pensieve_analytics.semantic_zap_distinct_products (
+    product_id TEXT PRIMARY KEY,
+    semantic_product_id TEXT NOT NULL
+        REFERENCES pensieve_analytics.semantic_products (product_id)
+        ON DELETE CASCADE,
+    complete_through_epoch BIGINT NOT NULL CHECK (
+        complete_through_epoch >= 0 AND complete_through_epoch % 86400 = 0
+    ),
+    product_version TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL CHECK (evidence_sha256 ~ '^[0-9a-f]{64}$'),
+    identity_artifact_sha256 TEXT NOT NULL
+        CHECK (identity_artifact_sha256 ~ '^[0-9a-f]{64}$'),
+    physical_identities BIGINT NOT NULL CHECK (physical_identities >= 0),
+    logical_identities BIGINT NOT NULL CHECK (logical_identities >= 0),
+    duplicate_identities BIGINT NOT NULL CHECK (duplicate_identities >= 0),
+    leaf_rows BIGINT NOT NULL CHECK (leaf_rows >= 0),
+    sketch_bytes BIGINT NOT NULL CHECK (sketch_bytes >= 0),
+    max_leaf_bytes BIGINT NOT NULL CHECK (max_leaf_bytes >= 0),
+    published_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (semantic_product_id, product_version)
+);
+
+CREATE TABLE IF NOT EXISTS pensieve_analytics.semantic_zap_distinct_leaves (
+    product_id TEXT NOT NULL
+        REFERENCES pensieve_analytics.semantic_zap_distinct_products (product_id)
+        ON DELETE CASCADE,
+    day_epoch BIGINT NOT NULL CHECK (day_epoch >= 0 AND day_epoch % 86400 = 0),
+    role SMALLINT NOT NULL CHECK (role IN (0, 1)),
+    exact_identities BIGINT NOT NULL CHECK (exact_identities >= 0),
+    estimated_identities BIGINT NOT NULL CHECK (estimated_identities >= 0),
+    relative_error_ppm BIGINT NOT NULL CHECK (
+        relative_error_ppm >= 0 AND relative_error_ppm <= 20000
+    ),
+    sketch BYTEA NOT NULL,
+    PRIMARY KEY (product_id, day_epoch, role)
+);
+
 CREATE INDEX IF NOT EXISTS semantic_engagement_window
     ON pensieve_analytics.semantic_engagement_daily (product_id, day_epoch);
 CREATE INDEX IF NOT EXISTS semantic_longform_window
     ON pensieve_analytics.semantic_longform_daily (product_id, day_epoch);
 CREATE INDEX IF NOT EXISTS semantic_zap_window
     ON pensieve_analytics.semantic_zap_daily (product_id, day_epoch);
+CREATE INDEX IF NOT EXISTS semantic_zap_distinct_window
+    ON pensieve_analytics.semantic_zap_distinct_leaves
+        (product_id, role, day_epoch);
 
 -- Deliberately no current-product view or pointer. Slice 7 publication stays
 -- dormant until the combined API serving gate succeeds.

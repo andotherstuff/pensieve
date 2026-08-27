@@ -22,6 +22,8 @@ mod schema;
 mod semantic_build;
 mod semantic_facts;
 mod semantic_publish;
+mod zap_distinct;
+mod zap_distinct_publish;
 
 pub use bounded::{
     ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
@@ -104,3 +106,11 @@ pub use semantic_facts::{
     write_semantic_facts, zap_histogram_bucket,
 };
 pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};
+pub use zap_distinct::{
+    BoundedZapDistinct, ZAP_DISTINCT_VERSION, ZAP_IDENTITY_BYTES, ZapDistinctConfig,
+    ZapDistinctEvidence, ZapDistinctLeaf, ZapParticipantRole, build_bounded_zap_distinct,
+    load_bounded_zap_distinct,
+};
+pub use zap_distinct_publish::{
+    ZapDistinctPublishOutcome, estimate_published_zap_distinct, publish_zap_distinct,
+};

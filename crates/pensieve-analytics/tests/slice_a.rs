@@ -6,12 +6,13 @@ use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
     EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
     ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, SemanticFactsConfig,
-    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
-    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
-    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen, build_bounded_semantic_facts,
-    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
+    ZapDistinctConfig, advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen,
+    apply_incremental, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    build_bounded_semantic_facts, build_bounded_zap_distinct, estimate_flexible_distinct_window,
+    estimate_flexible_distinct_windows, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen, load_bounded_semantic_facts,
+    load_bounded_zap_distinct, plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
     publish, publish_with_all_bounded_products, publish_with_identity,
     publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
@@ -259,6 +260,27 @@ fn bounded_semantic_facts_are_resumable_and_reconcile_relevant_ids() {
         load_bounded_semantic_facts(&evidence, &first.artifact_path).expect("load semantic facts");
     assert_eq!(loaded.evidence, first.evidence);
     assert_eq!(loaded.evidence_sha256, first.evidence_sha256);
+
+    let zap_root = fixture._directory.path().join("zap-distinct");
+    let zap_evidence = zap_root.join("evidence.json");
+    let zap = build_bounded_zap_distinct(
+        &loaded,
+        &zap_evidence,
+        ZapDistinctConfig {
+            work_root: zap_root,
+            chunk_records: 2,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build empty zap-distinct product");
+    assert_eq!(zap.evidence.physical_identities, 0);
+    assert_eq!(zap.evidence.logical_identities, 0);
+    assert!(zap.evidence.leaves.is_empty());
+    let loaded_zap = load_bounded_zap_distinct(&zap_evidence, &zap.identity_path, &loaded)
+        .expect("load zap-distinct product");
+    assert_eq!(loaded_zap.evidence, zap.evidence);
+    assert_eq!(loaded_zap.evidence_sha256, zap.evidence_sha256);
 }
 
 #[test]
