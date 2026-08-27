@@ -707,6 +707,43 @@ Goal: choose a product that is correct, bounded, and fast enough to serve.
 Gate: the contract is documented before DDL or route cutover. A daily top-K
 shortcut is explicitly prohibited.
 
+Candidate exact contract (`publisher-benchmark-v1`):
+
+- the frozen source is the fully validated fixed-activity artifact for the
+  same snapshot and as-of as the serving run;
+- benchmarked windows are 1, 7, 30, 90, and 365 days, with an inclusive as-of
+  and an inclusive lower timestamp equal to `as_of - days * 86400`;
+- the public limit remains bounded to 1 through 1,000 rows and ordering is
+  descending event count followed by ascending raw pubkey bytes;
+- exact `(day,pubkey)` facts carry event count and first/last timestamps;
+- exact `(day,pubkey,kind)` facts carry the same additive fields and provide
+  both filtered rankings and exact distinct-kind counts for unfiltered
+  publisher rows;
+- all daily identities are formed from the globally sorted exact activity
+  stream, so duplicate events cannot create duplicate facts; and
+- a requested window is ranked only after summing every contributing exact
+  daily fact. Daily top-K rows are never merged to answer a longer window.
+
+The benchmark makes one fixed-memory source pass. It records exact daily fact
+cardinality and compact byte projections, exact publisher cardinality for each
+window across all 65,536 kinds, the size of fully materializing the supported
+window top-K relation, representative exact top rows, scan throughput, and
+explicit maximum buffers. Only representative result heaps are retained; the
+per-kind cardinality table is a fixed 65,536-entry domain per configured
+window and therefore does not grow with input rows or publisher count.
+
+Implementation status:
+
+- [x] Exact fixed-memory benchmark runner, strict source validation, canonical
+  evidence, bounded top-K heaps, and deterministic tie fixtures.
+- [x] Exact daily-fact and predefined-window cardinality projections without
+  the prohibited daily-top-K shortcut.
+- [ ] Production benchmark on a frozen current activity generation.
+- [ ] Freeze either exact daily-fact queries or predefined materialized
+  windows from measured Postgres size, refresh cost, and request latency.
+- [ ] Add the selected DDL, atomic publication, query path, and comparison
+  evidence only after that measured decision.
+
 ### Slice 10 — endpoint cutover and ClickHouse retirement gate
 
 Goal: move routes independently after their products are accepted.

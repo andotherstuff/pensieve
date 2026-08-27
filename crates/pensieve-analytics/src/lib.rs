@@ -17,6 +17,7 @@ mod input;
 mod plan;
 mod pubkey_first_seen;
 mod publish;
+mod publisher_benchmark;
 mod reconcile;
 mod relay_build;
 mod relay_distribution;
@@ -91,6 +92,11 @@ pub use publish::{
     publish_incremental_with_all_bounded_products, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity,
+};
+pub use publisher_benchmark::{
+    PUBLISHER_BENCHMARK_VERSION, PUBLISHER_DAILY_FACT_BYTES, PUBLISHER_DAILY_KIND_FACT_BYTES,
+    PUBLISHER_MATERIALIZED_TOP_BYTES, PublisherBenchmarkConfig, PublisherBenchmarkEvidence,
+    PublisherBenchmarkRow, benchmark_publishers,
 };
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,

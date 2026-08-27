@@ -5,14 +5,14 @@ use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
     EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
-    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, RelayDistributionConfig,
-    SemanticFactsConfig, ZapDistinctConfig, advance_bounded_fixed_activity,
-    advance_bounded_pubkey_first_seen, apply_incremental, build_bounded_cohort_retention,
-    build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_flexible_distinct,
-    build_bounded_pubkey_first_seen, build_bounded_relay_distribution,
-    build_bounded_semantic_facts, build_bounded_zap_distinct, estimate_flexible_distinct_window,
-    estimate_flexible_distinct_windows, load_bounded_fixed_activity,
-    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    PublisherBenchmarkConfig, RelayDistributionConfig, SemanticFactsConfig, ZapDistinctConfig,
+    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
+    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
+    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
+    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     load_bounded_relay_distribution, load_bounded_semantic_facts, load_bounded_zap_distinct,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
     publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
@@ -861,6 +861,24 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
     let loaded_flexible =
         load_bounded_flexible_distinct(&flexible_evidence).expect("reload flexible evidence");
     assert_eq!(loaded_flexible.evidence_sha256, flexible_sha);
+
+    let publisher_evidence = directory.path().join("publisher-benchmark.json");
+    let publisher = benchmark_publishers(
+        &publisher_evidence,
+        &completed,
+        PublisherBenchmarkConfig {
+            windows_days: vec![1, 7],
+            sampled_kinds: vec![0, 1],
+            top_limit: 2,
+        },
+    )
+    .expect("benchmark publisher serving contracts");
+    assert_eq!(publisher.source_records, 11);
+    assert_eq!(publisher.publisher_daily_rows, 8);
+    assert_eq!(publisher.publisher_daily_kind_rows, 10);
+    assert_eq!(publisher.all_kind_publishers_by_window, vec![4, 5]);
+    assert_eq!(publisher.representative_top_rows.len(), 10);
+    assert!(publisher.materialized_top_rows >= publisher.representative_top_rows.len() as u64);
 
     drop(completed);
     let loaded = load_bounded_fixed_activity(&evidence).expect("reload evidence");
