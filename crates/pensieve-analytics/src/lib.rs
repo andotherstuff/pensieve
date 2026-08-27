@@ -10,6 +10,7 @@ mod distinct_sketch;
 mod error;
 mod event_facts;
 mod fixed_activity;
+mod flexible_distinct;
 mod incremental;
 mod input;
 mod plan;
@@ -38,7 +39,8 @@ pub use cohort_retention::{
 };
 pub use distinct_sketch::{
     DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
-    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchError,
+    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
+    DistinctSketchUnion,
 };
 pub use error::{Error, Result};
 pub use event_facts::{
@@ -51,6 +53,11 @@ pub use fixed_activity::{
     FIXED_ACTIVITY_RECORD_BYTES, FIXED_ACTIVITY_VERSION, FixedActivityConfig,
     FixedActivityEvidence, PUBKEY_FLAGS_RECORD_BYTES, advance_bounded_fixed_activity,
     build_bounded_fixed_activity, load_bounded_fixed_activity,
+};
+pub use flexible_distinct::{
+    BoundedFlexibleDistinct, FLEXIBLE_DISTINCT_IDENTITY_BYTES, FLEXIBLE_DISTINCT_VERSION,
+    FlexibleDistinctConfig, FlexibleDistinctEvidence, build_bounded_flexible_distinct,
+    estimate_flexible_distinct_window, load_bounded_flexible_distinct,
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};

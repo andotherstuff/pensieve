@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
-    EventFactsConfig, FixedActivityConfig, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig,
-    PublishOutcome, advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen,
-    apply_incremental, build_bounded_cohort_retention, build_bounded_event_facts,
-    build_bounded_fixed_activity, build_bounded_pubkey_first_seen, load_bounded_fixed_activity,
-    load_bounded_pubkey_first_seen, plan_catalog_delta_for_query_version,
-    plan_catalog_delta_from_run, publish, publish_with_all_bounded_products, publish_with_identity,
-    publish_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
+    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, ObjectLocation, PlannedRunKind,
+    PubkeyFirstSeenConfig, PublishOutcome, advance_bounded_fixed_activity,
+    advance_bounded_pubkey_first_seen, apply_incremental, build_bounded_cohort_retention,
+    build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_flexible_distinct,
+    build_bounded_pubkey_first_seen, estimate_flexible_distinct_window,
+    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
+    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
+    resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -421,6 +423,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
     let follows = Keys::generate();
     let both = Keys::generate();
     let excluded = Keys::generate();
+    let trailing = Keys::generate();
     let day_a = 1_699_833_600_u64; // 2023-11-13 UTC
     let day_b = day_a + 86_400;
     let duplicate = event_with_keys(&profile, day_a + 2, 1, "note one");
@@ -448,6 +451,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
             event_with_keys(&both, day_b + 3, 3, "follows"),
             event_with_keys(&both, day_b + 4, 1, "note"),
             event_with_keys(&follows, day_b + 5, 1, "note"),
+            event_with_keys(&trailing, AS_OF - 1, 1, "incomplete trailing hour"),
         ],
     );
     let snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
@@ -485,7 +489,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
     .expect("build fixed activity");
     assert_eq!(completed.evidence.batch_count, 2);
     assert_eq!(completed.evidence.merge_count, 1);
-    assert_eq!(completed.evidence.flags_artifact.row_count, 4);
+    assert_eq!(completed.evidence.flags_artifact.row_count, 5);
     assert_eq!(completed.evidence.max_merge_buffered_bytes, 3 * 70);
 
     let daily = completed
@@ -494,11 +498,11 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         .iter()
         .find(|row| row.grain == "day" && row.period_start == "2023-11-14")
         .expect("second daily row");
-    assert_eq!(daily.active_users, 3);
+    assert_eq!(daily.active_users, 4);
     assert_eq!(daily.has_profile, 2);
     assert_eq!(daily.has_follows_list, 2);
     assert_eq!(daily.has_profile_and_follows_list, 1);
-    assert_eq!(daily.total_events, 5);
+    assert_eq!(daily.total_events, 6);
 
     let daily_all: Vec<_> = completed
         .evidence
@@ -509,7 +513,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
     assert_eq!(daily_all.len(), 2);
     assert_eq!(
         daily_all.iter().map(|row| row.unique_pubkeys).sum::<u64>(),
-        7
+        8
     );
     let weekly = completed
         .evidence
@@ -517,7 +521,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         .iter()
         .find(|row| row.grain == "week" && row.kind.is_none())
         .expect("weekly all-kind row");
-    assert_eq!(weekly.unique_pubkeys, 4);
+    assert_eq!(weekly.unique_pubkeys, 5);
     assert!(daily_all.iter().map(|row| row.unique_pubkeys).sum::<u64>() > weekly.unique_pubkeys);
     let kind_one_weekly = completed
         .evidence
@@ -525,9 +529,50 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         .iter()
         .find(|row| row.grain == "week" && row.kind == Some(1))
         .expect("weekly kind-one row");
-    assert_eq!(kind_one_weekly.unique_pubkeys, 3);
+    assert_eq!(kind_one_weekly.unique_pubkeys, 4);
 
     let evidence_sha = completed.evidence_sha256.clone();
+    let flexible_root = directory.path().join("flexible-distinct");
+    let flexible_evidence = flexible_root.join("evidence.json");
+    let flexible_config = FlexibleDistinctConfig {
+        work_root: flexible_root,
+        source_records_per_batch: 3,
+        merge_fan_in: 2,
+        disk_reserve_bytes: 0,
+    };
+    let flexible =
+        build_bounded_flexible_distinct(&flexible_evidence, &completed, flexible_config.clone())
+            .expect("build flexible distinct");
+    assert_eq!(flexible.evidence.source_activity_rows, 11);
+    assert_eq!(flexible.evidence.batch_count, 4);
+    assert!(flexible.evidence.merge_count >= 2);
+    assert_eq!(flexible.evidence.max_batch_buffered_bytes, 3 * 38);
+    let complete_through = AS_OF - (AS_OF % 3_600);
+    assert_eq!(
+        estimate_flexible_distinct_window(&flexible, day_a, complete_through, None)
+            .expect("estimate all authors"),
+        4
+    );
+    assert_eq!(
+        estimate_flexible_distinct_window(&flexible, day_a, complete_through, Some(0))
+            .expect("estimate profile authors"),
+        2
+    );
+    assert!(
+        estimate_flexible_distinct_window(&flexible, day_a + 1, complete_through, None).is_err()
+    );
+    let flexible_sha = flexible.evidence_sha256.clone();
+    let flexible_leaf_sha = flexible.evidence.leaf_artifact.sha256.clone();
+    drop(flexible);
+    let retried = build_bounded_flexible_distinct(&flexible_evidence, &completed, flexible_config)
+        .expect("resume flexible distinct");
+    assert_eq!(retried.evidence_sha256, flexible_sha);
+    assert_eq!(retried.evidence.leaf_artifact.sha256, flexible_leaf_sha);
+    drop(retried);
+    let loaded_flexible =
+        load_bounded_flexible_distinct(&flexible_evidence).expect("reload flexible evidence");
+    assert_eq!(loaded_flexible.evidence_sha256, flexible_sha);
+
     drop(completed);
     let loaded = load_bounded_fixed_activity(&evidence).expect("reload evidence");
     assert_eq!(loaded.evidence_sha256, evidence_sha);

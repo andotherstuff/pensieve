@@ -49,6 +49,82 @@ pub struct DistinctSketch {
     inner: HllSketch,
 }
 
+/// Streaming deterministic leaf builder retaining only one prior identity.
+pub struct DistinctSketchBuilder {
+    inner: HllSketch,
+    previous: Option<[u8; 32]>,
+}
+
+/// Fixed-memory union for already canonical leaf order.
+pub struct DistinctSketchUnion {
+    inner: HllUnion,
+}
+
+impl Default for DistinctSketchUnion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DistinctSketchUnion {
+    /// Create an empty union using the fixed Slice 6 precision.
+    pub fn new() -> Self {
+        Self {
+            inner: HllUnion::new(DISTINCT_SKETCH_LG_K),
+        }
+    }
+
+    /// Merge one validated serialized leaf into the union.
+    pub fn push_serialized(&mut self, bytes: &[u8]) -> Result<(), DistinctSketchError> {
+        let sketch = DistinctSketch::deserialize(bytes)?;
+        self.inner.update(&sketch.inner);
+        Ok(())
+    }
+
+    /// Finish the union as a canonical HLL8 sketch.
+    pub fn finish(self) -> DistinctSketch {
+        DistinctSketch {
+            inner: self.inner.to_sketch(TARGET_HLL_TYPE),
+        }
+    }
+}
+
+impl Default for DistinctSketchBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DistinctSketchBuilder {
+    /// Create an empty builder using the fixed Slice 6 sketch configuration.
+    pub fn new() -> Self {
+        Self {
+            inner: HllSketch::new(DISTINCT_SKETCH_LG_K, TARGET_HLL_TYPE),
+            previous: None,
+        }
+    }
+
+    /// Add the next ascending raw identity, ignoring adjacent duplicates.
+    pub fn push(&mut self, identity: [u8; 32]) -> Result<(), DistinctSketchError> {
+        if let Some(previous) = self.previous {
+            if identity < previous {
+                return Err(DistinctSketchError::UnsortedIdentities);
+            }
+            if identity == previous {
+                return Ok(());
+            }
+        }
+        self.inner.update(raw_bytes::from_slice(&identity));
+        self.previous = Some(identity);
+        Ok(())
+    }
+
+    /// Finish the immutable sketch leaf.
+    pub fn finish(self) -> DistinctSketch {
+        DistinctSketch { inner: self.inner }
+    }
+}
+
 impl DistinctSketch {
     /// Build a deterministic leaf from sorted 32-byte identities.
     ///
@@ -57,21 +133,11 @@ impl DistinctSketch {
     pub fn from_sorted_identities(
         identities: impl IntoIterator<Item = [u8; 32]>,
     ) -> Result<Self, DistinctSketchError> {
-        let mut inner = HllSketch::new(DISTINCT_SKETCH_LG_K, TARGET_HLL_TYPE);
-        let mut previous = None;
+        let mut builder = DistinctSketchBuilder::new();
         for identity in identities {
-            if let Some(previous) = previous {
-                if identity < previous {
-                    return Err(DistinctSketchError::UnsortedIdentities);
-                }
-                if identity == previous {
-                    continue;
-                }
-            }
-            inner.update(raw_bytes::from_slice(&identity));
-            previous = Some(identity);
+            builder.push(identity)?;
         }
-        Ok(Self { inner })
+        Ok(builder.finish())
     }
 
     /// Merge serialized leaves in canonical byte order.
@@ -85,14 +151,11 @@ impl DistinctSketch {
         let mut canonical = sketches.into_iter().collect::<Vec<_>>();
         canonical.sort_unstable();
 
-        let mut union = HllUnion::new(DISTINCT_SKETCH_LG_K);
+        let mut union = DistinctSketchUnion::new();
         for bytes in canonical {
-            let sketch = Self::deserialize(bytes)?;
-            union.update(&sketch.inner);
+            union.push_serialized(bytes)?;
         }
-        Ok(Self {
-            inner: union.to_sketch(TARGET_HLL_TYPE),
-        })
+        Ok(union.finish())
     }
 
     /// Rounded cardinality estimate published to serving relations.

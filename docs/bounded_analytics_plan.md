@@ -554,9 +554,11 @@ Goal: serve dynamic event, kind, hourly, zap, and long-form identity counts.
   own format, precision, target type, and payload length.
 - [x] Add deterministic leaf and union rules plus sparse, dense, adversarial,
   duplicate, repeated-rebuild, envelope, and order-independent union tests.
-- daily/hour/kind sketch products as required;
+- [x] Add the bounded complete-hour/per-kind leaf builder from the validated
+  Slice 5 activity artifact, with immutable source batches, fixed-fan-in
+  external merge, resumable checkpoints, and exact leaf-to-identity validation.
 - absolute/relative tolerance evidence against exact samples; and
-- builder-side merge into Postgres final counts.
+- fixed-memory Rust-side union over versioned Postgres leaf blobs.
 
 Gate: errors remain within the accepted per-field tolerance across sparse,
 dense, adversarial, and repeated rebuild fixtures.
@@ -570,31 +572,39 @@ leaf checkpoints in any order: the primitive sorts the bounded list of
 serialized leaves before union so the resulting bytes are reproducible.
 
 The accepted dense-fixture relative error is at most 2%. Sparse fixtures must
-remain exact while Apache DataSketches is in its coupon modes. Postgres receives
-rounded final counts; estimates are never used as event, zap, or article row
-counts. Exact additive counts and fixed-grain distinct products remain on their
-existing exact paths.
+remain exact while Apache DataSketches is in its coupon modes. Postgres stores
+versioned leaves and Rust publishes rounded final counts after a fixed-memory
+union; estimates are never used as event, zap, or article row counts. Exact
+additive counts and fixed-grain distinct products remain on their existing
+exact paths.
 
 | API field | Sketch identity | Leaf key | Upstream fact gate |
 |---|---|---|---|
-| Event `unique_pubkeys` | event author pubkey | UTC day, optional kind | canonical event facts |
-| Hourly `unique_pubkeys` | event author pubkey | UTC day, hour-of-day, optional kind | canonical event facts |
+| Event `unique_pubkeys` | event author pubkey | completed UTC epoch hour and kind | validated Slice 5 activity state |
+| Hourly `unique_pubkeys` | event author pubkey | completed UTC epoch hour and kind | validated Slice 5 activity state |
 | Zap `unique_senders` / `unique_recipients` | validated sender / recipient pubkey | UTC day and role | Slice 7 zap parsing parity |
-| Long-form `unique_authors` | kind-30023 author pubkey | UTC day | canonical event facts |
+| Long-form `unique_authors` | kind-30023 author pubkey | completed UTC epoch hour and kind | validated Slice 5 activity state |
 
 Zap sketch publication is deliberately blocked until Slice 7 proves the
 canonical parsed-zap fact domain. The HLL primitive can land first because it
 does not assign zap semantics.
 
-Before the product-builder commit, the current sliding-second `days` behavior
-must be classified explicitly. Whole UTC-day sketches compose exactly at the
-bucket boundary, whereas the current raw ClickHouse paths use `now() - N DAY`
-and therefore include a partial boundary day. The implementation must either
-publish a documented UTC-day correction or add a bounded edge-bucket strategy;
-it must not silently treat those contracts as equivalent. Likewise, truly
-arbitrary request-time windows require either versioned sketch blobs in the
-serving relation for Rust-side union or a finite declared set of builder-side
-windows. This is the next Slice 6 design gate before Postgres DDL is accepted.
+The selected v1 time contract is complete UTC hours. The builder records
+`complete_through_epoch = floor_hour(as_of_epoch)` and excludes the incomplete
+trailing hour. `days=N` therefore means the exact half-open interval
+`[complete_through - N*24h, complete_through)`. Date-valued `since`/`until`
+remain naturally UTC-day aligned. This is an intentional correction from the
+current moving-second ClickHouse boundary and has a freshness lag strictly less
+than one hour. It must be quantified in the comparison canary before API
+cutover.
+
+One leaf key is `(UTC epoch hour, kind)`. Daily, all-kind, hour-of-day, and
+kind-30023 long-form author results are unions of those leaves, so the durable
+product does not duplicate identity state for each presentation grain. Truly
+arbitrary aligned request windows require versioned leaf blobs in the serving
+relation and fixed-memory Rust-side union; Postgres does not interpret the HLL
+format. The API/DDL commit remains gated on measured production leaf count and
+size evidence.
 
 ### Slice 7 — additive semantic products
 
