@@ -302,6 +302,10 @@ pub struct SemanticScanStats {
     pub logical_relevant_events: u64,
     /// Exact duplicate relevant rows suppressed.
     pub duplicate_relevant_rows: u64,
+    /// Lowest encoded event ID written, if the batch had relevant rows.
+    pub min_event_id: Option<[u8; 32]>,
+    /// Highest encoded event ID written, if the batch had relevant rows.
+    pub max_event_id: Option<[u8; 32]>,
 }
 
 impl<R: Read> SemanticFactReader<R> {
@@ -465,6 +469,8 @@ pub fn scan_semantic_facts(
             }
             Some(previous) => {
                 writer.write_all(&previous.encode())?;
+                stats.min_event_id.get_or_insert(previous.id);
+                stats.max_event_id = Some(previous.id);
                 stats.logical_relevant_events = stats
                     .logical_relevant_events
                     .checked_add(1)
@@ -478,6 +484,8 @@ pub fn scan_semantic_facts(
     }
     if let Some(record) = pending {
         writer.write_all(&record.encode())?;
+        stats.min_event_id.get_or_insert(record.id);
+        stats.max_event_id = Some(record.id);
         stats.logical_relevant_events =
             stats
                 .logical_relevant_events
@@ -715,6 +723,67 @@ impl SemanticRollups {
             }
         }
         Ok(())
+    }
+
+    /// Account for one already-classified, deduplicated semantic record.
+    pub fn observe_record(&mut self, record: &SemanticFactRecord) -> Result<(), &'static str> {
+        let day_epoch = record.created_at - record.created_at % 86_400;
+        match &record.payload {
+            SemanticPayload::OriginalNote => checked_increment(
+                &mut self.engagement_day(day_epoch).original_notes,
+                "engagement original notes overflowed",
+            ),
+            SemanticPayload::Reply => checked_increment(
+                &mut self.engagement_day(day_epoch).replies,
+                "engagement replies overflowed",
+            ),
+            SemanticPayload::Reaction => checked_increment(
+                &mut self.engagement_day(day_epoch).reactions,
+                "engagement reactions overflowed",
+            ),
+            SemanticPayload::Longform { content_bytes } => {
+                let day = self.longform_day(day_epoch);
+                checked_increment(&mut day.articles, "long-form article count overflowed")?;
+                day.content_bytes = day
+                    .content_bytes
+                    .checked_add(*content_bytes)
+                    .ok_or("long-form content bytes overflowed")?;
+                Ok(())
+            }
+            SemanticPayload::Zap {
+                amount_msats,
+                sender_pubkey,
+                recipient_pubkey,
+                histogram_bucket,
+            } => {
+                let day = self.zap_day(day_epoch);
+                checked_increment(&mut day.accepted, "accepted zap count overflowed")?;
+                day.amount_msats = day
+                    .amount_msats
+                    .checked_add(*amount_msats)
+                    .ok_or("zap amount sum overflowed")?;
+                if sender_pubkey.is_some() {
+                    checked_increment(
+                        &mut day.validated_senders,
+                        "validated sender count overflowed",
+                    )?;
+                }
+                if recipient_pubkey.is_some() {
+                    checked_increment(
+                        &mut day.validated_recipients,
+                        "validated recipient count overflowed",
+                    )?;
+                }
+                checked_increment(
+                    &mut day.histogram[usize::from(*histogram_bucket)],
+                    "zap histogram count overflowed",
+                )
+            }
+            SemanticPayload::RejectedZap(rejection) => checked_increment(
+                &mut self.zap_day(day_epoch).rejected[rejection.ordinal()],
+                "zap rejection count overflowed",
+            ),
+        }
     }
 
     fn engagement_day(&mut self, day_epoch: u64) -> &mut EngagementDay {
@@ -1007,8 +1076,16 @@ mod tests {
             .custom_created_at(Timestamp::from(1_700_000_001_u64))
             .sign_with_keys(&keys)
             .expect("metadata");
-        write_events(File::create(&path).expect("create"), [&reply, &unrelated])
-            .expect("write parquet");
+        let future_reply = EventBuilder::new(Kind::TextNote, "future reply")
+            .tags([Tag::parse(["e", &"22".repeat(32)]).expect("tag")])
+            .custom_created_at(Timestamp::from(1_700_000_101_u64))
+            .sign_with_keys(&keys)
+            .expect("future reply");
+        write_events(
+            File::create(&path).expect("create"),
+            [&reply, &unrelated, &future_reply],
+        )
+        .expect("write parquet");
 
         let connection = Connection::open_in_memory().expect("DuckDB");
         let mut bytes = Vec::new();
@@ -1025,6 +1102,8 @@ mod tests {
                 physical_relevant_rows: 1,
                 logical_relevant_events: 1,
                 duplicate_relevant_rows: 0,
+                min_event_id: Some(*reply.id.as_bytes()),
+                max_event_id: Some(*reply.id.as_bytes()),
             }
         );
         let mut reader = SemanticFactReader::new(bytes.as_slice());

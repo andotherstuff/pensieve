@@ -5,10 +5,10 @@ use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
     EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
-    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome, SemanticFactsConfig,
     advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
     build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
-    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen, build_bounded_semantic_facts,
     estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
     load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
@@ -216,6 +216,45 @@ fn slice_a_deduplicates_and_reconciles_exact_rollups() {
         })
         .expect("kind rows");
     assert_eq!(kind_counts, vec![(1, 1), (2, 2), (3, 1), (4, 1), (5, 1)]);
+}
+
+#[test]
+fn bounded_semantic_facts_are_resumable_and_reconcile_relevant_ids() {
+    let fixture = fixture();
+    let snapshot = fixture.build.snapshot.clone();
+    let config = fixture.build.config.clone();
+    let root = fixture._directory.path().join("semantic-facts");
+    let evidence = fixture._directory.path().join("semantic-evidence.json");
+    let facts_config = SemanticFactsConfig {
+        work_root: root,
+        batch_limits: BatchLimits {
+            max_bytes: u64::MAX,
+            max_rows: 4,
+        },
+        merge_fan_in: 2,
+        disk_reserve_bytes: 0,
+    };
+    let first = build_bounded_semantic_facts(
+        &evidence,
+        snapshot.clone(),
+        config.clone(),
+        facts_config.clone(),
+    )
+    .expect("build semantic facts");
+    assert_eq!(first.evidence.physical_rows, 7);
+    assert_eq!(first.evidence.physical_relevant_rows, 2);
+    assert_eq!(first.evidence.logical_relevant_events, 1);
+    assert_eq!(first.evidence.duplicate_relevant_rows, 1);
+    assert_eq!(first.evidence.domain_counts.original_notes, 1);
+    assert_eq!(first.evidence.domain_counts.replies, 0);
+    assert_eq!(first.evidence.rollups.engagement.values().count(), 1);
+    assert_eq!(first.evidence.batch_count, 2);
+    assert_eq!(first.evidence.merge_count, 1);
+
+    let retry = build_bounded_semantic_facts(&evidence, snapshot, config, facts_config)
+        .expect("resume semantic facts");
+    assert_eq!(retry.evidence, first.evidence);
+    assert_eq!(retry.evidence_sha256, first.evidence_sha256);
 }
 
 #[test]

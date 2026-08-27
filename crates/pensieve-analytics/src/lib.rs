@@ -19,6 +19,7 @@ mod pubkey_first_seen;
 mod publish;
 mod reconcile;
 mod schema;
+mod semantic_build;
 mod semantic_facts;
 
 pub use bounded::{
@@ -88,6 +89,10 @@ pub use publish::{
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
     ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
+};
+pub use semantic_build::{
+    BoundedSemanticFacts, SEMANTIC_FACTS_VERSION, SemanticDomainCounts, SemanticFactsConfig,
+    SemanticFactsEvidence, SemanticMemoryEvidence, build_bounded_semantic_facts,
 };
 pub use semantic_facts::{
     EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,
