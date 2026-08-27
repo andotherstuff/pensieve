@@ -6,6 +6,7 @@
 //! period keys.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,12 @@ pub const ZAP_HISTOGRAM_UPPER_SATS: [u64; 16] = [
     10, 21, 50, 100, 250, 500, 750, 1_000, 2_500, 5_000, 7_500, 10_000, 25_000, 50_000, 75_000,
     100_000,
 ];
+
+/// Encoded bytes in one compact event-ID-keyed semantic fact.
+pub const SEMANTIC_FACT_BYTES: usize = 32 + 8 + 1 + 8 + 32 + 32 + 1 + 1;
+
+/// Leading event-ID bytes used as the streaming merge key.
+pub const SEMANTIC_FACT_KEY_BYTES: usize = 32;
 
 /// Classification of one event for the engagement product.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +115,275 @@ pub struct ZapFact {
     pub sender_pubkey: Option<[u8; 32]>,
     /// Fixed public histogram bucket ordinal in the range 0..=16.
     pub histogram_bucket: u8,
+}
+
+/// Compact semantic payload retained after tags and content are classified.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticPayload {
+    /// Kind-1 original note.
+    OriginalNote,
+    /// Kind-1 reply.
+    Reply,
+    /// Kind-7 reaction.
+    Reaction,
+    /// Kind-30023 exact UTF-8 content bytes.
+    Longform { content_bytes: u64 },
+    /// Accepted zap with validated participant keys where available.
+    Zap {
+        amount_msats: u64,
+        sender_pubkey: Option<[u8; 32]>,
+        recipient_pubkey: Option<[u8; 32]>,
+        histogram_bucket: u8,
+    },
+    /// Rejected kind-9735 event with an exact fixed reason.
+    RejectedZap(ZapRejection),
+}
+
+/// One event-ID-keyed semantic fact suitable for fixed-memory run merging.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticFactRecord {
+    /// Canonical event ID and merge key.
+    pub id: [u8; SEMANTIC_FACT_KEY_BYTES],
+    /// Canonical unsigned event timestamp.
+    pub created_at: u64,
+    /// Classified compact payload.
+    pub payload: SemanticPayload,
+}
+
+impl SemanticFactRecord {
+    /// Classify a relevant canonical event; unrelated kinds return `None`.
+    pub fn classify(
+        id: [u8; 32],
+        created_at: u64,
+        kind: u16,
+        tags: &[Vec<String>],
+        content: &str,
+    ) -> Option<Self> {
+        let payload = match classify_engagement(kind, tags) {
+            EngagementFact::OriginalNote => SemanticPayload::OriginalNote,
+            EngagementFact::Reply => SemanticPayload::Reply,
+            EngagementFact::Reaction => SemanticPayload::Reaction,
+            EngagementFact::Other => {
+                if let Some(fact) = classify_longform(kind, content) {
+                    SemanticPayload::Longform {
+                        content_bytes: fact.content_bytes,
+                    }
+                } else {
+                    match classify_zap(kind, tags)? {
+                        Ok(fact) => SemanticPayload::Zap {
+                            amount_msats: fact.amount_msats,
+                            sender_pubkey: fact.sender_pubkey,
+                            recipient_pubkey: fact.recipient_pubkey,
+                            histogram_bucket: fact.histogram_bucket,
+                        },
+                        Err(rejection) => SemanticPayload::RejectedZap(rejection),
+                    }
+                }
+            }
+        };
+        Some(Self {
+            id,
+            created_at,
+            payload,
+        })
+    }
+
+    /// Encode the stable fixed-width representation.
+    pub fn encode(&self) -> [u8; SEMANTIC_FACT_BYTES] {
+        let mut encoded = [0_u8; SEMANTIC_FACT_BYTES];
+        encoded[..32].copy_from_slice(&self.id);
+        encoded[32..40].copy_from_slice(&self.created_at.to_be_bytes());
+        let (tag, value, sender, recipient, bucket, rejection) = match &self.payload {
+            SemanticPayload::OriginalNote => (1, 0, None, None, 0, 0),
+            SemanticPayload::Reply => (2, 0, None, None, 0, 0),
+            SemanticPayload::Reaction => (3, 0, None, None, 0, 0),
+            SemanticPayload::Longform { content_bytes } => (4, *content_bytes, None, None, 0, 0),
+            SemanticPayload::Zap {
+                amount_msats,
+                sender_pubkey,
+                recipient_pubkey,
+                histogram_bucket,
+            } => (
+                5,
+                *amount_msats,
+                sender_pubkey.as_ref(),
+                recipient_pubkey.as_ref(),
+                *histogram_bucket,
+                0,
+            ),
+            SemanticPayload::RejectedZap(reason) => {
+                (6, 0, None, None, 0, reason.ordinal() as u8 + 1)
+            }
+        };
+        encoded[40] = tag;
+        encoded[41..49].copy_from_slice(&value.to_be_bytes());
+        if let Some(sender) = sender {
+            encoded[49..81].copy_from_slice(sender);
+        }
+        if let Some(recipient) = recipient {
+            encoded[81..113].copy_from_slice(recipient);
+        }
+        encoded[113] = bucket;
+        encoded[114] = rejection;
+        encoded
+    }
+
+    /// Decode and validate one stable fixed-width representation.
+    pub fn decode(encoded: &[u8; SEMANTIC_FACT_BYTES]) -> Result<Self, &'static str> {
+        let id = encoded[..32].try_into().expect("fixed event ID width");
+        let created_at = u64::from_be_bytes(encoded[32..40].try_into().expect("fixed timestamp"));
+        let value = u64::from_be_bytes(encoded[41..49].try_into().expect("fixed value"));
+        let sender = optional_key(&encoded[49..81]);
+        let recipient = optional_key(&encoded[81..113]);
+        let bucket = encoded[113];
+        let rejection = encoded[114];
+        let payload = match encoded[40] {
+            1 if zero_tail(value, sender, recipient, bucket, rejection) => {
+                SemanticPayload::OriginalNote
+            }
+            2 if zero_tail(value, sender, recipient, bucket, rejection) => SemanticPayload::Reply,
+            3 if zero_tail(value, sender, recipient, bucket, rejection) => {
+                SemanticPayload::Reaction
+            }
+            4 if sender.is_none() && recipient.is_none() && bucket == 0 && rejection == 0 => {
+                SemanticPayload::Longform {
+                    content_bytes: value,
+                }
+            }
+            5 if value > 0
+                && value <= MAX_ZAP_AMOUNT_MSATS
+                && usize::from(bucket) <= ZAP_HISTOGRAM_UPPER_SATS.len()
+                && rejection == 0 =>
+            {
+                if zap_histogram_bucket(value) != bucket {
+                    return Err("semantic zap bucket does not match amount");
+                }
+                SemanticPayload::Zap {
+                    amount_msats: value,
+                    sender_pubkey: sender,
+                    recipient_pubkey: recipient,
+                    histogram_bucket: bucket,
+                }
+            }
+            6 if value == 0
+                && sender.is_none()
+                && recipient.is_none()
+                && bucket == 0
+                && (1..=ZapRejection::COUNT as u8).contains(&rejection) =>
+            {
+                SemanticPayload::RejectedZap(rejection_from_ordinal(rejection - 1))
+            }
+            _ => return Err("invalid canonical semantic fact encoding"),
+        };
+        Ok(Self {
+            id,
+            created_at,
+            payload,
+        })
+    }
+}
+
+/// Stream validated compact semantic records from a fixed-width artifact.
+pub struct SemanticFactReader<R> {
+    reader: R,
+    previous_id: Option<[u8; 32]>,
+}
+
+impl<R: Read> SemanticFactReader<R> {
+    /// Construct a strict reader. The artifact must be sorted and unique by ID.
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            previous_id: None,
+        }
+    }
+
+    /// Read the next record, rejecting truncation, invalid payloads, and order regressions.
+    pub fn next_record(&mut self) -> std::io::Result<Option<SemanticFactRecord>> {
+        let mut encoded = [0_u8; SEMANTIC_FACT_BYTES];
+        let mut offset = 0;
+        while offset < encoded.len() {
+            match self.reader.read(&mut encoded[offset..])? {
+                0 if offset == 0 => return Ok(None),
+                0 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated canonical semantic fact",
+                    ));
+                }
+                read => offset += read,
+            }
+        }
+        let record = SemanticFactRecord::decode(&encoded)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+        if self
+            .previous_id
+            .as_ref()
+            .is_some_and(|previous| previous >= &record.id)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical semantic facts are not strictly ordered by event ID",
+            ));
+        }
+        self.previous_id = Some(record.id);
+        Ok(Some(record))
+    }
+}
+
+/// Write already-sorted unique semantic records in canonical fixed-width form.
+pub fn write_semantic_facts(
+    records: impl IntoIterator<Item = SemanticFactRecord>,
+    writer: &mut impl Write,
+) -> std::io::Result<u64> {
+    let mut previous_id: Option<[u8; 32]> = None;
+    let mut count = 0_u64;
+    for record in records {
+        if previous_id
+            .as_ref()
+            .is_some_and(|previous| previous >= &record.id)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "semantic facts must be strictly sorted and unique by event ID",
+            ));
+        }
+        writer.write_all(&record.encode())?;
+        previous_id = Some(record.id);
+        count = count.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "semantic fact count overflowed",
+            )
+        })?;
+    }
+    Ok(count)
+}
+
+fn optional_key(bytes: &[u8]) -> Option<[u8; 32]> {
+    (!bytes.iter().all(|byte| *byte == 0)).then(|| bytes.try_into().expect("fixed key width"))
+}
+
+fn zero_tail(
+    value: u64,
+    sender: Option<[u8; 32]>,
+    recipient: Option<[u8; 32]>,
+    bucket: u8,
+    rejection: u8,
+) -> bool {
+    value == 0 && sender.is_none() && recipient.is_none() && bucket == 0 && rejection == 0
+}
+
+fn rejection_from_ordinal(ordinal: u8) -> ZapRejection {
+    match ordinal {
+        0 => ZapRejection::MissingBolt11,
+        1 => ZapRejection::MissingBolt11Value,
+        2 => ZapRejection::MalformedBolt11,
+        3 => ZapRejection::AmountOverflow,
+        4 => ZapRejection::ZeroAmount,
+        5 => ZapRejection::AmountAboveLimit,
+        _ => unreachable!("validated rejection ordinal"),
+    }
 }
 
 /// Classify one event into the canonical parsed-zap domain.
@@ -502,5 +778,83 @@ mod tests {
         assert!(rollups.engagement.is_empty());
         assert!(rollups.longform.is_empty());
         assert!(rollups.zaps.is_empty());
+    }
+
+    #[test]
+    fn compact_records_round_trip_every_variant_and_reject_noncanonical_bytes() {
+        let records = vec![
+            SemanticFactRecord {
+                id: [1; 32],
+                created_at: 123,
+                payload: SemanticPayload::OriginalNote,
+            },
+            SemanticFactRecord {
+                id: [2; 32],
+                created_at: 124,
+                payload: SemanticPayload::Longform { content_bytes: 9 },
+            },
+            SemanticFactRecord {
+                id: [3; 32],
+                created_at: 125,
+                payload: SemanticPayload::Zap {
+                    amount_msats: 100_000,
+                    sender_pubkey: Some([4; 32]),
+                    recipient_pubkey: None,
+                    histogram_bucket: zap_histogram_bucket(100_000),
+                },
+            },
+            SemanticFactRecord {
+                id: [4; 32],
+                created_at: 126,
+                payload: SemanticPayload::RejectedZap(ZapRejection::MalformedBolt11),
+            },
+        ];
+        let mut bytes = Vec::new();
+        assert_eq!(
+            write_semantic_facts(records.clone(), &mut bytes).expect("write"),
+            4
+        );
+        assert_eq!(bytes.len(), records.len() * SEMANTIC_FACT_BYTES);
+        let mut reader = SemanticFactReader::new(bytes.as_slice());
+        for expected in records {
+            assert_eq!(reader.next_record().expect("read"), Some(expected));
+        }
+        assert_eq!(reader.next_record().expect("eof"), None);
+
+        let mut invalid = SemanticFactRecord {
+            id: [5; 32],
+            created_at: 127,
+            payload: SemanticPayload::OriginalNote,
+        }
+        .encode();
+        invalid[113] = 1;
+        assert!(SemanticFactRecord::decode(&invalid).is_err());
+    }
+
+    #[test]
+    fn compact_reader_rejects_truncation_and_order_regression() {
+        let record = SemanticFactRecord {
+            id: [1; 32],
+            created_at: 1,
+            payload: SemanticPayload::Reply,
+        };
+        let mut truncated = record.encode().to_vec();
+        truncated.pop();
+        assert_eq!(
+            SemanticFactReader::new(truncated.as_slice())
+                .next_record()
+                .expect_err("truncated")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let mut duplicate = record.encode().to_vec();
+        duplicate.extend_from_slice(&record.encode());
+        let mut reader = SemanticFactReader::new(duplicate.as_slice());
+        assert!(reader.next_record().expect("first").is_some());
+        assert_eq!(
+            reader.next_record().expect_err("duplicate").kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }

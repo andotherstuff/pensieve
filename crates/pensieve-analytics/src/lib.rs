@@ -91,6 +91,8 @@ pub use reconcile::{
 };
 pub use semantic_facts::{
     EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,
-    SemanticRollups, ZAP_HISTOGRAM_UPPER_SATS, ZapDay, ZapFact, ZapRejection, classify_engagement,
-    classify_longform, classify_zap, zap_histogram_bucket,
+    SEMANTIC_FACT_BYTES, SEMANTIC_FACT_KEY_BYTES, SemanticFactReader, SemanticFactRecord,
+    SemanticPayload, SemanticRollups, ZAP_HISTOGRAM_UPPER_SATS, ZapDay, ZapFact, ZapRejection,
+    classify_engagement, classify_longform, classify_zap, write_semantic_facts,
+    zap_histogram_bucket,
 };
