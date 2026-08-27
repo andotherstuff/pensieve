@@ -5,6 +5,8 @@
 //! every input event ID while retaining only fixed-size counters and additive
 //! period keys.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Maximum accepted zap amount, matching the current production safety gate.
@@ -74,6 +76,21 @@ pub enum ZapRejection {
     ZeroAmount,
     /// The parsed amount exceeds the production anti-abuse ceiling.
     AmountAboveLimit,
+}
+
+impl ZapRejection {
+    const COUNT: usize = 6;
+
+    fn ordinal(self) -> usize {
+        match self {
+            Self::MissingBolt11 => 0,
+            Self::MissingBolt11Value => 1,
+            Self::MalformedBolt11 => 2,
+            Self::AmountOverflow => 3,
+            Self::ZeroAmount => 4,
+            Self::AmountAboveLimit => 5,
+        }
+    }
 }
 
 /// One accepted, additive zap fact.
@@ -171,6 +188,155 @@ fn parse_bolt11_msats(invoice: &str) -> Result<u64, ZapRejection> {
 pub fn zap_histogram_bucket(amount_msats: u64) -> u8 {
     let sats = amount_msats / 1_000;
     ZAP_HISTOGRAM_UPPER_SATS.partition_point(|upper| sats > *upper) as u8
+}
+
+/// Exact additive engagement counters for one UTC day.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EngagementDay {
+    /// UTC day start as Unix seconds.
+    pub day_epoch: u64,
+    /// Kind-1 events without an `e` tag.
+    pub original_notes: u64,
+    /// Kind-1 events with an `e` tag.
+    pub replies: u64,
+    /// Kind-7 events.
+    pub reactions: u64,
+}
+
+/// Exact additive long-form counters for one UTC day.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LongformDay {
+    /// UTC day start as Unix seconds.
+    pub day_epoch: u64,
+    /// Kind-30023 event count.
+    pub articles: u64,
+    /// Sum of exact UTF-8 content bytes.
+    pub content_bytes: u64,
+}
+
+/// Exact additive zap counters for one UTC day.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ZapDay {
+    /// UTC day start as Unix seconds.
+    pub day_epoch: u64,
+    /// Accepted positive zap facts.
+    pub accepted: u64,
+    /// Sum of accepted amounts in millisatoshis.
+    pub amount_msats: u64,
+    /// Accepted facts with a validated sender key.
+    pub validated_senders: u64,
+    /// Accepted facts with a validated recipient key.
+    pub validated_recipients: u64,
+    /// Exact counts in the 17 fixed histogram buckets.
+    pub histogram: [u64; 17],
+    /// Rejected kind-9735 events, indexed by [`ZapRejection`].
+    pub rejected: [u64; ZapRejection::COUNT],
+}
+
+/// Bounded Slice 7 additive state keyed only by UTC day.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticRollups {
+    /// Engagement counters by UTC day.
+    pub engagement: BTreeMap<u64, EngagementDay>,
+    /// Long-form counters by UTC day.
+    pub longform: BTreeMap<u64, LongformDay>,
+    /// Zap counters and rejection accounting by UTC day.
+    pub zaps: BTreeMap<u64, ZapDay>,
+}
+
+impl SemanticRollups {
+    /// Account for one already-deduplicated canonical event.
+    pub fn observe(
+        &mut self,
+        created_at: u64,
+        kind: u16,
+        tags: &[Vec<String>],
+        content: &str,
+    ) -> Result<(), &'static str> {
+        let day_epoch = created_at - created_at % 86_400;
+        match classify_engagement(kind, tags) {
+            EngagementFact::Reply => checked_increment(
+                &mut self.engagement_day(day_epoch).replies,
+                "engagement replies overflowed",
+            )?,
+            EngagementFact::OriginalNote => checked_increment(
+                &mut self.engagement_day(day_epoch).original_notes,
+                "engagement original notes overflowed",
+            )?,
+            EngagementFact::Reaction => checked_increment(
+                &mut self.engagement_day(day_epoch).reactions,
+                "engagement reactions overflowed",
+            )?,
+            EngagementFact::Other => {}
+        }
+        if let Some(fact) = classify_longform(kind, content) {
+            let day = self.longform_day(day_epoch);
+            checked_increment(&mut day.articles, "long-form article count overflowed")?;
+            day.content_bytes = day
+                .content_bytes
+                .checked_add(fact.content_bytes)
+                .ok_or("long-form content bytes overflowed")?;
+        }
+        if let Some(result) = classify_zap(kind, tags) {
+            let day = self.zap_day(day_epoch);
+            match result {
+                Ok(fact) => {
+                    checked_increment(&mut day.accepted, "accepted zap count overflowed")?;
+                    day.amount_msats = day
+                        .amount_msats
+                        .checked_add(fact.amount_msats)
+                        .ok_or("zap amount sum overflowed")?;
+                    if fact.sender_pubkey.is_some() {
+                        checked_increment(
+                            &mut day.validated_senders,
+                            "validated sender count overflowed",
+                        )?;
+                    }
+                    if fact.recipient_pubkey.is_some() {
+                        checked_increment(
+                            &mut day.validated_recipients,
+                            "validated recipient count overflowed",
+                        )?;
+                    }
+                    checked_increment(
+                        &mut day.histogram[usize::from(fact.histogram_bucket)],
+                        "zap histogram count overflowed",
+                    )?;
+                }
+                Err(rejection) => checked_increment(
+                    &mut day.rejected[rejection.ordinal()],
+                    "zap rejection count overflowed",
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    fn engagement_day(&mut self, day_epoch: u64) -> &mut EngagementDay {
+        self.engagement.entry(day_epoch).or_insert(EngagementDay {
+            day_epoch,
+            ..EngagementDay::default()
+        })
+    }
+
+    fn longform_day(&mut self, day_epoch: u64) -> &mut LongformDay {
+        self.longform.entry(day_epoch).or_insert(LongformDay {
+            day_epoch,
+            ..LongformDay::default()
+        })
+    }
+
+    fn zap_day(&mut self, day_epoch: u64) -> &mut ZapDay {
+        self.zaps.entry(day_epoch).or_insert(ZapDay {
+            day_epoch,
+            ..ZapDay::default()
+        })
+    }
+}
+
+fn checked_increment(value: &mut u64, message: &'static str) -> Result<(), &'static str> {
+    *value = value.checked_add(1).ok_or(message)?;
+    Ok(())
 }
 
 fn parse_pubkey(value: &str) -> Option<[u8; 32]> {
@@ -281,5 +447,60 @@ mod tests {
             assert_eq!(zap_histogram_bucket((upper + 1) * 1_000), index as u8 + 1);
         }
         assert_eq!(zap_histogram_bucket(1), 0);
+    }
+
+    #[test]
+    fn additive_rollups_account_for_every_semantic_class() {
+        let mut rollups = SemanticRollups::default();
+        rollups.observe(86_401, 1, &[], "").expect("original");
+        rollups
+            .observe(86_402, 1, &tags(&[&["e"]]), "")
+            .expect("reply");
+        rollups.observe(86_403, 7, &[], "").expect("reaction");
+        rollups
+            .observe(86_404, 30_023, &[], "🦀")
+            .expect("long-form");
+        rollups
+            .observe(
+                86_405,
+                9_735,
+                &tags(&[
+                    &["bolt11", "lnbc1u1x"],
+                    &["p", &"11".repeat(32)],
+                    &["P", "malformed"],
+                ]),
+                "",
+            )
+            .expect("accepted zap");
+        rollups
+            .observe(86_406, 9_735, &tags(&[&["bolt11"]]), "")
+            .expect("rejected zap");
+
+        assert_eq!(
+            rollups.engagement[&86_400],
+            EngagementDay {
+                day_epoch: 86_400,
+                original_notes: 1,
+                replies: 1,
+                reactions: 1,
+            }
+        );
+        assert_eq!(rollups.longform[&86_400].articles, 1);
+        assert_eq!(rollups.longform[&86_400].content_bytes, 4);
+        let zaps = &rollups.zaps[&86_400];
+        assert_eq!(zaps.accepted, 1);
+        assert_eq!(zaps.amount_msats, 100_000);
+        assert_eq!(zaps.validated_recipients, 1);
+        assert_eq!(zaps.validated_senders, 0);
+        assert_eq!(zaps.histogram.iter().sum::<u64>(), 1);
+        assert_eq!(zaps.rejected[ZapRejection::MissingBolt11Value.ordinal()], 1);
+    }
+
+    #[test]
+    fn empty_rollups_have_zero_denominators_without_synthetic_rows() {
+        let rollups = SemanticRollups::default();
+        assert!(rollups.engagement.is_empty());
+        assert!(rollups.longform.is_empty());
+        assert!(rollups.zaps.is_empty());
     }
 }

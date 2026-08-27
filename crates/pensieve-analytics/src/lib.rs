@@ -90,6 +90,7 @@ pub use reconcile::{
     ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
 };
 pub use semantic_facts::{
-    EngagementFact, LongformFact, MAX_ZAP_AMOUNT_MSATS, ZAP_HISTOGRAM_UPPER_SATS, ZapFact,
-    ZapRejection, classify_engagement, classify_longform, classify_zap, zap_histogram_bucket,
+    EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,
+    SemanticRollups, ZAP_HISTOGRAM_UPPER_SATS, ZapDay, ZapFact, ZapRejection, classify_engagement,
+    classify_longform, classify_zap, zap_histogram_bucket,
 };
