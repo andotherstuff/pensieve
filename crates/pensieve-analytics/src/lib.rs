@@ -19,6 +19,7 @@ mod pubkey_first_seen;
 mod publish;
 mod reconcile;
 mod schema;
+mod semantic_facts;
 
 pub use bounded::{
     ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
@@ -87,4 +88,8 @@ pub use publish::{
 pub use reconcile::{
     Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
     ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
+};
+pub use semantic_facts::{
+    EngagementFact, LongformFact, MAX_ZAP_AMOUNT_MSATS, ZAP_HISTOGRAM_UPPER_SATS, ZapFact,
+    ZapRejection, classify_engagement, classify_longform, classify_zap, zap_histogram_bucket,
 };

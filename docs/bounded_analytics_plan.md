@@ -635,6 +635,25 @@ state.
 Gate: parsed fact counts reconcile to canonical input IDs and every semantic
 difference from ClickHouse is classified.
 
+The version-1 semantic contract is deliberately positional and byte exact:
+
+- a reply is a kind-1 event with any tag whose first element is exactly `e`;
+- long-form length is UTF-8 bytes (ClickHouse `length(String)`), and estimated
+  words remain integer `total_bytes / 5`;
+- the first `bolt11`, lowercase `p`, and uppercase `P` tags own zap parsing and
+  identity attribution; a later tag never repairs an invalid first value;
+- accepted invoices are lowercase mainnet `lnbc<digits><m|u|n|p>1...`, convert
+  with checked integer arithmetic, must be positive, and must not exceed
+  1,000,000,000 millisatoshis; and
+- the 17 zap histogram buckets use truncated whole sats and the existing
+  inclusive upper bounds. Sub-sat positive zaps therefore remain in bucket 0.
+
+Canonical facts retain separately validated 32-byte sender and recipient keys.
+Malformed or missing participant tags still contribute to exact additive zap
+count/sum products, but never invent an empty participant for distinct counts.
+The comparison report must quantify this intentional difference from
+ClickHouse `uniq(String)`, which treats its empty fallback as a value.
+
 ### Slice 8 — current NIP-65 relay distribution
 
 Goal: exact latest-by-pubkey replacement semantics.
