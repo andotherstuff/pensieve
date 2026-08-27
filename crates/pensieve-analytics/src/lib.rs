@@ -95,11 +95,13 @@ pub use pubkey_first_seen::{
     load_bounded_pubkey_first_seen,
 };
 pub use publish::{
-    AllBoundedProducts, FlexibleDistinctPublication, PublishOutcome, acquire_publication_lock,
-    publish, publish_incremental, publish_incremental_with_all_bounded_products,
-    publish_incremental_with_all_bounded_products_and_flexible, publish_incremental_with_identity,
-    publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
-    publish_with_identity, publish_with_identity_and_activity,
+    AllBoundedProducts, AllRecurringProducts, FlexibleDistinctPublication, PublishOutcome,
+    SemanticPublication, acquire_publication_lock, publish, publish_incremental,
+    publish_incremental_with_all_bounded_products,
+    publish_incremental_with_all_bounded_products_and_flexible,
+    publish_incremental_with_all_bounded_products_flexible_and_semantic,
+    publish_incremental_with_identity, publish_incremental_with_identity_and_activity,
+    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
 };
 pub use publisher_benchmark::{
     PUBLISHER_BENCHMARK_VERSION, PUBLISHER_DAILY_FACT_BYTES, PUBLISHER_DAILY_KIND_FACT_BYTES,

@@ -22,15 +22,17 @@ pub enum SemanticPublishOutcome {
     AlreadyPublished { product_id: String },
 }
 
+/// Proof that immutable semantic artifacts passed full validation.
+pub(crate) struct ValidatedSemanticPublication;
+
 /// Publish exact semantic rollups without moving the analytics current pointer.
 pub fn publish_semantic_facts(
     client: &mut Client,
     baseline_run_id: &str,
     product: &BoundedSemanticFacts,
 ) -> Result<SemanticPublishOutcome> {
-    validate_product(product)?;
+    let validated = validate_semantic_publication(product)?;
     client.batch_execute(SCHEMA_SQL)?;
-    let product_id = semantic_product_id(baseline_run_id, product);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
     let current = transaction.query_one(
@@ -47,6 +49,23 @@ pub fn publish_semantic_facts(
             "current Postgres run is not the exact corrected B3 Slice 7 baseline".to_owned(),
         ));
     }
+    let outcome = publish_semantic_facts_in_transaction(
+        &mut transaction,
+        baseline_run_id,
+        product,
+        &validated,
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+pub(crate) fn publish_semantic_facts_in_transaction(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    product: &BoundedSemanticFacts,
+    _validated: &ValidatedSemanticPublication,
+) -> Result<SemanticPublishOutcome> {
+    let product_id = semantic_product_id(run_id, product);
     if transaction
         .query_opt(
             "SELECT product_id FROM pensieve_analytics.semantic_products WHERE product_id=$1",
@@ -54,8 +73,7 @@ pub fn publish_semantic_facts(
         )?
         .is_some()
     {
-        reconcile(&mut transaction, &product_id, product)?;
-        transaction.commit()?;
+        reconcile(transaction, &product_id, product)?;
         return Ok(SemanticPublishOutcome::AlreadyPublished { product_id });
     }
 
@@ -67,7 +85,7 @@ pub fn publish_semantic_facts(
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())",
         &[
             &product_id,
-            &baseline_run_id,
+            &run_id,
             &product.evidence.snapshot_id,
             &to_i64("semantic as-of", product.evidence.as_of_epoch)?,
             &SEMANTIC_FACTS_VERSION,
@@ -92,9 +110,8 @@ pub fn publish_semantic_facts(
             )?,
         ],
     )?;
-    copy_rollups(&mut transaction, &product_id, product)?;
-    reconcile(&mut transaction, &product_id, product)?;
-    transaction.commit()?;
+    copy_rollups(transaction, &product_id, product)?;
+    reconcile(transaction, &product_id, product)?;
     Ok(SemanticPublishOutcome::Published { product_id })
 }
 
@@ -311,7 +328,10 @@ fn reconcile(
     Ok(())
 }
 
-fn validate_product(product: &BoundedSemanticFacts) -> Result<()> {
+pub(crate) fn validate_semantic_publication(
+    product: &BoundedSemanticFacts,
+) -> Result<ValidatedSemanticPublication> {
+    product.validate_for_publication()?;
     if product.evidence.status != "completed"
         || product.evidence.runner_version != SEMANTIC_FACTS_RUNNER_VERSION
         || product.evidence.final_artifact.row_count != product.evidence.retained_relevant_events
@@ -322,7 +342,7 @@ fn validate_product(product: &BoundedSemanticFacts) -> Result<()> {
             "semantic product failed immutable publication validation".to_owned(),
         ));
     }
-    Ok(())
+    Ok(ValidatedSemanticPublication)
 }
 
 fn semantic_product_id(baseline_run_id: &str, product: &BoundedSemanticFacts) -> String {

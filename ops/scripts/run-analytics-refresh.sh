@@ -33,6 +33,9 @@ activity_root="${PENSIEVE_ANALYTICS_ACTIVITY_ROOT:-/archive/analytics/fixed-acti
 cohort_enabled="${PENSIEVE_ANALYTICS_COHORT_ENABLED:-0}"
 flexible_enabled="${PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED:-0}"
 flexible_root="${PENSIEVE_ANALYTICS_FLEXIBLE_ROOT:-/archive/analytics/flexible-distinct}"
+semantic_enabled="${PENSIEVE_ANALYTICS_SEMANTIC_ENABLED:-0}"
+semantic_root="${PENSIEVE_ANALYTICS_SEMANTIC_ROOT:-/archive/analytics/semantic-facts}"
+zap_distinct_root="${PENSIEVE_ANALYTICS_ZAP_DISTINCT_ROOT:-/archive/analytics/zap-distinct}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -98,6 +101,10 @@ if [ "$flexible_enabled" != "0" ] && [ "$flexible_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$semantic_enabled" != "0" ] && [ "$semantic_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_SEMANTIC_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
     exit 2
@@ -108,6 +115,10 @@ if [ "$cohort_enabled" = "1" ] && [ "$activity_enabled" != "1" ]; then
 fi
 if [ "$flexible_enabled" = "1" ] && [ "$cohort_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED requires PENSIEVE_ANALYTICS_COHORT_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$semantic_enabled" = "1" ] && [ "$flexible_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_SEMANTIC_ENABLED requires PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED=1" >&2
     exit 2
 fi
 
@@ -190,6 +201,25 @@ if [ "$flexible_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$flexible_root"
+fi
+semantic_baseline_evidence=""
+semantic_baseline_artifact=""
+if [ "$semantic_enabled" = "1" ]; then
+    semantic_baseline_evidence="$current_generation/semantic-evidence.json"
+    if [ ! -s "$semantic_baseline_evidence" ]; then
+        echo "Current semantic evidence is missing: $semantic_baseline_evidence" >&2
+        exit 2
+    fi
+    semantic_baseline_artifact="$(jq -er '.final_artifact.path' "$semantic_baseline_evidence")"
+    if [ ! -s "$semantic_baseline_artifact" ]; then
+        echo "Current semantic artifact is missing: $semantic_baseline_artifact" >&2
+        exit 2
+    fi
+    if [ ! -s "$current_generation/zap-distinct-evidence.json" ]; then
+        echo "Current zap-distinct evidence is missing" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$semantic_root" "$zap_distinct_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -323,6 +353,12 @@ promote_generation() {
             cmp "$run_dir/flexible-distinct-validation.json" \
                 "$generation/flexible-distinct-validation.json"
         fi
+        if [ "$semantic_enabled" = "1" ] \
+            && [ -s "$run_dir/semantic-evidence.json" ]; then
+            cmp "$run_dir/semantic-evidence.json" "$generation/semantic-evidence.json"
+            cmp "$run_dir/zap-distinct-evidence.json" \
+                "$generation/zap-distinct-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -352,6 +388,12 @@ promote_generation() {
                 "$partial_generation/flexible-distinct-evidence.json"
             install -m 0640 "$run_dir/flexible-distinct-validation.json" \
                 "$partial_generation/flexible-distinct-validation.json"
+        fi
+        if [ "$semantic_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/semantic-evidence.json" \
+                "$partial_generation/semantic-evidence.json"
+            install -m 0640 "$run_dir/zap-distinct-evidence.json" \
+                "$partial_generation/zap-distinct-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         mapfile -t generation_files < <(
@@ -490,6 +532,18 @@ case "$run_kind" in
                     "$run_dir/flexible-distinct-validation.json"
             )
         fi
+        if [ "$semantic_enabled" = "1" ]; then
+            semantic_work_root="$semantic_root/$snapshot_hex"
+            zap_work_root="$zap_distinct_root/$snapshot_hex"
+            incremental_args+=(
+                --semantic-baseline-evidence "$semantic_baseline_evidence"
+                --semantic-baseline-artifact "$semantic_baseline_artifact"
+                --semantic-evidence "$run_dir/semantic-evidence.json"
+                --semantic-work-root "$semantic_work_root"
+                --zap-distinct-evidence "$run_dir/zap-distinct-evidence.json"
+                --zap-distinct-work-root "$zap_work_root"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -551,6 +605,13 @@ if [ "$flexible_enabled" = "1" ] \
     evidence_files+=(
         "$run_dir/flexible-distinct-evidence.json"
         "$run_dir/flexible-distinct-validation.json"
+    )
+fi
+if [ "$semantic_enabled" = "1" ] \
+    && [ -s "$run_dir/semantic-evidence.json" ]; then
+    evidence_files+=(
+        "$run_dir/semantic-evidence.json"
+        "$run_dir/zap-distinct-evidence.json"
     )
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"

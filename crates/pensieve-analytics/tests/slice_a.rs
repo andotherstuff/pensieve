@@ -3,23 +3,25 @@ use std::path::{Path, PathBuf};
 
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
-    AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
-    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctPublication,
-    FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
-    PublisherBenchmarkConfig, RelayDistributionConfig, SemanticFactsConfig, ZapDistinctConfig,
-    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, advance_bounded_semantic_facts, apply_incremental,
-    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
-    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    AllBoundedProducts, AllRecurringProducts, AnalyticsBuild, BatchLimits, BuildConfig,
+    CatalogDeltaPlan, EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig,
+    FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation, PlannedRunKind,
+    PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig, RelayDistributionConfig,
+    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, advance_bounded_fixed_activity,
+    advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
+    advance_bounded_semantic_facts, apply_incremental, benchmark_publishers,
+    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
+    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
     estimate_flexible_distinct_windows, load_bounded_fixed_activity,
     load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     load_bounded_relay_distribution, load_bounded_semantic_facts, load_bounded_zap_distinct,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
-    publish_incremental_with_all_bounded_products_and_flexible, publish_with_all_bounded_products,
-    publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
-    resolve_snapshot,
+    publish_incremental_with_all_bounded_products_and_flexible,
+    publish_incremental_with_all_bounded_products_flexible_and_semantic,
+    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
+    resolve_delta_locations, resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -2196,6 +2198,119 @@ fn slice_a_publication_is_atomic_and_idempotent() {
                 &[],
             )
             .expect("count flexible products")
+            .get::<_, i64>(0),
+        1
+    );
+    let semantic_root = fixture._directory.path().join("publication-semantic");
+    let semantic = build_bounded_semantic_facts(
+        semantic_root.join("evidence.json"),
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        SemanticFactsConfig {
+            work_root: semantic_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build semantic publication");
+    let zap_root = fixture._directory.path().join("publication-zap-distinct");
+    let zap_distinct = build_bounded_zap_distinct(
+        &semantic,
+        zap_root.join("evidence.json"),
+        ZapDistinctConfig {
+            work_root: zap_root,
+            chunk_records: 2,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build zap-distinct publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_zap_product_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected zap product publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_zap_product_test
+            BEFORE INSERT ON pensieve_analytics.semantic_zap_distinct_products
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_zap_product_test();
+            ",
+        )
+        .expect("install semantic failure injection");
+    let recurring = AllRecurringProducts {
+        bounded: AllBoundedProducts {
+            identity: &identity,
+            activity: &activity,
+            cohort: &cohort,
+        },
+        flexible: FlexibleDistinctPublication {
+            product: &flexible,
+            validation_evidence_path: &flexible_validation_path,
+            validation_evidence_sha256: &flexible_validation_sha,
+        },
+        semantic: SemanticPublication {
+            product: &semantic,
+            zap_distinct: &zap_distinct,
+        },
+    };
+    publish_incremental_with_all_bounded_products_flexible_and_semantic(
+        &mut client,
+        &fixture.build,
+        recurring,
+        &cohort_run_id,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected zap failure must roll back semantic publication");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.semantic_products",
+                &[],
+            )
+            .expect("count rolled-back semantic products")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_zap_product_test
+                ON pensieve_analytics.semantic_zap_distinct_products;
+            DROP FUNCTION pensieve_analytics.reject_zap_product_test();
+            ",
+        )
+        .expect("remove semantic failure injection");
+    assert_eq!(
+        publish_incremental_with_all_bounded_products_flexible_and_semantic(
+            &mut client,
+            &fixture.build,
+            recurring,
+            &cohort_run_id,
+            started_at,
+            completed_at,
+        )
+        .expect("atomically attach semantic products to current generation"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id.clone()
+        }
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.semantic_products products
+                  JOIN pensieve_analytics.semantic_zap_distinct_products zaps
+                    ON zaps.semantic_product_id = products.product_id",
+                &[],
+            )
+            .expect("count committed semantic product pair")
             .get::<_, i64>(0),
         1
     );

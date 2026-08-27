@@ -158,6 +158,13 @@ pub struct BoundedSemanticFacts {
     pub evidence_sha256: String,
 }
 
+impl BoundedSemanticFacts {
+    /// Revalidate immutable facts, evidence, and exact rollups before publication.
+    pub fn validate_for_publication(&self) -> Result<()> {
+        validate_loaded_product(self)
+    }
+}
+
 #[derive(Clone)]
 struct CompletedRun {
     path: PathBuf,

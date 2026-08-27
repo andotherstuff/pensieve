@@ -6,18 +6,21 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AllBoundedProducts, BatchLimits, BuildConfig, COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan,
-    CohortRetentionEvidence, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
-    FlexibleDistinctConfig, FlexibleDistinctPublication, IDENTITY_QUERY_VERSION,
-    PubkeyFirstSeenConfig, PublishOutcome, acquire_publication_lock,
+    AllBoundedProducts, AllRecurringProducts, BatchLimits, BuildConfig,
+    COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
+    FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig, FlexibleDistinctConfig,
+    FlexibleDistinctPublication, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome,
+    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, acquire_publication_lock,
     advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, apply_incremental, build_bounded_cohort_retention,
-    build_flexible_distinct_validation, load_bounded_fixed_activity,
-    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    plan_catalog_delta_for_query_version, publish_incremental,
+    advance_bounded_pubkey_first_seen, advance_bounded_semantic_facts, apply_incremental,
+    build_bounded_cohort_retention, build_bounded_zap_distinct, build_flexible_distinct_validation,
+    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, publish_incremental,
     publish_incremental_with_all_bounded_products,
-    publish_incremental_with_all_bounded_products_and_flexible, publish_incremental_with_identity,
-    publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
+    publish_incremental_with_all_bounded_products_and_flexible,
+    publish_incremental_with_all_bounded_products_flexible_and_semantic,
+    publish_incremental_with_identity, publish_incremental_with_identity_and_activity,
+    resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
@@ -141,6 +144,45 @@ struct Args {
     /// Maximum accepted representative Slice 6 relative error in ppm.
     #[arg(long, default_value_t = 20_000)]
     flexible_tolerance_ppm: u64,
+    /// Current immutable semantic evidence; enables recurring Slice 7.
+    #[arg(long)]
+    semantic_baseline_evidence: Option<PathBuf>,
+    /// Current immutable semantic fact artifact named by baseline evidence.
+    #[arg(long)]
+    semantic_baseline_artifact: Option<PathBuf>,
+    /// Immutable semantic successor evidence output.
+    #[arg(long)]
+    semantic_evidence: Option<PathBuf>,
+    /// Dedicated immutable semantic successor workspace.
+    #[arg(long)]
+    semantic_work_root: Option<PathBuf>,
+    /// Immutable zap-distinct successor evidence output.
+    #[arg(long)]
+    zap_distinct_evidence: Option<PathBuf>,
+    /// Dedicated immutable zap-distinct successor workspace.
+    #[arg(long)]
+    zap_distinct_work_root: Option<PathBuf>,
+    /// Maximum compressed delta bytes in one semantic scan.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    semantic_batch_bytes: u64,
+    /// Maximum physical delta rows in one semantic scan.
+    #[arg(long, default_value_t = 5_000_000)]
+    semantic_batch_rows: u64,
+    /// Maximum semantic runs opened by one merge.
+    #[arg(long, default_value_t = 16)]
+    semantic_merge_fan_in: usize,
+    /// Free semantic work-filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400)]
+    semantic_disk_reserve_bytes: u64,
+    /// Maximum zap identities held by one sorted chunk.
+    #[arg(long, default_value_t = 1_000_000)]
+    zap_distinct_chunk_records: usize,
+    /// Maximum zap identity runs opened by one merge.
+    #[arg(long, default_value_t = 16)]
+    zap_distinct_merge_fan_in: usize,
+    /// Free zap work-filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400)]
+    zap_distinct_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -155,6 +197,7 @@ struct Output<'a> {
     activity: Option<ActivityOutput<'a>>,
     cohort: Option<CohortOutput<'a>>,
     flexible: Option<FlexibleOutput<'a>>,
+    semantic: Option<SemanticOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -206,6 +249,18 @@ struct FlexibleOutput<'a> {
 }
 
 #[derive(Serialize)]
+struct SemanticOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    retained_relevant_events: u64,
+    logical_relevant_events: u64,
+    delta_object_count: u64,
+    zap_distinct_evidence_sha256: &'a str,
+    zap_distinct_identity_rows: u64,
+    zap_distinct_leaf_rows: usize,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum PublicationOutput {
     Published {
@@ -250,6 +305,7 @@ fn run() -> Result<()> {
     let activity_enabled = args.activity_baseline_evidence.is_some();
     let cohort_enabled = args.cohort_baseline_evidence.is_some();
     let flexible_enabled = args.flexible_baseline_evidence.is_some();
+    let semantic_enabled = args.semantic_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -269,6 +325,14 @@ fn run() -> Result<()> {
         args.flexible_work_root.is_some(),
         args.flexible_validation_evidence.is_some(),
     )?;
+    require_complete_semantic_args([
+        semantic_enabled,
+        args.semantic_baseline_artifact.is_some(),
+        args.semantic_evidence.is_some(),
+        args.semantic_work_root.is_some(),
+        args.zap_distinct_evidence.is_some(),
+        args.zap_distinct_work_root.is_some(),
+    ])?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
@@ -279,6 +343,9 @@ fn run() -> Result<()> {
     }
     if flexible_enabled && !cohort_enabled {
         bail!("flexible-distinct advancement requires the complete B3 lane in the same run");
+    }
+    if semantic_enabled && !flexible_enabled {
+        bail!("semantic advancement requires the complete Slice 6 lane in the same run");
     }
     let desired_query_version = if cohort_enabled {
         COHORT_RETENTION_QUERY_VERSION
@@ -484,12 +551,111 @@ fn run() -> Result<()> {
         .map(pensieve_lake::sha256_file)
         .transpose()
         .context("hash flexible-distinct tolerance evidence")?;
+    let semantic = if let (
+        Some(baseline_evidence),
+        Some(baseline_artifact),
+        Some(evidence_path),
+        Some(work_root),
+    ) = (
+        args.semantic_baseline_evidence.as_ref(),
+        args.semantic_baseline_artifact.as_ref(),
+        args.semantic_evidence.as_ref(),
+        args.semantic_work_root.as_ref(),
+    ) {
+        let baseline = load_bounded_semantic_facts(baseline_evidence, baseline_artifact)
+            .context("load baseline semantic evidence")?;
+        Some(
+            advance_bounded_semantic_facts(
+                evidence_path,
+                &baseline,
+                target.clone(),
+                &persisted_plan,
+                &delta_locations,
+                build.config.clone(),
+                SemanticFactsConfig {
+                    work_root: work_root.clone(),
+                    batch_limits: BatchLimits {
+                        max_bytes: args.semantic_batch_bytes,
+                        max_rows: args.semantic_batch_rows,
+                    },
+                    merge_fan_in: args.semantic_merge_fan_in,
+                    disk_reserve_bytes: args.semantic_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded semantic facts")?,
+        )
+    } else {
+        None
+    };
+    let zap_distinct = if let (Some(semantic), Some(evidence_path), Some(work_root)) = (
+        semantic.as_ref(),
+        args.zap_distinct_evidence.as_ref(),
+        args.zap_distinct_work_root.as_ref(),
+    ) {
+        Some(
+            build_bounded_zap_distinct(
+                semantic,
+                evidence_path,
+                ZapDistinctConfig {
+                    work_root: work_root.clone(),
+                    chunk_records: args.zap_distinct_chunk_records,
+                    merge_fan_in: args.zap_distinct_merge_fan_in,
+                    disk_reserve_bytes: args.zap_distinct_disk_reserve_bytes,
+                },
+            )
+            .context("build bounded zap-distinct state")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
             match if let (
+                Some(identity),
+                Some(activity),
+                Some(cohort),
+                Some(flexible),
+                Some(validation_path),
+                Some(validation_sha256),
+                Some(semantic),
+                Some(zap_distinct),
+            ) = (
+                identity.as_ref(),
+                activity.as_ref(),
+                cohort.as_ref(),
+                flexible.as_ref(),
+                args.flexible_validation_evidence.as_deref(),
+                flexible_validation_sha256.as_deref(),
+                semantic.as_ref(),
+                zap_distinct.as_ref(),
+            ) {
+                publish_incremental_with_all_bounded_products_flexible_and_semantic(
+                    &mut client,
+                    &build,
+                    AllRecurringProducts {
+                        bounded: AllBoundedProducts {
+                            identity,
+                            activity,
+                            cohort,
+                        },
+                        flexible: FlexibleDistinctPublication {
+                            product: flexible,
+                            validation_evidence_path: validation_path,
+                            validation_evidence_sha256: validation_sha256,
+                        },
+                        semantic: SemanticPublication {
+                            product: semantic,
+                            zap_distinct,
+                        },
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (
                 Some(identity),
                 Some(activity),
                 Some(cohort),
@@ -637,6 +803,32 @@ fn run() -> Result<()> {
                     .expect("flexible output has validation result")
                     .max_relative_error_ppm,
             }),
+            semantic: semantic.as_ref().map(|semantic| SemanticOutput {
+                evidence_sha256: &semantic.evidence_sha256,
+                baseline_evidence_sha256: semantic
+                    .evidence
+                    .baseline_evidence_sha256
+                    .as_deref()
+                    .expect("semantic successor has baseline evidence"),
+                retained_relevant_events: semantic.evidence.retained_relevant_events,
+                logical_relevant_events: semantic.evidence.logical_relevant_events,
+                delta_object_count: semantic.evidence.delta_object_count,
+                zap_distinct_evidence_sha256: &zap_distinct
+                    .as_ref()
+                    .expect("semantic output has zap distinct")
+                    .evidence_sha256,
+                zap_distinct_identity_rows: zap_distinct
+                    .as_ref()
+                    .expect("semantic output has zap distinct")
+                    .evidence
+                    .logical_identities,
+                zap_distinct_leaf_rows: zap_distinct
+                    .as_ref()
+                    .expect("semantic output has zap distinct")
+                    .evidence
+                    .leaves
+                    .len(),
+            }),
             publication,
         })?
     );
@@ -663,6 +855,15 @@ fn require_complete_flexible_args(
         return Ok(());
     }
     bail!("flexible baseline, output, work root, and validation evidence must be supplied together")
+}
+
+fn require_complete_semantic_args(present: [bool; 6]) -> Result<()> {
+    if present.into_iter().all(|value| value == present[0]) {
+        return Ok(());
+    }
+    bail!(
+        "semantic baseline evidence/artifact, successor evidence/work root, and zap evidence/work root must be supplied together"
+    )
 }
 
 fn validate_cohort_baseline(
@@ -798,5 +999,13 @@ mod tests {
             .expect("complete flexible lane is valid");
         assert!(require_complete_flexible_args(true, true, true, false).is_err());
         assert!(require_complete_flexible_args(false, true, true, true).is_err());
+    }
+
+    #[test]
+    fn semantic_arguments_are_all_or_nothing() {
+        require_complete_semantic_args([false; 6]).expect("disabled semantic lane is valid");
+        require_complete_semantic_args([true; 6]).expect("complete semantic lane is valid");
+        assert!(require_complete_semantic_args([true, true, true, true, true, false]).is_err());
+        assert!(require_complete_semantic_args([false, true, true, true, true, true]).is_err());
     }
 }

@@ -10,12 +10,21 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedFlexibleDistinct,
-    BoundedPubkeyFirstSeen, COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION,
-    IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
+    BoundedPubkeyFirstSeen, BoundedSemanticFacts, BoundedZapDistinct,
+    COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION,
+    QUERY_VERSION, Result,
     flexible_distinct_publish::{
         publish_flexible_distinct_leaves_in_transaction, validate_flexible_distinct_publication,
     },
     schema::SCHEMA_SQL,
+    semantic_publish::{
+        SemanticPublishOutcome, ValidatedSemanticPublication,
+        publish_semantic_facts_in_transaction, validate_semantic_publication,
+    },
+    zap_distinct_publish::{
+        ValidatedZapDistinctPublication, ZapDistinctPublishOutcome,
+        publish_zap_distinct_in_transaction, validate_zap_distinct_publication,
+    },
 };
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
@@ -26,6 +35,7 @@ struct PublicationProducts<'a> {
     activity: Option<&'a BoundedFixedActivity>,
     cohort: Option<&'a BoundedCohortRetention>,
     flexible: Option<FlexibleDistinctPublication<'a>>,
+    semantic: Option<SemanticPublication<'a>>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -77,6 +87,26 @@ pub struct FlexibleDistinctPublication<'a> {
     pub validation_evidence_sha256: &'a str,
 }
 
+/// Validated Slice 7 exact semantic facts and participant sketches.
+#[derive(Clone, Copy)]
+pub struct SemanticPublication<'a> {
+    /// Canonical additive semantic facts and rollups.
+    pub product: &'a BoundedSemanticFacts,
+    /// Daily validated zap sender/recipient sketches derived from the facts.
+    pub zap_distinct: &'a BoundedZapDistinct,
+}
+
+/// Every validated bounded product currently carried by recurring publication.
+#[derive(Clone, Copy)]
+pub struct AllRecurringProducts<'a> {
+    /// Exact B1/B2/B3 products.
+    pub bounded: AllBoundedProducts<'a>,
+    /// Complete-hour flexible distinct leaves and tolerance gate.
+    pub flexible: FlexibleDistinctPublication<'a>,
+    /// Additive semantic rollups and zap participant leaves.
+    pub semantic: SemanticPublication<'a>,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -95,6 +125,8 @@ struct ValidationRecord {
     cohort_retention_rows: u64,
     flexible_distinct_evidence_sha256: Option<String>,
     flexible_distinct_validation_sha256: Option<String>,
+    semantic_evidence_sha256: Option<String>,
+    zap_distinct_evidence_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -140,6 +172,7 @@ pub fn publish_with_identity(
             activity: None,
             cohort: None,
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -165,6 +198,7 @@ pub fn publish_with_identity_and_activity(
             activity: Some(activity),
             cohort: None,
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -189,6 +223,7 @@ pub fn publish_with_all_bounded_products(
             activity: Some(products.activity),
             cohort: Some(products.cohort),
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -233,6 +268,7 @@ pub fn publish_incremental_with_identity(
             activity: None,
             cohort: None,
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -259,6 +295,7 @@ pub fn publish_incremental_with_identity_and_activity(
             activity: Some(activity),
             cohort: None,
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -284,6 +321,7 @@ pub fn publish_incremental_with_all_bounded_products(
             activity: Some(products.activity),
             cohort: Some(products.cohort),
             flexible: None,
+            semantic: None,
         },
     )
 }
@@ -310,6 +348,33 @@ pub fn publish_incremental_with_all_bounded_products_and_flexible(
             activity: Some(products.activity),
             cohort: Some(products.cohort),
             flexible: Some(flexible),
+            semantic: None,
+        },
+    )
+}
+
+/// Publish one incremental B3, Slice 6, and Slice 7 generation atomically.
+pub fn publish_incremental_with_all_bounded_products_flexible_and_semantic(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllRecurringProducts<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.bounded.identity),
+            activity: Some(products.bounded.activity),
+            cohort: Some(products.bounded.cohort),
+            flexible: Some(products.flexible),
+            semantic: Some(products.semantic),
         },
     )
 }
@@ -327,6 +392,7 @@ fn publish_kind(
     let activity = products.activity;
     let cohort = products.cohort;
     let flexible = products.flexible;
+    let semantic = products.semantic;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -384,6 +450,21 @@ fn publish_kind(
     } else {
         None
     };
+    let validated_semantic = if let Some(semantic) = semantic {
+        if semantic.product.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || semantic.product.evidence.as_of_epoch != build.config.as_of_epoch
+        {
+            return Err(Error::Validation(
+                "semantic evidence does not match its publication generation".to_owned(),
+            ));
+        }
+        Some((
+            validate_semantic_publication(semantic.product)?,
+            validate_zap_distinct_publication(semantic.product, semantic.zap_distinct)?,
+        ))
+    } else {
+        None
+    };
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
@@ -415,6 +496,12 @@ fn publish_kind(
                     validated,
                 )?;
             }
+            publish_semantic_products(
+                &mut transaction,
+                &run_id,
+                semantic,
+                validated_semantic.as_ref(),
+            )?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -466,6 +553,10 @@ fn publish_kind(
             .map(|publication| publication.product.evidence_sha256.clone()),
         flexible_distinct_validation_sha256: flexible
             .map(|publication| publication.validation_evidence_sha256.to_owned()),
+        semantic_evidence_sha256: semantic
+            .map(|publication| publication.product.evidence_sha256.clone()),
+        zap_distinct_evidence_sha256: semantic
+            .map(|publication| publication.zap_distinct.evidence_sha256.clone()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -586,6 +677,12 @@ fn publish_kind(
             validated,
         )?;
     }
+    publish_semantic_products(
+        &mut transaction,
+        &run_id,
+        semantic,
+        validated_semantic.as_ref(),
+    )?;
 
     transaction.execute(
         "
@@ -600,6 +697,44 @@ fn publish_kind(
         run_id,
         previous_run_id: current_run_id,
     })
+}
+
+fn publish_semantic_products(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    semantic: Option<SemanticPublication<'_>>,
+    validated: Option<&(
+        ValidatedSemanticPublication,
+        ValidatedZapDistinctPublication,
+    )>,
+) -> Result<()> {
+    let Some(semantic) = semantic else {
+        return Ok(());
+    };
+    let Some((validated_semantic, validated_zap)) = validated else {
+        return Err(Error::Validation(
+            "semantic publication is missing pre-transaction validation".to_owned(),
+        ));
+    };
+    let semantic_product_id = match publish_semantic_facts_in_transaction(
+        transaction,
+        run_id,
+        semantic.product,
+        validated_semantic,
+    )? {
+        SemanticPublishOutcome::Published { product_id }
+        | SemanticPublishOutcome::AlreadyPublished { product_id } => product_id,
+    };
+    match publish_zap_distinct_in_transaction(
+        transaction,
+        &semantic_product_id,
+        semantic.product,
+        semantic.zap_distinct,
+        validated_zap,
+    )? {
+        ZapDistinctPublishOutcome::Published { .. }
+        | ZapDistinctPublishOutcome::AlreadyPublished { .. } => Ok(()),
+    }
 }
 
 fn reconcile_applied_objects(

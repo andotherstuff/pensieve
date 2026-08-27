@@ -24,6 +24,9 @@ pub enum ZapDistinctPublishOutcome {
     AlreadyPublished { product_id: String },
 }
 
+/// Proof that immutable zap identities and leaves passed full validation.
+pub(crate) struct ValidatedZapDistinctPublication;
+
 /// Publish daily sender/recipient leaves without moving the analytics pointer.
 pub fn publish_zap_distinct(
     client: &mut Client,
@@ -31,17 +34,8 @@ pub fn publish_zap_distinct(
     semantic: &BoundedSemanticFacts,
     product: &BoundedZapDistinct,
 ) -> Result<ZapDistinctPublishOutcome> {
-    validate_source(semantic, product)?;
+    let validated = validate_zap_distinct_publication(semantic, product)?;
     client.batch_execute(SCHEMA_SQL)?;
-    let product_id = zap_distinct_product_id(semantic_product_id, product);
-    let complete_through = floor_day(product.evidence.as_of_epoch);
-    let sketch_bytes = product
-        .evidence
-        .leaves
-        .iter()
-        .try_fold(0_u64, |sum, leaf| sum.checked_add(leaf.sketch.len() as u64))
-        .ok_or_else(|| Error::Validation("zap distinct sketch bytes overflowed".to_owned()))?;
-
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
     let baseline = transaction.query_one(
@@ -65,6 +59,25 @@ pub fn publish_zap_distinct(
         ));
     }
 
+    let outcome = publish_zap_distinct_in_transaction(
+        &mut transaction,
+        semantic_product_id,
+        semantic,
+        product,
+        &validated,
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+pub(crate) fn publish_zap_distinct_in_transaction(
+    transaction: &mut impl GenericClient,
+    semantic_product_id: &str,
+    _semantic: &BoundedSemanticFacts,
+    product: &BoundedZapDistinct,
+    _validated: &ValidatedZapDistinctPublication,
+) -> Result<ZapDistinctPublishOutcome> {
+    let product_id = zap_distinct_product_id(semantic_product_id, product);
     if transaction
         .query_opt(
             "SELECT product_id
@@ -74,11 +87,17 @@ pub fn publish_zap_distinct(
         )?
         .is_some()
     {
-        reconcile(&mut transaction, &product_id, product)?;
-        transaction.commit()?;
+        reconcile(transaction, &product_id, product)?;
         return Ok(ZapDistinctPublishOutcome::AlreadyPublished { product_id });
     }
 
+    let complete_through = floor_day(product.evidence.as_of_epoch);
+    let sketch_bytes = product
+        .evidence
+        .leaves
+        .iter()
+        .try_fold(0_u64, |sum, leaf| sum.checked_add(leaf.sketch.len() as u64))
+        .ok_or_else(|| Error::Validation("zap distinct sketch bytes overflowed".to_owned()))?;
     transaction.execute(
         "INSERT INTO pensieve_analytics.semantic_zap_distinct_products (
              product_id, semantic_product_id, complete_through_epoch,
@@ -116,9 +135,8 @@ pub fn publish_zap_distinct(
             )?,
         ],
     )?;
-    copy_leaves(&mut transaction, &product_id, product)?;
-    reconcile(&mut transaction, &product_id, product)?;
-    transaction.commit()?;
+    copy_leaves(transaction, &product_id, product)?;
+    reconcile(transaction, &product_id, product)?;
     Ok(ZapDistinctPublishOutcome::Published { product_id })
 }
 
@@ -250,7 +268,10 @@ fn reconcile(
     Ok(())
 }
 
-fn validate_source(semantic: &BoundedSemanticFacts, product: &BoundedZapDistinct) -> Result<()> {
+pub(crate) fn validate_zap_distinct_publication(
+    semantic: &BoundedSemanticFacts,
+    product: &BoundedZapDistinct,
+) -> Result<ValidatedZapDistinctPublication> {
     product.validate_for_publication(semantic)?;
     if product.evidence.status != "completed"
         || product.evidence.snapshot_id != semantic.evidence.snapshot_id
@@ -262,7 +283,7 @@ fn validate_source(semantic: &BoundedSemanticFacts, product: &BoundedZapDistinct
             "zap distinct product does not belong to semantic source".to_owned(),
         ));
     }
-    Ok(())
+    Ok(ValidatedZapDistinctPublication)
 }
 
 fn current_run_id(transaction: &mut impl GenericClient) -> Result<String> {
@@ -276,7 +297,7 @@ fn current_run_id(transaction: &mut impl GenericClient) -> Result<String> {
 
 fn zap_distinct_product_id(semantic_product_id: &str, product: &BoundedZapDistinct) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pensieve-zap-distinct-product-v1\0");
+    digest.update(b"pensieve-zap-distinct-product-v2\0");
     digest.update(semantic_product_id.as_bytes());
     digest.update([0]);
     digest.update(product.evidence_sha256.as_bytes());

@@ -686,7 +686,8 @@ Implementation status:
 - [x] Append-only successor construction from the baseline plus delta objects,
   including future-fact maturation and retry-safe checkpoints.
 - [x] Zap-distinct v2 as-of filtering and semantic-evidence version gate.
-- [ ] Atomic recurring Postgres publication for semantic and zap products.
+- [x] Atomic recurring Postgres publication for semantic and zap products,
+  including all-or-nothing refresh configuration and generation evidence.
 - [ ] Independent production comparison canary and recurring publication gate.
 
 ### Slice 8 — current NIP-65 relay distribution
