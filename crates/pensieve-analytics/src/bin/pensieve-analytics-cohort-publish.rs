@@ -95,6 +95,14 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
     let started_at = Utc::now();
+    // Fail fast on missing or invalid credentials before revalidating the
+    // multi-billion-row immutable activity inputs. The publication connection
+    // is opened again after the bounded build so it cannot go stale while the
+    // evidence pass runs.
+    connect_postgres(&args)
+        .context("preflight Postgres connection")?
+        .simple_query("SELECT 1")
+        .context("preflight Postgres query")?;
     let snapshot = resolve_snapshot(&args.catalog, args.local_object_root.as_deref())
         .context("resolve immutable snapshot")?;
     let build = AnalyticsBuild::open_completed(
@@ -102,10 +110,10 @@ fn run() -> Result<()> {
         snapshot,
         pensieve_analytics::BuildConfig {
             as_of_epoch: args.as_of,
-            code_version: args.code_version,
+            code_version: args.code_version.clone(),
             s3_region: "us-east-1".to_owned(),
             s3_force_path_style: false,
-            memory_limit: args.memory_limit,
+            memory_limit: args.memory_limit.clone(),
             threads: args.threads,
         },
     )
@@ -122,16 +130,7 @@ fn run() -> Result<()> {
     )
     .context("build bounded cohort retention")?;
 
-    let mut postgres_config: PostgresConfig = args
-        .postgres_url
-        .parse()
-        .context("parse Postgres connection")?;
-    if let Some(password) = args.postgres_password {
-        postgres_config.password(password);
-    }
-    let mut client = postgres_config
-        .connect(NoTls)
-        .context("connect to Postgres without TLS")?;
+    let mut client = connect_postgres(&args).context("connect to Postgres for publication")?;
     acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
     let current = client
         .query_one(
@@ -192,6 +191,19 @@ fn run() -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn connect_postgres(args: &Args) -> Result<postgres::Client> {
+    let mut postgres_config: PostgresConfig = args
+        .postgres_url
+        .parse()
+        .context("parse Postgres connection")?;
+    if let Some(password) = &args.postgres_password {
+        postgres_config.password(password);
+    }
+    postgres_config
+        .connect(NoTls)
+        .context("connect to Postgres without TLS")
 }
 
 fn validate_current_baseline(

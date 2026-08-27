@@ -553,9 +553,10 @@ bug: daily per-kind `unique_pubkeys` incremented once per event rather than once
 per `(pubkey, day, kind)`. Weekly, monthly, and all-kind rows already applied
 the intended distinct semantics. The correction is versioned as
 `fixed-activity-v3`, `slice-b2-v3`, and `slice-b3-v2`; older evidence fails
-closed and cannot be reused as a corrected publication. Slice 6 publication
-remains blocked until corrected exact reference evidence is rebuilt and the
-2% production tolerance gate passes.
+closed and cannot be reused as a corrected publication. Corrected exact
+reference evidence was rebuilt and the frozen 2% production tolerance gate
+passed; dormant publication remains tied to the exact corrected B3 v2
+baseline.
 
 - [x] Select Apache DataSketches Rust HLL, `lg_k=12`, `Hll8`, library
   serialization version 1 inside Pensieve envelope version 1. The dependency
