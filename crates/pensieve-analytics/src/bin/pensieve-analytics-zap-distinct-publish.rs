@@ -69,6 +69,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    connect_postgres(&args)
+        .context("preflight Postgres connection")?
+        .simple_query("SELECT 1")
+        .context("preflight Postgres query")?;
     let semantic = load_bounded_semantic_facts(&args.semantic_evidence, &args.semantic_artifact)
         .context("load semantic product")?;
     if semantic.evidence_sha256 != args.semantic_evidence_sha256 {
@@ -81,11 +85,7 @@ fn run() -> Result<()> {
         bail!("zap distinct evidence SHA-256 differs from the authorized gate");
     }
 
-    let mut config: PostgresConfig = args.postgres_url.parse().context("parse Postgres URL")?;
-    if let Some(password) = args.postgres_password {
-        config.password(password);
-    }
-    let mut client = config.connect(NoTls).context("connect to Postgres")?;
+    let mut client = connect_postgres(&args).context("connect to Postgres for publication")?;
     let current_before: String = client
         .query_one(
             "SELECT run_id FROM pensieve_analytics.current_run WHERE singleton=true",
@@ -141,4 +141,12 @@ fn run() -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn connect_postgres(args: &Args) -> Result<postgres::Client> {
+    let mut config: PostgresConfig = args.postgres_url.parse().context("parse Postgres URL")?;
+    if let Some(password) = &args.postgres_password {
+        config.password(password);
+    }
+    config.connect(NoTls).context("connect to Postgres")
 }

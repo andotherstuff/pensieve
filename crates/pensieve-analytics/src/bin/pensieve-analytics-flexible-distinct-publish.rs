@@ -62,6 +62,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    connect_postgres(&args)
+        .context("preflight Postgres connection")?
+        .simple_query("SELECT 1")
+        .context("preflight Postgres query")?;
     let product = load_bounded_flexible_distinct(&args.flexible_evidence)
         .context("load and validate flexible-distinct evidence")?;
     let actual_validation_sha =
@@ -70,16 +74,7 @@ fn run() -> Result<()> {
         bail!("tolerance evidence SHA-256 differs from the authorized gate");
     }
 
-    let mut postgres_config: PostgresConfig = args
-        .postgres_url
-        .parse()
-        .context("parse Postgres connection")?;
-    if let Some(password) = args.postgres_password {
-        postgres_config.password(password);
-    }
-    let mut client = postgres_config
-        .connect(NoTls)
-        .context("connect to Postgres without TLS")?;
+    let mut client = connect_postgres(&args).context("connect to Postgres for publication")?;
     let current = client
         .query_one(
             "SELECT run_id, snapshot_id, query_version, as_of_epoch
@@ -147,4 +142,17 @@ fn run() -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn connect_postgres(args: &Args) -> Result<postgres::Client> {
+    let mut config: PostgresConfig = args
+        .postgres_url
+        .parse()
+        .context("parse Postgres connection")?;
+    if let Some(password) = &args.postgres_password {
+        config.password(password);
+    }
+    config
+        .connect(NoTls)
+        .context("connect to Postgres without TLS")
 }
