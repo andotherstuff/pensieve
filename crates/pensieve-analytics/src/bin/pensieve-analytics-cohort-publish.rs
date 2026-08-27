@@ -15,9 +15,9 @@ use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
-#[command(about = "Atomically add exact cohort retention to a Slice B2 publication")]
+#[command(about = "Atomically publish exact cohort retention from an authorized baseline")]
 struct Args {
-    /// Canonical active-file snapshot matching the current Slice B2 run.
+    /// Canonical active-file snapshot matching the current authorized run.
     #[arg(long)]
     catalog: PathBuf,
     /// Verified local object root; omit when the DuckDB checkpoint is complete.
@@ -26,16 +26,16 @@ struct Args {
     /// Existing completed Slice A DuckDB checkpoint.
     #[arg(long)]
     work_database: PathBuf,
-    /// Verified first-seen evidence matching the current Slice B2 run.
+    /// Verified first-seen evidence matching the current run.
     #[arg(long)]
     identity_evidence: PathBuf,
-    /// Verified fixed-activity evidence matching the current Slice B2 run.
+    /// Verified fixed-activity evidence matching the target semantics.
     #[arg(long)]
     activity_evidence: PathBuf,
     /// Canonical immutable cohort-retention evidence to create.
     #[arg(long)]
     cohort_evidence: PathBuf,
-    /// Fixed as-of from the current Slice B2 run.
+    /// Fixed as-of from the current run.
     #[arg(long)]
     as_of: u64,
     /// Build/commit identity stored in analytics run metadata.
@@ -47,6 +47,13 @@ struct Args {
     /// Postgres password supplied separately from the connection string.
     #[arg(long, env = "POSTGRES_ANALYTICS_PASSWORD")]
     postgres_password: Option<String>,
+    /// Exact query version required on the current Postgres baseline.
+    ///
+    /// The default is the normal B2-to-B3 publication path. A deliberate
+    /// semantic republish may name an older B3 version explicitly while still
+    /// requiring the exact snapshot, as-of, and locked run identity.
+    #[arg(long, default_value = FIXED_ACTIVITY_QUERY_VERSION)]
+    expected_current_query_version: String,
     /// Hard ceiling for compact cohort-retention matrix rows.
     #[arg(long, default_value_t = 2_000_000)]
     matrix_row_limit: usize,
@@ -66,6 +73,7 @@ struct Output<'a> {
     snapshot_id: &'a str,
     as_of_epoch: u64,
     previous_run_id: String,
+    previous_query_version: String,
     run_id: Option<String>,
     publication_status: &'static str,
     dry_run: bool,
@@ -130,19 +138,19 @@ fn run() -> Result<()> {
             "SELECT run_id, snapshot_id, query_version, as_of_epoch FROM pensieve_analytics.current_run_metadata",
             &[],
         )
-        .context("load current Slice B2 baseline")?;
+        .context("load current authorized baseline")?;
     let previous_run_id: String = current.get(0);
     let current_snapshot: String = current.get(1);
     let current_query_version: String = current.get(2);
     let current_as_of: i64 = current.get(3);
-    if current_snapshot != build.snapshot.catalog.snapshot_id
-        || current_query_version != FIXED_ACTIVITY_QUERY_VERSION
-        || current_as_of != i64::try_from(args.as_of).context("as-of exceeds i64")?
-    {
-        bail!(
-            "current Postgres run is not the exact Slice B2 snapshot/as-of selected for cohort upgrade"
-        );
-    }
+    validate_current_baseline(
+        &current_snapshot,
+        &current_query_version,
+        current_as_of,
+        &build.snapshot.catalog.snapshot_id,
+        &args.expected_current_query_version,
+        args.as_of,
+    )?;
     let completed_at = Utc::now();
     let (run_id, publication_status) = if args.dry_run {
         (None, "not_published")
@@ -171,6 +179,7 @@ fn run() -> Result<()> {
             snapshot_id: &build.snapshot.catalog.snapshot_id,
             as_of_epoch: build.config.as_of_epoch,
             previous_run_id,
+            previous_query_version: current_query_version,
             run_id,
             publication_status,
             dry_run: args.dry_run,
@@ -183,4 +192,38 @@ fn run() -> Result<()> {
         })?
     );
     Ok(())
+}
+
+fn validate_current_baseline(
+    current_snapshot: &str,
+    current_query_version: &str,
+    current_as_of: i64,
+    expected_snapshot: &str,
+    expected_query_version: &str,
+    expected_as_of: u64,
+) -> Result<()> {
+    if current_snapshot != expected_snapshot
+        || current_query_version != expected_query_version
+        || current_as_of != i64::try_from(expected_as_of).context("as-of exceeds i64")?
+    {
+        bail!(
+            "current Postgres run is not the exact authorized snapshot/as-of/query-version baseline"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_republish_requires_the_exact_explicit_baseline() {
+        assert!(validate_current_baseline("s", "slice-b3-v1", 10, "s", "slice-b3-v1", 10).is_ok());
+        assert!(
+            validate_current_baseline("other", "slice-b3-v1", 10, "s", "slice-b3-v1", 10).is_err()
+        );
+        assert!(validate_current_baseline("s", "slice-b3-v2", 10, "s", "slice-b3-v1", 10).is_err());
+        assert!(validate_current_baseline("s", "slice-b3-v1", 11, "s", "slice-b3-v1", 10).is_err());
+    }
 }
