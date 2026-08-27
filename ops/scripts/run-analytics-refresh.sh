@@ -31,6 +31,8 @@ identity_root="${PENSIEVE_ANALYTICS_IDENTITY_ROOT:-/archive/analytics/pubkey-fir
 activity_enabled="${PENSIEVE_ANALYTICS_ACTIVITY_ENABLED:-0}"
 activity_root="${PENSIEVE_ANALYTICS_ACTIVITY_ROOT:-/archive/analytics/fixed-activity}"
 cohort_enabled="${PENSIEVE_ANALYTICS_COHORT_ENABLED:-0}"
+flexible_enabled="${PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED:-0}"
+flexible_root="${PENSIEVE_ANALYTICS_FLEXIBLE_ROOT:-/archive/analytics/flexible-distinct}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -92,12 +94,20 @@ if [ "$cohort_enabled" != "0" ] && [ "$cohort_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_COHORT_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$flexible_enabled" != "0" ] && [ "$flexible_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
     exit 2
 fi
 if [ "$cohort_enabled" = "1" ] && [ "$activity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_COHORT_ENABLED requires PENSIEVE_ANALYTICS_ACTIVITY_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$flexible_enabled" = "1" ] && [ "$cohort_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_FLEXIBLE_ENABLED requires PENSIEVE_ANALYTICS_COHORT_ENABLED=1" >&2
     exit 2
 fi
 
@@ -167,6 +177,19 @@ if [ "$cohort_enabled" = "1" ]; then
         echo "Current cohort evidence is missing: $cohort_baseline_evidence" >&2
         exit 2
     fi
+fi
+flexible_baseline_evidence=""
+if [ "$flexible_enabled" = "1" ]; then
+    flexible_baseline_evidence="$current_generation/flexible-distinct-evidence.json"
+    if [ ! -s "$flexible_baseline_evidence" ]; then
+        echo "Current flexible-distinct evidence is missing: $flexible_baseline_evidence" >&2
+        exit 2
+    fi
+    if [ ! -s "$current_generation/flexible-distinct-validation.json" ]; then
+        echo "Current flexible validation evidence is missing" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$flexible_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -293,6 +316,13 @@ promote_generation() {
         if [ "$cohort_enabled" = "1" ] && [ -s "$run_dir/cohort-evidence.json" ]; then
             cmp "$run_dir/cohort-evidence.json" "$generation/cohort-evidence.json"
         fi
+        if [ "$flexible_enabled" = "1" ] \
+            && [ -s "$run_dir/flexible-distinct-evidence.json" ]; then
+            cmp "$run_dir/flexible-distinct-evidence.json" \
+                "$generation/flexible-distinct-evidence.json"
+            cmp "$run_dir/flexible-distinct-validation.json" \
+                "$generation/flexible-distinct-validation.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -316,6 +346,12 @@ promote_generation() {
         if [ "$cohort_enabled" = "1" ]; then
             install -m 0640 "$run_dir/cohort-evidence.json" \
                 "$partial_generation/cohort-evidence.json"
+        fi
+        if [ "$flexible_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/flexible-distinct-evidence.json" \
+                "$partial_generation/flexible-distinct-evidence.json"
+            install -m 0640 "$run_dir/flexible-distinct-validation.json" \
+                "$partial_generation/flexible-distinct-validation.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         mapfile -t generation_files < <(
@@ -444,6 +480,16 @@ case "$run_kind" in
                 --cohort-evidence "$run_dir/cohort-evidence.json"
             )
         fi
+        if [ "$flexible_enabled" = "1" ]; then
+            flexible_work_root="$flexible_root/$snapshot_hex"
+            incremental_args+=(
+                --flexible-baseline-evidence "$flexible_baseline_evidence"
+                --flexible-evidence "$run_dir/flexible-distinct-evidence.json"
+                --flexible-work-root "$flexible_work_root"
+                --flexible-validation-evidence \
+                    "$run_dir/flexible-distinct-validation.json"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -499,6 +545,13 @@ if [ "$activity_enabled" = "1" ] && [ -s "$run_dir/activity-evidence.json" ]; th
 fi
 if [ "$cohort_enabled" = "1" ] && [ -s "$run_dir/cohort-evidence.json" ]; then
     evidence_files+=("$run_dir/cohort-evidence.json")
+fi
+if [ "$flexible_enabled" = "1" ] \
+    && [ -s "$run_dir/flexible-distinct-evidence.json" ]; then
+    evidence_files+=(
+        "$run_dir/flexible-distinct-evidence.json"
+        "$run_dir/flexible-distinct-validation.json"
+    )
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

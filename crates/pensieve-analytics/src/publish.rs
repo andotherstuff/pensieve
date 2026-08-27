@@ -1,6 +1,7 @@
 //! Transactional Postgres publication for completed Slice A products.
 
 use std::io::Write;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use postgres::{Client, GenericClient};
@@ -8,9 +9,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedPubkeyFirstSeen,
-    COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION,
-    QUERY_VERSION, Result, schema::SCHEMA_SQL,
+    AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedFlexibleDistinct,
+    BoundedPubkeyFirstSeen, COHORT_RETENTION_QUERY_VERSION, Error, FIXED_ACTIVITY_QUERY_VERSION,
+    IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
+    flexible_distinct_publish::{
+        publish_flexible_distinct_leaves_in_transaction, validate_flexible_distinct_publication,
+    },
+    schema::SCHEMA_SQL,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 8_056_718_693_194_101_224;
@@ -20,6 +25,7 @@ struct PublicationProducts<'a> {
     identity: Option<&'a BoundedPubkeyFirstSeen>,
     activity: Option<&'a BoundedFixedActivity>,
     cohort: Option<&'a BoundedCohortRetention>,
+    flexible: Option<FlexibleDistinctPublication<'a>>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -60,6 +66,17 @@ pub struct AllBoundedProducts<'a> {
     pub cohort: &'a BoundedCohortRetention,
 }
 
+/// Validated Slice 6 product and its exact production tolerance gate.
+#[derive(Clone, Copy)]
+pub struct FlexibleDistinctPublication<'a> {
+    /// Complete-hour HLL leaf product.
+    pub product: &'a BoundedFlexibleDistinct,
+    /// Canonical passed tolerance evidence.
+    pub validation_evidence_path: &'a Path,
+    /// Explicitly authorized SHA-256 of the tolerance evidence.
+    pub validation_evidence_sha256: &'a str,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -76,6 +93,8 @@ struct ValidationRecord {
     cohort_retention_evidence_sha256: Option<String>,
     cohort_retention_metric_sha256: Option<String>,
     cohort_retention_rows: u64,
+    flexible_distinct_evidence_sha256: Option<String>,
+    flexible_distinct_validation_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -120,6 +139,7 @@ pub fn publish_with_identity(
             identity: Some(identity),
             activity: None,
             cohort: None,
+            flexible: None,
         },
     )
 }
@@ -144,6 +164,7 @@ pub fn publish_with_identity_and_activity(
             identity: Some(identity),
             activity: Some(activity),
             cohort: None,
+            flexible: None,
         },
     )
 }
@@ -167,6 +188,7 @@ pub fn publish_with_all_bounded_products(
             identity: Some(products.identity),
             activity: Some(products.activity),
             cohort: Some(products.cohort),
+            flexible: None,
         },
     )
 }
@@ -210,6 +232,7 @@ pub fn publish_incremental_with_identity(
             identity: Some(identity),
             activity: None,
             cohort: None,
+            flexible: None,
         },
     )
 }
@@ -235,6 +258,7 @@ pub fn publish_incremental_with_identity_and_activity(
             identity: Some(identity),
             activity: Some(activity),
             cohort: None,
+            flexible: None,
         },
     )
 }
@@ -259,6 +283,33 @@ pub fn publish_incremental_with_all_bounded_products(
             identity: Some(products.identity),
             activity: Some(products.activity),
             cohort: Some(products.cohort),
+            flexible: None,
+        },
+    )
+}
+
+/// Publish an incremental B3 successor and its Slice 6 leaves atomically.
+pub fn publish_incremental_with_all_bounded_products_and_flexible(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllBoundedProducts<'_>,
+    flexible: FlexibleDistinctPublication<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.identity),
+            activity: Some(products.activity),
+            cohort: Some(products.cohort),
+            flexible: Some(flexible),
         },
     )
 }
@@ -275,6 +326,7 @@ fn publish_kind(
     let identity = products.identity;
     let activity = products.activity;
     let cohort = products.cohort;
+    let flexible = products.flexible;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -309,6 +361,29 @@ fn publish_kind(
         }
         cohort.validate_for_publication()?;
     }
+    let validated_flexible = if let Some(flexible) = flexible {
+        let Some(activity) = activity else {
+            return Err(Error::Validation(
+                "flexible-distinct publication requires fixed activity".to_owned(),
+            ));
+        };
+        if flexible.product.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || flexible.product.evidence.as_of_epoch != build.config.as_of_epoch
+            || flexible.product.evidence.activity_evidence_sha256 != activity.evidence_sha256
+            || flexible.product.evidence.activity_artifact != activity.evidence.activity_artifact
+        {
+            return Err(Error::Validation(
+                "flexible-distinct evidence does not match its publication inputs".to_owned(),
+            ));
+        }
+        Some(validate_flexible_distinct_publication(
+            flexible.product,
+            flexible.validation_evidence_path,
+            flexible.validation_evidence_sha256,
+        )?)
+    } else {
+        None
+    };
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
@@ -332,6 +407,14 @@ fn publish_kind(
             reconcile_published_identity(&mut transaction, &run_id, identity)?;
             reconcile_published_activity(&mut transaction, &run_id, activity)?;
             reconcile_published_cohort(&mut transaction, &run_id, cohort)?;
+            if let (Some(flexible), Some(validated)) = (flexible, &validated_flexible) {
+                publish_flexible_distinct_leaves_in_transaction(
+                    &mut transaction,
+                    &run_id,
+                    flexible.product,
+                    validated,
+                )?;
+            }
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
         }
@@ -379,6 +462,10 @@ fn publish_kind(
         cohort_retention_metric_sha256: cohort
             .map(|product| product.evidence.metric_sha256.clone()),
         cohort_retention_rows,
+        flexible_distinct_evidence_sha256: flexible
+            .map(|publication| publication.product.evidence_sha256.clone()),
+        flexible_distinct_validation_sha256: flexible
+            .map(|publication| publication.validation_evidence_sha256.to_owned()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -491,6 +578,14 @@ fn publish_kind(
     reconcile_published_identity(&mut transaction, &run_id, identity)?;
     reconcile_published_activity(&mut transaction, &run_id, activity)?;
     reconcile_published_cohort(&mut transaction, &run_id, cohort)?;
+    if let (Some(flexible), Some(validated)) = (flexible, &validated_flexible) {
+        publish_flexible_distinct_leaves_in_transaction(
+            &mut transaction,
+            &run_id,
+            flexible.product,
+            validated,
+        )?;
+    }
 
     transaction.execute(
         "

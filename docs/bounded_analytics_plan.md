@@ -584,10 +584,13 @@ baseline.
   evidence records the exact flexible predecessor, prior boundary, and activity
   checkpoints. This is the recurring Slice 6 state transition and avoids a
   fresh external sort of the full event history on every refresh.
-- [ ] Integrate the successor build, tolerance check, dormant leaf publication,
-  and generation evidence promotion into the locked recurring refresh. A
-  refresh must not expose a new generation as complete unless its Slice 6
-  product is bound to that same B3 run.
+- [x] Integrate the successor build, tolerance check, dormant leaf publication,
+  and generation evidence promotion into the locked recurring refresh. The B3
+  rows, Slice 6 product metadata, every leaf, and `current_run` now commit in
+  one Postgres transaction; a failed leaf copy rolls everything back. The
+  generation pointer moves only after that transaction and both canonical
+  evidence files succeed. Production activation remains gated on the initial
+  dormant publication and one recurring successor canary.
 
 Gate: errors remain within the accepted per-field tolerance across sparse,
 dense, adversarial, and repeated rebuild fixtures.

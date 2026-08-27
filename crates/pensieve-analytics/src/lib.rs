@@ -12,6 +12,7 @@ mod event_facts;
 mod fixed_activity;
 mod flexible_distinct;
 mod flexible_distinct_publish;
+mod flexible_distinct_validation;
 mod incremental;
 mod input;
 mod plan;
@@ -76,6 +77,11 @@ pub use flexible_distinct_publish::{
     FlexibleDistinctPublishOutcome, estimate_published_flexible_distinct,
     publish_flexible_distinct_leaves,
 };
+pub use flexible_distinct_validation::{
+    FLEXIBLE_DISTINCT_TOLERANCE_PPM, FLEXIBLE_DISTINCT_VALIDATION_RUNNER,
+    FlexibleDistinctValidationEvidence, FlexibleDistinctValidationSample,
+    build_flexible_distinct_validation,
+};
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use plan::{
@@ -89,8 +95,9 @@ pub use pubkey_first_seen::{
     load_bounded_pubkey_first_seen,
 };
 pub use publish::{
-    AllBoundedProducts, PublishOutcome, acquire_publication_lock, publish, publish_incremental,
-    publish_incremental_with_all_bounded_products, publish_incremental_with_identity,
+    AllBoundedProducts, FlexibleDistinctPublication, PublishOutcome, acquire_publication_lock,
+    publish, publish_incremental, publish_incremental_with_all_bounded_products,
+    publish_incremental_with_all_bounded_products_and_flexible, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity,
 };

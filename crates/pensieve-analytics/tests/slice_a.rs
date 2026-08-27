@@ -4,20 +4,22 @@ use std::path::{Path, PathBuf};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
-    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
-    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctPublication,
+    FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
     PublisherBenchmarkConfig, RelayDistributionConfig, SemanticFactsConfig, ZapDistinctConfig,
     advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
     advance_bounded_pubkey_first_seen, apply_incremental, benchmark_publishers,
     build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
     build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_relay_distribution, build_bounded_semantic_facts, build_bounded_zap_distinct,
-    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    build_flexible_distinct_validation, estimate_flexible_distinct_window,
+    estimate_flexible_distinct_windows, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     load_bounded_relay_distribution, load_bounded_semantic_facts, load_bounded_zap_distinct,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
-    publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
-    resolve_delta_locations, resolve_snapshot,
+    publish_incremental_with_all_bounded_products_and_flexible, publish_with_all_bounded_products,
+    publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
+    resolve_snapshot,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -1119,6 +1121,29 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
             )
             .is_err()
     );
+
+    let mut semantic_upgrade_baseline = baseline.clone();
+    semantic_upgrade_baseline
+        .evidence
+        .semantic_upgrade_evidence_sha256 = Some(baseline.evidence_sha256.clone());
+    semantic_upgrade_baseline.evidence_sha256 = "a".repeat(64);
+    let mut semantic_upgrade_successor = successor.clone();
+    semantic_upgrade_successor.evidence.baseline_evidence_sha256 =
+        Some(semantic_upgrade_baseline.evidence_sha256.clone());
+    let semantic_upgrade_root = directory.path().join("flexible-semantic-upgrade-work");
+    advance_bounded_flexible_distinct(
+        semantic_upgrade_root.join("evidence.json"),
+        &baseline_flexible,
+        &semantic_upgrade_baseline,
+        &semantic_upgrade_successor,
+        FlexibleDistinctConfig {
+            work_root: semantic_upgrade_root,
+            source_records_per_batch: 1,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("advance flexible state through a validated activity semantic upgrade");
 }
 
 #[test]
@@ -1893,6 +1918,116 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             .expect("count current cohort rows")
             .get::<_, i64>(0),
         cohort.evidence.period_rows as i64
+    );
+    let flexible_root = fixture._directory.path().join("publication-flexible");
+    let flexible_evidence_path = flexible_root.join("evidence.json");
+    let flexible = build_bounded_flexible_distinct(
+        &flexible_evidence_path,
+        &activity,
+        FlexibleDistinctConfig {
+            work_root: flexible_root,
+            source_records_per_batch: 2,
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build flexible publication");
+    let flexible_validation_path = fixture
+        ._directory
+        .path()
+        .join("publication-flexible-validation.json");
+    build_flexible_distinct_validation(
+        &flexible_validation_path,
+        &activity,
+        &flexible_evidence_path,
+        20_000,
+    )
+    .expect("validate flexible publication");
+    let flexible_validation_sha =
+        sha256_file(&flexible_validation_path).expect("hash flexible validation");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_flexible_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected flexible publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_flexible_test
+            BEFORE INSERT ON pensieve_analytics.flexible_distinct_leaves
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_flexible_test();
+            ",
+        )
+        .expect("install flexible failure injection");
+    publish_incremental_with_all_bounded_products_and_flexible(
+        &mut client,
+        &fixture.build,
+        AllBoundedProducts {
+            identity: &identity,
+            activity: &activity,
+            cohort: &cohort,
+        },
+        FlexibleDistinctPublication {
+            product: &flexible,
+            validation_evidence_path: &flexible_validation_path,
+            validation_evidence_sha256: &flexible_validation_sha,
+        },
+        &cohort_run_id,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected flexible COPY failure must abort publication");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.flexible_distinct_products",
+                &[],
+            )
+            .expect("count rolled-back flexible products")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_flexible_test ON pensieve_analytics.flexible_distinct_leaves;
+            DROP FUNCTION pensieve_analytics.reject_flexible_test();
+            ",
+        )
+        .expect("remove flexible failure injection");
+    assert_eq!(
+        publish_incremental_with_all_bounded_products_and_flexible(
+            &mut client,
+            &fixture.build,
+            AllBoundedProducts {
+                identity: &identity,
+                activity: &activity,
+                cohort: &cohort,
+            },
+            FlexibleDistinctPublication {
+                product: &flexible,
+                validation_evidence_path: &flexible_validation_path,
+                validation_evidence_sha256: &flexible_validation_sha,
+            },
+            &cohort_run_id,
+            started_at,
+            completed_at,
+        )
+        .expect("atomically attach flexible product to current B3"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id.clone()
+        }
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.flexible_distinct_products",
+                &[],
+            )
+            .expect("count flexible products")
+            .get::<_, i64>(0),
+        1
     );
     assert_eq!(
         publish_with_all_bounded_products(

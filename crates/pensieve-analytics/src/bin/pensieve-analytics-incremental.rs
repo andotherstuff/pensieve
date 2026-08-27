@@ -8,11 +8,15 @@ use clap::Parser;
 use pensieve_analytics::{
     AllBoundedProducts, BatchLimits, BuildConfig, COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan,
     CohortRetentionEvidence, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
-    IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome, acquire_publication_lock,
-    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
-    build_bounded_cohort_retention, load_bounded_fixed_activity, load_bounded_pubkey_first_seen,
+    FlexibleDistinctConfig, FlexibleDistinctPublication, IDENTITY_QUERY_VERSION,
+    PubkeyFirstSeenConfig, PublishOutcome, acquire_publication_lock,
+    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, apply_incremental, build_bounded_cohort_retention,
+    build_flexible_distinct_validation, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     plan_catalog_delta_for_query_version, publish_incremental,
-    publish_incremental_with_all_bounded_products, publish_incremental_with_identity,
+    publish_incremental_with_all_bounded_products,
+    publish_incremental_with_all_bounded_products_and_flexible, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
@@ -113,6 +117,30 @@ struct Args {
     /// Hard ceiling for compact cohort-retention matrix rows.
     #[arg(long, default_value_t = 2_000_000)]
     cohort_matrix_row_limit: usize,
+    /// Current immutable flexible-distinct evidence; enables recurring Slice 6.
+    #[arg(long)]
+    flexible_baseline_evidence: Option<PathBuf>,
+    /// Immutable flexible-distinct successor evidence output.
+    #[arg(long)]
+    flexible_evidence: Option<PathBuf>,
+    /// Dedicated immutable flexible-distinct successor workspace.
+    #[arg(long)]
+    flexible_work_root: Option<PathBuf>,
+    /// Canonical exact-versus-estimated tolerance evidence output.
+    #[arg(long)]
+    flexible_validation_evidence: Option<PathBuf>,
+    /// Exact activity records transformed by one bounded Slice 6 batch.
+    #[arg(long, default_value_t = 1_000_000)]
+    flexible_source_records_per_batch: u64,
+    /// Maximum Slice 6 immutable runs opened by one merge.
+    #[arg(long, default_value_t = 16)]
+    flexible_merge_fan_in: usize,
+    /// Free Slice 6 work-filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400)]
+    flexible_disk_reserve_bytes: u64,
+    /// Maximum accepted representative Slice 6 relative error in ppm.
+    #[arg(long, default_value_t = 20_000)]
+    flexible_tolerance_ppm: u64,
 }
 
 #[derive(Serialize)]
@@ -126,6 +154,7 @@ struct Output<'a> {
     identity: Option<IdentityOutput<'a>>,
     activity: Option<ActivityOutput<'a>>,
     cohort: Option<CohortOutput<'a>>,
+    flexible: Option<FlexibleOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -163,6 +192,17 @@ struct CohortOutput<'a> {
     metric_sha256: &'a str,
     matrix_row_limit: usize,
     max_pubkey_periods_buffered: usize,
+}
+
+#[derive(Serialize)]
+struct FlexibleOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    complete_through_epoch: u64,
+    identity_rows: u64,
+    leaf_rows: u64,
+    validation_evidence_sha256: &'a str,
+    max_relative_error_ppm: u64,
 }
 
 #[derive(Serialize)]
@@ -209,6 +249,7 @@ fn run() -> Result<()> {
     let identity_enabled = args.identity_baseline_evidence.is_some();
     let activity_enabled = args.activity_baseline_evidence.is_some();
     let cohort_enabled = args.cohort_baseline_evidence.is_some();
+    let flexible_enabled = args.flexible_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -222,6 +263,12 @@ fn run() -> Result<()> {
         args.activity_work_root.is_some(),
     )?;
     require_complete_cohort_args(cohort_enabled, args.cohort_evidence.is_some())?;
+    require_complete_flexible_args(
+        flexible_enabled,
+        args.flexible_evidence.is_some(),
+        args.flexible_work_root.is_some(),
+        args.flexible_validation_evidence.is_some(),
+    )?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
@@ -229,6 +276,9 @@ fn run() -> Result<()> {
         bail!(
             "cohort-retention advancement requires identity and activity advancement in the same run"
         );
+    }
+    if flexible_enabled && !cohort_enabled {
+        bail!("flexible-distinct advancement requires the complete B3 lane in the same run");
     }
     let desired_query_version = if cohort_enabled {
         COHORT_RETENTION_QUERY_VERSION
@@ -326,17 +376,21 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    let activity = if let (Some(baseline_path), Some(evidence_path), Some(work_root)) = (
-        args.activity_baseline_evidence.as_ref(),
+    let baseline_activity = args
+        .activity_baseline_evidence
+        .as_ref()
+        .map(load_bounded_fixed_activity)
+        .transpose()
+        .context("load baseline fixed-activity evidence")?;
+    let activity = if let (Some(baseline), Some(evidence_path), Some(work_root)) = (
+        baseline_activity.as_ref(),
         args.activity_evidence.as_ref(),
         args.activity_work_root.as_ref(),
     ) {
-        let baseline = load_bounded_fixed_activity(baseline_path)
-            .context("load baseline fixed-activity evidence")?;
         Some(
             advance_bounded_fixed_activity(
                 evidence_path,
-                &baseline,
+                baseline,
                 target.clone(),
                 &persisted_plan,
                 &delta_locations,
@@ -373,12 +427,101 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let flexible = if let (
+        Some(baseline_path),
+        Some(evidence_path),
+        Some(work_root),
+        Some(baseline_activity),
+        Some(activity),
+    ) = (
+        args.flexible_baseline_evidence.as_ref(),
+        args.flexible_evidence.as_ref(),
+        args.flexible_work_root.as_ref(),
+        baseline_activity.as_ref(),
+        activity.as_ref(),
+    ) {
+        let baseline = load_bounded_flexible_distinct(baseline_path)
+            .context("load baseline flexible-distinct evidence")?;
+        Some(
+            advance_bounded_flexible_distinct(
+                evidence_path,
+                &baseline,
+                baseline_activity,
+                activity,
+                FlexibleDistinctConfig {
+                    work_root: work_root.clone(),
+                    source_records_per_batch: args.flexible_source_records_per_batch,
+                    merge_fan_in: args.flexible_merge_fan_in,
+                    disk_reserve_bytes: args.flexible_disk_reserve_bytes,
+                },
+            )
+            .context("advance bounded flexible-distinct state")?,
+        )
+    } else {
+        None
+    };
+    let flexible_validation = if let (Some(path), Some(activity), Some(flexible_path)) = (
+        args.flexible_validation_evidence.as_ref(),
+        activity.as_ref(),
+        args.flexible_evidence.as_ref(),
+    ) {
+        Some(
+            build_flexible_distinct_validation(
+                path,
+                activity,
+                flexible_path,
+                args.flexible_tolerance_ppm,
+            )
+            .context("validate flexible-distinct production tolerance")?,
+        )
+    } else {
+        None
+    };
+    let flexible_validation_sha256 = args
+        .flexible_validation_evidence
+        .as_ref()
+        .filter(|_| flexible_validation.is_some())
+        .map(pensieve_lake::sha256_file)
+        .transpose()
+        .context("hash flexible-distinct tolerance evidence")?;
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
-            match if let (Some(identity), Some(activity), Some(cohort)) =
+            match if let (
+                Some(identity),
+                Some(activity),
+                Some(cohort),
+                Some(flexible),
+                Some(validation_path),
+                Some(validation_sha256),
+            ) = (
+                identity.as_ref(),
+                activity.as_ref(),
+                cohort.as_ref(),
+                flexible.as_ref(),
+                args.flexible_validation_evidence.as_deref(),
+                flexible_validation_sha256.as_deref(),
+            ) {
+                publish_incremental_with_all_bounded_products_and_flexible(
+                    &mut client,
+                    &build,
+                    AllBoundedProducts {
+                        identity,
+                        activity,
+                        cohort,
+                    },
+                    FlexibleDistinctPublication {
+                        product: flexible,
+                        validation_evidence_path: validation_path,
+                        validation_evidence_sha256: validation_sha256,
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (Some(identity), Some(activity), Some(cohort)) =
                 (identity.as_ref(), activity.as_ref(), cohort.as_ref())
             {
                 publish_incremental_with_all_bounded_products(
@@ -476,6 +619,24 @@ fn run() -> Result<()> {
                 matrix_row_limit: cohort.evidence.matrix_row_limit,
                 max_pubkey_periods_buffered: cohort.evidence.max_pubkey_periods_buffered,
             }),
+            flexible: flexible.as_ref().map(|flexible| FlexibleOutput {
+                evidence_sha256: &flexible.evidence_sha256,
+                baseline_evidence_sha256: flexible
+                    .evidence
+                    .baseline_evidence_sha256
+                    .as_deref()
+                    .expect("flexible successor has baseline evidence"),
+                complete_through_epoch: flexible.evidence.complete_through_epoch,
+                identity_rows: flexible.evidence.identity_artifact.row_count,
+                leaf_rows: flexible.evidence.leaf_artifact.row_count,
+                validation_evidence_sha256: flexible_validation_sha256
+                    .as_deref()
+                    .expect("flexible output has validation evidence"),
+                max_relative_error_ppm: flexible_validation
+                    .as_ref()
+                    .expect("flexible output has validation result")
+                    .max_relative_error_ppm,
+            }),
             publication,
         })?
     );
@@ -487,6 +648,21 @@ fn require_complete_cohort_args(baseline: bool, evidence: bool) -> Result<()> {
         return Ok(());
     }
     bail!("cohort baseline evidence and output evidence must be supplied together")
+}
+
+fn require_complete_flexible_args(
+    baseline: bool,
+    evidence: bool,
+    work_root: bool,
+    validation: bool,
+) -> Result<()> {
+    if [baseline, evidence, work_root, validation]
+        .into_iter()
+        .all(|value| value == baseline)
+    {
+        return Ok(());
+    }
+    bail!("flexible baseline, output, work root, and validation evidence must be supplied together")
 }
 
 fn validate_cohort_baseline(
@@ -612,5 +788,15 @@ mod tests {
         require_complete_cohort_args(true, true).expect("complete cohort arguments are valid");
         assert!(require_complete_cohort_args(true, false).is_err());
         assert!(require_complete_cohort_args(false, true).is_err());
+    }
+
+    #[test]
+    fn flexible_arguments_are_all_or_nothing() {
+        require_complete_flexible_args(false, false, false, false)
+            .expect("disabled flexible lane is valid");
+        require_complete_flexible_args(true, true, true, true)
+            .expect("complete flexible lane is valid");
+        assert!(require_complete_flexible_args(true, true, true, false).is_err());
+        assert!(require_complete_flexible_args(false, true, true, true).is_err());
     }
 }

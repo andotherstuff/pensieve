@@ -363,7 +363,10 @@ pub fn advance_bounded_flexible_distinct(
         successor_activity.evidence.as_of_epoch,
     )?;
     validate_config(&config)?;
-    if baseline.evidence.activity_evidence_sha256 != baseline_activity.evidence_sha256
+    if !activity_evidence_matches(
+        baseline_activity,
+        &baseline.evidence.activity_evidence_sha256,
+    ) || baseline.evidence.activity_artifact != baseline_activity.evidence.activity_artifact
         || successor_activity
             .evidence
             .baseline_evidence_sha256
@@ -1354,6 +1357,15 @@ fn is_sha256(value: &str) -> bool {
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn activity_evidence_matches(activity: &BoundedFixedActivity, expected_sha256: &str) -> bool {
+    activity.evidence_sha256 == expected_sha256
+        || activity
+            .evidence
+            .semantic_upgrade_evidence_sha256
+            .as_deref()
+            == Some(expected_sha256)
 }
 
 #[cfg(test)]

@@ -10,13 +10,13 @@ use std::path::Path;
 
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::{Client, GenericClient};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::schema::SCHEMA_SQL;
 use crate::{
     BoundedFlexibleDistinct, COHORT_RETENTION_QUERY_VERSION, DistinctSketchUnion, Error,
-    FLEXIBLE_DISTINCT_VERSION, Result, visit_flexible_distinct_leaves,
+    FLEXIBLE_DISTINCT_VERSION, FlexibleDistinctValidationEvidence, Result,
+    visit_flexible_distinct_leaves,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 0x5045_4e53_4945_5645;
@@ -33,26 +33,9 @@ pub enum FlexibleDistinctPublishOutcome {
     AlreadyPublished { product_id: String },
 }
 
-#[derive(Debug, Deserialize)]
-struct ValidationSample {
-    accepted: bool,
-    relative_error_ppm: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ValidationEvidence {
-    schema_version: u32,
-    runner_version: String,
-    status: String,
-    snapshot_id: String,
-    as_of_epoch: u64,
-    complete_through_epoch: u64,
-    activity_evidence_sha256: String,
-    flexible_evidence_sha256: String,
-    tolerance_ppm: u64,
-    sample_count: u64,
-    max_relative_error_ppm: u64,
-    samples: Vec<ValidationSample>,
+/// Fully checked tolerance evidence ready for one atomic publication.
+pub(crate) struct ValidatedFlexibleDistinctPublication {
+    validation_sha256: String,
 }
 
 /// Publish validated leaves without changing the analytics current-run pointer.
@@ -63,25 +46,13 @@ pub fn publish_flexible_distinct_leaves(
     validation_evidence_path: impl AsRef<Path>,
     expected_validation_sha256: &str,
 ) -> Result<FlexibleDistinctPublishOutcome> {
-    product
-        .validate_for_publication(&product.evidence.snapshot_id, product.evidence.as_of_epoch)?;
-    let validation_path = validation_evidence_path.as_ref();
-    let validation_bytes = fs::read(validation_path)?;
-    let validation: ValidationEvidence =
-        serde_json::from_slice(&validation_bytes).map_err(|e| {
-            Error::Validation(format!("decode flexible-distinct validation evidence: {e}"))
-        })?;
-    let validation_sha256 = pensieve_lake::sha256_file(validation_path)?;
-    if validation_sha256 != expected_validation_sha256 {
-        return Err(Error::Validation(
-            "flexible-distinct validation evidence SHA-256 differs from the authorized gate"
-                .to_owned(),
-        ));
-    }
-    validate_tolerance_evidence(product, &validation)?;
+    let validated = validate_flexible_distinct_publication(
+        product,
+        validation_evidence_path,
+        expected_validation_sha256,
+    )?;
 
     client.batch_execute(SCHEMA_SQL)?;
-    let product_id = flexible_product_id(baseline_run_id, product, &validation_sha256);
     let mut transaction = client.transaction()?;
     transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&PUBLICATION_LOCK_ID])?;
     let current = transaction.query_one(
@@ -103,6 +74,48 @@ pub fn publish_flexible_distinct_leaves(
         ));
     }
 
+    let outcome = publish_flexible_distinct_leaves_in_transaction(
+        &mut transaction,
+        baseline_run_id,
+        product,
+        &validated,
+    )?;
+    transaction.commit()?;
+    Ok(outcome)
+}
+
+pub(crate) fn validate_flexible_distinct_publication(
+    product: &BoundedFlexibleDistinct,
+    validation_evidence_path: impl AsRef<Path>,
+    expected_validation_sha256: &str,
+) -> Result<ValidatedFlexibleDistinctPublication> {
+    product
+        .validate_for_publication(&product.evidence.snapshot_id, product.evidence.as_of_epoch)?;
+    let validation_path = validation_evidence_path.as_ref();
+    let validation: FlexibleDistinctValidationEvidence =
+        serde_json::from_slice(&fs::read(validation_path)?).map_err(|error| {
+            Error::Validation(format!(
+                "decode flexible-distinct validation evidence: {error}"
+            ))
+        })?;
+    let validation_sha256 = pensieve_lake::sha256_file(validation_path)?;
+    if validation_sha256 != expected_validation_sha256 {
+        return Err(Error::Validation(
+            "flexible-distinct validation evidence SHA-256 differs from the authorized gate"
+                .to_owned(),
+        ));
+    }
+    validate_tolerance_evidence(product, &validation)?;
+    Ok(ValidatedFlexibleDistinctPublication { validation_sha256 })
+}
+
+pub(crate) fn publish_flexible_distinct_leaves_in_transaction(
+    transaction: &mut impl GenericClient,
+    baseline_run_id: &str,
+    product: &BoundedFlexibleDistinct,
+    validated: &ValidatedFlexibleDistinctPublication,
+) -> Result<FlexibleDistinctPublishOutcome> {
+    let product_id = flexible_product_id(baseline_run_id, product, &validated.validation_sha256);
     if transaction
         .query_opt(
             "SELECT product_id FROM pensieve_analytics.flexible_distinct_products
@@ -111,8 +124,7 @@ pub fn publish_flexible_distinct_leaves(
         )?
         .is_some()
     {
-        reconcile_flexible_product(&mut transaction, &product_id, product)?;
-        transaction.commit()?;
+        reconcile_flexible_product(transaction, &product_id, product)?;
         return Ok(FlexibleDistinctPublishOutcome::AlreadyPublished { product_id });
     }
 
@@ -139,7 +151,7 @@ pub fn publish_flexible_distinct_leaves(
             )?,
             &FLEXIBLE_DISTINCT_VERSION,
             &product.evidence_sha256,
-            &validation_sha256,
+            &validated.validation_sha256,
             &product.evidence.leaf_artifact.sha256,
             &to_i64(
                 "flexible leaf rows",
@@ -152,9 +164,8 @@ pub fn publish_flexible_distinct_leaves(
             )?,
         ],
     )?;
-    copy_flexible_leaves(&mut transaction, &product_id, product)?;
-    reconcile_flexible_product(&mut transaction, &product_id, product)?;
-    transaction.commit()?;
+    copy_flexible_leaves(transaction, &product_id, product)?;
+    reconcile_flexible_product(transaction, &product_id, product)?;
     Ok(FlexibleDistinctPublishOutcome::Published { product_id })
 }
 
@@ -282,7 +293,7 @@ fn reconcile_flexible_product(
 
 fn validate_tolerance_evidence(
     product: &BoundedFlexibleDistinct,
-    validation: &ValidationEvidence,
+    validation: &FlexibleDistinctValidationEvidence,
 ) -> Result<()> {
     let samples_match = validation.sample_count == validation.samples.len() as u64
         && validation.sample_count > 0
