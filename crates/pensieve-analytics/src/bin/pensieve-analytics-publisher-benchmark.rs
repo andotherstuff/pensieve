@@ -18,6 +18,9 @@ struct Args {
     /// Canonical benchmark evidence to create.
     #[arg(long)]
     evidence: PathBuf,
+    /// Exact source revision recorded in benchmark evidence.
+    #[arg(long)]
+    code_version: String,
     /// Strictly increasing exact rolling windows, in days.
     #[arg(long, value_delimiter = ',', default_value = "1,7,30,90,365")]
     windows_days: Vec<u32>,
@@ -60,6 +63,7 @@ fn run() -> Result<()> {
         &args.evidence,
         &activity,
         PublisherBenchmarkConfig {
+            code_version: args.code_version,
             windows_days: args.windows_days,
             sampled_kinds: args.sampled_kinds,
             top_limit: args.top_limit,

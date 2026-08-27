@@ -867,6 +867,7 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         &publisher_evidence,
         &completed,
         PublisherBenchmarkConfig {
+            code_version: "publisher-benchmark-test".to_owned(),
             windows_days: vec![1, 7],
             sampled_kinds: vec![0, 1],
             top_limit: 2,

@@ -729,7 +729,9 @@ The benchmark makes one fixed-memory source pass. It records exact daily fact
 cardinality and compact byte projections, exact publisher cardinality for each
 window across all 65,536 kinds, the size of fully materializing the supported
 window top-K relation, representative exact top rows, scan throughput, and
-explicit maximum buffers. Only representative result heaps are retained; the
+explicit maximum buffers. Evidence records the exact source revision as well
+as the frozen snapshot, as-of, fixed-activity evidence, and activity artifact
+identities. Only representative result heaps are retained; the
 per-kind cardinality table is a fixed 65,536-entry domain per configured
 window and therefore does not grow with input rows or publisher count.
 

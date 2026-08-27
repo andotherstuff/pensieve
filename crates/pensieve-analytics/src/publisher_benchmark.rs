@@ -31,6 +31,8 @@ const KIND_DOMAIN: usize = u16::MAX as usize + 1;
 /// Exact windows and bounded top-K limits benchmarked by Slice 9.
 #[derive(Clone, Debug)]
 pub struct PublisherBenchmarkConfig {
+    /// Exact source revision used for this measured run.
+    pub code_version: String,
     /// Exact rolling windows in days.
     pub windows_days: Vec<u32>,
     /// Representative kind filters whose exact rows are retained in evidence.
@@ -69,6 +71,8 @@ pub struct PublisherBenchmarkEvidence {
     pub status: String,
     /// Stable benchmark semantics.
     pub benchmark_version: String,
+    /// Exact source revision that produced the evidence.
+    pub code_version: String,
     /// Frozen activity snapshot.
     pub snapshot_id: String,
     /// Fixed analytics boundary.
@@ -332,6 +336,7 @@ pub fn benchmark_publishers(
         runner_version: RUNNER_VERSION.to_owned(),
         status: "completed".to_owned(),
         benchmark_version: PUBLISHER_BENCHMARK_VERSION.to_owned(),
+        code_version: config.code_version,
         snapshot_id: activity.evidence.snapshot_id.clone(),
         as_of_epoch: activity.evidence.as_of_epoch,
         activity_evidence_sha256: activity.evidence_sha256.clone(),
@@ -521,7 +526,8 @@ fn validate_config(
         &activity.evidence.snapshot_id,
         activity.evidence.as_of_epoch,
     )?;
-    if config.windows_days.is_empty()
+    if config.code_version.is_empty()
+        || config.windows_days.is_empty()
         || config
             .windows_days
             .windows(2)
@@ -551,6 +557,7 @@ fn validate_evidence(evidence: &PublisherBenchmarkEvidence) -> Result<()> {
         || evidence.runner_version != RUNNER_VERSION
         || evidence.status != "completed"
         || evidence.benchmark_version != PUBLISHER_BENCHMARK_VERSION
+        || evidence.code_version.is_empty()
         || evidence.windows_days.len() != evidence.all_kind_publishers_by_window.len()
         || evidence.windows_days.len() != evidence.per_kind_publishers_by_window.len()
         || evidence.representative_rows_sha256 != rows_sha256
