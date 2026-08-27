@@ -37,8 +37,9 @@ pub const FIXED_ACTIVITY_RECORD_BYTES: usize = FIXED_ACTIVITY_KEY_BYTES;
 /// Pubkey plus exact ever-observed profile/follows flags.
 pub const PUBKEY_FLAGS_RECORD_BYTES: usize = 33;
 /// Semantic product version.
-pub const FIXED_ACTIVITY_VERSION: &str = "fixed-activity-v2";
-const RUNNER_VERSION: &str = "pensieve-analytics-fixed-activity-v2";
+pub const FIXED_ACTIVITY_VERSION: &str = "fixed-activity-v3";
+const RUNNER_VERSION: &str = "pensieve-analytics-fixed-activity-v3";
+const LEGACY_RUNNER_VERSION: &str = "pensieve-analytics-fixed-activity-v2";
 const PROFILE_FLAG: u8 = 1;
 const FOLLOWS_FLAG: u8 = 2;
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -110,6 +111,9 @@ pub struct FixedActivityEvidence {
     /// Prior evidence consumed by an incremental successor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_evidence_sha256: Option<String>,
+    /// Exact v2 evidence re-finalized for the v3 daily-kind correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_upgrade_evidence_sha256: Option<String>,
     /// Immutable batch count.
     pub batch_count: u64,
     /// Immutable merge count.
@@ -177,27 +181,7 @@ impl BoundedFixedActivity {
             &evidence.flags_artifact,
             evidence.as_of_epoch,
         )?;
-        if finalized.distinct_pubkeys != evidence.distinct_pubkeys
-            || finalized.active_users != evidence.active_users
-            || to_u64(finalized.distinct_pubkeys.len())? != evidence.distinct_period_rows
-            || to_u64(finalized.active_users.len())? != evidence.active_period_rows
-            || finalized.max_week_kinds_buffered != evidence.max_week_kinds_buffered
-            || finalized.max_month_kinds_buffered != evidence.max_month_kinds_buffered
-        {
-            return Err(BoundedExecutionError::Invalid(
-                "fixed-activity metrics do not match immutable state".to_owned(),
-            )
-            .into());
-        }
-        if metric_sha256(&finalized.distinct_pubkeys, &finalized.active_users)?
-            != evidence.metric_sha256
-        {
-            return Err(BoundedExecutionError::Invalid(
-                "fixed-activity metric SHA-256 mismatch".to_owned(),
-            )
-            .into());
-        }
-        Ok(())
+        validate_finalized(evidence, &finalized)
     }
 }
 
@@ -217,6 +201,59 @@ pub fn load_bounded_fixed_activity(path: impl AsRef<Path>) -> Result<BoundedFixe
         completed.evidence.as_of_epoch,
     )?;
     Ok(completed)
+}
+
+/// Re-finalize a fully validated v2 artifact under corrected v3 daily-kind semantics.
+pub fn upgrade_bounded_fixed_activity_v2(
+    output_path: impl AsRef<Path>,
+    legacy_path: impl AsRef<Path>,
+) -> Result<BoundedFixedActivity> {
+    let legacy_path = legacy_path.as_ref();
+    let legacy_bytes = fs::read(legacy_path)?;
+    let legacy: FixedActivityEvidence = serde_json::from_slice(&legacy_bytes).map_err(|error| {
+        BoundedExecutionError::Invalid(format!("decode legacy fixed-activity evidence: {error}"))
+    })?;
+    if legacy.schema_version != 1
+        || legacy.runner_version != LEGACY_RUNNER_VERSION
+        || legacy.status != "completed"
+        || legacy.semantic_upgrade_evidence_sha256.is_some()
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "legacy fixed-activity evidence is not an upgradeable v2 product".to_owned(),
+        )
+        .into());
+    }
+    validate_artifact(&legacy.activity_artifact, FIXED_ACTIVITY_RECORD_BYTES)?;
+    validate_artifact(&legacy.flags_artifact, PUBKEY_FLAGS_RECORD_BYTES)?;
+    let legacy_finalized = finalize_with_daily_kind_dedup(
+        Path::new(&legacy.activity_artifact.path),
+        Path::new(&legacy.flags_artifact.path),
+        &legacy.activity_artifact,
+        &legacy.flags_artifact,
+        legacy.as_of_epoch,
+        false,
+    )?;
+    validate_finalized(&legacy, &legacy_finalized)?;
+
+    let corrected = finalize(
+        Path::new(&legacy.activity_artifact.path),
+        Path::new(&legacy.flags_artifact.path),
+        &legacy.activity_artifact,
+        &legacy.flags_artifact,
+        legacy.as_of_epoch,
+    )?;
+    let mut evidence = legacy;
+    evidence.runner_version = RUNNER_VERSION.to_owned();
+    evidence.semantic_upgrade_evidence_sha256 = Some(pensieve_lake::sha256_file(legacy_path)?);
+    evidence.metric_sha256 = metric_sha256(&corrected.distinct_pubkeys, &corrected.active_users)?;
+    evidence.distinct_period_rows = to_u64(corrected.distinct_pubkeys.len())?;
+    evidence.active_period_rows = to_u64(corrected.active_users.len())?;
+    evidence.max_week_kinds_buffered = corrected.max_week_kinds_buffered;
+    evidence.max_month_kinds_buffered = corrected.max_month_kinds_buffered;
+    evidence.distinct_pubkeys = corrected.distinct_pubkeys;
+    evidence.active_users = corrected.active_users;
+    publish_canonical_json(output_path.as_ref(), &evidence)?;
+    load_bounded_fixed_activity(output_path)
 }
 
 #[derive(Clone)]
@@ -416,6 +453,7 @@ fn build_from_inputs(
         delta_object_count: to_u64(inputs.len())?,
         physical_rows: snapshot.catalog.totals().physical_rows,
         baseline_evidence_sha256,
+        semantic_upgrade_evidence_sha256: None,
         batch_count: to_u64(batches.len())?,
         merge_count: merged.merge_count,
         activity_artifact: merged.final_run.checkpoint.artifact,
@@ -777,6 +815,24 @@ fn finalize(
     flags_artifact: &ArtifactIdentity,
     as_of_epoch: u64,
 ) -> Result<FinalizedActivity> {
+    finalize_with_daily_kind_dedup(
+        activity_path,
+        flags_path,
+        activity_artifact,
+        flags_artifact,
+        as_of_epoch,
+        true,
+    )
+}
+
+fn finalize_with_daily_kind_dedup(
+    activity_path: &Path,
+    flags_path: &Path,
+    activity_artifact: &ArtifactIdentity,
+    flags_artifact: &ArtifactIdentity,
+    as_of_epoch: u64,
+    deduplicate_daily_kinds: bool,
+) -> Result<FinalizedActivity> {
     let mut activity = ActivityReader::open(activity_path)?;
     let mut flags = BufReader::new(File::open(flags_path)?);
     let mut distinct = BTreeMap::<(u8, u32, Option<u16>), u64>::new();
@@ -789,6 +845,7 @@ fn finalize(
     let mut active_day = None;
     let mut active_week = None;
     let mut active_month = None;
+    let mut day_kinds = BTreeSet::new();
     let mut week_kinds = BTreeSet::new();
     let mut month_kinds = BTreeSet::new();
     let mut activity_rows = 0_u64;
@@ -820,6 +877,7 @@ fn finalize(
             active_day = None;
             active_week = None;
             active_month = None;
+            day_kinds.clear();
             week_kinds.clear();
             month_kinds.clear();
         }
@@ -829,13 +887,16 @@ fn finalize(
         if last_day != Some(day) {
             increment_map(&mut distinct, (0, day, None), 1, "daily distinct")?;
             last_day = Some(day);
+            day_kinds.clear();
         }
-        increment_map(
-            &mut distinct,
-            (0, day, Some(record.kind)),
-            1,
-            "daily kind distinct",
-        )?;
+        if !deduplicate_daily_kinds || day_kinds.insert(record.kind) {
+            increment_map(
+                &mut distinct,
+                (0, day, Some(record.kind)),
+                1,
+                "daily kind distinct",
+            )?;
+        }
         if last_week != Some(week) {
             increment_map(&mut distinct, (1, week, None), 1, "weekly distinct")?;
             last_week = Some(week);
@@ -926,6 +987,33 @@ fn finalize(
         max_week_kinds_buffered,
         max_month_kinds_buffered,
     })
+}
+
+fn validate_finalized(
+    evidence: &FixedActivityEvidence,
+    finalized: &FinalizedActivity,
+) -> Result<()> {
+    if finalized.distinct_pubkeys != evidence.distinct_pubkeys
+        || finalized.active_users != evidence.active_users
+        || to_u64(finalized.distinct_pubkeys.len())? != evidence.distinct_period_rows
+        || to_u64(finalized.active_users.len())? != evidence.active_period_rows
+        || finalized.max_week_kinds_buffered != evidence.max_week_kinds_buffered
+        || finalized.max_month_kinds_buffered != evidence.max_month_kinds_buffered
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "fixed-activity metrics do not match immutable state".to_owned(),
+        )
+        .into());
+    }
+    if metric_sha256(&finalized.distinct_pubkeys, &finalized.active_users)?
+        != evidence.metric_sha256
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "fixed-activity metric SHA-256 mismatch".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn add_active_events(
@@ -1256,4 +1344,134 @@ fn completed_run_bytes(root: &Path) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_upgrade_deduplicates_daily_kind_authors_and_preserves_artifacts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let activity_path = directory.path().join("activity.run");
+        let flags_path = directory.path().join("flags.run");
+        let pubkey = [7_u8; 32];
+        let first = activity_record(pubkey, 1_700_000_001, 1, [1_u8; 32]);
+        let second = activity_record(pubkey, 1_700_000_002, 1, [2_u8; 32]);
+        let mut activity_bytes = first.to_vec();
+        activity_bytes.extend_from_slice(&second);
+        fs::write(&activity_path, &activity_bytes).expect("write activity");
+        let mut flag_bytes = pubkey.to_vec();
+        flag_bytes.push(0);
+        fs::write(&flags_path, &flag_bytes).expect("write flags");
+        let activity_artifact = artifact(&activity_path, 2, Some(first), Some(second));
+        let flags_artifact = artifact::<PUBKEY_FLAGS_RECORD_BYTES>(&flags_path, 1, None, None);
+        let legacy = finalize_with_daily_kind_dedup(
+            &activity_path,
+            &flags_path,
+            &activity_artifact,
+            &flags_artifact,
+            1_700_000_100,
+            false,
+        )
+        .expect("legacy finalize");
+        assert_eq!(daily_kind_one(&legacy), 2);
+        let legacy_evidence = FixedActivityEvidence {
+            schema_version: 1,
+            runner_version: LEGACY_RUNNER_VERSION.to_owned(),
+            status: "completed".to_owned(),
+            snapshot_id: "sha256:test".to_owned(),
+            as_of_epoch: 1_700_000_100,
+            object_count: 1,
+            delta_object_count: 1,
+            physical_rows: 2,
+            baseline_evidence_sha256: None,
+            semantic_upgrade_evidence_sha256: None,
+            batch_count: 1,
+            merge_count: 0,
+            activity_artifact: activity_artifact.clone(),
+            flags_artifact: flags_artifact.clone(),
+            distinct_pubkeys: legacy.distinct_pubkeys.clone(),
+            active_users: legacy.active_users.clone(),
+            metric_sha256: metric_sha256(&legacy.distinct_pubkeys, &legacy.active_users)
+                .expect("legacy metric SHA"),
+            distinct_period_rows: to_u64(legacy.distinct_pubkeys.len()).expect("distinct rows"),
+            active_period_rows: to_u64(legacy.active_users.len()).expect("active rows"),
+            max_week_kinds_buffered: legacy.max_week_kinds_buffered,
+            max_month_kinds_buffered: legacy.max_month_kinds_buffered,
+            max_merge_buffered_bytes: 0,
+            estimated_run_bytes: 0,
+            disk_reserve_bytes: 0,
+            batch_checkpoints: Vec::new(),
+            merge_checkpoints: Vec::new(),
+        };
+        let legacy_path = directory.path().join("legacy.json");
+        publish_canonical_json(&legacy_path, &legacy_evidence).expect("publish legacy evidence");
+        let upgraded_path = directory.path().join("upgraded.json");
+        let upgraded = upgrade_bounded_fixed_activity_v2(&upgraded_path, &legacy_path)
+            .expect("upgrade evidence");
+        assert_eq!(upgraded.evidence.runner_version, RUNNER_VERSION);
+        assert_eq!(
+            upgraded.evidence.activity_artifact.sha256,
+            activity_artifact.sha256
+        );
+        assert_eq!(
+            upgraded.evidence.flags_artifact.sha256,
+            flags_artifact.sha256
+        );
+        let legacy_sha256 = pensieve_lake::sha256_file(&legacy_path).expect("legacy SHA");
+        assert_eq!(
+            upgraded
+                .evidence
+                .semantic_upgrade_evidence_sha256
+                .as_deref(),
+            Some(legacy_sha256.as_str())
+        );
+        let corrected = upgraded
+            .evidence
+            .distinct_pubkeys
+            .iter()
+            .find(|row| row.grain == "day" && row.kind == Some(1))
+            .expect("corrected daily kind");
+        assert_eq!(corrected.unique_pubkeys, 1);
+    }
+
+    fn activity_record(
+        pubkey: [u8; 32],
+        created_at: u32,
+        kind: u16,
+        id: [u8; 32],
+    ) -> [u8; FIXED_ACTIVITY_RECORD_BYTES] {
+        let mut record = [0_u8; FIXED_ACTIVITY_RECORD_BYTES];
+        record[..32].copy_from_slice(&pubkey);
+        record[32..36].copy_from_slice(&created_at.to_be_bytes());
+        record[36..38].copy_from_slice(&kind.to_be_bytes());
+        record[38..].copy_from_slice(&id);
+        record
+    }
+
+    fn artifact<const N: usize>(
+        path: &Path,
+        row_count: u64,
+        min: Option<[u8; N]>,
+        max: Option<[u8; N]>,
+    ) -> ArtifactIdentity {
+        ArtifactIdentity {
+            path: path.to_string_lossy().into_owned(),
+            byte_size: fs::metadata(path).expect("artifact metadata").len(),
+            row_count,
+            min_key: min.map(hex::encode),
+            max_key: max.map(hex::encode),
+            sha256: pensieve_lake::sha256_file(path).expect("artifact SHA"),
+        }
+    }
+
+    fn daily_kind_one(finalized: &FinalizedActivity) -> u64 {
+        finalized
+            .distinct_pubkeys
+            .iter()
+            .find(|row| row.grain == "day" && row.kind == Some(1))
+            .expect("daily kind-one row")
+            .unique_pubkeys
+    }
 }

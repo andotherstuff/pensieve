@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use clap::Parser;
 use pensieve_analytics::{
-    DistinctPubkeysPeriod, FlexibleDistinctWindow, estimate_flexible_distinct_windows,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, publish_canonical_json,
+    DistinctPubkeysPeriod, FlexibleDistinctWindow, load_and_estimate_flexible_distinct_windows,
+    load_bounded_fixed_activity, publish_canonical_json,
 };
 use serde::Serialize;
 
@@ -50,7 +50,7 @@ struct ValidationSample {
 struct ValidationEvidence {
     schema_version: u32,
     runner_version: &'static str,
-    status: &'static str,
+    status: String,
     snapshot_id: String,
     as_of_epoch: u64,
     complete_through_epoch: u64,
@@ -74,18 +74,13 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let activity = load_bounded_fixed_activity(&args.activity_evidence)
         .context("load validated fixed-activity evidence")?;
-    let flexible = load_bounded_flexible_distinct(&args.flexible_evidence)
-        .context("load validated flexible-distinct evidence")?;
-    if activity.evidence.snapshot_id != flexible.evidence.snapshot_id
-        || activity.evidence.as_of_epoch != flexible.evidence.as_of_epoch
-        || activity.evidence_sha256 != flexible.evidence.activity_evidence_sha256
-    {
-        bail!("fixed-activity and flexible-distinct evidence identities differ");
-    }
-
+    let flexible_header: pensieve_analytics::FlexibleDistinctEvidence = serde_json::from_slice(
+        &std::fs::read(&args.flexible_evidence).context("read flexible-distinct evidence")?,
+    )
+    .context("decode flexible-distinct evidence header")?;
     let exact = select_samples(
         &activity.evidence.distinct_pubkeys,
-        flexible.evidence.complete_through_epoch,
+        flexible_header.complete_through_epoch,
     )?;
     let windows = exact
         .iter()
@@ -95,8 +90,23 @@ fn run() -> Result<()> {
             kind: row.kind,
         })
         .collect::<Vec<_>>();
-    let estimates = estimate_flexible_distinct_windows(&flexible, &windows)
-        .context("estimate representative complete-day windows")?;
+    let (flexible, estimates) =
+        load_and_estimate_flexible_distinct_windows(&args.flexible_evidence, &windows)
+            .context("validate leaves and estimate representative complete-day windows")?;
+    let activity_evidence_matches = activity.evidence_sha256
+        == flexible.evidence.activity_evidence_sha256
+        || activity
+            .evidence
+            .semantic_upgrade_evidence_sha256
+            .as_deref()
+            == Some(flexible.evidence.activity_evidence_sha256.as_str());
+    if activity.evidence.snapshot_id != flexible.evidence.snapshot_id
+        || activity.evidence.as_of_epoch != flexible.evidence.as_of_epoch
+        || !activity_evidence_matches
+        || activity.evidence.activity_artifact != flexible.evidence.activity_artifact
+    {
+        bail!("fixed-activity and flexible-distinct evidence identities differ");
+    }
     let mut samples = Vec::with_capacity(exact.len());
     for (((period_start, since_epoch, row), window), estimate) in
         exact.into_iter().zip(windows).zip(estimates)
@@ -125,16 +135,11 @@ fn run() -> Result<()> {
         .map(|sample| sample.relative_error_ppm)
         .max()
         .unwrap_or(0);
-    if samples.is_empty() || samples.iter().any(|sample| !sample.accepted) {
-        bail!(
-            "representative flexible-distinct error exceeds {} ppm",
-            args.tolerance_ppm
-        );
-    }
+    let passed = !samples.is_empty() && samples.iter().all(|sample| sample.accepted);
     let evidence = ValidationEvidence {
         schema_version: 1,
         runner_version: RUNNER_VERSION,
-        status: "passed",
+        status: if passed { "passed" } else { "failed" }.to_owned(),
         snapshot_id: flexible.evidence.snapshot_id.clone(),
         as_of_epoch: flexible.evidence.as_of_epoch,
         complete_through_epoch: flexible.evidence.complete_through_epoch,
@@ -149,6 +154,12 @@ fn run() -> Result<()> {
     publish_canonical_json(&args.evidence, &evidence)
         .context("publish canonical flexible-distinct validation evidence")?;
     println!("{}", serde_json::to_string_pretty(&evidence)?);
+    if !passed {
+        bail!(
+            "representative flexible-distinct error exceeds {} ppm",
+            args.tolerance_ppm
+        );
+    }
     Ok(())
 }
 

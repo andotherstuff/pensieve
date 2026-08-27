@@ -13,9 +13,9 @@ pub const QUERY_VERSION: &str = "slice-a-v1";
 /// Version of Slice A plus bounded exact first-seen identity products.
 pub const IDENTITY_QUERY_VERSION: &str = "slice-b1-v1";
 /// Version of Slice A plus bounded first-seen and fixed-grain activity products.
-pub const FIXED_ACTIVITY_QUERY_VERSION: &str = "slice-b2-v2";
+pub const FIXED_ACTIVITY_QUERY_VERSION: &str = "slice-b2-v3";
 /// Query contract after exact cohort-retention products are present.
-pub const COHORT_RETENTION_QUERY_VERSION: &str = "slice-b3-v1";
+pub const COHORT_RETENTION_QUERY_VERSION: &str = "slice-b3-v2";
 pub(crate) const API_TIMESTAMP_MAX: u64 = u32::MAX as u64;
 const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;

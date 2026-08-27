@@ -52,13 +52,14 @@ pub use fixed_activity::{
     ActiveUsersPeriod, BoundedFixedActivity, DistinctPubkeysPeriod, FIXED_ACTIVITY_KEY_BYTES,
     FIXED_ACTIVITY_RECORD_BYTES, FIXED_ACTIVITY_VERSION, FixedActivityConfig,
     FixedActivityEvidence, PUBKEY_FLAGS_RECORD_BYTES, advance_bounded_fixed_activity,
-    build_bounded_fixed_activity, load_bounded_fixed_activity,
+    build_bounded_fixed_activity, load_bounded_fixed_activity, upgrade_bounded_fixed_activity_v2,
 };
 pub use flexible_distinct::{
     BoundedFlexibleDistinct, FLEXIBLE_DISTINCT_IDENTITY_BYTES, FLEXIBLE_DISTINCT_VERSION,
     FlexibleDistinctConfig, FlexibleDistinctEvidence, FlexibleDistinctWindow,
     build_bounded_flexible_distinct, estimate_flexible_distinct_window,
-    estimate_flexible_distinct_windows, load_bounded_flexible_distinct,
+    estimate_flexible_distinct_windows, load_and_estimate_flexible_distinct_windows,
+    load_bounded_flexible_distinct,
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};

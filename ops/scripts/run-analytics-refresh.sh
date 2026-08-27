@@ -261,9 +261,9 @@ fi
 
 plan_args=(--catalog "$target_snapshot")
 if [ "$cohort_enabled" = "1" ]; then
-    plan_args+=(--query-version slice-b3-v1)
+    plan_args+=(--query-version slice-b3-v2)
 elif [ "$activity_enabled" = "1" ]; then
-    plan_args+=(--query-version slice-b2-v2)
+    plan_args+=(--query-version slice-b2-v3)
 elif [ "$identity_enabled" = "1" ]; then
     plan_args+=(--query-version slice-b1-v1)
 fi

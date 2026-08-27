@@ -314,6 +314,23 @@ pub fn estimate_flexible_distinct_windows(
 ) -> Result<Vec<u64>> {
     product
         .validate_for_publication(&product.evidence.snapshot_id, product.evidence.as_of_epoch)?;
+    estimate_validated_windows(product, windows)
+}
+
+/// Load, fully validate, and estimate several windows without a redundant validation pass.
+pub fn load_and_estimate_flexible_distinct_windows(
+    evidence_path: impl AsRef<Path>,
+    windows: &[FlexibleDistinctWindow],
+) -> Result<(BoundedFlexibleDistinct, Vec<u64>)> {
+    let product = load_bounded_flexible_distinct(evidence_path)?;
+    let estimates = estimate_validated_windows(&product, windows)?;
+    Ok((product, estimates))
+}
+
+fn estimate_validated_windows(
+    product: &BoundedFlexibleDistinct,
+    windows: &[FlexibleDistinctWindow],
+) -> Result<Vec<u64>> {
     let mut bounded = Vec::with_capacity(windows.len());
     for window in windows {
         if !window.since_epoch.is_multiple_of(SECONDS_PER_HOUR)

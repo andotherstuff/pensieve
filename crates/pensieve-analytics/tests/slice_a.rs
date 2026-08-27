@@ -488,6 +488,17 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         },
     )
     .expect("build fixed activity");
+    assert_eq!(
+        completed.evidence.runner_version,
+        "pensieve-analytics-fixed-activity-v3"
+    );
+    let mut legacy_evidence = completed.clone();
+    legacy_evidence.evidence.runner_version = "pensieve-analytics-fixed-activity-v2".to_owned();
+    assert!(
+        legacy_evidence
+            .validate_for_publication(&snapshot.snapshot_id, AS_OF)
+            .is_err()
+    );
     assert_eq!(completed.evidence.batch_count, 2);
     assert_eq!(completed.evidence.merge_count, 1);
     assert_eq!(completed.evidence.flags_artifact.row_count, 5);
@@ -531,6 +542,13 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         .find(|row| row.grain == "week" && row.kind == Some(1))
         .expect("weekly kind-one row");
     assert_eq!(kind_one_weekly.unique_pubkeys, 4);
+    let kind_one_daily = completed
+        .evidence
+        .distinct_pubkeys
+        .iter()
+        .find(|row| row.grain == "day" && row.period_start == "2023-11-14" && row.kind == Some(1))
+        .expect("daily kind-one row");
+    assert_eq!(kind_one_daily.unique_pubkeys, 4);
 
     let evidence_sha = completed.evidence_sha256.clone();
     let flexible_root = directory.path().join("flexible-distinct");
@@ -1381,7 +1399,7 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             &[],
         )
         .expect("read current activity metadata");
-    assert_eq!(activity_metadata.get::<_, String>(0), "slice-b2-v2");
+    assert_eq!(activity_metadata.get::<_, String>(0), "slice-b2-v3");
     assert_eq!(
         activity_metadata.get::<_, i64>(1),
         activity.evidence.distinct_period_rows as i64
@@ -1505,7 +1523,7 @@ fn slice_a_publication_is_atomic_and_idempotent() {
             &[],
         )
         .expect("read current cohort metadata");
-    assert_eq!(cohort_metadata.get::<_, String>(0), "slice-b3-v1");
+    assert_eq!(cohort_metadata.get::<_, String>(0), "slice-b3-v2");
     assert_eq!(
         cohort_metadata.get::<_, i64>(1),
         cohort.evidence.period_rows as i64
