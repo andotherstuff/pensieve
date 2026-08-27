@@ -56,8 +56,9 @@ pub use fixed_activity::{
 };
 pub use flexible_distinct::{
     BoundedFlexibleDistinct, FLEXIBLE_DISTINCT_IDENTITY_BYTES, FLEXIBLE_DISTINCT_VERSION,
-    FlexibleDistinctConfig, FlexibleDistinctEvidence, build_bounded_flexible_distinct,
-    estimate_flexible_distinct_window, load_bounded_flexible_distinct,
+    FlexibleDistinctConfig, FlexibleDistinctEvidence, FlexibleDistinctWindow,
+    build_bounded_flexible_distinct, estimate_flexible_distinct_window,
+    estimate_flexible_distinct_windows, load_bounded_flexible_distinct,
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};

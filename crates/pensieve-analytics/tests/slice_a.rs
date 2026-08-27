@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
-    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, ObjectLocation, PlannedRunKind,
-    PubkeyFirstSeenConfig, PublishOutcome, advance_bounded_fixed_activity,
-    advance_bounded_pubkey_first_seen, apply_incremental, build_bounded_cohort_retention,
-    build_bounded_event_facts, build_bounded_fixed_activity, build_bounded_flexible_distinct,
-    build_bounded_pubkey_first_seen, estimate_flexible_distinct_window,
+    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctWindow,
+    ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
+    advance_bounded_fixed_activity, advance_bounded_pubkey_first_seen, apply_incremental,
+    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
+    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
     load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
     publish_with_all_bounded_products, publish_with_identity, publish_with_identity_and_activity,
@@ -557,6 +558,25 @@ fn bounded_fixed_activity_is_exact_across_grains_flags_and_exclusions() {
         estimate_flexible_distinct_window(&flexible, day_a, complete_through, Some(0))
             .expect("estimate profile authors"),
         2
+    );
+    assert_eq!(
+        estimate_flexible_distinct_windows(
+            &flexible,
+            &[
+                FlexibleDistinctWindow {
+                    since_epoch: day_a,
+                    until_epoch: complete_through,
+                    kind: None,
+                },
+                FlexibleDistinctWindow {
+                    since_epoch: day_a,
+                    until_epoch: complete_through,
+                    kind: Some(0),
+                },
+            ],
+        )
+        .expect("estimate several windows"),
+        vec![4, 2]
     );
     assert!(
         estimate_flexible_distinct_window(&flexible, day_a + 1, complete_through, None).is_err()

@@ -104,6 +104,17 @@ pub struct BoundedFlexibleDistinct {
     pub evidence_sha256: String,
 }
 
+/// One complete-hour-aligned distinct-author query over immutable leaves.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FlexibleDistinctWindow {
+    /// Inclusive UTC epoch-second boundary, aligned to an hour.
+    pub since_epoch: u64,
+    /// Exclusive UTC epoch-second boundary, aligned to an hour.
+    pub until_epoch: u64,
+    /// Optional event-kind restriction; `None` unions all kinds.
+    pub kind: Option<u16>,
+}
+
 impl BoundedFlexibleDistinct {
     /// Revalidate all immutable input, identity, leaf, and evidence invariants.
     pub fn validate_for_publication(&self, snapshot_id: &str, as_of_epoch: u64) -> Result<()> {
@@ -283,30 +294,63 @@ pub fn estimate_flexible_distinct_window(
     until_epoch: u64,
     kind: Option<u16>,
 ) -> Result<u64> {
+    let estimates = estimate_flexible_distinct_windows(
+        product,
+        &[FlexibleDistinctWindow {
+            since_epoch,
+            until_epoch,
+            kind,
+        }],
+    )?;
+    estimates.into_iter().next().ok_or_else(|| {
+        BoundedExecutionError::Invalid("missing flexible estimate".to_owned()).into()
+    })
+}
+
+/// Validate once and estimate several windows with one bounded leaf scan.
+pub fn estimate_flexible_distinct_windows(
+    product: &BoundedFlexibleDistinct,
+    windows: &[FlexibleDistinctWindow],
+) -> Result<Vec<u64>> {
     product
         .validate_for_publication(&product.evidence.snapshot_id, product.evidence.as_of_epoch)?;
-    if !since_epoch.is_multiple_of(SECONDS_PER_HOUR)
-        || !until_epoch.is_multiple_of(SECONDS_PER_HOUR)
-        || since_epoch > until_epoch
-        || until_epoch > product.evidence.complete_through_epoch
-    {
-        return invalid("flexible distinct window is not a valid complete-hour interval");
+    let mut bounded = Vec::with_capacity(windows.len());
+    for window in windows {
+        if !window.since_epoch.is_multiple_of(SECONDS_PER_HOUR)
+            || !window.until_epoch.is_multiple_of(SECONDS_PER_HOUR)
+            || window.since_epoch > window.until_epoch
+            || window.until_epoch > product.evidence.complete_through_epoch
+        {
+            return invalid("flexible distinct window is not a valid complete-hour interval");
+        }
+        let start_hour = u32::try_from(window.since_epoch / SECONDS_PER_HOUR).map_err(|_| {
+            BoundedExecutionError::Invalid("window start hour exceeds u32".to_owned())
+        })?;
+        let end_hour = u32::try_from(window.until_epoch / SECONDS_PER_HOUR).map_err(|_| {
+            BoundedExecutionError::Invalid("window end hour exceeds u32".to_owned())
+        })?;
+        bounded.push((
+            start_hour,
+            end_hour,
+            window.kind,
+            DistinctSketchUnion::new(),
+        ));
     }
-    let start_hour = u32::try_from(since_epoch / SECONDS_PER_HOUR)
-        .map_err(|_| BoundedExecutionError::Invalid("window start hour exceeds u32".to_owned()))?;
-    let end_hour = u32::try_from(until_epoch / SECONDS_PER_HOUR)
-        .map_err(|_| BoundedExecutionError::Invalid("window end hour exceeds u32".to_owned()))?;
-    let mut union = DistinctSketchUnion::new();
     let mut reader = LeafReader::open(Path::new(&product.evidence.leaf_artifact.path))?;
     while let Some(leaf) = reader.next()? {
-        if leaf.hour >= start_hour
-            && leaf.hour < end_hour
-            && kind.is_none_or(|kind| kind == leaf.kind)
-        {
-            union.push_serialized(&leaf.sketch).map_err(sketch_error)?;
+        for (start_hour, end_hour, kind, union) in &mut bounded {
+            if leaf.hour >= *start_hour
+                && leaf.hour < *end_hour
+                && kind.is_none_or(|kind| kind == leaf.kind)
+            {
+                union.push_serialized(&leaf.sketch).map_err(sketch_error)?;
+            }
         }
     }
-    Ok(union.finish().estimate())
+    Ok(bounded
+        .into_iter()
+        .map(|(_, _, _, union)| union.finish().estimate())
+        .collect())
 }
 
 fn build_batch(
