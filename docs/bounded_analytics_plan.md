@@ -784,6 +784,8 @@ Implementation status:
   evidence, bounded top-K heaps, and deterministic tie fixtures.
 - [x] Exact daily-fact and predefined-window cardinality projections without
   the prohibited daily-top-K shortcut.
+- [x] Immutable bounded comparison harness for all accepted windows plus
+  sparse/median/dense kind groups, with fixed-as-of and deterministic ties.
 - [ ] Production benchmark on a frozen current activity generation.
 - [ ] Freeze either exact daily-fact queries or predefined materialized
   windows from measured Postgres size, refresh cost, and request latency.
