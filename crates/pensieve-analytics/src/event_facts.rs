@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use chrono::{DateTime, Utc};
 use duckdb::Connection;
+use pensieve_lake::{ActiveRawSnapshot, CatalogObject};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -20,11 +21,12 @@ use crate::build::{
     create_from_compact_rollups, sql_string,
 };
 use crate::{
-    AnalyticsBuild, ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget,
-    EventDaily, EventDailyKind, FixedRecordLayout, InputIdentity, KindAllTime, MergeStats,
-    ObjectLocation, Overview, ResolvedSnapshot, Result, RunCheckpoint, RunIdentity,
-    load_reusable_checkpoint, merge_fixed_runs, plan_input_batches, preflight_disk,
-    publish_canonical_json, publish_run_checkpoint,
+    AnalyticsBuild, ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION,
+    BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget, EventDaily, EventDailyKind,
+    FixedRecordLayout, InputIdentity, KindAllTime, MergeStats, ObjectLocation, Overview,
+    ResolvedSnapshot, Result, RunCheckpoint, RunIdentity, load_reusable_checkpoint,
+    merge_fixed_runs, plan_input_batches, preflight_disk, publish_canonical_json,
+    publish_run_checkpoint,
 };
 
 /// Encoded event-ID bytes at the start of every event fact.
@@ -37,7 +39,8 @@ pub const EVENT_FACT_BYTES: usize = EVENT_FACT_KEY_BYTES + 8 + 2;
 pub const EVENT_FACTS_VERSION: &str = "canonical-event-facts-v1";
 
 const EVENT_FACTS_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const EVENT_FACTS_RUNNER_VERSION: &str = "pensieve-analytics-event-facts-v1";
+const EVENT_FACTS_RUNNER_VERSION_V1: &str = "pensieve-analytics-event-facts-v1";
+const EVENT_FACTS_RUNNER_VERSION_V2: &str = "pensieve-analytics-event-facts-v2";
 const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
 const THIRTY_DAYS_SECS: u64 = 30 * 24 * 60 * 60;
 const HOURS_PER_SEVEN_DAYS: f64 = 168.0;
@@ -90,6 +93,12 @@ pub struct EventFactsEvidence {
     pub as_of_epoch: u64,
     /// Catalog objects scanned.
     pub object_count: u64,
+    /// Prior evidence consumed by an append-only successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_evidence_sha256: Option<String>,
+    /// New catalog objects scanned for this generation.
+    #[serde(default)]
+    pub delta_object_count: u64,
     /// Bounded batch runs completed.
     pub batch_count: u64,
     /// Fixed-fan-in merges completed or exactly reused.
@@ -138,12 +147,36 @@ pub fn load_event_facts_evidence(path: impl AsRef<Path>) -> Result<(EventFactsEv
             BoundedExecutionError::Invalid(format!("decode event-facts evidence: {error}"))
         })?;
     if evidence.schema_version != EVENT_FACTS_EVIDENCE_SCHEMA_VERSION
-        || evidence.runner_version != EVENT_FACTS_RUNNER_VERSION
+        || !matches!(
+            evidence.runner_version.as_str(),
+            EVENT_FACTS_RUNNER_VERSION_V1 | EVENT_FACTS_RUNNER_VERSION_V2
+        )
         || evidence.status != "completed"
         || evidence.final_artifact.row_count != evidence.logical_events
     {
         return Err(BoundedExecutionError::Invalid(
             "event-facts evidence is not a completed canonical product".to_owned(),
+        )
+        .into());
+    }
+    let lineage_is_valid = match evidence.runner_version.as_str() {
+        EVENT_FACTS_RUNNER_VERSION_V1 => {
+            evidence.baseline_evidence_sha256.is_none()
+                && (matches!(evidence.delta_object_count, 0)
+                    || evidence.delta_object_count == evidence.object_count)
+        }
+        EVENT_FACTS_RUNNER_VERSION_V2 => {
+            evidence
+                .baseline_evidence_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+                && evidence.delta_object_count > 0
+        }
+        _ => false,
+    };
+    if !lineage_is_valid || evidence.delta_object_count > evidence.object_count {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts evidence has invalid append-only lineage".to_owned(),
         )
         .into());
     }
@@ -329,11 +362,13 @@ pub fn build_bounded_event_facts(
     let batch_count = to_u64(batches.len(), "batch count")?;
     let evidence = EventFactsEvidence {
         schema_version: EVENT_FACTS_EVIDENCE_SCHEMA_VERSION,
-        runner_version: EVENT_FACTS_RUNNER_VERSION.to_owned(),
+        runner_version: EVENT_FACTS_RUNNER_VERSION_V1.to_owned(),
         status: "completed".to_owned(),
         snapshot_id: snapshot.catalog.snapshot_id.clone(),
         as_of_epoch: build_config.as_of_epoch,
         object_count,
+        baseline_evidence_sha256: None,
+        delta_object_count: object_count,
         batch_count,
         merge_count: merge.merge_count,
         physical_rows,
@@ -364,6 +399,342 @@ pub fn build_bounded_event_facts(
         evidence,
         evidence_sha256,
     })
+}
+
+/// Advance canonical event facts from one fully verified append-only baseline.
+///
+/// The baseline catalog is required independently of the baseline evidence so
+/// every target object is proven unchanged or selected as new work. The prior
+/// final artifact is streamed as one immutable merge input; it is never copied,
+/// relabelled, or trusted without full row-order and SHA-256 validation.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_bounded_event_facts(
+    work_database: impl AsRef<Path>,
+    evidence_path: impl AsRef<Path>,
+    baseline_evidence_path: impl AsRef<Path>,
+    baseline_catalog: &ActiveRawSnapshot,
+    target: ResolvedSnapshot,
+    build_config: BuildConfig,
+    facts_config: EventFactsConfig,
+) -> Result<BoundedEventBuild> {
+    let (baseline, baseline_evidence_sha256) = load_event_facts_evidence(baseline_evidence_path)?;
+    baseline_catalog.validate()?;
+    if baseline_catalog.snapshot_id != baseline.snapshot_id
+        || baseline_catalog.store_id() != target.catalog.store_id()
+        || u64::try_from(baseline_catalog.objects().len()).map_err(|_| {
+            BoundedExecutionError::Invalid("baseline object count exceeds u64".to_owned())
+        })? != baseline.object_count
+        || baseline_catalog.totals().physical_rows != baseline.physical_rows
+        || build_config.as_of_epoch < baseline.as_of_epoch
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts baseline catalog and evidence identity differ".to_owned(),
+        )
+        .into());
+    }
+    validate_config(&target, &build_config, &facts_config)?;
+    let delta_indices = append_only_delta_indices(baseline_catalog, &target.catalog)?;
+    if delta_indices.is_empty() {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts successor requires at least one added immutable object".to_owned(),
+        )
+        .into());
+    }
+    fs::create_dir_all(&facts_config.work_root)?;
+    let delta_objects = delta_indices
+        .iter()
+        .map(|&index| &target.catalog.objects()[index])
+        .collect::<Vec<_>>();
+    let inputs = delta_objects
+        .iter()
+        .map(|object| input_identity(object))
+        .collect::<Vec<_>>();
+    let delta_locations = delta_indices
+        .iter()
+        .map(|&index| target.locations[index].clone())
+        .collect::<Vec<_>>();
+    let batches = plan_input_batches(&inputs, facts_config.batch_limits)?;
+    let estimated_rows = baseline
+        .logical_events
+        .checked_add(delta_objects.iter().try_fold(0_u64, |sum, object| {
+            checked_add(sum, object.row_count, "event-facts delta rows")
+        })?)
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid(
+                "event-facts successor row estimate overflowed".to_owned(),
+            )
+        })?;
+    let successor_estimated_bytes = estimate_run_bytes(
+        estimated_rows,
+        batches.len().saturating_add(1),
+        facts_config.merge_fan_in,
+    )?;
+    let retained_bytes = completed_run_bytes(&facts_config.work_root)?;
+    preflight_disk(
+        &facts_config.work_root,
+        DiskBudget {
+            output_bytes: successor_estimated_bytes.saturating_sub(retained_bytes),
+            temporary_bytes: 0,
+            retained_bytes,
+            reserve_bytes: facts_config.disk_reserve_bytes,
+        },
+    )?;
+
+    let connection = Connection::open_in_memory()?;
+    configure_execution(&connection, &build_config)?;
+    connection.execute_batch("SET TimeZone = 'UTC'; SET preserve_insertion_order = false")?;
+    configure_remote_access(&connection, &target, &build_config)?;
+    let baseline_artifact = baseline.final_artifact.clone();
+    let mut runs = vec![CompletedRun {
+        identity: format!("baseline:{baseline_evidence_sha256}"),
+        path: PathBuf::from(&baseline_artifact.path),
+        checkpoint_path: PathBuf::new(),
+        checkpoint: RunCheckpoint {
+            schema_version: BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+            runner_version: BOUNDED_RUNNER_VERSION.to_owned(),
+            run: RunIdentity {
+                snapshot_id: target.catalog.snapshot_id.clone(),
+                as_of: build_config.as_of_epoch,
+                product: "canonical-event-facts-baseline".to_owned(),
+                product_version: EVENT_FACTS_VERSION.to_owned(),
+                key_space: "event-id-32-created-at-u64-kind-u16-be-v1".to_owned(),
+            },
+            inputs: Vec::new(),
+            artifact: baseline_artifact,
+        },
+    }];
+    let batch_root = facts_config.work_root.join("batches");
+    fs::create_dir_all(&batch_root)?;
+    let mut offset = 0_usize;
+    let mut delta_batch_duplicates = 0_u64;
+    let mut max_batch_bytes = baseline.memory.max_batch_bytes;
+    let mut max_batch_rows = baseline.memory.max_batch_rows;
+    let mut batch_checkpoints = baseline.batch_checkpoints.clone();
+    for batch in &batches {
+        let end = offset.checked_add(batch.inputs.len()).ok_or_else(|| {
+            BoundedExecutionError::Invalid("event-facts delta offset overflowed".to_owned())
+        })?;
+        let locations = delta_locations.get(offset..end).ok_or_else(|| {
+            BoundedExecutionError::Invalid("event-facts delta locations are incomplete".to_owned())
+        })?;
+        let run = build_batch_run(
+            &connection,
+            &target,
+            &build_config,
+            batch,
+            locations,
+            &batch_root,
+        )?;
+        delta_batch_duplicates = checked_add(
+            delta_batch_duplicates,
+            batch
+                .row_count
+                .checked_sub(run.checkpoint.artifact.row_count)
+                .ok_or_else(|| {
+                    BoundedExecutionError::Invalid(
+                        "event-facts delta artifact exceeds physical input rows".to_owned(),
+                    )
+                })?,
+            "event-facts delta batch duplicates",
+        )?;
+        max_batch_bytes = max_batch_bytes.max(batch.byte_size);
+        max_batch_rows = max_batch_rows.max(batch.row_count);
+        batch_checkpoints.push(run.checkpoint_path.to_string_lossy().into_owned());
+        runs.push(run);
+        offset = end;
+    }
+    if offset != delta_locations.len() {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts successor did not consume every delta location".to_owned(),
+        )
+        .into());
+    }
+    let merge_root = facts_config.work_root.join("merges");
+    fs::create_dir_all(&merge_root)?;
+    let merge = merge_to_single(
+        runs,
+        &target,
+        &build_config,
+        facts_config.merge_fan_in,
+        &merge_root,
+    )?;
+    let final_run = merge.final_run;
+    let physical_rows = target.catalog.totals().physical_rows;
+    let logical_events = final_run.checkpoint.artifact.row_count;
+    let duplicate_rows = physical_rows.checked_sub(logical_events).ok_or_else(|| {
+        BoundedExecutionError::Invalid(
+            "event-facts successor logical rows exceed physical rows".to_owned(),
+        )
+    })?;
+    let batch_duplicate_rows = checked_add(
+        baseline.batch_duplicate_rows,
+        delta_batch_duplicates,
+        "event-facts successor batch duplicates",
+    )?;
+    let merge_duplicate_rows = checked_add(
+        baseline.merge_duplicate_rows,
+        merge.duplicate_rows,
+        "event-facts successor merge duplicates",
+    )?;
+    if checked_add(
+        batch_duplicate_rows,
+        merge_duplicate_rows,
+        "event-facts successor duplicates",
+    )? != duplicate_rows
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts successor duplicate accounting does not reconcile".to_owned(),
+        )
+        .into());
+    }
+    let finalized = finalize_rollups(
+        &final_run.path,
+        &final_run.checkpoint.artifact,
+        build_config.as_of_epoch,
+    )?;
+    if finalized.rollups.logical_events != logical_events {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts successor rollups did not consume every event".to_owned(),
+        )
+        .into());
+    }
+    let analytics = create_from_compact_rollups(
+        work_database,
+        target.clone(),
+        build_config.clone(),
+        finalized.rollups,
+    )?;
+    let metric_sha256 = hex::encode(Sha256::digest(analytics.canonical_metric_bytes()?));
+    let object_count = to_u64(target.catalog.objects().len(), "object count")?;
+    let delta_object_count = to_u64(delta_indices.len(), "delta object count")?;
+    let batch_count = checked_add(
+        baseline.batch_count,
+        to_u64(batches.len(), "delta batch count")?,
+        "event-facts successor batch count",
+    )?;
+    let merge_count = checked_add(
+        baseline.merge_count,
+        merge.merge_count,
+        "event-facts successor merge count",
+    )?;
+    let estimated_run_bytes = checked_add(
+        baseline.estimated_run_bytes,
+        successor_estimated_bytes,
+        "event-facts successor estimated bytes",
+    )?;
+    let mut merge_checkpoints = baseline.merge_checkpoints.clone();
+    merge_checkpoints.extend(merge.checkpoints);
+    let evidence = EventFactsEvidence {
+        schema_version: EVENT_FACTS_EVIDENCE_SCHEMA_VERSION,
+        runner_version: EVENT_FACTS_RUNNER_VERSION_V2.to_owned(),
+        status: "completed".to_owned(),
+        snapshot_id: target.catalog.snapshot_id.clone(),
+        as_of_epoch: build_config.as_of_epoch,
+        object_count,
+        baseline_evidence_sha256: Some(baseline_evidence_sha256),
+        delta_object_count,
+        batch_count,
+        merge_count,
+        physical_rows,
+        logical_events,
+        duplicate_rows,
+        batch_duplicate_rows,
+        merge_duplicate_rows,
+        final_artifact: final_run.checkpoint.artifact,
+        metric_sha256,
+        estimated_run_bytes,
+        disk_reserve_bytes: facts_config.disk_reserve_bytes,
+        memory: EventFactsMemoryEvidence {
+            max_batch_bytes,
+            max_batch_rows,
+            max_merge_buffered_bytes: baseline
+                .memory
+                .max_merge_buffered_bytes
+                .max(merge.max_buffered_bytes),
+            daily_keys: finalized.daily_keys,
+            daily_kind_keys: finalized.daily_kind_keys,
+            kind_counter_slots: KIND_DOMAIN,
+        },
+        batch_checkpoints,
+        merge_checkpoints,
+    };
+    let evidence_path = evidence_path.as_ref();
+    publish_canonical_json(evidence_path, &evidence)?;
+    let evidence_sha256 = pensieve_lake::sha256_file(evidence_path)?;
+    let completed = BoundedEventBuild {
+        analytics,
+        evidence,
+        evidence_sha256,
+    };
+    let _ = load_event_facts_evidence(evidence_path)?;
+    Ok(completed)
+}
+
+fn append_only_delta_indices(
+    baseline: &ActiveRawSnapshot,
+    target: &ActiveRawSnapshot,
+) -> Result<Vec<usize>> {
+    append_only_delta_indices_from_objects(
+        baseline.store_id(),
+        baseline.objects(),
+        target.store_id(),
+        target.objects(),
+    )
+}
+
+fn append_only_delta_indices_from_objects(
+    baseline_store: &str,
+    baseline: &[CatalogObject],
+    target_store: &str,
+    target: &[CatalogObject],
+) -> Result<Vec<usize>> {
+    if baseline_store != target_store {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts catalogs use different object stores".to_owned(),
+        )
+        .into());
+    }
+    let mut prior = baseline
+        .iter()
+        .map(|object| (object.object_key.as_str(), object))
+        .collect::<BTreeMap<_, _>>();
+    let mut added = Vec::new();
+    for (index, object) in target.iter().enumerate() {
+        match prior.remove(object.object_key.as_str()) {
+            None => added.push(index),
+            Some(previous) if previous == object => {}
+            Some(_) => {
+                return Err(BoundedExecutionError::Invalid(format!(
+                    "event-facts immutable object changed: {}",
+                    object.object_key
+                ))
+                .into());
+            }
+        }
+    }
+    if let Some((removed, _)) = prior.into_iter().next() {
+        return Err(BoundedExecutionError::Invalid(format!(
+            "event-facts target removed baseline object: {removed}"
+        ))
+        .into());
+    }
+    Ok(added)
+}
+
+fn input_identity(object: &CatalogObject) -> InputIdentity {
+    InputIdentity {
+        identity: object.object_key.clone(),
+        byte_size: object.byte_size,
+        row_count: object.row_count,
+        sha256: object.sha256.clone(),
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone)]
@@ -1266,6 +1637,58 @@ mod tests {
             created_at,
             kind,
         }
+    }
+
+    fn object(key: &str, sha: char) -> CatalogObject {
+        CatalogObject {
+            object_key: key.to_owned(),
+            work_unit_id: format!("work-{key}"),
+            part_number: 0,
+            byte_size: 10,
+            sha256: sha.to_string().repeat(64),
+            writer_version: "test".to_owned(),
+            row_count: 2,
+            min_created_at: Some("1".to_owned()),
+            max_created_at: Some("2".to_owned()),
+        }
+    }
+
+    #[test]
+    fn append_only_successor_selects_only_exact_new_objects() {
+        let baseline = vec![object("a", 'a'), object("b", 'b')];
+        let target = vec![object("a", 'a'), object("b", 'b'), object("c", 'c')];
+        assert_eq!(
+            append_only_delta_indices_from_objects("store", &baseline, "store", &target)
+                .expect("append-only delta"),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn append_only_successor_rejects_changes_removals_and_store_drift() {
+        let baseline = vec![object("a", 'a'), object("b", 'b')];
+        assert!(
+            append_only_delta_indices_from_objects(
+                "store",
+                &baseline,
+                "store",
+                &[object("a", 'c'), object("b", 'b')],
+            )
+            .is_err()
+        );
+        assert!(
+            append_only_delta_indices_from_objects(
+                "store",
+                &baseline,
+                "store",
+                &[object("a", 'a')],
+            )
+            .is_err()
+        );
+        assert!(
+            append_only_delta_indices_from_objects("store-a", &baseline, "store-b", &baseline,)
+                .is_err()
+        );
     }
 
     #[test]

@@ -9,12 +9,12 @@ use pensieve_analytics::{
     FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation, PlannedRunKind,
     PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig, PublisherRankingConfig,
     RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ServingFactsConfig,
-    ZapDistinctConfig, advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
-    advance_bounded_pubkey_first_seen, advance_bounded_publisher_ranking,
-    advance_bounded_relay_distribution, advance_bounded_semantic_facts,
-    advance_bounded_serving_facts, apply_incremental, benchmark_publishers,
-    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
-    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    ZapDistinctConfig, advance_bounded_event_facts, advance_bounded_fixed_activity,
+    advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
+    advance_bounded_publisher_ranking, advance_bounded_relay_distribution,
+    advance_bounded_semantic_facts, advance_bounded_serving_facts, apply_incremental,
+    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_publisher_ranking, build_bounded_relay_distribution,
     build_bounded_semantic_facts, build_bounded_serving_facts, build_bounded_zap_distinct,
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
@@ -783,6 +783,148 @@ fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
             .expect("resumed metric bytes"),
         reference_bytes
     );
+}
+
+#[test]
+fn bounded_event_facts_successor_matches_a_full_target_rebuild() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let lake_root = directory.path().join("lake");
+    let duplicate = event(AS_OF - 10, 1, "duplicate across snapshots");
+    let mut inventory = Inventory::open_in_memory().expect("inventory");
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "event-baseline",
+        &[duplicate.clone(), event(AS_OF - 20, 2, "baseline")],
+    );
+    let baseline_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "event-successor",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("baseline fragment")])
+    .expect("baseline snapshot");
+    let baseline_catalog = directory.path().join("event-baseline.json");
+    write_catalog_atomically(&baseline_catalog, &baseline_snapshot).expect("baseline catalog");
+    let baseline_root = directory.path().join("event-baseline-work");
+    let baseline_evidence = baseline_root.join("evidence.json");
+    let baseline_build = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "event-successor-baseline".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let baseline = build_bounded_event_facts(
+        directory.path().join("event-baseline.duckdb"),
+        &baseline_evidence,
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline"),
+        baseline_build,
+        EventFactsConfig {
+            work_root: baseline_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 2,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline event facts");
+    let baseline_sha = baseline.evidence_sha256.clone();
+    drop(baseline);
+
+    publish_object(
+        &mut inventory,
+        &lake_root,
+        "event-delta",
+        &[duplicate, event(AS_OF + 10, 3, "new")],
+    );
+    let target_snapshot = merge_active_raw_fragments([ActiveRawFragment::export(
+        &mut inventory,
+        "event-successor",
+        "s3+https://example.test/test-bucket",
+    )
+    .expect("target fragment")])
+    .expect("target snapshot");
+    let target_catalog = directory.path().join("event-target.json");
+    write_catalog_atomically(&target_catalog, &target_snapshot).expect("target catalog");
+    let target_build = BuildConfig {
+        as_of_epoch: AS_OF + 20,
+        code_version: "event-successor-target".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let full_root = directory.path().join("event-full-work");
+    let full = build_bounded_event_facts(
+        directory.path().join("event-full.duckdb"),
+        full_root.join("evidence.json"),
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve full target"),
+        target_build.clone(),
+        EventFactsConfig {
+            work_root: full_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 2,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build full target event facts");
+    let successor_root = directory.path().join("event-successor-work");
+    let successor_evidence = successor_root.join("evidence.json");
+    let successor_config = EventFactsConfig {
+        work_root: successor_root,
+        batch_limits: BatchLimits {
+            max_bytes: u64::MAX,
+            max_rows: 2,
+        },
+        merge_fan_in: 2,
+        disk_reserve_bytes: 0,
+    };
+    let successor = advance_bounded_event_facts(
+        directory.path().join("event-successor.duckdb"),
+        &successor_evidence,
+        &baseline_evidence,
+        &baseline_snapshot,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve successor target"),
+        target_build.clone(),
+        successor_config.clone(),
+    )
+    .expect("advance event facts");
+    assert_eq!(
+        successor.evidence.baseline_evidence_sha256.as_deref(),
+        Some(baseline_sha.as_str())
+    );
+    assert_eq!(successor.evidence.delta_object_count, 1);
+    assert_eq!(successor.evidence.physical_rows, 4);
+    assert_eq!(successor.evidence.logical_events, 3);
+    assert_eq!(successor.evidence.duplicate_rows, 1);
+    assert_eq!(
+        successor.evidence.final_artifact.sha256,
+        full.evidence.final_artifact.sha256
+    );
+    assert_eq!(
+        successor.evidence.metric_sha256,
+        full.evidence.metric_sha256
+    );
+    let successor_sha = successor.evidence_sha256.clone();
+    drop(successor);
+    let retried = advance_bounded_event_facts(
+        directory.path().join("event-successor.duckdb"),
+        &successor_evidence,
+        &baseline_evidence,
+        &baseline_snapshot,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve retry target"),
+        target_build,
+        successor_config,
+    )
+    .expect("resume event-facts successor");
+    assert_eq!(retried.evidence_sha256, successor_sha);
 }
 
 #[test]

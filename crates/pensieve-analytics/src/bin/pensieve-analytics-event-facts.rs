@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, EventFactsConfig, build_bounded_event_facts,
-    publish_canonical_json, resolve_snapshot,
+    AnalyticsBuild, BatchLimits, BuildConfig, EventFactsConfig, advance_bounded_event_facts,
+    build_bounded_event_facts, publish_canonical_json, resolve_snapshot,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -26,6 +26,12 @@ struct Args {
     /// Dedicated canary DuckDB output.
     #[arg(long)]
     work_database: PathBuf,
+    /// Fully validated predecessor evidence for an append-only successor.
+    #[arg(long, requires = "baseline_catalog")]
+    baseline_evidence: Option<PathBuf>,
+    /// Canonical predecessor catalog matching `--baseline-evidence`.
+    #[arg(long, requires = "baseline_evidence")]
+    baseline_catalog: Option<PathBuf>,
     /// Immutable bounded-build evidence JSON.
     #[arg(long)]
     evidence: PathBuf,
@@ -119,22 +125,37 @@ fn main() -> Result<()> {
                 .context("serialize accepted Slice A metrics")
         })
         .transpose()?;
-    let completed = build_bounded_event_facts(
-        &args.work_database,
-        &args.evidence,
-        snapshot,
-        build_config,
-        EventFactsConfig {
-            work_root: args.work_root,
-            batch_limits: BatchLimits {
-                max_bytes: args.batch_bytes,
-                max_rows: args.batch_rows,
-            },
-            merge_fan_in: args.merge_fan_in,
-            disk_reserve_bytes: args.disk_reserve_bytes,
+    let facts_config = EventFactsConfig {
+        work_root: args.work_root,
+        batch_limits: BatchLimits {
+            max_bytes: args.batch_bytes,
+            max_rows: args.batch_rows,
         },
-    )
-    .context("build bounded canonical event facts")?;
+        merge_fan_in: args.merge_fan_in,
+        disk_reserve_bytes: args.disk_reserve_bytes,
+    };
+    let completed = match (&args.baseline_evidence, &args.baseline_catalog) {
+        (Some(evidence), Some(catalog)) => advance_bounded_event_facts(
+            &args.work_database,
+            &args.evidence,
+            evidence,
+            &pensieve_lake::read_catalog_snapshot(catalog)
+                .context("read predecessor event-facts catalog")?,
+            snapshot,
+            build_config,
+            facts_config,
+        )
+        .context("advance bounded canonical event facts")?,
+        (None, None) => build_bounded_event_facts(
+            &args.work_database,
+            &args.evidence,
+            snapshot,
+            build_config,
+            facts_config,
+        )
+        .context("build bounded canonical event facts")?,
+        _ => unreachable!("clap requires complete baseline arguments"),
+    };
 
     let candidate_bytes = completed
         .analytics

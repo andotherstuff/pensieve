@@ -61,7 +61,7 @@ pub use error::{Error, Result};
 pub use event_facts::{
     BoundedEventBuild, EVENT_FACT_BYTES, EVENT_FACT_KEY_BYTES, EventFact, EventFactBatchStats,
     EventFactReader, EventFactsConfig, EventFactsEvidence, EventFactsMemoryEvidence,
-    build_bounded_event_facts, load_event_facts_evidence,
+    advance_bounded_event_facts, build_bounded_event_facts, load_event_facts_evidence,
 };
 pub use fixed_activity::{
     ActiveUsersPeriod, BoundedFixedActivity, DistinctPubkeysPeriod, FIXED_ACTIVITY_KEY_BYTES,

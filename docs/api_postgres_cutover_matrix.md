@@ -118,6 +118,8 @@ not make a partial analytics generation current.
 ## Slice 9.5 implementation status
 
 - [x] Canonical fixed-width enriched facts with exact event-ID/content join.
+- [x] Versioned append-only event-fact bootstrap from a fully verified earlier
+  artifact, with exact catalog ancestry and predecessor-evidence lineage.
 - [x] Sparse complete-hour all-kind and per-kind event counts.
 - [x] Exact enriched all-time per-kind summaries and content-byte denominator.
 - [x] Retry-safe dormant Postgres publication through migration 010.

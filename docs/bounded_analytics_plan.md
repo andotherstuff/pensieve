@@ -839,6 +839,11 @@ Implementation status:
   gated with the rest of Slice 9.5.
 - [x] Build and validate canonical hourly event and enriched per-kind facts
   with a fixed-width event-ID/content join and append-only successor.
+- [x] Advance the canonical event-fact anchor from an independently supplied,
+  fully validated append-only predecessor catalog and evidence. The successor
+  records the predecessor evidence SHA-256, rejects removals or changed object
+  identities, scans only added objects, and re-finalizes the complete merged
+  artifact at the target as-of boundary.
 - [x] Publish both compact products through migration 010 in the all-product
   transaction with rollback, retry, and no-pointer-change tests.
 - [x] Add an immutable bounded comparison harness for deterministic all-kind
