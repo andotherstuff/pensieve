@@ -841,6 +841,10 @@ Implementation status:
   with a fixed-width event-ID/content join and append-only successor.
 - [x] Publish both compact products through migration 010 in the all-product
   transaction with rollback, retry, and no-pointer-change tests.
+- [x] Add an immutable bounded comparison harness for deterministic all-kind
+  hourly, per-kind hourly, and enriched kind-summary samples. The harness uses
+  fixed-as-of `events_local FINAL` reads, preserves cross-store population
+  classifications, and fails closed on same-count metric disagreements.
 - [ ] Run the frozen production build and dormant publication canaries.
 - [ ] Prove one moving recurring all-product successor in production.
 

@@ -91,6 +91,12 @@ artifact proves the content average without retaining raw content. Duplicate
 event IDs are removed before count and content accumulation. Production build,
 publication, and recurring-successor evidence remain gated.
 
+The independent comparison runner samples sparse, midpoint-density, and dense
+all-kind hours, per-kind hours, and all-time kinds. It performs bounded
+fixed-as-of reads from `events_local FINAL`; count-driven deltas retain the
+documented cross-store population classification, while same-count differences
+in exact publisher, timestamp, or UTF-8 content metrics fail closed.
+
 ### Latest sealed event watermark
 
 The ingestion pipeline atomically publishes a tiny versioned document only
@@ -109,6 +115,8 @@ not make a partial analytics generation current.
 - [x] Retry-safe dormant Postgres publication through migration 010.
 - [x] All-product recurring transaction and append-only successor integration.
 - [x] Atomic ingestion-owned latest sealed-event watermark implementation.
+- [x] Constant-memory fixed-as-of ClickHouse comparison harness for exact
+  hourly counts and enriched all-time kind summaries.
 - [ ] Frozen production event-fact and serving-fact builds.
 - [ ] Dormant publication with no current-pointer change.
 - [ ] Watermark activation and freshness validation.
