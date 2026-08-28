@@ -47,6 +47,12 @@ publisher_batch_size="${PENSIEVE_ANALYTICS_PUBLISHER_BATCH_SIZE:-10000}"
 publisher_max_state_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_MAX_STATE_BYTES:-536870912000}"
 publisher_sqlite_cache_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_SQLITE_CACHE_BYTES:-536870912}"
 publisher_disk_reserve_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_DISK_RESERVE_BYTES:-107374182400}"
+serving_enabled="${PENSIEVE_ANALYTICS_SERVING_ENABLED:-0}"
+serving_root="${PENSIEVE_ANALYTICS_SERVING_ROOT:-/archive/analytics/serving-facts}"
+serving_batch_bytes="${PENSIEVE_ANALYTICS_SERVING_BATCH_BYTES:-1073741824}"
+serving_batch_rows="${PENSIEVE_ANALYTICS_SERVING_BATCH_ROWS:-5000000}"
+serving_merge_fan_in="${PENSIEVE_ANALYTICS_SERVING_MERGE_FAN_IN:-16}"
+serving_disk_reserve_bytes="${PENSIEVE_ANALYTICS_SERVING_DISK_RESERVE_BYTES:-107374182400}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -124,6 +130,10 @@ if [ "$publisher_enabled" != "0" ] && [ "$publisher_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_PUBLISHER_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$serving_enabled" != "0" ] && [ "$serving_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_SERVING_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
     exit 2
@@ -146,6 +156,10 @@ if [ "$relay_enabled" = "1" ] && [ "$semantic_enabled" != "1" ]; then
 fi
 if [ "$publisher_enabled" = "1" ] && [ "$relay_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_PUBLISHER_ENABLED requires PENSIEVE_ANALYTICS_RELAY_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$serving_enabled" = "1" ] && [ "$publisher_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_SERVING_ENABLED requires PENSIEVE_ANALYTICS_PUBLISHER_ENABLED=1" >&2
     exit 2
 fi
 
@@ -280,6 +294,15 @@ if [ "$publisher_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$publisher_root"
+fi
+serving_baseline_evidence=""
+if [ "$serving_enabled" = "1" ]; then
+    serving_baseline_evidence="$current_generation/serving-facts-evidence.json"
+    if [ ! -s "$serving_baseline_evidence" ]; then
+        echo "Current serving-facts evidence is missing: $serving_baseline_evidence" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$serving_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -429,6 +452,11 @@ promote_generation() {
             cmp "$run_dir/publisher-ranking-evidence.json" \
                 "$generation/publisher-ranking-evidence.json"
         fi
+        if [ "$serving_enabled" = "1" ] \
+            && [ -s "$run_dir/serving-facts-evidence.json" ]; then
+            cmp "$run_dir/serving-facts-evidence.json" \
+                "$generation/serving-facts-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -472,6 +500,10 @@ promote_generation() {
         if [ "$publisher_enabled" = "1" ]; then
             install -m 0640 "$run_dir/publisher-ranking-evidence.json" \
                 "$partial_generation/publisher-ranking-evidence.json"
+        fi
+        if [ "$serving_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/serving-facts-evidence.json" \
+                "$partial_generation/serving-facts-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         mapfile -t generation_files < <(
@@ -646,6 +678,18 @@ case "$run_kind" in
                 --publisher-disk-reserve-bytes "$publisher_disk_reserve_bytes"
             )
         fi
+        if [ "$serving_enabled" = "1" ]; then
+            serving_work_root="$serving_root/$snapshot_hex"
+            incremental_args+=(
+                --serving-baseline-evidence "$serving_baseline_evidence"
+                --serving-evidence "$run_dir/serving-facts-evidence.json"
+                --serving-work-root "$serving_work_root"
+                --serving-batch-bytes "$serving_batch_bytes"
+                --serving-batch-rows "$serving_batch_rows"
+                --serving-merge-fan-in "$serving_merge_fan_in"
+                --serving-disk-reserve-bytes "$serving_disk_reserve_bytes"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -723,6 +767,10 @@ fi
 if [ "$publisher_enabled" = "1" ] \
     && [ -s "$run_dir/publisher-ranking-evidence.json" ]; then
     evidence_files+=("$run_dir/publisher-ranking-evidence.json")
+fi
+if [ "$serving_enabled" = "1" ] \
+    && [ -s "$run_dir/serving-facts-evidence.json" ]; then
+    evidence_files+=("$run_dir/serving-facts-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

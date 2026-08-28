@@ -7,23 +7,26 @@ use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
     AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
-    AllRecurringProductsWithRelay, BatchLimits, BuildConfig, COHORT_RETENTION_QUERY_VERSION,
-    CatalogDeltaPlan, CohortRetentionEvidence, FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig,
-    FlexibleDistinctConfig, FlexibleDistinctPublication, IDENTITY_QUERY_VERSION,
-    PubkeyFirstSeenConfig, PublishOutcome, PublisherRankingConfig, RelayDistributionConfig,
-    SemanticFactsConfig, SemanticPublication, ZapDistinctConfig, acquire_publication_lock,
+    AllRecurringProductsWithRelay, AllRecurringProductsWithServing, BatchLimits, BuildConfig,
+    COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
+    FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig, FlexibleDistinctConfig,
+    FlexibleDistinctPublication, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome,
+    PublisherRankingConfig, RelayDistributionConfig, SemanticFactsConfig, SemanticPublication,
+    ServingFactsConfig, ZapDistinctConfig, acquire_publication_lock,
     advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
     advance_bounded_pubkey_first_seen, advance_bounded_publisher_ranking,
-    advance_bounded_relay_distribution, advance_bounded_semantic_facts, apply_incremental,
-    build_bounded_cohort_retention, build_bounded_zap_distinct, build_flexible_distinct_validation,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
-    load_bounded_publisher_ranking, load_bounded_relay_distribution_for_advance,
-    load_bounded_semantic_facts, plan_catalog_delta_for_query_version, publish_incremental,
+    advance_bounded_relay_distribution, advance_bounded_semantic_facts,
+    advance_bounded_serving_facts, apply_incremental, build_bounded_cohort_retention,
+    build_bounded_zap_distinct, build_flexible_distinct_validation, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen, load_bounded_publisher_ranking,
+    load_bounded_relay_distribution_for_advance, load_bounded_semantic_facts,
+    load_bounded_serving_facts, plan_catalog_delta_for_query_version, publish_incremental,
     publish_incremental_with_all_bounded_products,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
     publish_incremental_with_all_recurring_products_and_publisher,
-    publish_incremental_with_all_recurring_products_and_relay, publish_incremental_with_identity,
+    publish_incremental_with_all_recurring_products_and_relay,
+    publish_incremental_with_all_recurring_products_and_serving, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, resolve_delta_locations, resolve_snapshot,
 };
 use postgres::{Config as PostgresConfig, NoTls};
@@ -247,6 +250,27 @@ struct Args {
     /// Free publisher-ledger filesystem bytes left untouched.
     #[arg(long, default_value_t = 107_374_182_400_u64)]
     publisher_disk_reserve_bytes: u64,
+    /// Current immutable serving-facts evidence; enables recurring Slice 9.5.
+    #[arg(long)]
+    serving_baseline_evidence: Option<PathBuf>,
+    /// Immutable serving-facts successor evidence output.
+    #[arg(long)]
+    serving_evidence: Option<PathBuf>,
+    /// Dedicated immutable serving-facts successor workspace.
+    #[arg(long)]
+    serving_work_root: Option<PathBuf>,
+    /// Maximum compressed delta bytes in one serving-facts scan.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    serving_batch_bytes: u64,
+    /// Maximum physical delta rows in one serving-facts scan.
+    #[arg(long, default_value_t = 5_000_000)]
+    serving_batch_rows: u64,
+    /// Maximum serving-facts runs opened by one merge.
+    #[arg(long, default_value_t = 16)]
+    serving_merge_fan_in: usize,
+    /// Free serving-facts filesystem bytes left untouched.
+    #[arg(long, default_value_t = 107_374_182_400)]
+    serving_disk_reserve_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -264,6 +288,7 @@ struct Output<'a> {
     semantic: Option<SemanticOutput<'a>>,
     relay: Option<RelayOutput<'a>>,
     publisher: Option<PublisherOutput<'a>>,
+    serving: Option<ServingOutput<'a>>,
     publication: Option<PublicationOutput>,
 }
 
@@ -347,6 +372,17 @@ struct PublisherOutput<'a> {
 }
 
 #[derive(Serialize)]
+struct ServingOutput<'a> {
+    evidence_sha256: &'a str,
+    baseline_evidence_sha256: &'a str,
+    logical_events: u64,
+    delta_object_count: u64,
+    hourly_rows: u64,
+    kind_rows: u64,
+    complete_through_epoch: u64,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum PublicationOutput {
     Published {
@@ -394,6 +430,7 @@ fn run() -> Result<()> {
     let semantic_enabled = args.semantic_baseline_evidence.is_some();
     let relay_enabled = args.relay_baseline_evidence.is_some();
     let publisher_enabled = args.publisher_baseline_evidence.is_some();
+    let serving_enabled = args.serving_baseline_evidence.is_some();
     require_complete_product_args(
         "identity",
         identity_enabled,
@@ -433,6 +470,11 @@ fn run() -> Result<()> {
         args.publisher_artifact.is_some(),
         args.publisher_evidence.is_some(),
     ])?;
+    require_complete_serving_args([
+        serving_enabled,
+        args.serving_evidence.is_some(),
+        args.serving_work_root.is_some(),
+    ])?;
     if activity_enabled && !identity_enabled {
         bail!("fixed-activity advancement requires identity advancement in the same run");
     }
@@ -452,6 +494,9 @@ fn run() -> Result<()> {
     }
     if publisher_enabled && !relay_enabled {
         bail!("publisher advancement requires the complete Slice 8 lane in the same run");
+    }
+    if serving_enabled && !publisher_enabled {
+        bail!("serving-facts advancement requires the complete Slice 9 lane in the same run");
     }
     let desired_query_version = if cohort_enabled {
         COHORT_RETENTION_QUERY_VERSION
@@ -783,12 +828,106 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let serving = if let (
+        Some(baseline_evidence),
+        Some(evidence_path),
+        Some(work_root),
+        Some(activity_evidence),
+    ) = (
+        args.serving_baseline_evidence.as_ref(),
+        args.serving_evidence.as_ref(),
+        args.serving_work_root.as_ref(),
+        args.activity_evidence.as_ref(),
+    ) {
+        let baseline = load_bounded_serving_facts(baseline_evidence)
+            .context("load baseline serving-facts evidence")?;
+        Some(
+            advance_bounded_serving_facts(
+                evidence_path,
+                &baseline,
+                target.clone(),
+                &persisted_plan,
+                &delta_locations,
+                build.config.clone(),
+                ServingFactsConfig {
+                    work_root: work_root.clone(),
+                    batch_limits: BatchLimits {
+                        max_bytes: args.serving_batch_bytes,
+                        max_rows: args.serving_batch_rows,
+                    },
+                    merge_fan_in: args.serving_merge_fan_in,
+                    disk_reserve_bytes: args.serving_disk_reserve_bytes,
+                },
+                activity_evidence,
+            )
+            .context("advance bounded serving facts")?,
+        )
+    } else {
+        None
+    };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None
     } else {
         Some(
             match if let (
+                Some(identity),
+                Some(activity),
+                Some(cohort),
+                Some(flexible),
+                Some(validation_path),
+                Some(validation_sha256),
+                Some(semantic),
+                Some(zap_distinct),
+                Some(relay),
+                Some(publisher),
+                Some(serving),
+            ) = (
+                identity.as_ref(),
+                activity.as_ref(),
+                cohort.as_ref(),
+                flexible.as_ref(),
+                args.flexible_validation_evidence.as_deref(),
+                flexible_validation_sha256.as_deref(),
+                semantic.as_ref(),
+                zap_distinct.as_ref(),
+                relay.as_ref(),
+                publisher.as_ref(),
+                serving.as_ref(),
+            ) {
+                publish_incremental_with_all_recurring_products_and_serving(
+                    &mut client,
+                    &build,
+                    AllRecurringProductsWithServing {
+                        recurring: AllRecurringProductsWithPublisher {
+                            recurring: AllRecurringProductsWithRelay {
+                                recurring: AllRecurringProducts {
+                                    bounded: AllBoundedProducts {
+                                        identity,
+                                        activity,
+                                        cohort,
+                                    },
+                                    flexible: FlexibleDistinctPublication {
+                                        product: flexible,
+                                        validation_evidence_path: validation_path,
+                                        validation_evidence_sha256: validation_sha256,
+                                    },
+                                    semantic: SemanticPublication {
+                                        product: semantic,
+                                        zap_distinct,
+                                    },
+                                },
+                                relay,
+                            },
+                            publisher,
+                        },
+                        serving,
+                    },
+                    previous_run_id,
+                    started_at,
+                    completed_at,
+                )
+            } else if let (
                 Some(identity),
                 Some(activity),
                 Some(cohort),
@@ -1127,6 +1266,19 @@ fn run() -> Result<()> {
                 ranking_rows: publisher.evidence.ranking_artifact.row_count,
                 ranking_bytes: publisher.evidence.ranking_artifact.byte_size,
             }),
+            serving: serving.as_ref().map(|serving| ServingOutput {
+                evidence_sha256: &serving.evidence_sha256,
+                baseline_evidence_sha256: serving
+                    .evidence
+                    .baseline_evidence_sha256
+                    .as_deref()
+                    .expect("serving successor has baseline evidence"),
+                logical_events: serving.evidence.logical_events,
+                delta_object_count: serving.evidence.delta_object_count,
+                hourly_rows: serving.evidence.hourly_artifact.row_count,
+                kind_rows: serving.evidence.kind_artifact.row_count,
+                complete_through_epoch: serving.evidence.complete_through_epoch,
+            }),
             publication,
         })?
     );
@@ -1180,6 +1332,13 @@ fn require_complete_publisher_args(present: [bool; 5]) -> Result<()> {
     bail!(
         "publisher baseline evidence/state and successor state/artifact/evidence must be supplied together"
     )
+}
+
+fn require_complete_serving_args(present: [bool; 3]) -> Result<()> {
+    if present.into_iter().all(|value| value == present[0]) {
+        return Ok(());
+    }
+    bail!("serving baseline evidence, successor evidence, and work root must be supplied together")
 }
 
 fn validate_cohort_baseline(
@@ -1339,5 +1498,13 @@ mod tests {
         require_complete_publisher_args([true; 5]).expect("complete publisher lane is valid");
         assert!(require_complete_publisher_args([true, true, true, true, false]).is_err());
         assert!(require_complete_publisher_args([false, true, true, true, true]).is_err());
+    }
+
+    #[test]
+    fn serving_arguments_are_all_or_nothing() {
+        require_complete_serving_args([false; 3]).expect("disabled serving lane is valid");
+        require_complete_serving_args([true; 3]).expect("complete serving lane is valid");
+        assert!(require_complete_serving_args([true, true, false]).is_err());
+        assert!(require_complete_serving_args([false, true, true]).is_err());
     }
 }
