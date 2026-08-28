@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     AnalyticsBuild, BoundedCohortRetention, BoundedFixedActivity, BoundedFlexibleDistinct,
     BoundedPubkeyFirstSeen, BoundedPublisherRanking, BoundedRelayDistribution,
-    BoundedSemanticFacts, BoundedZapDistinct, COHORT_RETENTION_QUERY_VERSION, Error,
-    FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
+    BoundedSemanticFacts, BoundedServingFacts, BoundedZapDistinct, COHORT_RETENTION_QUERY_VERSION,
+    Error, FIXED_ACTIVITY_QUERY_VERSION, IDENTITY_QUERY_VERSION, QUERY_VERSION, Result,
     flexible_distinct_publish::{
         publish_flexible_distinct_leaves_in_transaction, validate_flexible_distinct_publication,
     },
@@ -28,6 +28,10 @@ use crate::{
     semantic_publish::{
         SemanticPublishOutcome, ValidatedSemanticPublication,
         publish_semantic_facts_in_transaction, validate_semantic_publication,
+    },
+    serving_publish::{
+        ServingFactsPublishOutcome, ValidatedServingFactsPublication,
+        publish_serving_facts_in_transaction, validate_serving_facts_publication,
     },
     zap_distinct_publish::{
         ValidatedZapDistinctPublication, ZapDistinctPublishOutcome,
@@ -46,6 +50,7 @@ struct PublicationProducts<'a> {
     semantic: Option<SemanticPublication<'a>>,
     relay: Option<&'a BoundedRelayDistribution>,
     publisher: Option<&'a BoundedPublisherRanking>,
+    serving: Option<&'a BoundedServingFacts>,
 }
 
 /// Hold the analytics publication lock for the lifetime of `client`.
@@ -135,6 +140,15 @@ pub struct AllRecurringProductsWithPublisher<'a> {
     pub publisher: &'a BoundedPublisherRanking,
 }
 
+/// Every validated bounded product through the Slice 9.5 serving gate.
+#[derive(Clone, Copy)]
+pub struct AllRecurringProductsWithServing<'a> {
+    /// Recurring products through Slice 9.
+    pub recurring: AllRecurringProductsWithPublisher<'a>,
+    /// Exact hourly and enriched all-time kind serving facts.
+    pub serving: &'a BoundedServingFacts,
+}
+
 #[derive(Serialize)]
 struct ValidationRecord {
     event_daily_sum: u64,
@@ -157,6 +171,7 @@ struct ValidationRecord {
     zap_distinct_evidence_sha256: Option<String>,
     relay_distribution_evidence_sha256: Option<String>,
     publisher_ranking_evidence_sha256: Option<String>,
+    serving_facts_evidence_sha256: Option<String>,
     result: &'static str,
 }
 
@@ -205,6 +220,7 @@ pub fn publish_with_identity(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -233,6 +249,7 @@ pub fn publish_with_identity_and_activity(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -260,6 +277,7 @@ pub fn publish_with_all_bounded_products(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -307,6 +325,7 @@ pub fn publish_incremental_with_identity(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -336,6 +355,7 @@ pub fn publish_incremental_with_identity_and_activity(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -364,6 +384,7 @@ pub fn publish_incremental_with_all_bounded_products(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -393,6 +414,7 @@ pub fn publish_incremental_with_all_bounded_products_and_flexible(
             semantic: None,
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -421,6 +443,7 @@ pub fn publish_incremental_with_all_bounded_products_flexible_and_semantic(
             semantic: Some(products.semantic),
             relay: None,
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -449,6 +472,7 @@ pub fn publish_incremental_with_all_recurring_products_and_relay(
             semantic: Some(products.recurring.semantic),
             relay: Some(products.relay),
             publisher: None,
+            serving: None,
         },
     )
 }
@@ -477,6 +501,36 @@ pub fn publish_incremental_with_all_recurring_products_and_publisher(
             semantic: Some(products.recurring.recurring.semantic),
             relay: Some(products.recurring.relay),
             publisher: Some(products.publisher),
+            serving: None,
+        },
+    )
+}
+
+/// Publish one incremental generation containing every product through Slice 9.5.
+pub fn publish_incremental_with_all_recurring_products_and_serving(
+    client: &mut Client,
+    build: &AnalyticsBuild,
+    products: AllRecurringProductsWithServing<'_>,
+    expected_previous_run_id: &str,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<PublishOutcome> {
+    publish_kind(
+        client,
+        build,
+        started_at,
+        completed_at,
+        "incremental",
+        Some(expected_previous_run_id),
+        PublicationProducts {
+            identity: Some(products.recurring.recurring.recurring.bounded.identity),
+            activity: Some(products.recurring.recurring.recurring.bounded.activity),
+            cohort: Some(products.recurring.recurring.recurring.bounded.cohort),
+            flexible: Some(products.recurring.recurring.recurring.flexible),
+            semantic: Some(products.recurring.recurring.recurring.semantic),
+            relay: Some(products.recurring.recurring.relay),
+            publisher: Some(products.recurring.publisher),
+            serving: Some(products.serving),
         },
     )
 }
@@ -497,6 +551,7 @@ fn publish_kind(
     let semantic = products.semantic;
     let relay = products.relay;
     let publisher = products.publisher;
+    let serving = products.serving;
     if let Some(identity) = identity {
         identity.validate_for_publication(
             &build.snapshot.catalog.snapshot_id,
@@ -609,6 +664,26 @@ fn publish_kind(
     } else {
         None
     };
+    let validated_serving = if let Some(serving) = serving {
+        let Some(activity) = activity else {
+            return Err(Error::Validation(
+                "serving-facts publication requires fixed activity".to_owned(),
+            ));
+        };
+        if publisher.is_none()
+            || serving.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
+            || serving.evidence.as_of_epoch != build.config.as_of_epoch
+            || !activity.matches_evidence_sha256(&serving.evidence.activity_evidence_sha256)
+            || serving.evidence.activity_artifact != activity.evidence.activity_artifact
+        {
+            return Err(Error::Validation(
+                "serving-facts evidence does not match its publication generation".to_owned(),
+            ));
+        }
+        Some(validate_serving_facts_publication(serving)?)
+    } else {
+        None
+    };
     client.batch_execute(SCHEMA_SQL)?;
     let run_id = run_id(build, identity, activity, cohort);
     let mut transaction = client.transaction()?;
@@ -652,6 +727,12 @@ fn publish_kind(
                 &run_id,
                 publisher,
                 validated_publisher.as_ref(),
+            )?;
+            publish_serving_product(
+                &mut transaction,
+                &run_id,
+                serving,
+                validated_serving.as_ref(),
             )?;
             transaction.commit()?;
             return Ok(PublishOutcome::AlreadyCurrent { run_id });
@@ -710,6 +791,7 @@ fn publish_kind(
             .map(|publication| publication.zap_distinct.evidence_sha256.clone()),
         relay_distribution_evidence_sha256: relay.map(|product| product.evidence_sha256.clone()),
         publisher_ranking_evidence_sha256: publisher.map(|product| product.evidence_sha256.clone()),
+        serving_facts_evidence_sha256: serving.map(|product| product.evidence_sha256.clone()),
         result: "passed",
     })
     .expect("serializing a fixed validation record cannot fail");
@@ -843,6 +925,12 @@ fn publish_kind(
         publisher,
         validated_publisher.as_ref(),
     )?;
+    publish_serving_product(
+        &mut transaction,
+        &run_id,
+        serving,
+        validated_serving.as_ref(),
+    )?;
 
     transaction.execute(
         "
@@ -896,6 +984,26 @@ fn publish_publisher_product(
     match publish_publisher_ranking_in_transaction(transaction, run_id, publisher, validated)? {
         PublisherRankingPublishOutcome::Published { .. }
         | PublisherRankingPublishOutcome::AlreadyPublished { .. } => Ok(()),
+    }
+}
+
+fn publish_serving_product(
+    transaction: &mut impl GenericClient,
+    run_id: &str,
+    serving: Option<&BoundedServingFacts>,
+    validated: Option<&ValidatedServingFactsPublication>,
+) -> Result<()> {
+    let Some(serving) = serving else {
+        return Ok(());
+    };
+    let Some(validated) = validated else {
+        return Err(Error::Validation(
+            "serving publication is missing pre-transaction validation".to_owned(),
+        ));
+    };
+    match publish_serving_facts_in_transaction(transaction, run_id, serving, validated)? {
+        ServingFactsPublishOutcome::Published { .. }
+        | ServingFactsPublishOutcome::AlreadyPublished { .. } => Ok(()),
     }
 }
 

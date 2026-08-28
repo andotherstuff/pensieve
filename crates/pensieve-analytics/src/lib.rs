@@ -30,6 +30,7 @@ mod semantic_build;
 mod semantic_facts;
 mod semantic_publish;
 mod serving_facts;
+mod serving_publish;
 mod zap_distinct;
 mod zap_distinct_publish;
 
@@ -100,13 +101,14 @@ pub use pubkey_first_seen::{
 };
 pub use publish::{
     AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
-    AllRecurringProductsWithRelay, FlexibleDistinctPublication, PublishOutcome,
-    SemanticPublication, acquire_publication_lock, publish, publish_incremental,
+    AllRecurringProductsWithRelay, AllRecurringProductsWithServing, FlexibleDistinctPublication,
+    PublishOutcome, SemanticPublication, acquire_publication_lock, publish, publish_incremental,
     publish_incremental_with_all_bounded_products,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
     publish_incremental_with_all_recurring_products_and_publisher,
-    publish_incremental_with_all_recurring_products_and_relay, publish_incremental_with_identity,
+    publish_incremental_with_all_recurring_products_and_relay,
+    publish_incremental_with_all_recurring_products_and_serving, publish_incremental_with_identity,
     publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity,
 };
@@ -159,6 +161,10 @@ pub use serving_facts::{
     ServingFactsMemoryEvidence, ServingHourlyRow, ServingKindRow, advance_bounded_serving_facts,
     build_bounded_serving_facts, load_bounded_serving_facts, visit_serving_hourly_rows,
     visit_serving_kind_rows,
+};
+pub use serving_publish::{
+    ServingFactsPublishOutcome, publish_serving_facts, query_published_serving_hourly,
+    query_published_serving_kind,
 };
 pub use zap_distinct::{
     BoundedZapDistinct, ZAP_DISTINCT_VERSION, ZAP_IDENTITY_BYTES, ZapDistinctConfig,

@@ -4,16 +4,17 @@ use std::path::{Path, PathBuf};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use pensieve_analytics::{
     AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
-    AllRecurringProductsWithRelay, AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan,
-    EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctPublication,
-    FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
-    PublisherBenchmarkConfig, PublisherRankingConfig, RelayDistributionConfig, SemanticFactsConfig,
-    SemanticPublication, ServingFactsConfig, ZapDistinctConfig, advance_bounded_fixed_activity,
-    advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
-    advance_bounded_publisher_ranking, advance_bounded_relay_distribution,
-    advance_bounded_semantic_facts, advance_bounded_serving_facts, apply_incremental,
-    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
-    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    AllRecurringProductsWithRelay, AllRecurringProductsWithServing, AnalyticsBuild, BatchLimits,
+    BuildConfig, CatalogDeltaPlan, EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig,
+    FlexibleDistinctPublication, FlexibleDistinctWindow, ObjectLocation, PlannedRunKind,
+    PubkeyFirstSeenConfig, PublishOutcome, PublisherBenchmarkConfig, PublisherRankingConfig,
+    RelayDistributionConfig, SemanticFactsConfig, SemanticPublication, ServingFactsConfig,
+    ZapDistinctConfig, advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    advance_bounded_pubkey_first_seen, advance_bounded_publisher_ranking,
+    advance_bounded_relay_distribution, advance_bounded_semantic_facts,
+    advance_bounded_serving_facts, apply_incremental, benchmark_publishers,
+    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
+    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_publisher_ranking, build_bounded_relay_distribution,
     build_bounded_semantic_facts, build_bounded_serving_facts, build_bounded_zap_distinct,
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
@@ -25,7 +26,8 @@ use pensieve_analytics::{
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
     publish_incremental_with_all_recurring_products_and_publisher,
-    publish_incremental_with_all_recurring_products_and_relay, publish_with_all_bounded_products,
+    publish_incremental_with_all_recurring_products_and_relay,
+    publish_incremental_with_all_recurring_products_and_serving, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
     resolve_snapshot, visit_publisher_ranking_rows, visit_serving_hourly_rows,
     visit_serving_kind_rows,
@@ -2830,6 +2832,119 @@ fn slice_a_publication_is_atomic_and_idempotent() {
                 &[],
             )
             .expect("count committed publisher products")
+            .get::<_, i64>(0),
+        1
+    );
+    let event_root = fixture._directory.path().join("publication-event-facts");
+    let event_evidence_path = event_root.join("evidence.json");
+    build_bounded_event_facts(
+        fixture
+            ._directory
+            .path()
+            .join("publication-event-facts.duckdb"),
+        &event_evidence_path,
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        EventFactsConfig {
+            work_root: event_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build serving event anchor");
+    let serving_root = fixture._directory.path().join("publication-serving");
+    let serving = build_bounded_serving_facts(
+        serving_root.join("evidence.json"),
+        fixture.build.snapshot.clone(),
+        fixture.build.config.clone(),
+        ServingFactsConfig {
+            work_root: serving_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+        event_evidence_path,
+        fixture
+            ._directory
+            .path()
+            .join("publication-activity/evidence.json"),
+    )
+    .expect("build serving publication");
+    client
+        .batch_execute(
+            "
+            CREATE OR REPLACE FUNCTION pensieve_analytics.reject_serving_product_test()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected serving product publication failure';
+            END;
+            $$;
+            CREATE TRIGGER reject_serving_product_test
+            BEFORE INSERT ON pensieve_analytics.serving_hourly_counts
+            FOR EACH ROW EXECUTE FUNCTION pensieve_analytics.reject_serving_product_test();
+            ",
+        )
+        .expect("install serving failure injection");
+    let recurring_with_serving = AllRecurringProductsWithServing {
+        recurring: recurring_with_publisher,
+        serving: &serving,
+    };
+    publish_incremental_with_all_recurring_products_and_serving(
+        &mut client,
+        &fixture.build,
+        recurring_with_serving,
+        &cohort_run_id,
+        started_at,
+        completed_at,
+    )
+    .expect_err("injected serving failure must roll back the complete generation");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.serving_fact_products",
+                &[],
+            )
+            .expect("count rolled-back serving products")
+            .get::<_, i64>(0),
+        0
+    );
+    client
+        .batch_execute(
+            "
+            DROP TRIGGER reject_serving_product_test
+                ON pensieve_analytics.serving_hourly_counts;
+            DROP FUNCTION pensieve_analytics.reject_serving_product_test();
+            ",
+        )
+        .expect("remove serving failure injection");
+    assert_eq!(
+        publish_incremental_with_all_recurring_products_and_serving(
+            &mut client,
+            &fixture.build,
+            recurring_with_serving,
+            &cohort_run_id,
+            started_at,
+            completed_at,
+        )
+        .expect("atomically attach serving product to current generation"),
+        PublishOutcome::AlreadyCurrent {
+            run_id: cohort_run_id.clone()
+        }
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pensieve_analytics.serving_fact_products",
+                &[],
+            )
+            .expect("count committed serving products")
             .get::<_, i64>(0),
         1
     );

@@ -145,6 +145,25 @@ pub struct BoundedServingFacts {
     pub evidence_sha256: String,
 }
 
+impl BoundedServingFacts {
+    /// Revalidate this immutable product and require the exact publication identity.
+    pub fn validate_for_publication(
+        &self,
+        snapshot_id: &str,
+        as_of_epoch: u64,
+        activity_evidence_sha256: &str,
+    ) -> Result<()> {
+        validate_bounded_serving_facts(self)?;
+        if self.evidence.snapshot_id != snapshot_id
+            || self.evidence.as_of_epoch != as_of_epoch
+            || self.evidence.activity_evidence_sha256 != activity_evidence_sha256
+        {
+            return invalid("serving-facts publication identity mismatch");
+        }
+        Ok(())
+    }
+}
+
 /// One exact sparse hourly event-count row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServingHourlyRow {
