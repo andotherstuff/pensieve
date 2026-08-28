@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use pensieve_analytics::{
-    COHORT_RETENTION_QUERY_VERSION, FlexibleDistinctPublishOutcome, load_bounded_flexible_distinct,
+    COHORT_RETENTION_QUERY_VERSION, FlexibleDistinctPublishOutcome,
+    FlexibleDistinctValidationEvidence, load_bounded_flexible_distinct,
     publish_flexible_distinct_leaves,
 };
 use postgres::{Config as PostgresConfig, NoTls};
@@ -73,11 +74,16 @@ fn run() -> Result<()> {
     if actual_validation_sha != args.validation_evidence_sha256 {
         bail!("tolerance evidence SHA-256 differs from the authorized gate");
     }
+    let validation: FlexibleDistinctValidationEvidence = serde_json::from_slice(
+        &std::fs::read(&args.validation_evidence).context("read tolerance evidence")?,
+    )
+    .context("decode tolerance evidence")?;
 
     let mut client = connect_postgres(&args).context("connect to Postgres for publication")?;
     let current = client
         .query_one(
-            "SELECT run_id, snapshot_id, query_version, as_of_epoch
+            "SELECT run_id, snapshot_id, query_version, as_of_epoch,
+                    validation ->> 'fixed_activity_evidence_sha256'
                FROM pensieve_analytics.current_run_metadata",
             &[],
         )
@@ -86,11 +92,14 @@ fn run() -> Result<()> {
     let current_snapshot: String = current.get(1);
     let current_query_version: String = current.get(2);
     let current_as_of: i64 = current.get(3);
+    let current_activity_evidence_sha256: Option<String> = current.get(4);
     if current_run_id != args.baseline_run_id
         || current_snapshot != product.evidence.snapshot_id
         || current_query_version != COHORT_RETENTION_QUERY_VERSION
         || current_as_of
             != i64::try_from(product.evidence.as_of_epoch).context("as-of exceeds i64")?
+        || current_activity_evidence_sha256.as_deref()
+            != Some(validation.activity_evidence_sha256.as_str())
     {
         bail!("current Postgres run is not the exact corrected B3 Slice 6 baseline");
     }

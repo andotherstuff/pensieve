@@ -1360,12 +1360,7 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn activity_evidence_matches(activity: &BoundedFixedActivity, expected_sha256: &str) -> bool {
-    activity.evidence_sha256 == expected_sha256
-        || activity
-            .evidence
-            .semantic_upgrade_evidence_sha256
-            .as_deref()
-            == Some(expected_sha256)
+    activity.matches_evidence_sha256(expected_sha256)
 }
 
 #[cfg(test)]

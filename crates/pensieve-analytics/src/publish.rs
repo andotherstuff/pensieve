@@ -537,9 +537,11 @@ fn publish_kind(
                 "flexible-distinct publication requires fixed activity".to_owned(),
             ));
         };
+        let activity_evidence_matches =
+            activity.matches_evidence_sha256(&flexible.product.evidence.activity_evidence_sha256);
         if flexible.product.evidence.snapshot_id != build.snapshot.catalog.snapshot_id
             || flexible.product.evidence.as_of_epoch != build.config.as_of_epoch
-            || flexible.product.evidence.activity_evidence_sha256 != activity.evidence_sha256
+            || !activity_evidence_matches
             || flexible.product.evidence.activity_artifact != activity.evidence.activity_artifact
         {
             return Err(Error::Validation(

@@ -108,13 +108,8 @@ pub fn build_flexible_distinct_validation(
         .collect::<Vec<_>>();
     let (flexible, estimates) =
         load_and_estimate_flexible_distinct_windows(flexible_path, &windows)?;
-    let activity_evidence_matches = activity.evidence_sha256
-        == flexible.evidence.activity_evidence_sha256
-        || activity
-            .evidence
-            .semantic_upgrade_evidence_sha256
-            .as_deref()
-            == Some(flexible.evidence.activity_evidence_sha256.as_str());
+    let activity_evidence_matches =
+        activity.matches_evidence_sha256(&flexible.evidence.activity_evidence_sha256);
     if activity.evidence.snapshot_id != flexible.evidence.snapshot_id
         || activity.evidence.as_of_epoch != flexible.evidence.as_of_epoch
         || !activity_evidence_matches

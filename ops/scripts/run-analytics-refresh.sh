@@ -39,6 +39,14 @@ zap_distinct_root="${PENSIEVE_ANALYTICS_ZAP_DISTINCT_ROOT:-/archive/analytics/za
 relay_enabled="${PENSIEVE_ANALYTICS_RELAY_ENABLED:-0}"
 relay_root="${PENSIEVE_ANALYTICS_RELAY_ROOT:-/archive/analytics/relay-distribution}"
 relay_state_database="${PENSIEVE_ANALYTICS_RELAY_STATE_DATABASE:-$relay_root/state.sqlite}"
+publisher_enabled="${PENSIEVE_ANALYTICS_PUBLISHER_ENABLED:-0}"
+publisher_root="${PENSIEVE_ANALYTICS_PUBLISHER_ROOT:-/archive/analytics/publisher-ranking}"
+publisher_windows_days="${PENSIEVE_ANALYTICS_PUBLISHER_WINDOWS_DAYS:-1,7,30,90,365}"
+publisher_top_limit="${PENSIEVE_ANALYTICS_PUBLISHER_TOP_LIMIT:-1000}"
+publisher_batch_size="${PENSIEVE_ANALYTICS_PUBLISHER_BATCH_SIZE:-10000}"
+publisher_max_state_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_MAX_STATE_BYTES:-536870912000}"
+publisher_sqlite_cache_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_SQLITE_CACHE_BYTES:-536870912}"
+publisher_disk_reserve_bytes="${PENSIEVE_ANALYTICS_PUBLISHER_DISK_RESERVE_BYTES:-107374182400}"
 
 s3_bucket="${PENSIEVE_PARQUET_SHADOW_S3_BUCKET:-${S3_BUCKET:-}}"
 s3_endpoint_url="${PENSIEVE_PARQUET_SHADOW_S3_ENDPOINT_URL:-${S3_ENDPOINT_URL:-}}"
@@ -112,6 +120,10 @@ if [ "$relay_enabled" != "0" ] && [ "$relay_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_RELAY_ENABLED must be 0 or 1" >&2
     exit 2
 fi
+if [ "$publisher_enabled" != "0" ] && [ "$publisher_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_PUBLISHER_ENABLED must be 0 or 1" >&2
+    exit 2
+fi
 if [ "$activity_enabled" = "1" ] && [ "$identity_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_ACTIVITY_ENABLED requires PENSIEVE_ANALYTICS_IDENTITY_ENABLED=1" >&2
     exit 2
@@ -130,6 +142,10 @@ if [ "$semantic_enabled" = "1" ] && [ "$flexible_enabled" != "1" ]; then
 fi
 if [ "$relay_enabled" = "1" ] && [ "$semantic_enabled" != "1" ]; then
     echo "PENSIEVE_ANALYTICS_RELAY_ENABLED requires PENSIEVE_ANALYTICS_SEMANTIC_ENABLED=1" >&2
+    exit 2
+fi
+if [ "$publisher_enabled" = "1" ] && [ "$relay_enabled" != "1" ]; then
+    echo "PENSIEVE_ANALYTICS_PUBLISHER_ENABLED requires PENSIEVE_ANALYTICS_RELAY_ENABLED=1" >&2
     exit 2
 fi
 
@@ -244,6 +260,26 @@ if [ "$relay_enabled" = "1" ]; then
         exit 2
     fi
     install -d -m 0750 "$relay_root"
+fi
+publisher_baseline_evidence=""
+publisher_baseline_state_database=""
+if [ "$publisher_enabled" = "1" ]; then
+    publisher_baseline_evidence="$current_generation/publisher-ranking-evidence.json"
+    if [ ! -s "$publisher_baseline_evidence" ]; then
+        echo "Current publisher-ranking evidence is missing: $publisher_baseline_evidence" >&2
+        exit 2
+    fi
+    current_snapshot_hex="$(basename "$current_generation")"
+    if ! [[ "$current_snapshot_hex" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Current generation name is not a snapshot digest: $current_snapshot_hex" >&2
+        exit 2
+    fi
+    publisher_baseline_state_database="$publisher_root/$current_snapshot_hex/state.sqlite"
+    if [ ! -s "$publisher_baseline_state_database" ]; then
+        echo "Current publisher-ranking state is missing: $publisher_baseline_state_database" >&2
+        exit 2
+    fi
+    install -d -m 0750 "$publisher_root"
 fi
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -388,6 +424,11 @@ promote_generation() {
             cmp "$run_dir/relay-distribution-evidence.json" \
                 "$generation/relay-distribution-evidence.json"
         fi
+        if [ "$publisher_enabled" = "1" ] \
+            && [ -s "$run_dir/publisher-ranking-evidence.json" ]; then
+            cmp "$run_dir/publisher-ranking-evidence.json" \
+                "$generation/publisher-ranking-evidence.json"
+        fi
     else
         partial_generation="$generations_root/.$snapshot_hex.partial.$$"
         mkdir -m 0750 "$partial_generation"
@@ -427,6 +468,10 @@ promote_generation() {
         if [ "$relay_enabled" = "1" ]; then
             install -m 0640 "$run_dir/relay-distribution-evidence.json" \
                 "$partial_generation/relay-distribution-evidence.json"
+        fi
+        if [ "$publisher_enabled" = "1" ]; then
+            install -m 0640 "$run_dir/publisher-ranking-evidence.json" \
+                "$partial_generation/publisher-ranking-evidence.json"
         fi
         printf '%s\n' "$snapshot_id" >"$partial_generation/APPLIED"
         mapfile -t generation_files < <(
@@ -584,6 +629,23 @@ case "$run_kind" in
                 --relay-evidence "$run_dir/relay-distribution-evidence.json"
             )
         fi
+        if [ "$publisher_enabled" = "1" ]; then
+            publisher_work_root="$publisher_root/$snapshot_hex"
+            install -d -m 0750 "$publisher_work_root"
+            incremental_args+=(
+                --publisher-baseline-evidence "$publisher_baseline_evidence"
+                --publisher-baseline-state-database "$publisher_baseline_state_database"
+                --publisher-state-database "$publisher_work_root/state.sqlite"
+                --publisher-artifact "$publisher_work_root/ranking.bin"
+                --publisher-evidence "$run_dir/publisher-ranking-evidence.json"
+                --publisher-windows-days "$publisher_windows_days"
+                --publisher-top-limit "$publisher_top_limit"
+                --publisher-batch-size "$publisher_batch_size"
+                --publisher-max-state-bytes "$publisher_max_state_bytes"
+                --publisher-sqlite-cache-bytes "$publisher_sqlite_cache_bytes"
+                --publisher-disk-reserve-bytes "$publisher_disk_reserve_bytes"
+            )
+        fi
         "$incremental_bin" "${incremental_args[@]}" >"$run_dir/apply.json.new"
         mv "$run_dir/apply.json.new" "$run_dir/apply.json"
         jq -e \
@@ -657,6 +719,10 @@ fi
 if [ "$relay_enabled" = "1" ] \
     && [ -s "$run_dir/relay-distribution-evidence.json" ]; then
     evidence_files+=("$run_dir/relay-distribution-evidence.json")
+fi
+if [ "$publisher_enabled" = "1" ] \
+    && [ -s "$run_dir/publisher-ranking-evidence.json" ]; then
+    evidence_files+=("$run_dir/publisher-ranking-evidence.json")
 fi
 sha256sum "${evidence_files[@]}" >"$run_dir/SHA256SUMS"
 sync -f "$run_dir/SHA256SUMS"

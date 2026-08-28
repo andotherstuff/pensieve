@@ -158,6 +158,12 @@ pub struct BoundedFixedActivity {
 }
 
 impl BoundedFixedActivity {
+    /// Whether `expected` names this evidence or its validated semantic parent.
+    pub fn matches_evidence_sha256(&self, expected: &str) -> bool {
+        self.evidence_sha256 == expected
+            || self.evidence.semantic_upgrade_evidence_sha256.as_deref() == Some(expected)
+    }
+
     /// Revalidate immutable state and all compact serving rows.
     pub fn validate_for_publication(&self, snapshot_id: &str, as_of_epoch: u64) -> Result<()> {
         let evidence = &self.evidence;
@@ -1427,6 +1433,9 @@ mod tests {
                 .as_deref(),
             Some(legacy_sha256.as_str())
         );
+        assert!(upgraded.matches_evidence_sha256(&legacy_sha256));
+        assert!(upgraded.matches_evidence_sha256(&upgraded.evidence_sha256));
+        assert!(!upgraded.matches_evidence_sha256(&"0".repeat(64)));
         let corrected = upgraded
             .evidence
             .distinct_pubkeys
