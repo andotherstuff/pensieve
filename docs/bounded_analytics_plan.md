@@ -733,6 +733,8 @@ Implementation status:
   identity, exact delta-object accounting, and future-candidate maturation.
 - [x] Recurring generation integration with pre-transaction validation and
   all-or-nothing publication alongside B3, Slice 6, and Slice 7.
+- [x] Immutable bounded sparse/median/dense winner and complete serving-row
+  comparison harness with explicit legacy-semantic classifications.
 - [ ] Independent production winner/count comparison canary.
 
 ### Slice 9 — publisher benchmark and contract
