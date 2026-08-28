@@ -8,25 +8,27 @@ use pensieve_analytics::{
     EventFactsConfig, FixedActivityConfig, FlexibleDistinctConfig, FlexibleDistinctPublication,
     FlexibleDistinctWindow, ObjectLocation, PlannedRunKind, PubkeyFirstSeenConfig, PublishOutcome,
     PublisherBenchmarkConfig, PublisherRankingConfig, RelayDistributionConfig, SemanticFactsConfig,
-    SemanticPublication, ZapDistinctConfig, advance_bounded_fixed_activity,
+    SemanticPublication, ServingFactsConfig, ZapDistinctConfig, advance_bounded_fixed_activity,
     advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
     advance_bounded_publisher_ranking, advance_bounded_relay_distribution,
     advance_bounded_semantic_facts, apply_incremental, benchmark_publishers,
     build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
     build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_publisher_ranking, build_bounded_relay_distribution,
-    build_bounded_semantic_facts, build_bounded_zap_distinct, build_flexible_distinct_validation,
-    estimate_flexible_distinct_window, estimate_flexible_distinct_windows,
-    load_bounded_fixed_activity, load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
+    build_bounded_semantic_facts, build_bounded_serving_facts, build_bounded_zap_distinct,
+    build_flexible_distinct_validation, estimate_flexible_distinct_window,
+    estimate_flexible_distinct_windows, load_bounded_fixed_activity,
+    load_bounded_flexible_distinct, load_bounded_pubkey_first_seen,
     load_bounded_relay_distribution, load_bounded_relay_distribution_for_advance,
-    load_bounded_semantic_facts, load_bounded_zap_distinct, plan_catalog_delta_for_query_version,
-    plan_catalog_delta_from_run, publish,
+    load_bounded_semantic_facts, load_bounded_serving_facts, load_bounded_zap_distinct,
+    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run, publish,
     publish_incremental_with_all_bounded_products_and_flexible,
     publish_incremental_with_all_bounded_products_flexible_and_semantic,
     publish_incremental_with_all_recurring_products_and_publisher,
     publish_incremental_with_all_recurring_products_and_relay, publish_with_all_bounded_products,
     publish_with_identity, publish_with_identity_and_activity, resolve_delta_locations,
-    resolve_snapshot, visit_publisher_ranking_rows,
+    resolve_snapshot, visit_publisher_ranking_rows, visit_serving_hourly_rows,
+    visit_serving_kind_rows,
 };
 use pensieve_lake::{
     ActiveRawFragment, Inventory, ObjectKind, ObjectRecord, ObjectState, WorkState,
@@ -779,6 +781,125 @@ fn bounded_event_facts_are_byte_identical_to_slice_a_and_resume_exactly() {
             .expect("resumed metric bytes"),
         reference_bytes
     );
+}
+
+#[test]
+fn bounded_serving_facts_join_exact_sources_and_resume() {
+    let fixture = fixture();
+    let build = BuildConfig {
+        as_of_epoch: AS_OF,
+        code_version: "serving-test".to_owned(),
+        s3_region: "test".to_owned(),
+        s3_force_path_style: false,
+        memory_limit: "256MB".to_owned(),
+        threads: 1,
+    };
+    let event_root = fixture._directory.path().join("serving-event-facts");
+    let event_evidence = event_root.join("evidence.json");
+    build_bounded_event_facts(
+        fixture._directory.path().join("serving-event.duckdb"),
+        &event_evidence,
+        resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+            .expect("resolve event snapshot"),
+        build.clone(),
+        EventFactsConfig {
+            work_root: event_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build event facts");
+    let activity_root = fixture._directory.path().join("serving-activity");
+    let activity_evidence = activity_root.join("evidence.json");
+    build_bounded_fixed_activity(
+        &activity_evidence,
+        resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+            .expect("resolve activity snapshot"),
+        build.clone(),
+        FixedActivityConfig {
+            work_root: activity_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 4,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build activity facts");
+
+    let serving_root = fixture._directory.path().join("serving-facts");
+    let serving_evidence = serving_root.join("evidence.json");
+    let config = ServingFactsConfig {
+        work_root: serving_root,
+        batch_limits: BatchLimits {
+            max_bytes: u64::MAX,
+            max_rows: 4,
+        },
+        merge_fan_in: 2,
+        disk_reserve_bytes: 0,
+    };
+    let completed = build_bounded_serving_facts(
+        &serving_evidence,
+        resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+            .expect("resolve serving snapshot"),
+        build.clone(),
+        config.clone(),
+        &event_evidence,
+        &activity_evidence,
+    )
+    .expect("build serving facts");
+    assert_eq!(completed.evidence.physical_rows, 7);
+    assert_eq!(completed.evidence.logical_events, 6);
+    assert_eq!(completed.evidence.duplicate_rows, 1);
+    assert_eq!(completed.evidence.eligible_kind_events, 3);
+    assert_eq!(completed.evidence.eligible_content_bytes, 20);
+    assert_eq!(completed.evidence.complete_hour_events, 2);
+    let mut hourly = Vec::new();
+    visit_serving_hourly_rows(&completed, |row| {
+        hourly.push(row);
+        Ok(())
+    })
+    .expect("visit hourly rows");
+    assert_eq!(hourly.len(), 4);
+    assert_eq!(
+        hourly
+            .iter()
+            .filter(|row| row.kind.is_none())
+            .map(|row| row.event_count)
+            .sum::<u64>(),
+        2
+    );
+    let mut kinds = Vec::new();
+    visit_serving_kind_rows(&completed, |row| {
+        kinds.push(row);
+        Ok(())
+    })
+    .expect("visit kind rows");
+    assert_eq!(kinds.len(), 2);
+    assert_eq!(kinds.iter().map(|row| row.event_count).sum::<u64>(), 3);
+    assert_eq!(kinds.iter().map(|row| row.content_bytes).sum::<u64>(), 20);
+    let evidence_sha = completed.evidence_sha256.clone();
+    drop(completed);
+
+    let loaded = load_bounded_serving_facts(&serving_evidence).expect("reload serving facts");
+    assert_eq!(loaded.evidence_sha256, evidence_sha);
+    drop(loaded);
+    let retried = build_bounded_serving_facts(
+        &serving_evidence,
+        resolve_snapshot(&fixture.catalog_path, Some(&fixture.lake_root))
+            .expect("resolve retry snapshot"),
+        build,
+        config,
+        &event_evidence,
+        &activity_evidence,
+    )
+    .expect("resume serving facts");
+    assert_eq!(retried.evidence_sha256, evidence_sha);
 }
 
 #[test]

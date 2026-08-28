@@ -209,6 +209,52 @@ pub fn load_bounded_fixed_activity(path: impl AsRef<Path>) -> Result<BoundedFixe
     Ok(completed)
 }
 
+/// Derive exact all-time eligible distinct-pubkey counts for every kind.
+///
+/// The activity artifact is sorted by pubkey, so this retains only the current
+/// pubkey's fixed-domain kind set plus one 65,536-entry counter vector.
+pub fn exact_kind_unique_pubkeys(product: &BoundedFixedActivity) -> Result<Vec<u64>> {
+    let evidence = &product.evidence;
+    exact_kind_unique_pubkeys_from_artifact(
+        Path::new(&evidence.activity_artifact.path),
+        evidence.activity_artifact.row_count,
+        evidence.as_of_epoch,
+    )
+}
+
+pub(crate) fn exact_kind_unique_pubkeys_from_artifact(
+    path: &Path,
+    expected_rows: u64,
+    as_of_epoch: u64,
+) -> Result<Vec<u64>> {
+    let mut reader = ActivityReader::open(path)?;
+    let mut counts = vec![0_u64; 65_536];
+    let mut current_pubkey = None;
+    let mut kinds = BTreeSet::new();
+    let mut rows = 0_u64;
+    while let Some(record) = reader.next()? {
+        rows = checked_add(rows, 1, "kind-unique activity rows")?;
+        if u64::from(record.created_at) > as_of_epoch {
+            continue;
+        }
+        if current_pubkey != Some(record.pubkey) {
+            current_pubkey = Some(record.pubkey);
+            kinds.clear();
+        }
+        if kinds.insert(record.kind) {
+            let count = &mut counts[usize::from(record.kind)];
+            *count = checked_add(*count, 1, "all-time kind distinct pubkeys")?;
+        }
+    }
+    if rows != expected_rows {
+        return Err(BoundedExecutionError::Invalid(
+            "kind-unique activity scan differs from artifact row count".to_owned(),
+        )
+        .into());
+    }
+    Ok(counts)
+}
+
 /// Re-finalize a fully validated v2 artifact under corrected v3 daily-kind semantics.
 pub fn upgrade_bounded_fixed_activity_v2(
     output_path: impl AsRef<Path>,
@@ -1443,6 +1489,23 @@ mod tests {
             .find(|row| row.grain == "day" && row.kind == Some(1))
             .expect("corrected daily kind");
         assert_eq!(corrected.unique_pubkeys, 1);
+    }
+
+    #[test]
+    fn exact_kind_unique_counts_each_pubkey_once_per_kind() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("activity.run");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&activity_record([1; 32], 10, 7, [1; 32]));
+        bytes.extend_from_slice(&activity_record([1; 32], 11, 7, [2; 32]));
+        bytes.extend_from_slice(&activity_record([1; 32], 12, 8, [3; 32]));
+        bytes.extend_from_slice(&activity_record([2; 32], 13, 7, [4; 32]));
+        fs::write(&path, bytes).expect("write activity");
+        let counts = exact_kind_unique_pubkeys_from_artifact(&path, 4, 20)
+            .expect("count exact kind authors");
+        assert_eq!(counts[7], 2);
+        assert_eq!(counts[8], 1);
+        assert_eq!(counts.iter().sum::<u64>(), 3);
     }
 
     fn activity_record(

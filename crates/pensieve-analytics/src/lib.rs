@@ -29,6 +29,7 @@ mod schema;
 mod semantic_build;
 mod semantic_facts;
 mod semantic_publish;
+mod serving_facts;
 mod zap_distinct;
 mod zap_distinct_publish;
 
@@ -59,13 +60,14 @@ pub use error::{Error, Result};
 pub use event_facts::{
     BoundedEventBuild, EVENT_FACT_BYTES, EVENT_FACT_KEY_BYTES, EventFact, EventFactBatchStats,
     EventFactReader, EventFactsConfig, EventFactsEvidence, EventFactsMemoryEvidence,
-    build_bounded_event_facts,
+    build_bounded_event_facts, load_event_facts_evidence,
 };
 pub use fixed_activity::{
     ActiveUsersPeriod, BoundedFixedActivity, DistinctPubkeysPeriod, FIXED_ACTIVITY_KEY_BYTES,
     FIXED_ACTIVITY_RECORD_BYTES, FIXED_ACTIVITY_VERSION, FixedActivityConfig,
     FixedActivityEvidence, PUBKEY_FLAGS_RECORD_BYTES, advance_bounded_fixed_activity,
-    build_bounded_fixed_activity, load_bounded_fixed_activity, upgrade_bounded_fixed_activity_v2,
+    build_bounded_fixed_activity, exact_kind_unique_pubkeys, load_bounded_fixed_activity,
+    upgrade_bounded_fixed_activity_v2,
 };
 pub use flexible_distinct::{
     BoundedFlexibleDistinct, FLEXIBLE_DISTINCT_IDENTITY_BYTES, FLEXIBLE_DISTINCT_VERSION,
@@ -151,6 +153,12 @@ pub use semantic_facts::{
     write_semantic_facts, zap_histogram_bucket,
 };
 pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};
+pub use serving_facts::{
+    BoundedServingFacts, CONTENT_FACT_BYTES, HOURLY_COUNT_BYTES, KIND_SUMMARY_BYTES,
+    SERVING_FACTS_RUNNER_VERSION, SERVING_FACTS_VERSION, ServingFactsConfig, ServingFactsEvidence,
+    ServingFactsMemoryEvidence, ServingHourlyRow, ServingKindRow, build_bounded_serving_facts,
+    load_bounded_serving_facts, visit_serving_hourly_rows, visit_serving_kind_rows,
+};
 pub use zap_distinct::{
     BoundedZapDistinct, ZAP_DISTINCT_VERSION, ZAP_IDENTITY_BYTES, ZapDistinctConfig,
     ZapDistinctEvidence, ZapDistinctLeaf, ZapParticipantRole, build_bounded_zap_distinct,

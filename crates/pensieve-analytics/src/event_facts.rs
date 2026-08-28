@@ -130,6 +130,61 @@ pub struct BoundedEventBuild {
     pub evidence_sha256: String,
 }
 
+/// Load and fully revalidate immutable event-fact evidence for a downstream lane.
+pub fn load_event_facts_evidence(path: impl AsRef<Path>) -> Result<(EventFactsEvidence, String)> {
+    let path = path.as_ref();
+    let evidence: EventFactsEvidence =
+        serde_json::from_slice(&fs::read(path)?).map_err(|error| {
+            BoundedExecutionError::Invalid(format!("decode event-facts evidence: {error}"))
+        })?;
+    if evidence.schema_version != EVENT_FACTS_EVIDENCE_SCHEMA_VERSION
+        || evidence.runner_version != EVENT_FACTS_RUNNER_VERSION
+        || evidence.status != "completed"
+        || evidence.final_artifact.row_count != evidence.logical_events
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts evidence is not a completed canonical product".to_owned(),
+        )
+        .into());
+    }
+    let expected_bytes = evidence
+        .logical_events
+        .checked_mul(u64::try_from(EVENT_FACT_BYTES).expect("event-fact width fits u64"))
+        .ok_or_else(|| {
+            BoundedExecutionError::Invalid("event-fact byte accounting overflowed".to_owned())
+        })?;
+    let artifact_path = Path::new(&evidence.final_artifact.path);
+    if evidence.final_artifact.byte_size != expected_bytes
+        || artifact_path.metadata()?.len() != expected_bytes
+        || pensieve_lake::sha256_file(artifact_path)? != evidence.final_artifact.sha256
+    {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts artifact identity does not match evidence".to_owned(),
+        )
+        .into());
+    }
+    let mut reader = EventFactReader::open(artifact_path)?;
+    let mut previous = None;
+    let mut rows = 0_u64;
+    while let Some(fact) = reader.read_next()? {
+        if previous.is_some_and(|id| id >= fact.id) {
+            return Err(BoundedExecutionError::Invalid(
+                "event-facts artifact is not strictly sorted and unique".to_owned(),
+            )
+            .into());
+        }
+        previous = Some(fact.id);
+        rows = checked_add(rows, 1, "validated event-fact rows")?;
+    }
+    if rows != evidence.logical_events {
+        return Err(BoundedExecutionError::Invalid(
+            "event-facts artifact row count differs from evidence".to_owned(),
+        )
+        .into());
+    }
+    Ok((evidence, pensieve_lake::sha256_file(path)?))
+}
+
 /// Build the bounded canonical event-fact canary and compact Slice A products.
 ///
 /// This path is intentionally separate from the live incremental DuckDB
