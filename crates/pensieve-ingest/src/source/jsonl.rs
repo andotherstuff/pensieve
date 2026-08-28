@@ -145,7 +145,7 @@ impl JsonlSource {
             pack_buf.clear();
 
             // Parse and validate
-            let event_id = if self.config.skip_validation {
+            let (event_id, created_at) = if self.config.skip_validation {
                 match serde_json::from_str::<NoteBuf>(&line) {
                     Ok(note) => {
                         if let Err(e) = pack_note_into(&note, &mut pack_buf) {
@@ -168,7 +168,7 @@ impl JsonlSource {
                             }
                         }
                         // Parse event ID from the note
-                        hex_to_bytes32(&note.id)?
+                        (hex_to_bytes32(&note.id)?, note.created_at)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -203,7 +203,7 @@ impl JsonlSource {
                     Ok(event) => {
                         let id_bytes: [u8; 32] = *event.id.as_bytes();
                         pack_event_binary_into(&event, &mut pack_buf);
-                        id_bytes
+                        (id_bytes, event.created_at.as_secs())
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -228,6 +228,7 @@ impl JsonlSource {
             // Call the handler
             let packed_event = PackedEvent {
                 event_id,
+                created_at,
                 data: pack_buf.clone(),
             };
 

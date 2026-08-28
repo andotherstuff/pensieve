@@ -28,5 +28,6 @@ pub use coverage::CoverageSampler;
 pub use dedupe::{DedupeIndex, DedupeStats, EventStatus};
 pub use parquet_shadow::{ParquetShadowConfig, ParquetShadowPublisher, start_parquet_shadow};
 pub use segment::{
-    PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter, pack_nostr_event,
+    LatestEventWatermark, PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter,
+    pack_nostr_event, read_latest_event_watermark,
 };

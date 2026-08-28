@@ -708,6 +708,7 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
         max_segment_size: args.segment_size,
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
+        latest_event_watermark_path: None,
     };
     // Backfill marks archived itself (see below), so the writer gets no dedupe ref.
     let segment_writer = Arc::new(SegmentWriter::new(segment_config, sealed_sender, None)?);

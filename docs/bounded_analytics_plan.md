@@ -823,6 +823,18 @@ The API contract also needs two explicit decisions before implementation:
   candidate set is 1, 7, 30, 90, and 365) unless a separately validated
   arbitrary-window implementation lands.
 
+Implementation status:
+
+- [x] Add an optional ingestion-owned latest-event watermark. It is atomically
+  and canonically published after durable notepack sealing, excludes future and
+  out-of-`u32` timestamps, merges concurrent segment completions monotonically,
+  and fails open for ingestion while its reader fails closed on malformed or
+  non-canonical state. Production activation and freshness evidence remain
+  gated with the rest of Slice 9.5.
+- [ ] Build and validate canonical hourly event and enriched per-kind facts.
+- [ ] Publish both compact products in the all-product transaction and prove a
+  moving recurring successor.
+
 Gate: a route-to-product matrix proves every response field and parameter
 shape from versioned Postgres state or the explicit ingestion watermark. No
 route is classified as ready merely because its headline count is available.

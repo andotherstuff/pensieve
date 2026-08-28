@@ -138,6 +138,10 @@ struct Args {
     #[arg(long)]
     no_compress: bool,
 
+    /// Atomically publish the latest eligible timestamp in durably sealed segments.
+    #[arg(long, env = "PENSIEVE_LATEST_EVENT_WATERMARK_PATH")]
+    latest_event_watermark_path: Option<PathBuf>,
+
     /// Publish sealed notepack segments to an immutable local Parquet shadow lake.
     #[arg(
         long,
@@ -1347,12 +1351,14 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         max_segment_size: args.segment_size,
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
+        latest_event_watermark_path: args.latest_event_watermark_path.clone(),
     };
 
     tracing::info!(
         output_dir = %args.output_dir.display(),
         max_segment_size = args.segment_size,
         compress = !args.no_compress,
+        latest_event_watermark_path = ?args.latest_event_watermark_path,
         "segment writer configured"
     );
 

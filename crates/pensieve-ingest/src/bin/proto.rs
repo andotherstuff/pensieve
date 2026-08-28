@@ -720,6 +720,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         max_segment_size: args.segment_size,
         segment_prefix: "segment".to_string(),
         compress: !args.no_compress,
+        latest_event_watermark_path: None,
     };
     tracing::info!(
         "Segment compression: {}",
@@ -833,11 +834,15 @@ fn process_file_impl(
         pack_buf.clear();
 
         // Validate and pack
-        let (event_id, _packed_len) = if args.skip_validation {
+        let (event_id, created_at, _packed_len) = if args.skip_validation {
             match proto_to_notepack_unvalidated(&proto_event, &mut pack_buf) {
                 Ok(len) => {
                     let id_bytes = hex_to_bytes32(&proto_event.id)?;
-                    (id_bytes, len)
+                    (
+                        id_bytes,
+                        u64::try_from(proto_event.created_at).unwrap_or(u64::MAX),
+                        len,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -864,7 +869,7 @@ fn process_file_impl(
                 Ok(event) => {
                     let id_bytes: [u8; 32] = *event.id.as_bytes();
                     let len = pack_event_binary_into(&event, &mut pack_buf);
-                    (id_bytes, len)
+                    (id_bytes, event.created_at.as_secs(), len)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -899,6 +904,7 @@ fn process_file_impl(
         // Write to segment
         let packed_event = PackedEvent {
             event_id,
+            created_at,
             data: pack_buf.clone(),
         };
 

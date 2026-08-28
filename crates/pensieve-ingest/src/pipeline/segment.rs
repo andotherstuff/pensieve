@@ -29,6 +29,7 @@ use crossbeam_channel::Sender;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,6 +56,12 @@ pub struct SegmentConfig {
     /// Compress sealed segments with gzip.
     /// Default: true
     pub compress: bool,
+
+    /// Optional canonical JSON watermark updated after each durable segment seal.
+    ///
+    /// Publication is best-effort so an analytics sidecar can never prevent the
+    /// archive from sealing. Readers validate the file strictly and fail closed.
+    pub latest_event_watermark_path: Option<PathBuf>,
 }
 
 impl Default for SegmentConfig {
@@ -64,8 +71,71 @@ impl Default for SegmentConfig {
             max_segment_size: 256 * 1024 * 1024, // 256 MB
             segment_prefix: "segment".to_string(),
             compress: true,
+            latest_event_watermark_path: None,
         }
     }
+}
+
+/// Canonical ingestion-owned evidence for the latest eligible archived event.
+///
+/// The timestamp intentionally follows the existing API's `u32` domain and
+/// excludes events dated after their segment's seal time. All fields are
+/// cumulative so out-of-order completion of concurrent seals cannot regress
+/// the published value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LatestEventWatermark {
+    /// Watermark schema version.
+    pub schema_version: u32,
+    /// Publication status; currently always `published`.
+    pub status: String,
+    /// Greatest segment number observed by the publisher.
+    pub max_sealed_segment_number: u64,
+    /// Greatest eligible event timestamp across observed sealed segments.
+    pub max_eligible_created_at: Option<u64>,
+    /// Greatest seal timestamp across observed sealed segments.
+    pub max_sealed_at_epoch: u64,
+    /// Wall-clock timestamp at which this file was atomically published.
+    pub published_at_epoch: u64,
+}
+
+impl LatestEventWatermark {
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 || self.status != "published" {
+            return Err(Error::Validation(
+                "latest-event watermark has an unsupported schema or status".to_owned(),
+            ));
+        }
+        if self.published_at_epoch < self.max_sealed_at_epoch {
+            return Err(Error::Validation(
+                "latest-event watermark predates its latest segment seal".to_owned(),
+            ));
+        }
+        if self.max_eligible_created_at.is_some_and(|created_at| {
+            created_at > self.max_sealed_at_epoch || created_at > u64::from(u32::MAX)
+        }) {
+            return Err(Error::Validation(
+                "latest-event watermark contains an ineligible event timestamp".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read and strictly validate a canonical latest-event watermark.
+pub fn read_latest_event_watermark(path: impl AsRef<Path>) -> Result<LatestEventWatermark> {
+    let bytes = fs::read(path)?;
+    let watermark: LatestEventWatermark =
+        serde_json::from_slice(&bytes).map_err(|error| Error::Serialization(error.to_string()))?;
+    watermark.validate()?;
+    let mut canonical = serde_json::to_vec_pretty(&watermark)
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+    canonical.push(b'\n');
+    if bytes != canonical {
+        return Err(Error::Validation(
+            "latest-event watermark is not canonically encoded".to_owned(),
+        ));
+    }
+    Ok(watermark)
 }
 
 /// Information about a sealed segment.
@@ -97,6 +167,9 @@ pub struct SealedSegment {
 pub struct PackedEvent {
     /// The 32-byte event ID.
     pub event_id: [u8; 32],
+
+    /// Event creation timestamp in Unix seconds.
+    pub created_at: u64,
 
     /// The notepack-encoded bytes (without length prefix).
     pub data: Vec<u8>,
@@ -136,6 +209,7 @@ pub fn pack_nostr_event(event: &nostr_sdk::Event) -> crate::Result<PackedEvent> 
 
     Ok(PackedEvent {
         event_id: *event.id.as_bytes(),
+        created_at: event.created_at.as_secs(),
         data: buf,
     })
 }
@@ -156,6 +230,9 @@ struct CurrentSegment {
 
     /// Event IDs in this segment.
     event_ids: Vec<[u8; 32]>,
+
+    /// Event timestamps retained until seal for an exact eligible maximum.
+    created_ats: Option<Vec<u64>>,
 }
 
 /// Segment writer for the notepack archive.
@@ -177,6 +254,8 @@ pub struct SegmentWriter {
     /// what makes mid-stream seals crash-safe. Backfill binaries pass `None` and
     /// mark archived themselves.
     dedupe: Option<Arc<DedupeIndex>>,
+    /// Serializes cumulative watermark read/merge/write publication.
+    watermark_publication: Mutex<()>,
 }
 
 impl SegmentWriter {
@@ -225,6 +304,7 @@ impl SegmentWriter {
             compression_threads: Mutex::new(Vec::new()),
             sealed_senders,
             dedupe,
+            watermark_publication: Mutex::new(()),
         })
     }
 
@@ -303,6 +383,11 @@ impl SegmentWriter {
                 event_count: 0,
                 size_bytes: 0,
                 event_ids: Vec::with_capacity(10000),
+                created_ats: self
+                    .config
+                    .latest_event_watermark_path
+                    .as_ref()
+                    .map(|_| Vec::with_capacity(10000)),
             });
         }
 
@@ -330,6 +415,9 @@ impl SegmentWriter {
         segment.event_count += 1;
         segment.size_bytes += written_bytes;
         segment.event_ids.push(event.event_id);
+        if let Some(created_ats) = &mut segment.created_ats {
+            created_ats.push(event.created_at);
+        }
 
         self.total_events.fetch_add(1, Ordering::Relaxed);
         self.total_bytes.fetch_add(written_bytes, Ordering::Relaxed);
@@ -393,6 +481,7 @@ impl SegmentWriter {
             event_count,
             size_bytes,
             event_ids,
+            created_ats,
         } = segment;
 
         // Flush the buffer and fsync so the segment bytes are durable on disk
@@ -431,6 +520,19 @@ impl SegmentWriter {
         }
 
         let sealed_at = Utc::now();
+
+        self.publish_latest_event_watermark(
+            segment_number,
+            sealed_at,
+            created_ats
+                .into_iter()
+                .flatten()
+                .filter(|created_at| {
+                    *created_at <= sealed_at.timestamp() as u64
+                        && *created_at <= u64::from(u32::MAX)
+                })
+                .max(),
+        );
 
         // Build the sealed segment info (returned immediately)
         // If compressing, the path/size will be updated in the background
@@ -528,6 +630,64 @@ impl SegmentWriter {
         }
 
         Ok(Some(sealed))
+    }
+
+    fn publish_latest_event_watermark(
+        &self,
+        segment_number: u64,
+        sealed_at: DateTime<Utc>,
+        candidate_created_at: Option<u64>,
+    ) {
+        let Some(path) = &self.config.latest_event_watermark_path else {
+            return;
+        };
+        let sealed_at_epoch = u64::try_from(sealed_at.timestamp()).unwrap_or(0);
+        let candidate_created_at = candidate_created_at
+            .filter(|created_at| *created_at <= sealed_at_epoch)
+            .filter(|created_at| *created_at <= u64::from(u32::MAX));
+        let _guard = self.watermark_publication.lock();
+        let result = (|| -> Result<()> {
+            let previous = match path.try_exists() {
+                Ok(true) => Some(read_latest_event_watermark(path)?),
+                Ok(false) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let published_at_epoch = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
+            let watermark = LatestEventWatermark {
+                schema_version: 1,
+                status: "published".to_owned(),
+                max_sealed_segment_number: previous.as_ref().map_or(segment_number, |state| {
+                    state.max_sealed_segment_number.max(segment_number)
+                }),
+                max_eligible_created_at: previous
+                    .as_ref()
+                    .and_then(|state| state.max_eligible_created_at)
+                    .into_iter()
+                    .chain(candidate_created_at)
+                    .max(),
+                max_sealed_at_epoch: previous.as_ref().map_or(sealed_at_epoch, |state| {
+                    state.max_sealed_at_epoch.max(sealed_at_epoch)
+                }),
+                published_at_epoch,
+            };
+            watermark.validate()?;
+            pensieve_lake::write_catalog_atomically(path, &watermark)
+                .map_err(|error| Error::Serialization(error.to_string()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                metrics::counter!("ingest_latest_event_watermark_publications_total").increment(1);
+            }
+            Err(error) => {
+                metrics::counter!("ingest_latest_event_watermark_failures_total").increment(1);
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %compact_error(&error),
+                    "failed to publish latest-event watermark; segment remains durably sealed"
+                );
+            }
+        }
     }
 
     fn reap_finished_compression_threads(&self) {
@@ -722,13 +882,109 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_event(n: u8) -> PackedEvent {
+        test_event_at(n, u64::from(n))
+    }
+
+    fn test_event_at(n: u8, created_at: u64) -> PackedEvent {
         let mut event_id = [0u8; 32];
         event_id[0] = n;
 
         PackedEvent {
             event_id,
+            created_at,
             data: vec![1, 2, 3, 4, 5], // Dummy notepack data
         }
+    }
+
+    fn watermark_config(tmp: &TempDir) -> (SegmentConfig, PathBuf) {
+        let watermark = tmp.path().join("state/latest-event.json");
+        (
+            SegmentConfig {
+                output_dir: tmp.path().join("segments"),
+                compress: false,
+                latest_event_watermark_path: Some(watermark.clone()),
+                ..Default::default()
+            },
+            watermark,
+        )
+    }
+
+    #[test]
+    fn latest_event_watermark_is_canonical_and_monotonic() {
+        let tmp = TempDir::new().unwrap();
+        let (config, path) = watermark_config(&tmp);
+        let writer = SegmentWriter::new(config, None, None).unwrap();
+        let now = u64::try_from(Utc::now().timestamp()).unwrap();
+
+        writer.write(test_event_at(1, now - 20)).unwrap();
+        writer.seal().unwrap().expect("first seal");
+        let first = read_latest_event_watermark(&path).unwrap();
+        assert_eq!(first.max_sealed_segment_number, 0);
+        assert_eq!(first.max_eligible_created_at, Some(now - 20));
+
+        writer.write(test_event_at(2, now - 10)).unwrap();
+        writer.seal().unwrap().expect("second seal");
+        let second = read_latest_event_watermark(&path).unwrap();
+        assert_eq!(second.max_sealed_segment_number, 1);
+        assert_eq!(second.max_eligible_created_at, Some(now - 10));
+        let mut canonical = serde_json::to_vec_pretty(&second).unwrap();
+        canonical.push(b'\n');
+        assert_eq!(fs::read(path).unwrap(), canonical);
+    }
+
+    #[test]
+    fn latest_event_watermark_excludes_future_events() {
+        let tmp = TempDir::new().unwrap();
+        let (config, path) = watermark_config(&tmp);
+        let writer = SegmentWriter::new(config, None, None).unwrap();
+        let now = u64::try_from(Utc::now().timestamp()).unwrap();
+
+        writer.write(test_event_at(1, now - 5)).unwrap();
+        writer.write(test_event_at(2, now + 86_400)).unwrap();
+        writer.seal().unwrap().expect("seal");
+
+        assert_eq!(
+            read_latest_event_watermark(path)
+                .unwrap()
+                .max_eligible_created_at,
+            Some(now - 5)
+        );
+    }
+
+    #[test]
+    fn latest_event_watermark_never_regresses() {
+        let tmp = TempDir::new().unwrap();
+        let (config, path) = watermark_config(&tmp);
+        let writer = SegmentWriter::new(config, None, None).unwrap();
+        let now = u64::try_from(Utc::now().timestamp()).unwrap();
+
+        writer.write(test_event_at(1, now - 1)).unwrap();
+        writer.seal().unwrap().expect("first seal");
+        writer.write(test_event_at(2, now - 100)).unwrap();
+        writer.seal().unwrap().expect("second seal");
+
+        assert_eq!(
+            read_latest_event_watermark(path)
+                .unwrap()
+                .max_eligible_created_at,
+            Some(now - 1)
+        );
+    }
+
+    #[test]
+    fn malformed_watermark_does_not_prevent_segment_seal() {
+        let tmp = TempDir::new().unwrap();
+        let (config, path) = watermark_config(&tmp);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{}\n").unwrap();
+        let writer = SegmentWriter::new(config, None, None).unwrap();
+
+        writer.write(test_event(1)).unwrap();
+        let sealed = writer.seal().unwrap().expect("seal remains authoritative");
+
+        assert!(sealed.path.exists());
+        assert!(read_latest_event_watermark(&path).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"{}\n");
     }
 
     #[test]

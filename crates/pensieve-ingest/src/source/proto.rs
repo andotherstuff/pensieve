@@ -157,10 +157,13 @@ impl ProtoSource {
             pack_buf.clear();
 
             // Validate and pack
-            let event_id = if self.config.skip_validation {
+            let (event_id, created_at) = if self.config.skip_validation {
                 // Just pack without full validation
                 match proto_to_notepack_unvalidated(&proto_event, &mut pack_buf) {
-                    Ok(_) => hex_to_bytes32(&proto_event.id)?,
+                    Ok(_) => (
+                        hex_to_bytes32(&proto_event.id)?,
+                        u64::try_from(proto_event.created_at).unwrap_or(u64::MAX),
+                    ),
                     Err(e) => {
                         tracing::warn!(
                             event_id = %proto_event.id,
@@ -186,7 +189,7 @@ impl ProtoSource {
                     Ok(event) => {
                         let id_bytes: [u8; 32] = *event.id.as_bytes();
                         pack_event_binary_into(&event, &mut pack_buf);
-                        id_bytes
+                        (id_bytes, event.created_at.as_secs())
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -215,6 +218,7 @@ impl ProtoSource {
             // Call the handler
             let packed_event = PackedEvent {
                 event_id,
+                created_at,
                 data: pack_buf.clone(),
             };
 
