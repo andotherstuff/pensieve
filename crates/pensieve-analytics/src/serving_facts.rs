@@ -1,10 +1,11 @@
 //! Bounded canonical facts required to finish the Postgres serving contract.
 //!
 //! The existing event-fact artifact deliberately omits content. This lane
-//! retains only event ID and UTF-8 content bytes, joins it one-for-one with
-//! the validated event-fact stream, and combines that with the validated
-//! pubkey-sorted activity stream. The result is compact exact hourly counts
-//! and exact per-kind summaries without cardinality-sized RAM state.
+//! extends its fixed record with exact UTF-8 content bytes, aligns the initial
+//! full build one-for-one with the validated event-fact stream, and then
+//! advances that enriched artifact only from append-only catalog deltas. It
+//! combines the result with validated pubkey-sorted activity to produce exact
+//! hourly counts and per-kind summaries without cardinality-sized RAM state.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -21,16 +22,16 @@ use crate::build::{API_TIMESTAMP_MAX, configure_execution, configure_remote_acce
 use crate::event_facts::verify_local_batch_inputs;
 use crate::fixed_activity::exact_kind_unique_pubkeys_from_artifact;
 use crate::{
-    ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, DiskBudget,
-    EVENT_FACT_BYTES, EventFactReader, EventFactsEvidence, FIXED_ACTIVITY_RECORD_BYTES,
-    FixedRecordLayout, InputBatch, InputIdentity, ObjectLocation, ResolvedSnapshot, Result,
+    ArtifactIdentity, BatchLimits, BoundedExecutionError, BuildConfig, CatalogDeltaPlan,
+    DiskBudget, EVENT_FACT_BYTES, EventFactReader, FIXED_ACTIVITY_RECORD_BYTES, FixedRecordLayout,
+    InputBatch, InputIdentity, ObjectLocation, PlannedRunKind, ResolvedSnapshot, Result,
     RunCheckpoint, RunIdentity, exact_kind_unique_pubkeys, load_bounded_fixed_activity,
     load_event_facts_evidence, load_reusable_checkpoint, merge_fixed_runs, plan_input_batches,
     preflight_disk, publish_canonical_json, publish_run_checkpoint,
 };
 
-/// Event ID plus exact UTF-8 content byte length.
-pub const CONTENT_FACT_BYTES: usize = 32 + 8;
+/// Event ID, timestamp, kind, and exact UTF-8 content byte length.
+pub const CONTENT_FACT_BYTES: usize = 32 + 8 + 2 + 8;
 /// Sparse hourly row: hour, all-kind/kind key, exact count.
 pub const HOURLY_COUNT_BYTES: usize = 4 + 4 + 8;
 /// Kind, event/unique counts, first/last, content bytes/rows.
@@ -92,14 +93,18 @@ pub struct ServingFactsEvidence {
     pub object_count: u64,
     /// Catalog physical row count.
     pub physical_rows: u64,
+    /// New catalog objects scanned for this generation.
+    pub delta_object_count: u64,
+    /// Fully validated predecessor evidence, when this is an incremental successor.
+    pub baseline_evidence_sha256: Option<String>,
     /// Exact unique canonical event count.
     pub logical_events: u64,
     /// Physical duplicates suppressed by ID.
     pub duplicate_rows: u64,
-    /// Immutable source event-facts evidence SHA-256.
-    pub event_facts_evidence_sha256: String,
-    /// Immutable source event-fact artifact identity.
-    pub event_facts_artifact: ArtifactIdentity,
+    /// Initial full event-facts evidence that anchored canonical ID alignment.
+    pub initial_event_facts_evidence_sha256: String,
+    /// Initial full event-fact artifact used for that alignment.
+    pub initial_event_facts_artifact: ArtifactIdentity,
     /// Immutable source fixed-activity evidence SHA-256.
     pub activity_evidence_sha256: String,
     /// Immutable source activity artifact identity.
@@ -209,23 +214,112 @@ pub fn build_bounded_serving_facts(
     event_facts_evidence_path: impl AsRef<Path>,
     activity_evidence_path: impl AsRef<Path>,
 ) -> Result<BoundedServingFacts> {
+    let inputs = catalog_inputs(&snapshot)?;
+    let locations = snapshot.locations.clone();
+    build_serving_facts_from_inputs(
+        evidence_path.as_ref(),
+        snapshot,
+        build,
+        config,
+        Some(event_facts_evidence_path.as_ref()),
+        activity_evidence_path.as_ref(),
+        inputs,
+        locations,
+        None,
+    )
+}
+
+/// Advance serving facts from a validated append-only predecessor and catalog delta.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_bounded_serving_facts(
+    evidence_path: impl AsRef<Path>,
+    baseline: &BoundedServingFacts,
+    target: ResolvedSnapshot,
+    plan: &CatalogDeltaPlan,
+    delta_locations: &[ObjectLocation],
+    build: BuildConfig,
+    config: ServingFactsConfig,
+    activity_evidence_path: impl AsRef<Path>,
+) -> Result<BoundedServingFacts> {
+    validate_bounded_serving_facts(baseline)?;
+    if plan.run_kind != PlannedRunKind::Incremental
+        || plan.snapshot_id != target.catalog.snapshot_id
+        || plan.previous_snapshot_id.as_deref() != Some(&baseline.evidence.snapshot_id)
+        || !plan.removed_objects.is_empty()
+        || plan.added_objects.len() != delta_locations.len()
+    {
+        return invalid("invalid incremental serving-facts plan");
+    }
+    let inputs = plan
+        .added_objects
+        .iter()
+        .map(|object| InputIdentity {
+            identity: object.object_key.clone(),
+            byte_size: object.byte_size,
+            row_count: object.row_count,
+            sha256: object.sha256.clone(),
+        })
+        .collect();
+    build_serving_facts_from_inputs(
+        evidence_path.as_ref(),
+        target,
+        build,
+        config,
+        None,
+        activity_evidence_path.as_ref(),
+        inputs,
+        delta_locations.to_vec(),
+        Some(baseline),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_serving_facts_from_inputs(
+    evidence_path: &Path,
+    snapshot: ResolvedSnapshot,
+    build: BuildConfig,
+    config: ServingFactsConfig,
+    event_facts_evidence_path: Option<&Path>,
+    activity_evidence_path: &Path,
+    inputs: Vec<InputIdentity>,
+    locations: Vec<ObjectLocation>,
+    baseline: Option<&BoundedServingFacts>,
+) -> Result<BoundedServingFacts> {
     validate_config(&snapshot, &build, &config)?;
-    let (event_evidence, event_evidence_sha) =
-        load_event_facts_evidence(event_facts_evidence_path)?;
     let activity = load_bounded_fixed_activity(activity_evidence_path)?;
-    if event_evidence.snapshot_id != snapshot.catalog.snapshot_id
-        || event_evidence.as_of_epoch != build.as_of_epoch
-        || activity.evidence.snapshot_id != snapshot.catalog.snapshot_id
+    if activity.evidence.snapshot_id != snapshot.catalog.snapshot_id
         || activity.evidence.as_of_epoch != build.as_of_epoch
     {
-        return invalid("serving-facts source products do not share one frozen identity");
+        return invalid("serving-facts activity does not share the target identity");
     }
+    let initial_event_source = if let Some(path) = event_facts_evidence_path {
+        if baseline.is_some() {
+            return invalid("incremental serving facts cannot replace the initial event anchor");
+        }
+        let (evidence, sha256) = load_event_facts_evidence(path)?;
+        if evidence.snapshot_id != snapshot.catalog.snapshot_id
+            || evidence.as_of_epoch != build.as_of_epoch
+        {
+            return invalid("initial serving-facts sources do not share one frozen identity");
+        }
+        Some((evidence, sha256))
+    } else {
+        if baseline.is_none() {
+            return invalid("initial serving facts require canonical event-facts evidence");
+        }
+        None
+    };
     fs::create_dir_all(&config.work_root)?;
-    let inputs = catalog_inputs(&snapshot)?;
     let batches = plan_input_batches(&inputs, config.batch_limits)?;
+    let estimated_rows = baseline
+        .map_or(0, |value| value.evidence.logical_events)
+        .checked_add(inputs.iter().try_fold(0_u64, |sum, input| {
+            checked_add(sum, input.row_count, "content input rows")
+        })?)
+        .ok_or_else(|| invalid_error("content row estimate overflowed"))?;
     let estimated_run_bytes = estimate_run_bytes(
-        snapshot.catalog.totals().physical_rows,
-        batches.len(),
+        estimated_rows,
+        batches.len() + usize::from(baseline.is_some()),
         config.merge_fan_in,
     )?;
     preflight_disk(
@@ -244,7 +338,20 @@ pub fn build_bounded_serving_facts(
     configure_remote_access(&connection, &snapshot, &build)?;
     let batch_root = config.work_root.join("batches");
     fs::create_dir_all(&batch_root)?;
-    let mut runs = Vec::with_capacity(batches.len().max(1));
+    let mut runs = Vec::with_capacity((batches.len() + usize::from(baseline.is_some())).max(1));
+    if let Some(baseline) = baseline {
+        runs.push(CompletedRun {
+            path: PathBuf::from(&baseline.evidence.content_artifact.path),
+            checkpoint_path: PathBuf::new(),
+            checkpoint: RunCheckpoint {
+                schema_version: crate::BOUNDED_CHECKPOINT_SCHEMA_VERSION,
+                runner_version: crate::BOUNDED_RUNNER_VERSION.to_owned(),
+                run: run_identity(&snapshot, &build, "baseline"),
+                inputs: Vec::new(),
+                artifact: baseline.evidence.content_artifact.clone(),
+            },
+        });
+    }
     let mut offset = 0_usize;
     let mut batch_duplicates = 0_u64;
     let mut max_batch_bytes = 0_u64;
@@ -254,8 +361,7 @@ pub fn build_bounded_serving_facts(
         let end = offset
             .checked_add(batch.inputs.len())
             .ok_or_else(|| invalid_error("serving-facts batch offset overflowed"))?;
-        let locations = snapshot
-            .locations
+        let batch_locations = locations
             .get(offset..end)
             .ok_or_else(|| invalid_error("serving-facts batch locations are incomplete"))?;
         let run = build_batch(
@@ -263,7 +369,7 @@ pub fn build_bounded_serving_facts(
             &snapshot,
             &build,
             batch,
-            locations,
+            batch_locations,
             &batch_root,
         )?;
         batch_duplicates = checked_add(
@@ -280,7 +386,7 @@ pub fn build_bounded_serving_facts(
         runs.push(run);
         offset = end;
     }
-    if offset != snapshot.locations.len() {
+    if offset != locations.len() {
         return invalid("serving-facts batches did not consume all snapshot locations");
     }
     if runs.is_empty() {
@@ -296,13 +402,26 @@ pub fn build_bounded_serving_facts(
         .physical_rows
         .checked_sub(logical_events)
         .ok_or_else(|| invalid_error("content facts exceed physical rows"))?;
-    if logical_events != event_evidence.logical_events
-        || checked_add(
+    let accounted_duplicates = checked_add(
+        baseline.map_or(0, |value| value.evidence.duplicate_rows),
+        checked_add(
             batch_duplicates,
             merged.duplicate_rows,
             "content duplicates",
-        )? != duplicate_rows
-    {
+        )?,
+        "content predecessor duplicates",
+    )?;
+    if let Some((event_evidence, _)) = initial_event_source.as_ref() {
+        if logical_events != event_evidence.logical_events {
+            return invalid("initial enriched facts differ from canonical event facts");
+        }
+        validate_initial_event_alignment(
+            Path::new(&event_evidence.final_artifact.path),
+            &merged.final_run.path,
+            logical_events,
+        )?;
+    }
+    if accounted_duplicates != duplicate_rows {
         return invalid("content facts do not reconcile to canonical event facts");
     }
 
@@ -310,8 +429,8 @@ pub fn build_bounded_serving_facts(
     let compact_root = config.work_root.join("compact");
     fs::create_dir_all(&compact_root)?;
     let finalized = finalize(
-        &event_evidence,
         &merged.final_run.path,
+        logical_events,
         &unique_by_kind,
         build.as_of_epoch,
         &compact_root,
@@ -327,10 +446,21 @@ pub fn build_bounded_serving_facts(
         complete_through_epoch: floor_hour(build.as_of_epoch),
         object_count: to_u64(snapshot.catalog.objects().len(), "object count")?,
         physical_rows: snapshot.catalog.totals().physical_rows,
+        delta_object_count: to_u64(inputs.len(), "delta object count")?,
+        baseline_evidence_sha256: baseline.map(|value| value.evidence_sha256.clone()),
         logical_events,
         duplicate_rows,
-        event_facts_evidence_sha256: event_evidence_sha,
-        event_facts_artifact: event_evidence.final_artifact,
+        initial_event_facts_evidence_sha256: initial_event_source
+            .as_ref()
+            .map(|(_, sha256)| sha256.clone())
+            .or_else(|| {
+                baseline.map(|value| value.evidence.initial_event_facts_evidence_sha256.clone())
+            })
+            .expect("initial event provenance"),
+        initial_event_facts_artifact: initial_event_source
+            .map(|(evidence, _)| evidence.final_artifact)
+            .or_else(|| baseline.map(|value| value.evidence.initial_event_facts_artifact.clone()))
+            .expect("initial event artifact"),
         activity_evidence_sha256: activity.evidence_sha256,
         activity_artifact: activity.evidence.activity_artifact,
         content_artifact: merged.final_run.checkpoint.artifact,
@@ -353,10 +483,10 @@ pub fn build_bounded_serving_facts(
         batch_checkpoints,
         merge_checkpoints: merged.checkpoints,
     };
-    publish_canonical_json(evidence_path.as_ref(), &evidence)?;
+    publish_canonical_json(evidence_path, &evidence)?;
     let product = BoundedServingFacts {
         evidence,
-        evidence_sha256: pensieve_lake::sha256_file(evidence_path.as_ref())?,
+        evidence_sha256: pensieve_lake::sha256_file(evidence_path)?,
     };
     validate_bounded_serving_facts(&product)?;
     Ok(product)
@@ -372,8 +502,8 @@ struct Finalized {
 }
 
 fn finalize(
-    event_evidence: &EventFactsEvidence,
     content_path: &Path,
+    expected_rows: u64,
     unique_by_kind: &[u64],
     as_of_epoch: u64,
     root: &Path,
@@ -383,12 +513,7 @@ fn finalize(
     if unique_by_kind.len() != 65_536 {
         return invalid("kind unique-pubkey vector has the wrong fixed domain");
     }
-    let derived = derive_compact_rows(
-        Path::new(&event_evidence.final_artifact.path),
-        event_evidence.logical_events,
-        content_path,
-        as_of_epoch,
-    )?;
+    let derived = derive_compact_rows(content_path, expected_rows, as_of_epoch)?;
     let content_sha = pensieve_lake::sha256_file(content_path)?;
     let compact_input = InputIdentity {
         identity: format!("sha256:{content_sha}"),
@@ -434,67 +559,49 @@ fn finalize(
 }
 
 fn derive_compact_rows(
-    event_path: &Path,
-    expected_rows: u64,
     content_path: &Path,
+    expected_rows: u64,
     as_of_epoch: u64,
 ) -> Result<DerivedCompact> {
-    let mut events = EventFactReader::open(event_path)?;
     let mut content = ContentFactReader::open(content_path)?;
     let mut hourly = BTreeMap::<(u32, u32), u64>::new();
     let mut kinds = vec![KindAccumulator::default(); 65_536];
     let complete_through = floor_hour(as_of_epoch);
     let mut rows = 0_u64;
-    loop {
-        match (events.read_next()?, content.next()?) {
-            (Some(event), Some(content)) if event.id == content.id => {
-                rows = checked_add(rows, 1, "serving finalization rows")?;
-                if event.created_at < u64::from(NOSTR_GENESIS_TIMESTAMP)
-                    || event.created_at > as_of_epoch
-                    || event.created_at > API_TIMESTAMP_MAX
-                {
-                    continue;
-                }
-                let created_at = u32::try_from(event.created_at)
-                    .map_err(|_| invalid_error("eligible timestamp exceeds u32"))?;
-                let accumulator = &mut kinds[usize::from(event.kind)];
-                accumulator.event_count =
-                    checked_add(accumulator.event_count, 1, "kind event count")?;
-                accumulator.content_bytes = checked_add(
-                    accumulator.content_bytes,
-                    content.content_bytes,
-                    "kind content bytes",
-                )?;
-                accumulator.content_rows =
-                    checked_add(accumulator.content_rows, 1, "kind content rows")?;
-                if accumulator.event_count == 1 {
-                    accumulator.first_seen = created_at;
-                    accumulator.last_seen = created_at;
-                } else {
-                    accumulator.first_seen = accumulator.first_seen.min(created_at);
-                    accumulator.last_seen = accumulator.last_seen.max(created_at);
-                }
-                if event.created_at < complete_through {
-                    let hour = u32::try_from(event.created_at / 3_600)
-                        .map_err(|_| invalid_error("hour key exceeds u32"))?;
-                    increment_map(&mut hourly, (hour, ALL_KINDS_KEY), "all-kind hourly")?;
-                    increment_map(
-                        &mut hourly,
-                        (hour, u32::from(event.kind) + 1),
-                        "per-kind hourly",
-                    )?;
-                }
-            }
-            (None, None) => break,
-            (Some(event), Some(content)) => {
-                return Err(BoundedExecutionError::Invalid(format!(
-                    "event/content fact identity mismatch: {} != {}",
-                    hex::encode(event.id),
-                    hex::encode(content.id)
-                ))
-                .into());
-            }
-            _ => return invalid("event/content fact streams have different lengths"),
+    while let Some(content) = content.next()? {
+        rows = checked_add(rows, 1, "serving finalization rows")?;
+        if content.created_at < u64::from(NOSTR_GENESIS_TIMESTAMP)
+            || content.created_at > as_of_epoch
+            || content.created_at > API_TIMESTAMP_MAX
+        {
+            continue;
+        }
+        let created_at = u32::try_from(content.created_at)
+            .map_err(|_| invalid_error("eligible timestamp exceeds u32"))?;
+        let accumulator = &mut kinds[usize::from(content.kind)];
+        accumulator.event_count = checked_add(accumulator.event_count, 1, "kind event count")?;
+        accumulator.content_bytes = checked_add(
+            accumulator.content_bytes,
+            content.content_bytes,
+            "kind content bytes",
+        )?;
+        accumulator.content_rows = checked_add(accumulator.content_rows, 1, "kind content rows")?;
+        if accumulator.event_count == 1 {
+            accumulator.first_seen = created_at;
+            accumulator.last_seen = created_at;
+        } else {
+            accumulator.first_seen = accumulator.first_seen.min(created_at);
+            accumulator.last_seen = accumulator.last_seen.max(created_at);
+        }
+        if content.created_at < complete_through {
+            let hour = u32::try_from(content.created_at / 3_600)
+                .map_err(|_| invalid_error("hour key exceeds u32"))?;
+            increment_map(&mut hourly, (hour, ALL_KINDS_KEY), "all-kind hourly")?;
+            increment_map(
+                &mut hourly,
+                (hour, u32::from(content.kind) + 1),
+                "per-kind hourly",
+            )?;
         }
     }
     if rows != expected_rows {
@@ -507,9 +614,41 @@ fn derive_compact_rows(
     })
 }
 
-#[derive(Clone, Copy)]
+fn validate_initial_event_alignment(
+    event_path: &Path,
+    enriched_path: &Path,
+    expected_rows: u64,
+) -> Result<()> {
+    let mut events = EventFactReader::open(event_path)?;
+    let mut enriched = ContentFactReader::open(enriched_path)?;
+    let mut rows = 0_u64;
+    loop {
+        match (events.read_next()?, enriched.next()?) {
+            (Some(event), Some(enriched))
+                if event.id == enriched.id
+                    && event.created_at == enriched.created_at
+                    && event.kind == enriched.kind =>
+            {
+                rows = checked_add(rows, 1, "initial event alignment rows")?;
+            }
+            (None, None) => break,
+            (Some(_), Some(_)) => {
+                return invalid("initial enriched facts differ from canonical event facts");
+            }
+            _ => return invalid("initial event and enriched streams have different lengths"),
+        }
+    }
+    if rows != expected_rows {
+        return invalid("initial event alignment row count changed");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ContentFact {
     id: [u8; 32],
+    created_at: u64,
+    kind: u16,
     content_bytes: u64,
 }
 
@@ -517,7 +656,9 @@ impl ContentFact {
     fn encode(self) -> [u8; CONTENT_FACT_BYTES] {
         let mut bytes = [0_u8; CONTENT_FACT_BYTES];
         bytes[..32].copy_from_slice(&self.id);
-        bytes[32..].copy_from_slice(&self.content_bytes.to_be_bytes());
+        bytes[32..40].copy_from_slice(&self.created_at.to_be_bytes());
+        bytes[40..42].copy_from_slice(&self.kind.to_be_bytes());
+        bytes[42..].copy_from_slice(&self.content_bytes.to_be_bytes());
         bytes
     }
 }
@@ -547,7 +688,9 @@ impl ContentFactReader {
         self.previous = Some(id);
         Ok(Some(ContentFact {
             id,
-            content_bytes: u64::from_be_bytes(bytes[32..].try_into().expect("content bytes")),
+            created_at: u64::from_be_bytes(bytes[32..40].try_into().expect("timestamp")),
+            kind: u16::from_be_bytes(bytes[40..42].try_into().expect("kind")),
+            content_bytes: u64::from_be_bytes(bytes[42..].try_into().expect("content bytes")),
         }))
     }
 }
@@ -572,9 +715,10 @@ fn scan_content_facts(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT id, octet_length(encode(content))::UBIGINT AS content_bytes \
+        "SELECT id, created_at::UBIGINT, kind::USMALLINT, \
+                octet_length(encode(content))::UBIGINT AS content_bytes \
          FROM read_parquet([{paths}], union_by_name=false) \
-         ORDER BY id, content_bytes"
+         ORDER BY id, created_at, kind, content_bytes"
     );
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query([])?;
@@ -588,12 +732,14 @@ fn scan_content_facts(
             id: id.try_into().map_err(|id: Vec<u8>| {
                 invalid_error(&format!("content ID has {} bytes", id.len()))
             })?,
-            content_bytes: row.get(1)?,
+            created_at: row.get(1)?,
+            kind: row.get(2)?,
+            content_bytes: row.get(3)?,
         };
         match previous {
             Some(value) if value.id == fact.id => {
-                if value.content_bytes != fact.content_bytes {
-                    return invalid("duplicate event ID has conflicting content length");
+                if value != fact {
+                    return invalid("duplicate event ID has conflicting enriched facts");
                 }
             }
             Some(value) if value.id > fact.id => {
@@ -1100,6 +1246,12 @@ fn validate_bounded_serving_facts(product: &BoundedServingFacts) -> Result<()> {
         || evidence.status != "completed"
         || evidence.complete_through_epoch != floor_hour(evidence.as_of_epoch)
         || evidence.content_artifact.row_count != evidence.logical_events
+        || evidence.delta_object_count > evidence.object_count
+        || evidence.memory.kind_counter_slots != 65_536
+        || to_u64(evidence.batch_checkpoints.len(), "batch checkpoint count")?
+            != evidence.batch_count
+        || to_u64(evidence.merge_checkpoints.len(), "merge checkpoint count")?
+            != evidence.merge_count
         || checked_add(
             evidence.logical_events,
             evidence.duplicate_rows,
@@ -1108,18 +1260,35 @@ fn validate_bounded_serving_facts(product: &BoundedServingFacts) -> Result<()> {
     {
         return invalid("serving-facts evidence identity or accounting is invalid");
     }
+    if !is_sha256(&evidence.initial_event_facts_evidence_sha256)
+        || !is_sha256(&evidence.activity_evidence_sha256)
+        || evidence
+            .baseline_evidence_sha256
+            .as_deref()
+            .is_some_and(|sha256| !is_sha256(sha256))
+        || (evidence.baseline_evidence_sha256.is_none()
+            && evidence.delta_object_count != evidence.object_count)
+    {
+        return invalid("serving-facts evidence lineage is invalid");
+    }
     validate_artifact(&evidence.content_artifact, CONTENT_FACT_BYTES)?;
     validate_artifact(&evidence.hourly_artifact, HOURLY_COUNT_BYTES)?;
     validate_artifact(&evidence.kind_artifact, KIND_SUMMARY_BYTES)?;
-    validate_artifact(&evidence.event_facts_artifact, EVENT_FACT_BYTES)?;
+    validate_artifact(&evidence.initial_event_facts_artifact, EVENT_FACT_BYTES)?;
     validate_artifact(&evidence.activity_artifact, FIXED_ACTIVITY_RECORD_BYTES)?;
-    if evidence.event_facts_artifact.row_count != evidence.logical_events {
-        return invalid("serving-facts event source row count is invalid");
+    if evidence.baseline_evidence_sha256.is_none() {
+        if evidence.initial_event_facts_artifact.row_count != evidence.logical_events {
+            return invalid("initial serving-facts event source row count is invalid");
+        }
+        validate_initial_event_alignment(
+            Path::new(&evidence.initial_event_facts_artifact.path),
+            Path::new(&evidence.content_artifact.path),
+            evidence.logical_events,
+        )?;
     }
     let derived = derive_compact_rows(
-        Path::new(&evidence.event_facts_artifact.path),
-        evidence.logical_events,
         Path::new(&evidence.content_artifact.path),
+        evidence.logical_events,
         evidence.as_of_epoch,
     )?;
     if derived.rows != evidence.logical_events {
@@ -1358,6 +1527,13 @@ fn invalid_error(message: &str) -> BoundedExecutionError {
     BoundedExecutionError::Invalid(message.to_owned())
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,6 +1550,8 @@ mod tests {
         bytes.extend(
             ContentFact {
                 id: [2; 32],
+                created_at: 1,
+                kind: 1,
                 content_bytes: 1,
             }
             .encode(),
@@ -1381,6 +1559,8 @@ mod tests {
         bytes.extend(
             ContentFact {
                 id: [1; 32],
+                created_at: 1,
+                kind: 1,
                 content_bytes: 1,
             }
             .encode(),
@@ -1400,9 +1580,10 @@ mod tests {
         let id_two = format!("{:0>64}", "2");
         connection
             .execute_batch(&format!(
-                "CREATE TABLE events(id BLOB, content VARCHAR); \
+                "CREATE TABLE events(id BLOB, created_at UBIGINT, kind USMALLINT, content VARCHAR); \
                  INSERT INTO events VALUES \
-                   (from_hex('{}'), 'é'), (from_hex('{}'), 'é'), (from_hex('{}'), 'abc'); \
+                   (from_hex('{}'), 10, 1, 'é'), (from_hex('{}'), 10, 1, 'é'), \
+                   (from_hex('{}'), 11, 2, 'abc'); \
                  COPY events TO '{}' (FORMAT parquet)",
                 id_one,
                 id_one,
@@ -1419,9 +1600,15 @@ mod tests {
         assert_eq!(stats.min_id.as_deref(), Some(expected_min_id.as_str()));
         assert_eq!(stats.max_id.as_deref(), Some(expected_max_id.as_str()));
         assert_eq!(output.len(), 2 * CONTENT_FACT_BYTES);
-        assert_eq!(u64::from_be_bytes(output[32..40].try_into().unwrap()), 2);
+        assert_eq!(u64::from_be_bytes(output[32..40].try_into().unwrap()), 10);
+        assert_eq!(u16::from_be_bytes(output[40..42].try_into().unwrap()), 1);
+        assert_eq!(u64::from_be_bytes(output[42..50].try_into().unwrap()), 2);
         assert_eq!(
-            u64::from_be_bytes(output[CONTENT_FACT_BYTES + 32..].try_into().unwrap()),
+            u64::from_be_bytes(
+                output[CONTENT_FACT_BYTES + 42..CONTENT_FACT_BYTES + 50]
+                    .try_into()
+                    .unwrap()
+            ),
             3
         );
     }
@@ -1436,7 +1623,6 @@ mod tests {
     #[test]
     fn compact_rows_exclude_incomplete_hours_but_keep_all_time_kind_metrics() {
         let directory = tempfile::tempdir().unwrap();
-        let event_path = directory.path().join("events.run");
         let content_path = directory.path().join("content.run");
         let as_of = u64::from(NOSTR_GENESIS_TIMESTAMP) + 10_000;
         let complete_through = floor_hour(as_of);
@@ -1457,22 +1643,21 @@ mod tests {
                 kind: 1,
             },
         ];
-        let mut event_bytes = Vec::new();
         let mut content_bytes = Vec::new();
         for (index, event) in events.iter().enumerate() {
-            event_bytes.extend_from_slice(&event.encode());
             content_bytes.extend_from_slice(
                 &ContentFact {
                     id: event.id,
+                    created_at: event.created_at,
+                    kind: event.kind,
                     content_bytes: u64::try_from(index + 1).unwrap(),
                 }
                 .encode(),
             );
         }
-        fs::write(&event_path, event_bytes).unwrap();
         fs::write(&content_path, content_bytes).unwrap();
 
-        let derived = derive_compact_rows(&event_path, 3, &content_path, as_of).unwrap();
+        let derived = derive_compact_rows(&content_path, 3, as_of).unwrap();
         assert_eq!(derived.rows, 3);
         assert_eq!(derived.hourly.len(), 2);
         assert_eq!(derived.hourly.values().copied().sum::<u64>(), 2);

@@ -156,8 +156,9 @@ pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};
 pub use serving_facts::{
     BoundedServingFacts, CONTENT_FACT_BYTES, HOURLY_COUNT_BYTES, KIND_SUMMARY_BYTES,
     SERVING_FACTS_RUNNER_VERSION, SERVING_FACTS_VERSION, ServingFactsConfig, ServingFactsEvidence,
-    ServingFactsMemoryEvidence, ServingHourlyRow, ServingKindRow, build_bounded_serving_facts,
-    load_bounded_serving_facts, visit_serving_hourly_rows, visit_serving_kind_rows,
+    ServingFactsMemoryEvidence, ServingHourlyRow, ServingKindRow, advance_bounded_serving_facts,
+    build_bounded_serving_facts, load_bounded_serving_facts, visit_serving_hourly_rows,
+    visit_serving_kind_rows,
 };
 pub use zap_distinct::{
     BoundedZapDistinct, ZAP_DISTINCT_VERSION, ZAP_IDENTITY_BYTES, ZapDistinctConfig,

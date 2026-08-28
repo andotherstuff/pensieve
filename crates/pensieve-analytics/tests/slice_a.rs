@@ -11,9 +11,9 @@ use pensieve_analytics::{
     SemanticPublication, ServingFactsConfig, ZapDistinctConfig, advance_bounded_fixed_activity,
     advance_bounded_flexible_distinct, advance_bounded_pubkey_first_seen,
     advance_bounded_publisher_ranking, advance_bounded_relay_distribution,
-    advance_bounded_semantic_facts, apply_incremental, benchmark_publishers,
-    build_bounded_cohort_retention, build_bounded_event_facts, build_bounded_fixed_activity,
-    build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
+    advance_bounded_semantic_facts, advance_bounded_serving_facts, apply_incremental,
+    benchmark_publishers, build_bounded_cohort_retention, build_bounded_event_facts,
+    build_bounded_fixed_activity, build_bounded_flexible_distinct, build_bounded_pubkey_first_seen,
     build_bounded_publisher_ranking, build_bounded_relay_distribution,
     build_bounded_semantic_facts, build_bounded_serving_facts, build_bounded_zap_distinct,
     build_flexible_distinct_validation, estimate_flexible_distinct_window,
@@ -856,6 +856,9 @@ fn bounded_serving_facts_join_exact_sources_and_resume() {
     assert_eq!(completed.evidence.physical_rows, 7);
     assert_eq!(completed.evidence.logical_events, 6);
     assert_eq!(completed.evidence.duplicate_rows, 1);
+    assert_eq!(completed.evidence.delta_object_count, 2);
+    assert!(completed.evidence.baseline_evidence_sha256.is_none());
+    assert_eq!(completed.evidence.content_artifact.byte_size, 6 * 50);
     assert_eq!(completed.evidence.eligible_kind_events, 3);
     assert_eq!(completed.evidence.eligible_content_bytes, 20);
     assert_eq!(completed.evidence.complete_hour_events, 2);
@@ -1346,7 +1349,7 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline"),
         build.clone(),
         FixedActivityConfig {
-            work_root: baseline_root,
+            work_root: baseline_root.clone(),
             batch_limits: BatchLimits {
                 max_bytes: u64::MAX,
                 max_rows: u64::MAX,
@@ -1366,6 +1369,45 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
             .sum::<u64>(),
         3
     );
+    let baseline_event_root = directory.path().join("serving-event-baseline-work");
+    let baseline_event_evidence = baseline_event_root.join("evidence.json");
+    build_bounded_event_facts(
+        directory.path().join("serving-event-baseline.duckdb"),
+        &baseline_event_evidence,
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline events"),
+        build.clone(),
+        EventFactsConfig {
+            work_root: baseline_event_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 1,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+    )
+    .expect("build baseline event facts");
+    let baseline_serving_root = directory.path().join("serving-baseline-work");
+    let baseline_serving_evidence = baseline_serving_root.join("evidence.json");
+    let baseline_serving = build_bounded_serving_facts(
+        &baseline_serving_evidence,
+        resolve_snapshot(&baseline_catalog, Some(&lake_root)).expect("resolve baseline serving"),
+        build.clone(),
+        ServingFactsConfig {
+            work_root: baseline_serving_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 1,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+        &baseline_event_evidence,
+        baseline_root.join("evidence.json"),
+    )
+    .expect("build baseline serving facts");
+    assert_eq!(baseline_serving.evidence.logical_events, 2);
+    assert_eq!(baseline_serving.evidence.eligible_kind_events, 1);
     let baseline_flexible_root = directory.path().join("flexible-baseline-work");
     let baseline_flexible = build_bounded_flexible_distinct(
         baseline_flexible_root.join("evidence.json"),
@@ -1439,10 +1481,10 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         )],
         BuildConfig {
             as_of_epoch: AS_OF + 3_700,
-            ..build
+            ..build.clone()
         },
         FixedActivityConfig {
-            work_root: successor_root,
+            work_root: successor_root.clone(),
             batch_limits: BatchLimits {
                 max_bytes: u64::MAX,
                 max_rows: u64::MAX,
@@ -1473,6 +1515,50 @@ fn bounded_fixed_activity_incrementally_unions_identities_and_counts_events() {
         .find(|row| row.grain == "week" && row.kind == Some(1))
         .expect("weekly kind row");
     assert_eq!(week_kind.unique_pubkeys, 2);
+
+    let successor_serving_root = directory.path().join("serving-successor-work");
+    let successor_serving = advance_bounded_serving_facts(
+        successor_serving_root.join("evidence.json"),
+        &baseline_serving,
+        resolve_snapshot(&target_catalog, Some(&lake_root)).expect("resolve serving target"),
+        &plan,
+        &[ObjectLocation::Local(
+            lake_root.join(&added_object.object_key),
+        )],
+        BuildConfig {
+            as_of_epoch: AS_OF + 3_700,
+            ..build
+        },
+        ServingFactsConfig {
+            work_root: successor_serving_root,
+            batch_limits: BatchLimits {
+                max_bytes: u64::MAX,
+                max_rows: 1,
+            },
+            merge_fan_in: 2,
+            disk_reserve_bytes: 0,
+        },
+        successor_root.join("evidence.json"),
+    )
+    .expect("advance serving facts");
+    assert_eq!(successor_serving.evidence.delta_object_count, 1);
+    assert_eq!(successor_serving.evidence.logical_events, 5);
+    assert_eq!(successor_serving.evidence.eligible_kind_events, 5);
+    assert_eq!(
+        successor_serving
+            .evidence
+            .baseline_evidence_sha256
+            .as_deref(),
+        Some(baseline_serving.evidence_sha256.as_str())
+    );
+    assert_eq!(
+        successor_serving
+            .evidence
+            .initial_event_facts_artifact
+            .row_count,
+        2
+    );
+    assert_eq!(successor_serving.evidence.content_artifact.row_count, 5);
 
     let successor_flexible_root = directory.path().join("flexible-successor-work");
     let successor_flexible = advance_bounded_flexible_distinct(
