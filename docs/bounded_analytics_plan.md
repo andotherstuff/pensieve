@@ -786,6 +786,49 @@ Implementation status:
 - [ ] Add the selected DDL, atomic publication, query path, and comparison
   evidence only after that measured decision.
 
+### Slice 9.5 — serving-completeness gate
+
+Goal: close the remaining data-product gaps exposed by an exact audit of all
+24 ClickHouse-backed analytics routes before any route is allowed to select
+Postgres.
+
+Slices A/B1-B3 and 6-9 provide the accepted snapshot overview, identity,
+fixed-grain activity, retention, flexible-distinct, semantic, relay, and
+predefined publisher products. They do not yet provide every field consumed by
+the current route handlers. In particular, the following state must exist in a
+versioned product tied to the same atomic run:
+
+- sparse exact hourly event counts keyed by `(hour_epoch, optional_kind)`, so
+  moving-window event counts, exact 168-hour throughput, recent-kind counts,
+  and hour-of-day activity counts never scan raw history on the request path;
+- exact all-time per-kind count, first timestamp, last eligible timestamp,
+  content-byte sum, and content-bearing row count, so the kind list/detail
+  response can preserve its current fields and byte-length semantics; and
+- an ingestion-owned latest-sealed-event watermark with an explicit freshness
+  objective, so `/stats/events/latest` does not pretend that an analytics
+  snapshot is a live head.
+
+The hourly and kind products must use canonical event-ID deduplication before
+aggregation. Physical Parquet rows, daily sums, or publisher top-K rows cannot
+stand in for this proof. Content averages require an exact content-byte fact;
+the existing v1 event-fact and fixed-activity artifacts do not retain content
+length and therefore cannot prove this field without a versioned enriched fact
+build or an equivalent bounded external join.
+
+The API contract also needs two explicit decisions before implementation:
+
+- moving `days=N` requests are anchored to the published complete-hour
+  boundary rather than wall-clock seconds; and
+- publisher `days` accepts only the production-benchmarked exact windows (the
+  candidate set is 1, 7, 30, 90, and 365) unless a separately validated
+  arbitrary-window implementation lands.
+
+Gate: a route-to-product matrix proves every response field and parameter
+shape from versioned Postgres state or the explicit ingestion watermark. No
+route is classified as ready merely because its headline count is available.
+The new products publish in the same transaction and generation as B3 and
+Slices 6-9, with retry, rollback, reconciliation, and moving-snapshot evidence.
+
 ### Slice 10 — endpoint cutover and ClickHouse retirement gate
 
 Goal: move routes independently after their products are accepted.
