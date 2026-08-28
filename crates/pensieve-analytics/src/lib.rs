@@ -55,7 +55,7 @@ pub use cohort_retention::{
 pub use distinct_sketch::{
     DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
     DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
-    DistinctSketchUnion,
+    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K,
 };
 pub use error::{Error, Result};
 pub use event_facts::{

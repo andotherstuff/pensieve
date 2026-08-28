@@ -18,6 +18,14 @@ pub const DATASKETCHES_HLL_SERIALIZATION_VERSION: u8 = 1;
 /// HLL precision: 4096 registers and roughly 1.6% nominal relative error.
 pub const DISTINCT_SKETCH_LG_K: u8 = 12;
 
+/// Higher precision reserved for daily zap-participant leaves.
+///
+/// Keeping this separate from the Slice 6 precision preserves every existing
+/// flexible-distinct artifact while making the per-leaf 2% zap gate a strong
+/// production invariant rather than a likely statistical failure across
+/// thousands of leaves.
+pub const ZAP_DISTINCT_SKETCH_LG_K: u8 = 16;
+
 /// Maximum accepted relative error for dense Slice 6 validation fixtures.
 pub const DISTINCT_SKETCH_RELATIVE_TOLERANCE: f64 = 0.02;
 
@@ -41,6 +49,9 @@ pub enum DistinctSketchError {
     /// The embedded Apache DataSketches payload is invalid.
     #[error("invalid Apache DataSketches HLL payload: {0}")]
     InvalidPayload(#[source] datasketches::error::Error),
+    /// A union must not silently downsample a leaf built at another precision.
+    #[error("distinct sketch precision mismatch: expected lg_k={expected}, actual lg_k={actual}")]
+    PrecisionMismatch { expected: u8, actual: u8 },
 }
 
 /// One fixed-memory, mergeable distinct-identity sketch.
@@ -58,6 +69,7 @@ pub struct DistinctSketchBuilder {
 /// Fixed-memory union for already canonical leaf order.
 pub struct DistinctSketchUnion {
     inner: HllUnion,
+    lg_k: u8,
 }
 
 impl Default for DistinctSketchUnion {
@@ -69,14 +81,27 @@ impl Default for DistinctSketchUnion {
 impl DistinctSketchUnion {
     /// Create an empty union using the fixed Slice 6 precision.
     pub fn new() -> Self {
-        Self {
-            inner: HllUnion::new(DISTINCT_SKETCH_LG_K),
-        }
+        Self::with_lg_k(DISTINCT_SKETCH_LG_K).expect("the fixed Slice 6 HLL precision is supported")
+    }
+
+    /// Create an empty union at one explicitly supported product precision.
+    pub fn with_lg_k(lg_k: u8) -> Result<Self, DistinctSketchError> {
+        validate_lg_k(lg_k)?;
+        Ok(Self {
+            inner: HllUnion::new(lg_k),
+            lg_k,
+        })
     }
 
     /// Merge one validated serialized leaf into the union.
     pub fn push_serialized(&mut self, bytes: &[u8]) -> Result<(), DistinctSketchError> {
         let sketch = DistinctSketch::deserialize(bytes)?;
+        if sketch.lg_k() != self.lg_k {
+            return Err(DistinctSketchError::PrecisionMismatch {
+                expected: self.lg_k,
+                actual: sketch.lg_k(),
+            });
+        }
         self.inner.update(&sketch.inner);
         Ok(())
     }
@@ -98,10 +123,16 @@ impl Default for DistinctSketchBuilder {
 impl DistinctSketchBuilder {
     /// Create an empty builder using the fixed Slice 6 sketch configuration.
     pub fn new() -> Self {
-        Self {
-            inner: HllSketch::new(DISTINCT_SKETCH_LG_K, TARGET_HLL_TYPE),
+        Self::with_lg_k(DISTINCT_SKETCH_LG_K).expect("the fixed Slice 6 HLL precision is supported")
+    }
+
+    /// Create a deterministic builder at one explicitly supported precision.
+    pub fn with_lg_k(lg_k: u8) -> Result<Self, DistinctSketchError> {
+        validate_lg_k(lg_k)?;
+        Ok(Self {
+            inner: HllSketch::new(lg_k, TARGET_HLL_TYPE),
             previous: None,
-        }
+        })
     }
 
     /// Add the next ascending raw identity, ignoring adjacent duplicates.
@@ -151,7 +182,12 @@ impl DistinctSketch {
         let mut canonical = sketches.into_iter().collect::<Vec<_>>();
         canonical.sort_unstable();
 
-        let mut union = DistinctSketchUnion::new();
+        let lg_k = canonical
+            .first()
+            .map(|bytes| DistinctSketch::deserialize(bytes).map(|sketch| sketch.lg_k()))
+            .transpose()?
+            .unwrap_or(DISTINCT_SKETCH_LG_K);
+        let mut union = DistinctSketchUnion::with_lg_k(lg_k)?;
         for bytes in canonical {
             union.push_serialized(bytes)?;
         }
@@ -163,6 +199,11 @@ impl DistinctSketch {
         self.inner.estimate().round() as u64
     }
 
+    /// HLL precision encoded by this immutable sketch.
+    pub fn lg_k(&self) -> u8 {
+        self.inner.lg_config_k()
+    }
+
     /// Serialize using the versioned Pensieve envelope.
     pub fn serialize(&self) -> Vec<u8> {
         let payload = self.inner.serialize();
@@ -170,7 +211,7 @@ impl DistinctSketch {
         let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
         bytes.extend_from_slice(MAGIC);
         bytes.push(DISTINCT_SKETCH_FORMAT_VERSION);
-        bytes.push(DISTINCT_SKETCH_LG_K);
+        bytes.push(self.lg_k());
         bytes.push(TARGET_HLL_TYPE_CODE);
         bytes.extend_from_slice(&payload_len.to_be_bytes());
         bytes.extend_from_slice(&payload);
@@ -190,14 +231,12 @@ impl DistinctSketch {
         let version = bytes[MAGIC.len()];
         let lg_k = bytes[MAGIC.len() + 1];
         let hll_type = bytes[MAGIC.len() + 2];
-        if version != DISTINCT_SKETCH_FORMAT_VERSION
-            || lg_k != DISTINCT_SKETCH_LG_K
-            || hll_type != TARGET_HLL_TYPE_CODE
-        {
+        if version != DISTINCT_SKETCH_FORMAT_VERSION || hll_type != TARGET_HLL_TYPE_CODE {
             return Err(DistinctSketchError::UnsupportedEnvelope(format!(
                 "version={version}, lg_k={lg_k}, hll_type={hll_type}"
             )));
         }
+        validate_lg_k(lg_k)?;
 
         let payload_len_offset = MAGIC.len() + 3;
         let payload_len = u32::from_be_bytes(
@@ -223,7 +262,7 @@ impl DistinctSketch {
             )));
         }
         let inner = HllSketch::deserialize(payload).map_err(DistinctSketchError::InvalidPayload)?;
-        if inner.lg_config_k() != DISTINCT_SKETCH_LG_K || inner.target_type() != TARGET_HLL_TYPE {
+        if inner.lg_config_k() != lg_k || inner.target_type() != TARGET_HLL_TYPE {
             return Err(DistinctSketchError::UnsupportedEnvelope(format!(
                 "payload lg_k={}, hll_type={:?}",
                 inner.lg_config_k(),
@@ -231,6 +270,16 @@ impl DistinctSketch {
             )));
         }
         Ok(Self { inner })
+    }
+}
+
+fn validate_lg_k(lg_k: u8) -> Result<(), DistinctSketchError> {
+    if matches!(lg_k, DISTINCT_SKETCH_LG_K | ZAP_DISTINCT_SKETCH_LG_K) {
+        Ok(())
+    } else {
+        Err(DistinctSketchError::UnsupportedEnvelope(format!(
+            "unsupported lg_k={lg_k}"
+        )))
     }
 }
 
@@ -289,6 +338,32 @@ mod tests {
             .expect("merge right first");
         assert_eq!(left_first.serialize(), right_first.serialize());
         assert_relative_error(left_first.estimate(), 15_000);
+    }
+
+    #[test]
+    fn high_precision_round_trips_and_cannot_be_silently_downsampled() {
+        let mut builder =
+            DistinctSketchBuilder::with_lg_k(ZAP_DISTINCT_SKETCH_LG_K).expect("builder");
+        for value in 0..100_000 {
+            builder.push(identity(value)).expect("push");
+        }
+        let sketch = builder.finish();
+        let bytes = sketch.serialize();
+        let decoded = DistinctSketch::deserialize(&bytes).expect("decode");
+        assert_eq!(decoded.lg_k(), ZAP_DISTINCT_SKETCH_LG_K);
+        assert_relative_error(decoded.estimate(), 100_000);
+
+        let mut wrong_union = DistinctSketchUnion::new();
+        assert!(matches!(
+            wrong_union.push_serialized(&bytes),
+            Err(DistinctSketchError::PrecisionMismatch { .. })
+        ));
+        assert_eq!(
+            DistinctSketch::merge_serialized([bytes.as_slice()])
+                .expect("merge")
+                .lg_k(),
+            ZAP_DISTINCT_SKETCH_LG_K
+        );
     }
 
     #[test]

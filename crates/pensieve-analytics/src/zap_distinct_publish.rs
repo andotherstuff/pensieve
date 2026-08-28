@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::schema::SCHEMA_SQL;
 use crate::{
     BoundedSemanticFacts, BoundedZapDistinct, COHORT_RETENTION_QUERY_VERSION, DistinctSketchUnion,
-    Error, Result, ZAP_DISTINCT_VERSION, ZapParticipantRole,
+    Error, Result, ZAP_DISTINCT_SKETCH_LG_K, ZAP_DISTINCT_VERSION, ZapParticipantRole,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 0x5045_4e53_4945_5645;
@@ -161,7 +161,9 @@ pub fn estimate_published_zap_distinct(
     )?;
     validate_window(since_epoch, until_epoch, complete_through)?;
     let role = role_code(role);
-    let mut union = DistinctSketchUnion::new();
+    let mut union = DistinctSketchUnion::with_lg_k(ZAP_DISTINCT_SKETCH_LG_K).map_err(|error| {
+        Error::Validation(format!("create published zap distinct union: {error}"))
+    })?;
     let mut rows = client.query_raw(
         "SELECT sketch
            FROM pensieve_analytics.semantic_zap_distinct_leaves
@@ -297,7 +299,7 @@ fn current_run_id(transaction: &mut impl GenericClient) -> Result<String> {
 
 fn zap_distinct_product_id(semantic_product_id: &str, product: &BoundedZapDistinct) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"pensieve-zap-distinct-product-v2\0");
+    digest.update(b"pensieve-zap-distinct-product-v3\0");
     digest.update(semantic_product_id.as_bytes());
     digest.update([0]);
     digest.update(product.evidence_sha256.as_bytes());

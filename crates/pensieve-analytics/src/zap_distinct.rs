@@ -12,19 +12,19 @@ use sha2::{Digest, Sha256};
 use crate::{
     ArtifactIdentity, BoundedExecutionError, BoundedSemanticFacts, DiskBudget, DistinctSketch,
     DistinctSketchBuilder, FixedRecordLayout, InputIdentity, Result, RunCheckpoint, RunIdentity,
-    SEMANTIC_FACTS_RUNNER_VERSION, SemanticFactReader, SemanticPayload, load_reusable_checkpoint,
-    merge_fixed_runs, preflight_disk, publish_canonical_json, publish_run_checkpoint,
-    read_run_checkpoint, validate_run_checkpoint,
+    SEMANTIC_FACTS_RUNNER_VERSION, SemanticFactReader, SemanticPayload, ZAP_DISTINCT_SKETCH_LG_K,
+    load_reusable_checkpoint, merge_fixed_runs, preflight_disk, publish_canonical_json,
+    publish_run_checkpoint, read_run_checkpoint, validate_run_checkpoint,
 };
 
 /// Encoded bytes for `day_epoch`, participant role, and pubkey.
 pub const ZAP_IDENTITY_BYTES: usize = 8 + 1 + 32;
 
 /// Stable product version.
-pub const ZAP_DISTINCT_VERSION: &str = "zap-distinct-daily-v2";
+pub const ZAP_DISTINCT_VERSION: &str = "zap-distinct-daily-v3";
 
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
-const RUNNER_VERSION: &str = "pensieve-analytics-zap-distinct-v2";
+const RUNNER_VERSION: &str = "pensieve-analytics-zap-distinct-v3";
 const MAX_RELATIVE_ERROR_PPM: u64 = 20_000;
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -123,6 +123,8 @@ pub struct ZapDistinctEvidence {
     pub max_buffered_identity_bytes: usize,
     /// Maximum bytes in one serialized leaf.
     pub max_leaf_bytes: usize,
+    /// HLL precision used by every daily participant leaf.
+    pub sketch_lg_k: u8,
     /// Maximum accepted relative error.
     pub tolerance_ppm: u64,
     /// Configured disk reserve.
@@ -325,6 +327,7 @@ pub fn build_bounded_zap_distinct(
         leaves,
         max_buffered_identity_bytes,
         max_leaf_bytes,
+        sketch_lg_k: ZAP_DISTINCT_SKETCH_LG_K,
         tolerance_ppm: MAX_RELATIVE_ERROR_PPM,
         disk_reserve_bytes: config.disk_reserve_bytes,
         chunk_checkpoints,
@@ -600,14 +603,14 @@ fn build_leaves(path: &Path) -> Result<Vec<ZapDistinctLeaf>> {
             }
             Some(previous) => {
                 leaves.push(finish_leaf(previous)?);
-                let mut builder = DistinctSketchBuilder::new();
+                let mut builder = zap_sketch_builder()?;
                 builder.push(pubkey).map_err(|error| {
                     BoundedExecutionError::Invalid(format!("build zap leaf: {error}"))
                 })?;
                 current = Some((day, role, builder, 1));
             }
             None => {
-                let mut builder = DistinctSketchBuilder::new();
+                let mut builder = zap_sketch_builder()?;
                 builder.push(pubkey).map_err(|error| {
                     BoundedExecutionError::Invalid(format!("build zap leaf: {error}"))
                 })?;
@@ -634,7 +637,8 @@ fn finish_leaf(
     let relative_error_ppm = relative_error_ppm(exact_identities, estimated_identities);
     if relative_error_ppm > MAX_RELATIVE_ERROR_PPM {
         return Err(BoundedExecutionError::Invalid(format!(
-            "zap distinct leaf error {relative_error_ppm} ppm exceeds tolerance"
+            "zap distinct leaf day={day_epoch} role={role:?} exact={exact_identities} \
+             estimate={estimated_identities} error={relative_error_ppm} ppm exceeds tolerance"
         ))
         .into());
     }
@@ -692,6 +696,7 @@ fn validate_evidence(
         || bytes != expected_bytes
         || reconciled_physical != evidence.physical_identities
         || semantic_physical != evidence.physical_identities
+        || evidence.sketch_lg_k != ZAP_DISTINCT_SKETCH_LG_K
         || evidence.tolerance_ppm != MAX_RELATIVE_ERROR_PPM
         || evidence.max_leaf_bytes
             != evidence
@@ -718,6 +723,7 @@ fn validate_evidence(
             BoundedExecutionError::Invalid(format!("decode zap distinct leaf: {error}"))
         })?;
         if sketch.estimate() != leaf.estimated_identities
+            || sketch.lg_k() != evidence.sketch_lg_k
             || relative_error_ppm(leaf.exact_identities, leaf.estimated_identities)
                 != leaf.relative_error_ppm
             || leaf.relative_error_ppm > evidence.tolerance_ppm
@@ -741,6 +747,12 @@ fn validate_evidence(
         &["zap-distinct-merge"],
     )?;
     Ok(())
+}
+
+fn zap_sketch_builder() -> Result<DistinctSketchBuilder> {
+    DistinctSketchBuilder::with_lg_k(ZAP_DISTINCT_SKETCH_LG_K).map_err(|error| {
+        BoundedExecutionError::Invalid(format!("create zap distinct sketch: {error}")).into()
+    })
 }
 
 fn validate_checkpoint_set(
@@ -978,6 +990,12 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].exact_identities, 1_000);
+        assert_eq!(
+            DistinctSketch::deserialize(&first[0].sketch)
+                .expect("decode")
+                .lg_k(),
+            ZAP_DISTINCT_SKETCH_LG_K
+        );
         assert!(first[0].relative_error_ppm <= MAX_RELATIVE_ERROR_PPM);
         assert_eq!(first[1].estimated_identities, 1);
     }

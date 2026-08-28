@@ -675,9 +675,13 @@ artifact to retain relevant future-dated events. Final rollups and domain
 counts apply the fixed run as-of boundary, while an append-only successor
 merges the validated baseline artifact with facts scanned only from new catalog
 objects and then re-finalizes at the successor boundary. This lets retained
-facts mature without rescanning immutable objects. Zap-distinct v2 applies the
+facts mature without rescanning immutable objects. Zap-distinct v3 applies the
 same as-of boundary while reading that retained artifact and fails closed on
-older semantic evidence.
+older semantic evidence. Its daily participant leaves use a separately
+versioned 65,536-register HLL while Slice 6 remains on its byte-compatible
+4,096-register format. This preserves the 2% per-leaf gate without pretending
+that a 1.6%-nominal-error sketch can satisfy that bound across thousands of
+independent leaves.
 
 Implementation status:
 
@@ -685,7 +689,8 @@ Implementation status:
   future-fact retention, rollup reconciliation, and immutable evidence.
 - [x] Append-only successor construction from the baseline plus delta objects,
   including future-fact maturation and retry-safe checkpoints.
-- [x] Zap-distinct v2 as-of filtering and semantic-evidence version gate.
+- [x] Zap-distinct v3 as-of filtering, high-precision per-leaf 2% gate, and
+  semantic-evidence version gate.
 - [x] Atomic recurring Postgres publication for semantic and zap products,
   including all-or-nothing refresh configuration and generation evidence.
 - [x] Immutable bounded sparse/median/dense production comparison harness with
