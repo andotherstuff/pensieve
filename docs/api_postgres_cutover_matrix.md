@@ -51,7 +51,7 @@ Status values below mean:
 | `GET /stats/zaps` | semantic zap daily rows plus zap-distinct sender/recipient leaves | gated | Slice 7 build, comparison, dormant publication, and recurring publication |
 | `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Slice 7 build, boundary comparison, deterministic percentage rounding, and publication |
 | `GET /stats/engagement` | semantic engagement daily rows | gated | Slice 7 build, positional-tag comparison, and publication |
-| `GET /stats/longform` | semantic long-form daily rows plus kind-30023 flexible-distinct author leaves | gated | Slice 7 additive and Slice 6 sketch gates; exact all-time author contract or accepted approximation must be explicit |
+| `GET /stats/longform` | semantic long-form daily rows, exact all-time kind-30023 authors from the enriched kind summary, and kind-30023 flexible-distinct leaves for bounded windows | gated | Slice 7 additive, Slice 9.5 exact all-time summary, and Slice 6 bounded-window sketch comparisons |
 | `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Slice 9 benchmark/build/publication; reject unsupported `days` unless a separate arbitrary-window contract lands |
 | `GET /stats/relays/distribution` | dormant relay-distribution product | gated | Slice 8 replacement-semantics comparison and publication |
 | `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Publish and compare the implemented enriched per-kind summaries |
@@ -84,6 +84,14 @@ Store one row for every represented kind with:
 - last eligible timestamp;
 - checked total UTF-8 content bytes; and
 - content-bearing event count used as the average denominator.
+
+The all-time unique-pubkey field is exact. In particular,
+`GET /stats/longform` reads the kind-30023 row for its unbounded author total.
+A bounded `days=N` long-form request instead unions the accepted Slice 6
+kind-30023 leaves over the published complete-hour window and therefore keeps
+the approximation contract and error evidence of that product. The route must
+not substitute the bounded sketch for the exact all-time value or reuse the
+all-time value for a bounded request.
 
 The serving-facts implementation now joins the exact event-fact anchor with a
 bounded, event-ID-keyed UTF-8 content-length stream. Its fixed-width enriched
