@@ -828,6 +828,8 @@ shape from versioned Postgres state or the explicit ingestion watermark. No
 route is classified as ready merely because its headline count is available.
 The new products publish in the same transaction and generation as B3 and
 Slices 6-9, with retry, rollback, reconciliation, and moving-snapshot evidence.
+The authoritative field-level audit is
+[`api_postgres_cutover_matrix.md`](api_postgres_cutover_matrix.md).
 
 ### Slice 10 — endpoint cutover and ClickHouse retirement gate
 
