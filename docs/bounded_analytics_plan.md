@@ -688,6 +688,8 @@ Implementation status:
 - [x] Zap-distinct v2 as-of filtering and semantic-evidence version gate.
 - [x] Atomic recurring Postgres publication for semantic and zap products,
   including all-or-nothing refresh configuration and generation evidence.
+- [x] Immutable bounded sparse/median/dense production comparison harness with
+  explicit cross-store population and legacy zap-parser classifications.
 - [ ] Independent production comparison canary and recurring publication gate.
 
 ### Slice 8 — current NIP-65 relay distribution
