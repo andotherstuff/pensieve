@@ -31,31 +31,31 @@ Status values below mean:
 
 ## Route matrix
 
-| Route | Required product and contract | Status before Slice 9.5 | Remaining gate |
+| Route | Required product and contract | Current status | Remaining gate |
 |---|---|---|---|
-| `GET /stats` | `current_overview` plus exact eligible-pubkey total; latest timestamp comes from the ingestion watermark | partial | Live latest-event watermark and one response identity/freshness policy |
+| `GET /stats` | `current_overview` plus exact eligible-pubkey total; latest timestamp comes from the ingestion watermark | gated | Activate the implemented watermark and validate one response identity/freshness policy |
 | `GET /stats/events/total` | `current_overview.total_events` | ready | Route comparison only; Postgres returns canonical logical events rather than ClickHouse part rows |
 | `GET /stats/pubkeys/total` | `current_overview.total_pubkeys` | ready | Route comparison only |
 | `GET /stats/kinds/total` | `current_overview.kinds_30d` | ready | Anchor the 30-day boundary to the selected run |
 | `GET /stats/events/earliest` | `current_overview.earliest_event` | ready | Preserve the Nostr-genesis clamp in the route adapter |
-| `GET /stats/events/latest` | latest sealed canonical event watermark | external | Implement and validate the ingestion-owned atomic watermark and freshness objective |
-| `GET /stats/events` | `current_event_daily`, `current_event_daily_kind`, fixed-grain exact distincts, and flexible-distinct leaves | partial | Exact hourly additive counts for moving `days`; complete-hour anchoring; accepted sketch union for flexible distincts |
-| `GET /stats/throughput` | exact sparse hourly event counts over the last 168 complete hours, optionally by kind | partial | Slice 9.5 hourly-count product |
+| `GET /stats/events/latest` | latest sealed canonical event watermark | external | Activate the implemented ingestion-owned watermark and validate its freshness objective |
+| `GET /stats/events` | `current_event_daily`, `current_event_daily_kind`, fixed-grain exact distincts, flexible-distinct leaves, and sparse hourly counts | gated | Slice 9.5 production publication and every supported `days`/kind comparison |
+| `GET /stats/throughput` | exact sparse hourly event counts over the last 168 complete hours, optionally by kind | gated | Slice 9.5 production publication and exact 168-hour comparison |
 | `GET /stats/users/active` | latest rows from `current_active_users_period` for day/week/month | ready | Route comparison and empty-dataset behavior |
 | `GET /stats/users/active/daily` | `current_active_users_period` with `grain='day'` | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/users/active/weekly` | `current_active_users_period` with `grain='week'` | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/users/active/monthly` | `current_active_users_period` with `grain='month'` | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/users/retention` | `current_cohort_retention_period` | ready | Preserve the intentional newest-cohort-first correction and period-zero semantics |
 | `GET /stats/users/new` | `current_new_users_daily`, composed to day/week/month | ready | Ordering, `since`, and limit comparison |
-| `GET /stats/activity/hourly` | Slice 9.5 hourly event counts plus flexible-distinct leaf unions grouped by UTC hour-of-day | partial | Exact additive product and accepted sketch comparison for every `days`/kind shape |
+| `GET /stats/activity/hourly` | Slice 9.5 hourly event counts plus flexible-distinct leaf unions grouped by UTC hour-of-day | gated | Production publication and accepted sketch comparison for every `days`/kind shape |
 | `GET /stats/zaps` | semantic zap daily rows plus zap-distinct sender/recipient leaves | gated | Slice 7 build, comparison, dormant publication, and recurring publication |
 | `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Slice 7 build, boundary comparison, deterministic percentage rounding, and publication |
 | `GET /stats/engagement` | semantic engagement daily rows | gated | Slice 7 build, positional-tag comparison, and publication |
 | `GET /stats/longform` | semantic long-form daily rows plus kind-30023 flexible-distinct author leaves | gated | Slice 7 additive and Slice 6 sketch gates; exact all-time author contract or accepted approximation must be explicit |
 | `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Slice 9 benchmark/build/publication; reject unsupported `days` unless a separate arbitrary-window contract lands |
 | `GET /stats/relays/distribution` | dormant relay-distribution product | gated | Slice 8 replacement-semantics comparison and publication |
-| `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | partial | Slice 9.5 general per-kind summary; current `kind_all_time` contains only event count |
-| `GET /kinds/{kind}` | general per-kind summary plus exact hourly recent counts | partial | Slice 9.5 kind summary and hourly-count products |
+| `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Publish and compare the implemented enriched per-kind summaries |
+| `GET /kinds/{kind}` | enriched per-kind summary plus exact hourly recent counts | gated | Publish and compare the implemented kind-summary and hourly-count products |
 | `GET /kinds/{kind}/activity` | `current_event_daily_kind` plus exact fixed-grain distincts composed for day/week/month | ready | Route comparison, ordering, and limit behavior |
 
 ## Slice 9.5 product contract
@@ -85,11 +85,11 @@ Store one row for every represented kind with:
 - checked total UTF-8 content bytes; and
 - content-bearing event count used as the average denominator.
 
-The current v1 event-fact artifact stores only event ID, timestamp, and kind;
-the fixed-activity artifact adds pubkey but still omits content length. Neither
-can prove the content average. The implementation therefore needs a versioned
-enriched fact build or an equivalent bounded external join. Duplicate event
-IDs must be removed before count and content accumulation.
+The serving-facts implementation now joins the exact event-fact anchor with a
+bounded, event-ID-keyed UTF-8 content-length stream. Its fixed-width enriched
+artifact proves the content average without retaining raw content. Duplicate
+event IDs are removed before count and content accumulation. Production build,
+publication, and recurring-successor evidence remain gated.
 
 ### Latest sealed event watermark
 
@@ -100,6 +100,19 @@ publication timestamp, and schema version. The API reads a fully published
 document and reports its observed age; a partial file or stale/malformed
 identity fails closed. This watermark never changes an analytics run and must
 not make a partial analytics generation current.
+
+## Slice 9.5 implementation status
+
+- [x] Canonical fixed-width enriched facts with exact event-ID/content join.
+- [x] Sparse complete-hour all-kind and per-kind event counts.
+- [x] Exact enriched all-time per-kind summaries and content-byte denominator.
+- [x] Retry-safe dormant Postgres publication through migration 010.
+- [x] All-product recurring transaction and append-only successor integration.
+- [x] Atomic ingestion-owned latest sealed-event watermark implementation.
+- [ ] Frozen production event-fact and serving-fact builds.
+- [ ] Dormant publication with no current-pointer change.
+- [ ] Watermark activation and freshness validation.
+- [ ] One moving recurring all-product publication and 24-route comparison.
 
 ## Cutover evidence
 

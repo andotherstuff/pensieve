@@ -837,9 +837,12 @@ Implementation status:
   and fails open for ingestion while its reader fails closed on malformed or
   non-canonical state. Production activation and freshness evidence remain
   gated with the rest of Slice 9.5.
-- [ ] Build and validate canonical hourly event and enriched per-kind facts.
-- [ ] Publish both compact products in the all-product transaction and prove a
-  moving recurring successor.
+- [x] Build and validate canonical hourly event and enriched per-kind facts
+  with a fixed-width event-ID/content join and append-only successor.
+- [x] Publish both compact products through migration 010 in the all-product
+  transaction with rollback, retry, and no-pointer-change tests.
+- [ ] Run the frozen production build and dormant publication canaries.
+- [ ] Prove one moving recurring all-product successor in production.
 
 Gate: a route-to-product matrix proves every response field and parameter
 shape from versioned Postgres state or the explicit ingestion watermark. No
