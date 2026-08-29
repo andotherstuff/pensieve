@@ -39,7 +39,7 @@ Status values below mean:
 | `GET /stats/kinds/total` | `current_overview.kinds_30d` | ready | Anchor the 30-day boundary to the selected run |
 | `GET /stats/events/earliest` | `current_overview.earliest_event` | ready | Preserve the Nostr-genesis clamp in the route adapter |
 | `GET /stats/events/latest` | latest sealed canonical event watermark | external | Activate the implemented ingestion-owned watermark and validate its freshness objective |
-| `GET /stats/events` | `current_event_daily`, `current_event_daily_kind`, fixed-grain exact distincts, flexible-distinct leaves, and sparse hourly counts | gated | Slice 9.5 production publication and every supported `days`/kind comparison |
+| `GET /stats/events` | `current_event_daily`, `current_event_daily_kind`, fixed-grain exact distincts, flexible-distinct leaves, and sparse hourly counts | gated | Postgres adapter implemented with a 366-day complete-hour bound; publish Slice 9.5 and compare every supported `days`/kind/group shape plus the intentional rejection of larger explicit windows |
 | `GET /stats/throughput` | exact sparse hourly event counts over the last 168 complete hours, optionally by kind | gated | Postgres adapter implemented; publish Slice 9.5 and compare the exact 168-hour boundary |
 | `GET /stats/users/active` | latest rows from `current_active_users_period` for day/week/month | ready | Route comparison and empty-dataset behavior |
 | `GET /stats/users/active/daily` | `current_active_users_period` with `grain='day'` | ready | Ordering, `since`, and limit comparison |
@@ -47,7 +47,7 @@ Status values below mean:
 | `GET /stats/users/active/monthly` | `current_active_users_period` with `grain='month'` | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/users/retention` | `current_cohort_retention_period` | ready | Preserve the intentional newest-cohort-first correction and period-zero semantics |
 | `GET /stats/users/new` | `current_new_users_daily`, composed to day/week/month | ready | Ordering, `since`, and limit comparison |
-| `GET /stats/activity/hourly` | Slice 9.5 hourly event counts plus flexible-distinct leaf unions grouped by UTC hour-of-day | gated | Production publication and accepted sketch comparison for every `days`/kind shape |
+| `GET /stats/activity/hourly` | Slice 9.5 hourly event counts plus flexible-distinct leaf unions grouped by UTC hour-of-day | gated | Postgres adapter implemented with fixed-memory unions; publish Slice 9.5 and compare every `days`/kind shape |
 | `GET /stats/zaps` | semantic zap daily rows plus zap-distinct sender/recipient leaves | gated | Postgres adapter implemented; accept both products in one recurring run and compare every aggregate/grouped shape |
 | `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Postgres adapter and deterministic rounding implemented; accept the product and compare bucket boundaries |
 | `GET /stats/engagement` | semantic engagement daily rows | gated | Postgres adapter implemented; accept the semantic product and compare positional-tag semantics |

@@ -15,9 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::postgres_analytics::{
-    ZapPeriodGrain, current_longform_products, current_serving_product, current_zap_products,
-    estimate_flexible_distinct, estimate_zap_distinct_periods, estimate_zap_distinct_roles,
-    zap_period_expression,
+    EventDistinctGrain, ZapPeriodGrain, current_event_products, current_longform_products,
+    current_serving_product, current_zap_products, estimate_event_distinct,
+    estimate_event_distinct_periods, estimate_flexible_distinct, estimate_zap_distinct_periods,
+    estimate_zap_distinct_roles, event_period_expression, zap_period_expression,
 };
 use crate::state::{AnalyticsFamily, AppState};
 
@@ -338,9 +339,9 @@ mod postgres_analytics_tests {
     use pensieve_core::LatestEventWatermark;
 
     use super::{
-        api_timestamp, engagement_response, longform_response, nonnegative_u64, retention_response,
-        rounded_percent, validate_postgres_zap_days, validate_watermark_freshness,
-        zap_aggregate_response, zap_bucket_contract,
+        api_timestamp, engagement_response, longform_response, nonnegative_u64,
+        resolve_event_window, retention_response, rounded_percent, validate_postgres_zap_days,
+        validate_watermark_freshness, zap_aggregate_response, zap_bucket_contract,
     };
 
     fn watermark() -> LatestEventWatermark {
@@ -452,6 +453,17 @@ mod postgres_analytics_tests {
         assert!(validate_postgres_zap_days(0).is_err());
         assert!(validate_postgres_zap_days(367).is_err());
     }
+
+    #[test]
+    fn postgres_event_windows_use_complete_hours_and_hard_bounds() {
+        let complete = 400 * 86_400 + 3_600;
+        assert_eq!(
+            resolve_event_window(complete, Some(30), None, None).unwrap(),
+            (complete - 30 * 86_400, complete)
+        );
+        assert!(resolve_event_window(complete, Some(0), None, None).is_err());
+        assert!(resolve_event_window(complete, Some(367), None, None).is_err());
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -543,6 +555,18 @@ pub async fn events(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Events) {
+            return fetch_postgres_events(
+                &state,
+                kind,
+                days,
+                since,
+                until,
+                group_by.as_deref(),
+                limit,
+            )
+            .await;
+        }
         // Use pre-aggregated daily_user_stats when possible (no kind filter)
         // This is MUCH faster than scanning events_local
         let use_preaggregated = kind.is_none() && group_by.is_some();
@@ -718,6 +742,145 @@ pub async fn events(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_events(
+    state: &AppState,
+    kind: Option<u16>,
+    days: Option<u32>,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    group_by: Option<&str>,
+    limit: u32,
+) -> Result<serde_json::Value, ApiError> {
+    let client = state
+        .postgres_client(AnalyticsFamily::Events)
+        .await
+        .map_err(ApiError::Internal)?;
+    let products = current_event_products(&client)
+        .await
+        .map_err(ApiError::Internal)?;
+    let (since_epoch, until_epoch) =
+        resolve_event_window(products.complete_through_epoch, days, since, until)?;
+    let kind_key = kind.map_or(-1, i32::from);
+    let Some(group_by) = group_by else {
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(event_count),0)::bigint
+                   FROM pensieve_analytics.serving_hourly_counts
+                  WHERE product_id=$1 AND kind=$2
+                    AND hour_epoch >= $3 AND hour_epoch < $4",
+                &[
+                    &products.serving_product_id,
+                    &kind_key,
+                    &since_epoch,
+                    &until_epoch,
+                ],
+            )
+            .await
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        let count = nonnegative_u64(row.get(0), "event count")?;
+        let unique_pubkeys =
+            estimate_event_distinct(&client, &products, since_epoch, until_epoch, kind)
+                .await
+                .map_err(ApiError::Internal)?;
+        return Ok(serde_json::to_value(EventCountResponse {
+            count,
+            unique_pubkeys,
+        })?);
+    };
+    let grain = match group_by {
+        "day" => EventDistinctGrain::Day,
+        "week" => EventDistinctGrain::Week,
+        "month" => EventDistinctGrain::Month,
+        _ => unreachable!("group_by was validated before caching"),
+    };
+    let period_expression = event_period_expression(grain);
+    let query = format!(
+        "SELECT {period_expression} AS period_key,SUM(event_count)::bigint
+           FROM pensieve_analytics.serving_hourly_counts
+          WHERE product_id=$1 AND kind=$2
+            AND hour_epoch >= $3 AND hour_epoch < $4
+          GROUP BY period_key ORDER BY period_key DESC LIMIT $5"
+    );
+    let counts = client
+        .query(
+            &query,
+            &[
+                &products.serving_product_id,
+                &kind_key,
+                &since_epoch,
+                &until_epoch,
+                &i64::from(limit),
+            ],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let distinct =
+        estimate_event_distinct_periods(&client, &products, since_epoch, until_epoch, kind, grain)
+            .await
+            .map_err(ApiError::Internal)?
+            .into_iter()
+            .map(|period| (period.period_key, period.unique_pubkeys))
+            .collect::<BTreeMap<_, _>>();
+    let mut response = Vec::with_capacity(counts.len());
+    for row in counts {
+        let period_key: i64 = row.get(0);
+        let unique_pubkeys = distinct.get(&period_key).copied().ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!(
+                "event count period has no accepted distinct leaf"
+            ))
+        })?;
+        response.push(EventCountByPeriod {
+            period: period_label(period_key)?,
+            count: nonnegative_u64(row.get(1), "period event count")?,
+            unique_pubkeys,
+        });
+    }
+    Ok(serde_json::to_value(response)?)
+}
+
+fn resolve_event_window(
+    complete_through_epoch: i64,
+    days: Option<u32>,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+) -> Result<(i64, i64), ApiError> {
+    let (since_epoch, until_epoch) = if let Some(days @ 1..=366) = days {
+        (
+            complete_through_epoch - i64::from(days) * 86_400,
+            complete_through_epoch,
+        )
+    } else if let Some(days) = days {
+        return Err(ApiError::BadRequest(format!(
+            "days must be between 1 and 366, got {days}"
+        )));
+    } else {
+        let since_epoch = since.map_or(i64::from(NOSTR_GENESIS_TIMESTAMP), naive_date_epoch);
+        let until_epoch = until
+            .map(naive_date_epoch)
+            .unwrap_or(complete_through_epoch)
+            .min(complete_through_epoch);
+        (since_epoch, until_epoch)
+    };
+    if since_epoch < 0
+        || since_epoch >= until_epoch
+        || since_epoch % 3_600 != 0
+        || until_epoch % 3_600 != 0
+        || until_epoch - since_epoch > 366 * 86_400
+    {
+        return Err(ApiError::BadRequest(
+            "event window must be non-empty, hour-aligned, and at most 366 days".to_owned(),
+        ));
+    }
+    Ok((since_epoch, until_epoch))
+}
+
+fn naive_date_epoch(date: NaiveDate) -> i64 {
+    date.and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+        .timestamp()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1606,6 +1769,9 @@ pub async fn hourly_activity(
     );
 
     let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
+        if state.uses_postgres(AnalyticsFamily::Activity) {
+            return fetch_postgres_hourly_activity(&state, days, kind).await;
+        }
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),
@@ -1634,6 +1800,74 @@ pub async fn hourly_activity(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_hourly_activity(
+    state: &AppState,
+    days: u32,
+    kind: Option<u16>,
+) -> Result<Vec<HourlyActivityRow>, ApiError> {
+    if days == 0 {
+        return Err(ApiError::BadRequest("days must be at least 1".to_owned()));
+    }
+    let client = state
+        .postgres_client(AnalyticsFamily::Activity)
+        .await
+        .map_err(ApiError::Internal)?;
+    let products = current_event_products(&client)
+        .await
+        .map_err(ApiError::Internal)?;
+    let until_epoch = products.complete_through_epoch;
+    let since_epoch = until_epoch - i64::from(days) * 86_400;
+    let kind_key = kind.map_or(-1, i32::from);
+    let rows = client
+        .query(
+            "SELECT (hour_epoch / 3600) % 24 AS hour_of_day,
+                    SUM(event_count)::bigint
+               FROM pensieve_analytics.serving_hourly_counts
+              WHERE product_id=$1 AND kind=$2
+                AND hour_epoch >= $3 AND hour_epoch < $4
+              GROUP BY hour_of_day ORDER BY hour_of_day",
+            &[
+                &products.serving_product_id,
+                &kind_key,
+                &since_epoch,
+                &until_epoch,
+            ],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let distinct = estimate_event_distinct_periods(
+        &client,
+        &products,
+        since_epoch,
+        until_epoch,
+        kind,
+        EventDistinctGrain::HourOfDay,
+    )
+    .await
+    .map_err(ApiError::Internal)?
+    .into_iter()
+    .map(|period| (period.period_key, period.unique_pubkeys))
+    .collect::<BTreeMap<_, _>>();
+    rows.iter()
+        .map(|row| {
+            let hour_key: i64 = row.get(0);
+            let event_count = nonnegative_u64(row.get(1), "hour-of-day event count")?;
+            let unique_pubkeys = distinct.get(&hour_key).copied().ok_or_else(|| {
+                ApiError::Internal(anyhow::anyhow!(
+                    "hour-of-day count has no accepted distinct leaf"
+                ))
+            })?;
+            Ok(HourlyActivityRow {
+                hour: u8::try_from(hour_key)
+                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("hour-of-day exceeds u8")))?,
+                event_count,
+                unique_pubkeys,
+                avg_per_day: event_count as f64 / f64::from(days),
+            })
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
