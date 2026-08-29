@@ -297,10 +297,7 @@ fn build_publisher_ranking(
     }
     ensure_rank_index(&state)?;
     let ledger_rows = count(&state, "SELECT count(*) FROM publisher_windows")?;
-    let ranking_groups = count(
-        &state,
-        "SELECT count(*) FROM (SELECT 1 FROM publisher_windows GROUP BY days,kind)",
-    )?;
+    let ranking_groups = count_ranking_groups(&state, &config.windows_days)?;
     let ranking_artifact = materialize_artifact(&state, &config)?;
     let evidence = PublisherRankingEvidence {
         schema_version: EVIDENCE_SCHEMA_VERSION,
@@ -589,7 +586,7 @@ fn materialize_artifact(
     let mut row_count = 0_u64;
     let mut min_key = None;
     let mut max_key = None;
-    visit_state_rankings(state, config.top_limit, |ranking| {
+    visit_state_rankings(state, &config.windows_days, config.top_limit, |ranking| {
         let bytes = encode_ranking(&ranking);
         let key = hex::encode(&bytes[..40]);
         if min_key.as_ref().is_none_or(|minimum| &key < minimum) {
@@ -635,10 +632,7 @@ fn validate_evidence(evidence: &PublisherRankingEvidence, state: &Connection) ->
         "SELECT count(*) FROM sqlite_master
           WHERE type='index' AND name='publisher_window_rank'",
     )?;
-    let groups = count(
-        state,
-        "SELECT count(*) FROM (SELECT 1 FROM publisher_windows GROUP BY days,kind)",
-    )?;
+    let groups = count_ranking_groups(state, &evidence.windows_days)?;
     let metadata = std::fs::metadata(&evidence.ranking_artifact.path)?;
     let expected_bytes = evidence
         .ranking_artifact
@@ -695,17 +689,23 @@ fn validate_evidence(evidence: &PublisherRankingEvidence, state: &Connection) ->
     visit_publisher_ranking_rows(&product, |_| Ok(()))?;
     let mut artifact = BufReader::new(File::open(&evidence.ranking_artifact.path)?);
     let mut compared = 0_u64;
-    visit_state_rankings(state, evidence.top_limit, |expected| {
-        let mut bytes = [0_u8; PUBLISHER_RANKING_RECORD_BYTES];
-        if !read_exact_or_eof(&mut artifact, &mut bytes)? || decode_ranking(bytes)? != expected {
-            return Err(BoundedExecutionError::Invalid(
-                "publisher ranking artifact differs from exact ledger query".to_owned(),
-            )
-            .into());
-        }
-        compared = checked_add(compared, 1, "publisher reconciled rows")?;
-        Ok(())
-    })?;
+    visit_state_rankings(
+        state,
+        &evidence.windows_days,
+        evidence.top_limit,
+        |expected| {
+            let mut bytes = [0_u8; PUBLISHER_RANKING_RECORD_BYTES];
+            if !read_exact_or_eof(&mut artifact, &mut bytes)? || decode_ranking(bytes)? != expected
+            {
+                return Err(BoundedExecutionError::Invalid(
+                    "publisher ranking artifact differs from exact ledger query".to_owned(),
+                )
+                .into());
+            }
+            compared = checked_add(compared, 1, "publisher reconciled rows")?;
+            Ok(())
+        },
+    )?;
     if read_exact_or_eof(&mut artifact, &mut [0_u8; PUBLISHER_RANKING_RECORD_BYTES])?
         || compared != evidence.ranking_artifact.row_count
     {
@@ -719,38 +719,60 @@ fn validate_evidence(evidence: &PublisherRankingEvidence, state: &Connection) ->
 
 fn visit_state_rankings(
     state: &Connection,
+    windows_days: &[u32],
     top_limit: usize,
     mut visitor: impl FnMut(PublisherRankingRow) -> Result<()>,
 ) -> Result<()> {
     let mut statement = state.prepare(
-        "SELECT days,kind,pubkey,event_count,kinds_count,first_event,last_event
-           FROM (
-             SELECT *,row_number() OVER (
-               PARTITION BY days,kind ORDER BY event_count DESC,pubkey ASC
-             ) AS rank
-             FROM publisher_windows
-           ) WHERE rank <= ?1
-          ORDER BY days ASC,kind ASC,event_count DESC,pubkey ASC",
+        "SELECT pubkey,event_count,kinds_count,first_event,last_event
+           FROM publisher_windows
+          WHERE days=?1 AND kind=?2
+          ORDER BY event_count DESC,pubkey ASC
+          LIMIT ?3",
     )?;
-    let mut query = statement.query([to_i64("publisher top limit", top_limit as u64)?])?;
-    while let Some(row) = query.next()? {
-        visitor(PublisherRankingRow {
-            days: u32::try_from(row.get::<_, i64>(0)?).map_err(|_| {
-                BoundedExecutionError::Invalid("publisher days are invalid".to_owned())
-            })?,
-            kind: decode_kind(row.get(1)?)?,
-            pubkey: fixed_32(row.get(2)?, "publisher pubkey")?,
-            event_count: from_i64("publisher event count", row.get(3)?)?,
-            kinds_count: from_i64("publisher kind count", row.get(4)?)?,
-            first_event: u32::try_from(row.get::<_, i64>(5)?).map_err(|_| {
-                BoundedExecutionError::Invalid("publisher first event is invalid".to_owned())
-            })?,
-            last_event: u32::try_from(row.get::<_, i64>(6)?).map_err(|_| {
-                BoundedExecutionError::Invalid("publisher last event is invalid".to_owned())
-            })?,
-        })?;
+    let limit = to_i64("publisher top limit", top_limit as u64)?;
+    for days in windows_days {
+        for kind in std::iter::once(ALL_KINDS).chain((0..=u16::MAX).map(i64::from)) {
+            let mut query = statement.query(params![i64::from(*days), kind, limit])?;
+            while let Some(row) = query.next()? {
+                visitor(PublisherRankingRow {
+                    days: *days,
+                    kind: decode_kind(kind)?,
+                    pubkey: fixed_32(row.get(0)?, "publisher pubkey")?,
+                    event_count: from_i64("publisher event count", row.get(1)?)?,
+                    kinds_count: from_i64("publisher kind count", row.get(2)?)?,
+                    first_event: u32::try_from(row.get::<_, i64>(3)?).map_err(|_| {
+                        BoundedExecutionError::Invalid(
+                            "publisher first event is invalid".to_owned(),
+                        )
+                    })?,
+                    last_event: u32::try_from(row.get::<_, i64>(4)?).map_err(|_| {
+                        BoundedExecutionError::Invalid("publisher last event is invalid".to_owned())
+                    })?,
+                })?;
+            }
+        }
     }
     Ok(())
+}
+
+fn count_ranking_groups(state: &Connection, windows_days: &[u32]) -> Result<u64> {
+    let mut statement = state.prepare(
+        "SELECT EXISTS(
+             SELECT 1 FROM publisher_windows WHERE days=?1 AND kind=?2 LIMIT 1
+         )",
+    )?;
+    let mut groups = 0_u64;
+    for days in windows_days {
+        for kind in std::iter::once(ALL_KINDS).chain((0..=u16::MAX).map(i64::from)) {
+            let exists: bool =
+                statement.query_row(params![i64::from(*days), kind], |row| row.get(0))?;
+            if exists {
+                groups = checked_add(groups, 1, "publisher ranking groups")?;
+            }
+        }
+    }
+    Ok(groups)
 }
 
 fn validate_config(config: &PublisherRankingConfig) -> Result<()> {
@@ -912,9 +934,12 @@ fn from_i64(field: &'static str, value: i64) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
-    use super::{Result, prepare_rank_index_for_build};
+    use super::{
+        ALL_KINDS, PublisherRankingRow, Result, count_ranking_groups, prepare_rank_index_for_build,
+        visit_state_rankings,
+    };
 
     #[test]
     fn ranking_index_exists_only_after_the_source_is_complete() -> Result<()> {
@@ -937,6 +962,94 @@ mod tests {
         assert_eq!(index_count(&state)?, 1);
         assert!(prepare_rank_index_for_build(&state, 3, 2).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn indexed_group_lookups_match_exact_top_k_order() -> Result<()> {
+        let state = Connection::open_in_memory()?;
+        state.execute_batch(
+            "CREATE TABLE publisher_windows(
+                 days INTEGER NOT NULL,kind INTEGER NOT NULL,pubkey BLOB NOT NULL,
+                 event_count INTEGER NOT NULL,kinds_count INTEGER NOT NULL,
+                 first_event INTEGER NOT NULL,last_event INTEGER NOT NULL,
+                 PRIMARY KEY(days,kind,pubkey)
+             ) WITHOUT ROWID;
+             CREATE INDEX publisher_window_rank
+                 ON publisher_windows(days,kind,event_count DESC,pubkey ASC);",
+        )?;
+        let rows = [
+            (1, ALL_KINDS, 1_u8, 10, 2, 1, 10),
+            (1, ALL_KINDS, 2, 10, 3, 2, 11),
+            (1, 1, 3, 8, 1, 3, 12),
+            (1, 1, 1, 5, 1, 4, 13),
+            (1, 1, 2, 4, 1, 5, 14),
+            (7, i64::from(u16::MAX), 2, 2, 1, 6, 15),
+            (30, ALL_KINDS, 9, 99, 4, 7, 16),
+        ];
+        for (days, kind, pubkey_byte, count, kinds, first, last) in rows {
+            state.execute(
+                "INSERT INTO publisher_windows VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    days,
+                    kind,
+                    &[pubkey_byte; 32][..],
+                    count,
+                    kinds,
+                    first,
+                    last
+                ],
+            )?;
+        }
+
+        let mut actual = Vec::new();
+        visit_state_rankings(&state, &[1, 7], 2, |row| {
+            actual.push(row);
+            Ok(())
+        })?;
+        assert_eq!(
+            actual,
+            vec![
+                ranking(1, None, 1, 10, 2, 1, 10),
+                ranking(1, None, 2, 10, 3, 2, 11),
+                ranking(1, Some(1), 3, 8, 1, 3, 12),
+                ranking(1, Some(1), 1, 5, 1, 4, 13),
+                ranking(7, Some(u16::MAX), 2, 2, 1, 6, 15),
+            ]
+        );
+        assert_eq!(count_ranking_groups(&state, &[1, 7])?, 3);
+
+        let plan: String = state.query_row(
+            "EXPLAIN QUERY PLAN
+             SELECT pubkey,event_count,kinds_count,first_event,last_event
+               FROM publisher_windows
+              WHERE days=?1 AND kind=?2
+              ORDER BY event_count DESC,pubkey ASC LIMIT ?3",
+            params![1, ALL_KINDS, 2],
+            |row| row.get(3),
+        )?;
+        assert!(plan.contains("publisher_window_rank"));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ranking(
+        days: u32,
+        kind: Option<u16>,
+        pubkey_byte: u8,
+        event_count: u64,
+        kinds_count: u64,
+        first_event: u32,
+        last_event: u32,
+    ) -> PublisherRankingRow {
+        PublisherRankingRow {
+            days,
+            kind,
+            pubkey: [pubkey_byte; 32],
+            event_count,
+            kinds_count,
+            first_event,
+            last_event,
+        }
     }
 
     fn index_count(state: &Connection) -> Result<u64> {

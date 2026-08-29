@@ -821,6 +821,11 @@ Implementation status:
   product, while the recurring runner has built it in the same process; the
   publisher scan and final evidence validation remain exact. This removes two
   redundant full artifact reads from every ranking attempt.
+- [x] Materialize and reconcile publisher top-K rows with indexed fixed-domain
+  lookups for each accepted `(window, kind)` instead of a window-function scan
+  over the complete durable ledger. The 65,537-kind domain and five accepted
+  windows are fixed, each lookup is capped at the published top limit, and the
+  canonical all-kind/kind ordering is preserved exactly.
 - [ ] Complete the frozen production ranking build, measure actual durable
   state/refresh cost and Postgres request latency, run the independent
   comparison, and pass dormant publication, retry, and recurring-publication
