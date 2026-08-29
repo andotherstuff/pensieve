@@ -1,8 +1,8 @@
 //! Pensieve Serve - HTTP API for Nostr analytics
 //!
-//! This crate provides a REST API for querying aggregate Nostr data stored in ClickHouse.
-//! It is designed for analytics-oriented access patterns (counts, trends, aggregations)
-//! rather than real-time relay subscriptions.
+//! This crate provides a REST API for querying aggregate Nostr data from
+//! ClickHouse or atomically versioned Postgres products. It is designed for
+//! analytics-oriented access patterns rather than real-time relay subscriptions.
 //!
 //! # Authentication
 //!
@@ -11,7 +11,7 @@
 //!
 //! # Architecture
 //!
-//! - **AppState**: Shared application state (ClickHouse client, configuration)
+//! - **AppState**: Shared ClickHouse/Postgres clients and backend selection
 //! - **Auth**: Bearer token middleware for request authentication
 //! - **Routes**: Endpoint handlers grouped by domain
 
@@ -25,4 +25,4 @@ pub use self::auth::require_auth;
 pub use self::cache::{ResponseCache, get_or_compute, new_cache};
 pub use self::error::ApiError;
 pub use self::routes::router;
-pub use self::state::{AppState, Config};
+pub use self::state::{AnalyticsFamily, AppState, Config};

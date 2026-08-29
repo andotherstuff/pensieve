@@ -1,7 +1,7 @@
 //! Pensieve Serve - HTTP API server for Nostr analytics.
 //!
-//! This binary starts the API server that provides analytics queries against
-//! the ClickHouse event store.
+//! This binary starts the API server with independently selectable ClickHouse
+//! and versioned Postgres analytics route families.
 
 use axum::http::Request;
 use clap::Parser;
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr.clone();
 
     // Create application state
-    let state = AppState::new(config);
+    let state = AppState::new(config).await?;
 
     // Build router with middleware
     let app = router(state)

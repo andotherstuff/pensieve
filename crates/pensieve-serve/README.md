@@ -21,8 +21,20 @@ Generate a token: `openssl rand -hex 32`
 | `PENSIEVE_BIND_ADDR` | `0.0.0.0:8080` | Server bind address |
 | `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse connection URL |
 | `CLICKHOUSE_DATABASE` | `nostr` | ClickHouse database name |
+| `DATABASE_URL` | *(required for Postgres families)* | Postgres analytics connection URL |
+| `POSTGRES_ANALYTICS_PASSWORD` | *(optional)* | Password override kept outside `DATABASE_URL` |
+| `PENSIEVE_POSTGRES_POOL_SIZE` | `4` | Bounded persistent Postgres connections (1-32) |
+| `PENSIEVE_POSTGRES_API_FAMILIES` | *(empty)* | Comma-separated route families selected for Postgres |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
 | `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints |
+
+The Postgres selector fails closed and defaults every analytics route to
+ClickHouse. Supported family names are `overview`, `events`, `active_users`,
+`new_users`, `retention`, `activity`, `zaps`, `engagement`, `longform`,
+`publishers`, `relay_distribution`, and `kinds`; `all` selects every analytics
+family and `none` selects none. The three operational relay routes continue to
+use `RELAY_DB_PATH`. Removing one family from the list rolls only that family
+back to ClickHouse without changing ingestion or the selected analytics run.
 
 ---
 
