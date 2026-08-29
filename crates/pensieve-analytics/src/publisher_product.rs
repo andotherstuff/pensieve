@@ -208,6 +208,11 @@ fn build_publisher_ranking(
     configure_state(&state, &config)?;
     initialize_identity(&state, activity, &config)?;
     let (mut source_records, mut max_kinds) = state_progress(&state)?;
+    prepare_rank_index_for_build(
+        &state,
+        source_records,
+        activity.evidence.activity_artifact.row_count,
+    )?;
     let source_path = Path::new(&activity.evidence.activity_artifact.path);
     let mut reader = BufReader::new(File::open(source_path)?);
     reader.seek(SeekFrom::Start(
@@ -283,6 +288,7 @@ fn build_publisher_ranking(
         )
         .into());
     }
+    ensure_rank_index(&state)?;
     let ledger_rows = count(&state, "SELECT count(*) FROM publisher_windows")?;
     let ranking_groups = count(
         &state,
@@ -387,9 +393,7 @@ fn configure_state(state: &Connection, config: &PublisherRankingConfig) -> Resul
              event_count INTEGER NOT NULL,kinds_count INTEGER NOT NULL,
              first_event INTEGER NOT NULL,last_event INTEGER NOT NULL,
              PRIMARY KEY(days,kind,pubkey)
-         ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS publisher_window_rank
-             ON publisher_windows(days,kind,event_count DESC,pubkey ASC);",
+         ) WITHOUT ROWID;",
     )?;
     let page_size: u64 = state.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     let max_pages = config.max_state_bytes / page_size;
@@ -404,6 +408,33 @@ fn configure_state(state: &Connection, config: &PublisherRankingConfig) -> Resul
     let cache = -i64::try_from(cache_kib)
         .map_err(|_| BoundedExecutionError::Invalid("publisher cache exceeds i64".to_owned()))?;
     state.pragma_update(None, "cache_size", cache)?;
+    Ok(())
+}
+
+fn prepare_rank_index_for_build(
+    state: &Connection,
+    source_records: u64,
+    expected_source_records: u64,
+) -> Result<()> {
+    if source_records > expected_source_records {
+        return Err(BoundedExecutionError::Invalid(
+            "publisher source progress exceeds its immutable activity artifact".to_owned(),
+        )
+        .into());
+    }
+    if source_records < expected_source_records {
+        state.execute_batch("DROP INDEX IF EXISTS publisher_window_rank")?;
+    } else {
+        ensure_rank_index(state)?;
+    }
+    Ok(())
+}
+
+fn ensure_rank_index(state: &Connection) -> Result<()> {
+    state.execute_batch(
+        "CREATE INDEX IF NOT EXISTS publisher_window_rank
+             ON publisher_windows(days,kind,event_count DESC,pubkey ASC)",
+    )?;
     Ok(())
 }
 
@@ -592,6 +623,11 @@ fn materialize_artifact(
 
 fn validate_evidence(evidence: &PublisherRankingEvidence, state: &Connection) -> Result<()> {
     let ledger_rows = count(state, "SELECT count(*) FROM publisher_windows")?;
+    let rank_indexes = count(
+        state,
+        "SELECT count(*) FROM sqlite_master
+          WHERE type='index' AND name='publisher_window_rank'",
+    )?;
     let groups = count(
         state,
         "SELECT count(*) FROM (SELECT 1 FROM publisher_windows GROUP BY days,kind)",
@@ -631,6 +667,7 @@ fn validate_evidence(evidence: &PublisherRankingEvidence, state: &Connection) ->
         || state_identity != expected_identity
         || evidence.source_records != source_records
         || evidence.max_publisher_kinds_buffered != max_kinds
+        || rank_indexes != 1
         || evidence.ledger_rows != ledger_rows
         || evidence.ranking_groups != groups
         || evidence.ranking_artifact.row_count > groups.saturating_mul(evidence.top_limit as u64)
@@ -868,4 +905,43 @@ fn to_i64(field: &'static str, value: u64) -> Result<i64> {
 
 fn from_i64(field: &'static str, value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| crate::Error::NegativeLedgerValue { field, value })
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{Result, prepare_rank_index_for_build};
+
+    #[test]
+    fn ranking_index_exists_only_after_the_source_is_complete() -> Result<()> {
+        let state = Connection::open_in_memory()?;
+        state.execute_batch(
+            "CREATE TABLE publisher_windows(
+                 days INTEGER NOT NULL,kind INTEGER NOT NULL,pubkey BLOB NOT NULL,
+                 event_count INTEGER NOT NULL,kinds_count INTEGER NOT NULL,
+                 first_event INTEGER NOT NULL,last_event INTEGER NOT NULL,
+                 PRIMARY KEY(days,kind,pubkey)
+             ) WITHOUT ROWID;
+             CREATE INDEX publisher_window_rank
+                 ON publisher_windows(days,kind,event_count DESC,pubkey ASC);",
+        )?;
+
+        prepare_rank_index_for_build(&state, 1, 2)?;
+        assert_eq!(index_count(&state)?, 0);
+
+        prepare_rank_index_for_build(&state, 2, 2)?;
+        assert_eq!(index_count(&state)?, 1);
+        assert!(prepare_rank_index_for_build(&state, 3, 2).is_err());
+        Ok(())
+    }
+
+    fn index_count(state: &Connection) -> Result<u64> {
+        Ok(state.query_row(
+            "SELECT count(*) FROM sqlite_master
+              WHERE type='index' AND name='publisher_window_rank'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
 }

@@ -811,6 +811,11 @@ Implementation status:
   size, source-scan throughput, and the bounded serving contract.
 - [x] Add the selected DDL, atomic publication, bounded query path, and
   comparison harness after the measured decision.
+- [x] Defer the serving-order SQLite index until the resumable source scan is
+  complete. Incomplete runs drop an index left by older binaries before
+  resuming, and canonical materialization recreates it before evidence is
+  emitted, avoiding per-row secondary-index amplification without changing
+  ranking semantics or retry identity.
 - [ ] Complete the frozen production ranking build, measure actual durable
   state/refresh cost and Postgres request latency, run the independent
   comparison, and pass dormant publication, retry, and recurring-publication
