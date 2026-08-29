@@ -3750,6 +3750,7 @@ dependencies = [
  "clap",
  "clickhouse",
  "dotenvy",
+ "futures-util",
  "hex_fmt",
  "http-body-util",
  "metrics",

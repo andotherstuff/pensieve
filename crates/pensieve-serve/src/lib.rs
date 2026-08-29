@@ -18,6 +18,7 @@
 mod auth;
 pub mod cache;
 mod error;
+mod postgres_analytics;
 mod routes;
 mod state;
 

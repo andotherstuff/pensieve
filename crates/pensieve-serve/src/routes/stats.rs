@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
+use crate::postgres_analytics::estimate_current_flexible_distinct;
 use crate::state::{AnalyticsFamily, AppState};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -329,7 +330,7 @@ mod postgres_analytics_tests {
     use pensieve_core::LatestEventWatermark;
 
     use super::{
-        api_timestamp, engagement_response, nonnegative_u64, retention_response,
+        api_timestamp, engagement_response, longform_response, nonnegative_u64, retention_response,
         validate_watermark_freshness,
     };
 
@@ -395,6 +396,19 @@ mod postgres_analytics_tests {
         let empty = engagement_response(30, 0, 0, 0);
         assert_eq!(empty.replies_per_note, 0.0);
         assert_eq!(empty.reactions_per_note, 0.0);
+    }
+
+    #[test]
+    fn longform_adapter_preserves_exact_totals_and_zero_behavior() {
+        let populated = longform_response(4, 3, 100);
+        assert_eq!(populated.articles_count, 4);
+        assert_eq!(populated.unique_authors, 3);
+        assert_eq!(populated.avg_content_length, 25.0);
+        assert_eq!(populated.estimated_total_words, 20);
+
+        let empty = longform_response(0, 0, 0);
+        assert_eq!(empty.avg_content_length, 0.0);
+        assert_eq!(empty.estimated_total_words, 0);
     }
 }
 
@@ -2045,6 +2059,9 @@ pub async fn longform(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Longform) {
+            return fetch_postgres_longform(&state, days).await;
+        }
         let days_clause = match days {
             Some(days) => format!("AND created_at >= now() - INTERVAL {} DAY", days),
             None => String::new(),
@@ -2072,6 +2089,126 @@ pub async fn longform(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_longform(
+    state: &AppState,
+    days: Option<u32>,
+) -> Result<LongformStats, ApiError> {
+    let client = state
+        .postgres_client(AnalyticsFamily::Longform)
+        .await
+        .map_err(ApiError::Internal)?;
+    let (articles, unique_authors, content_bytes) = match days {
+        Some(days @ 1..=366) => {
+            let days = i64::from(days);
+            let row = client
+                .query_one(
+                    "WITH product AS (
+                         SELECT products.product_id,
+                                (products.as_of_epoch / 86400) * 86400 AS complete_through
+                           FROM pensieve_analytics.semantic_products products
+                           JOIN pensieve_analytics.current_run_metadata current USING (run_id)
+                          WHERE products.evidence_sha256 =
+                                current.validation ->> 'semantic_evidence_sha256'
+                     )
+                     SELECT COUNT(DISTINCT product.product_id)::bigint,
+                            MIN(product.complete_through)::bigint,
+                            COALESCE(SUM(daily.articles),0)::bigint,
+                            COALESCE(SUM(daily.content_bytes),0)::bigint
+                       FROM product
+                       LEFT JOIN pensieve_analytics.semantic_longform_daily daily
+                         ON daily.product_id=product.product_id
+                        AND daily.day_epoch >= product.complete_through - $1 * 86400
+                        AND daily.day_epoch < product.complete_through",
+                    &[&days],
+                )
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
+            if row.get::<_, i64>(0) != 1 {
+                return Err(ApiError::Internal(anyhow::anyhow!(
+                    "current semantic longform product is unavailable"
+                )));
+            }
+            let complete_through = row.get::<_, Option<i64>>(1).ok_or_else(|| {
+                ApiError::Internal(anyhow::anyhow!(
+                    "current semantic longform boundary is unavailable"
+                ))
+            })?;
+            let since_epoch = complete_through
+                .checked_sub(days * 86_400)
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("longform window underflow")))?;
+            let unique_authors = estimate_current_flexible_distinct(
+                &client,
+                since_epoch,
+                complete_through,
+                Some(30_023),
+            )
+            .await
+            .map_err(ApiError::Internal)?;
+            (
+                nonnegative_u64(row.get(2), "longform articles")?,
+                unique_authors,
+                nonnegative_u64(row.get(3), "longform content bytes")?,
+            )
+        }
+        Some(days) => {
+            return Err(ApiError::BadRequest(format!(
+                "days must be between 1 and 366, got {days}"
+            )));
+        }
+        None => {
+            let row = client
+                .query_one(
+                    "WITH product AS (
+                         SELECT products.product_id
+                           FROM pensieve_analytics.serving_fact_products products
+                           JOIN pensieve_analytics.current_run_metadata current USING (run_id)
+                          WHERE products.evidence_sha256 =
+                                current.validation ->> 'serving_facts_evidence_sha256'
+                     )
+                     SELECT COUNT(DISTINCT product.product_id)::bigint,
+                            COALESCE(SUM(summary.event_count),0)::bigint,
+                            COALESCE(SUM(summary.unique_pubkeys),0)::bigint,
+                            COALESCE(SUM(summary.content_bytes),0)::bigint
+                       FROM product
+                       LEFT JOIN pensieve_analytics.serving_kind_summaries summary
+                         ON summary.product_id=product.product_id AND summary.kind=30023",
+                    &[],
+                )
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
+            if row.get::<_, i64>(0) != 1 {
+                return Err(ApiError::Internal(anyhow::anyhow!(
+                    "current all-time longform product is unavailable"
+                )));
+            }
+            (
+                nonnegative_u64(row.get(1), "longform articles")?,
+                nonnegative_u64(row.get(2), "longform authors")?,
+                nonnegative_u64(row.get(3), "longform content bytes")?,
+            )
+        }
+    };
+    Ok(longform_response(articles, unique_authors, content_bytes))
+}
+
+fn longform_response(
+    articles_count: u64,
+    unique_authors: u64,
+    total_content_length: u64,
+) -> LongformStats {
+    LongformStats {
+        articles_count,
+        unique_authors,
+        avg_content_length: if articles_count == 0 {
+            0.0
+        } else {
+            total_content_length as f64 / articles_count as f64
+        },
+        total_content_length,
+        estimated_total_words: total_content_length / 5,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

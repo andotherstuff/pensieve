@@ -30,6 +30,7 @@ clickhouse.workspace = true
 
 # Postgres cutover backend
 tokio-postgres.workspace = true
+futures-util.workspace = true
 
 # Serialization
 serde.workspace = true
