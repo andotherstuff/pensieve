@@ -6,7 +6,6 @@
 mod bounded;
 mod build;
 mod cohort_retention;
-mod distinct_sketch;
 mod error;
 mod event_facts;
 mod fixed_activity;
@@ -52,11 +51,6 @@ pub use cohort_retention::{
     BoundedCohortRetention, CohortRetentionEvidence, CohortRetentionPeriod,
     build_bounded_cohort_retention, load_bounded_cohort_retention,
 };
-pub use distinct_sketch::{
-    DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
-    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
-    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K,
-};
 pub use error::{Error, Result};
 pub use event_facts::{
     BoundedEventBuild, EVENT_FACT_BYTES, EVENT_FACT_KEY_BYTES, EventFact, EventFactBatchStats,
@@ -89,6 +83,11 @@ pub use flexible_distinct_validation::{
 };
 pub use incremental::{IncrementalSummary, apply_incremental, resolve_delta_locations};
 pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
+pub use pensieve_core::{
+    DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
+    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
+    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K,
+};
 pub use plan::{
     AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta,
     plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,

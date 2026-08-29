@@ -27,6 +27,7 @@ prost.workspace = true
 
 # Error handling
 thiserror.workspace = true
+datasketches.workspace = true
 
 # Observability
 tracing.workspace = true

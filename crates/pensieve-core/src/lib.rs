@@ -7,6 +7,7 @@
 //! - Prometheus metrics helpers
 //! - Shared error types
 
+mod distinct_sketch;
 mod error;
 mod event;
 pub mod metrics;
@@ -26,6 +27,11 @@ pub const NOSTR_GENESIS_TIMESTAMP: u32 = 1604707200; // 2020-11-07 00:00:00 UTC
 /// Nostr genesis date as a string for SQL queries.
 pub const NOSTR_GENESIS_DATE_SQL: &str = "2020-11-07 00:00:00";
 
+pub use distinct_sketch::{
+    DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
+    DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
+    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K,
+};
 pub use error::{Error, Result};
 pub use event::{
     event_to_notebuf, pack_event_binary, pack_event_binary_into, validate_event, validate_event_id,

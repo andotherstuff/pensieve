@@ -18,7 +18,6 @@ anyhow.workspace = true
 chrono.workspace = true
 clap = { version = "4.4", features = ["derive", "env"] }
 clickhouse.workspace = true
-datasketches.workspace = true
 duckdb.workspace = true
 hex.workspace = true
 pensieve-core = { path = "../pensieve-core" }
