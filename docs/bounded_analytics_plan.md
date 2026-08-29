@@ -783,6 +783,21 @@ identities. Only representative result heaps are retained; the
 per-kind cardinality table is a fixed 65,536-entry domain per configured
 window and therefore does not grow with input rows or publisher count.
 
+Production decision (`sha256:0beff0d9adaccb680034da2bf00d970c94cacbe59082525d244613e76ac0db7e`,
+as-of `1787794425`): use exact predefined materialized windows, not request-time
+daily-fact aggregation. Canonical benchmark evidence SHA-256
+`bf3a87a920dcb193c2616acd5f7b1c90cd7712f9e2f23fb1789d1176c0b66b0f`
+measured 241,846,318 `(day,pubkey)` facts and 290,279,961
+`(day,pubkey,kind)` facts, projecting 28,251,126,430 compact bytes. The accepted
+1/7/30/90/365-day top-1,000 relation instead contains at most 3,146,821 rows
+and 195,102,902 compact bytes (6,906 ppm of the daily-fact projection). The
+exact source scan processed 2,044,215,995 rows in 899,008 ms (2,273,857
+rows/second) with at most 1,703 kinds buffered for one publisher and 25,000
+representative heap rows. The durable builder may retain its resumable exact
+window ledger, but Postgres publishes only the compact ranking relation and the
+request path accepts only the five measured windows with a limit of 1 through
+1,000.
+
 Implementation status:
 
 - [x] Exact fixed-memory benchmark runner, strict source validation, canonical
@@ -791,11 +806,15 @@ Implementation status:
   the prohibited daily-top-K shortcut.
 - [x] Immutable bounded comparison harness for all accepted windows plus
   sparse/median/dense kind groups, with fixed-as-of and deterministic ties.
-- [ ] Production benchmark on a frozen current activity generation.
-- [ ] Freeze either exact daily-fact queries or predefined materialized
-  windows from measured Postgres size, refresh cost, and request latency.
-- [ ] Add the selected DDL, atomic publication, query path, and comparison
-  evidence only after that measured decision.
+- [x] Production benchmark on a frozen current activity generation.
+- [x] Freeze predefined materialized windows from measured cardinality, compact
+  size, source-scan throughput, and the bounded serving contract.
+- [x] Add the selected DDL, atomic publication, bounded query path, and
+  comparison harness after the measured decision.
+- [ ] Complete the frozen production ranking build, measure actual durable
+  state/refresh cost and Postgres request latency, run the independent
+  comparison, and pass dormant publication, retry, and recurring-publication
+  gates.
 
 ### Slice 9.5 — serving-completeness gate
 
