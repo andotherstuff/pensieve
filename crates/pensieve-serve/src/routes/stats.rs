@@ -16,9 +16,10 @@ use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::postgres_analytics::{
     EventDistinctGrain, ZapPeriodGrain, current_event_products, current_longform_products,
-    current_serving_product, current_zap_products, estimate_event_distinct,
-    estimate_event_distinct_periods, estimate_flexible_distinct, estimate_zap_distinct_periods,
-    estimate_zap_distinct_roles, event_period_expression, zap_period_expression,
+    current_publisher_product, current_serving_product, current_zap_products,
+    estimate_event_distinct, estimate_event_distinct_periods, estimate_flexible_distinct,
+    estimate_zap_distinct_periods, estimate_zap_distinct_roles, event_period_expression,
+    zap_period_expression,
 };
 use crate::state::{AnalyticsFamily, AppState};
 
@@ -340,8 +341,9 @@ mod postgres_analytics_tests {
 
     use super::{
         api_timestamp, engagement_response, longform_response, nonnegative_u64,
-        resolve_event_window, retention_response, rounded_percent, validate_postgres_zap_days,
-        validate_watermark_freshness, zap_aggregate_response, zap_bucket_contract,
+        resolve_event_window, retention_response, rounded_percent,
+        validate_postgres_publisher_days, validate_postgres_zap_days, validate_watermark_freshness,
+        zap_aggregate_response, zap_bucket_contract,
     };
 
     fn watermark() -> LatestEventWatermark {
@@ -463,6 +465,16 @@ mod postgres_analytics_tests {
         );
         assert!(resolve_event_window(complete, Some(0), None, None).is_err());
         assert!(resolve_event_window(complete, Some(367), None, None).is_err());
+    }
+
+    #[test]
+    fn postgres_publishers_accept_only_materialized_exact_windows() {
+        for days in [1, 7, 30, 90, 365] {
+            assert!(validate_postgres_publisher_days(days).is_ok());
+        }
+        for days in [0, 2, 29, 366] {
+            assert!(validate_postgres_publisher_days(days).is_err());
+        }
     }
 }
 
@@ -2933,6 +2945,9 @@ pub async fn publishers(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Publishers) {
+            return fetch_postgres_publishers(&state, days, kind, limit).await;
+        }
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),
@@ -2963,4 +2978,64 @@ pub async fn publishers(
     .await?;
 
     Ok(Json(result))
+}
+
+fn validate_postgres_publisher_days(days: u32) -> Result<(), ApiError> {
+    if [1, 7, 30, 90, 365].contains(&days) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "Postgres publisher rankings support days=1,7,30,90,365; got {days}"
+        )))
+    }
+}
+
+async fn fetch_postgres_publishers(
+    state: &AppState,
+    days: u32,
+    kind: Option<u16>,
+    limit: u32,
+) -> Result<Vec<PublisherRow>, ApiError> {
+    validate_postgres_publisher_days(days)?;
+    let client = state
+        .postgres_client(AnalyticsFamily::Publishers)
+        .await
+        .map_err(ApiError::Internal)?;
+    let product = current_publisher_product(&client)
+        .await
+        .map_err(ApiError::Internal)?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let days = i32::try_from(days).expect("accepted publisher days fit i32");
+    let kind = kind.map_or(-1_i32, i32::from);
+    let limit = i64::from(limit);
+    let rows = client
+        .query(
+            "SELECT encode(pubkey,'hex'),event_count,kinds_count,
+                    first_event,last_event
+               FROM pensieve_analytics.publisher_ranking_rows
+              WHERE product_id=$1 AND days=$2 AND kind=$3
+              ORDER BY event_count DESC,pubkey ASC LIMIT $4",
+            &[&product.product_id, &days, &kind, &limit],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    rows.iter()
+        .map(|row| {
+            let first_event: i64 = row.get(3);
+            let last_event: i64 = row.get(4);
+            Ok(PublisherRow {
+                pubkey: row.get(0),
+                event_count: nonnegative_u64(row.get(1), "publisher event_count")?,
+                kinds_count: nonnegative_u64(row.get(2), "publisher kinds_count")?,
+                first_event: u32::try_from(first_event).map_err(|_| {
+                    ApiError::Internal(anyhow::anyhow!("publisher first_event exceeds u32"))
+                })?,
+                last_event: u32::try_from(last_event).map_err(|_| {
+                    ApiError::Internal(anyhow::anyhow!("publisher last_event exceeds u32"))
+                })?,
+            })
+        })
+        .collect()
 }

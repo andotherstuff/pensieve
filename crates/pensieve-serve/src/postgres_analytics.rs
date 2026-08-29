@@ -48,6 +48,12 @@ pub struct CurrentEventProducts {
     pub complete_through_epoch: i64,
 }
 
+/// Accepted exact publisher-ranking product tied to the current run.
+pub struct CurrentPublisherProduct {
+    /// Immutable ranking product identifier.
+    pub product_id: String,
+}
+
 /// Supported calendar grouping for bounded zap-distinct unions.
 #[derive(Clone, Copy)]
 pub enum ZapPeriodGrain {
@@ -221,6 +227,31 @@ pub async fn current_event_products(client: &Client) -> anyhow::Result<CurrentEv
         serving_product_id: row.get(0),
         flexible_product_id: row.get(1),
         complete_through_epoch: serving_complete,
+    })
+}
+
+/// Resolve the accepted exact predefined-window publisher ranking.
+pub async fn current_publisher_product(client: &Client) -> anyhow::Result<CurrentPublisherProduct> {
+    let row = client
+        .query_opt(
+            "SELECT products.product_id,products.windows_days,products.top_limit
+               FROM pensieve_analytics.current_run_metadata current
+               JOIN pensieve_analytics.publisher_ranking_products products
+                 ON products.run_id=current.run_id
+                AND products.evidence_sha256 =
+                    current.validation ->> 'publisher_ranking_evidence_sha256'
+              WHERE products.product_version='publisher-ranking-v1'",
+            &[],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("current publisher-ranking product is unavailable"))?;
+    let windows: Vec<i32> = row.get(1);
+    let top_limit: i32 = row.get(2);
+    if windows != [1, 7, 30, 90, 365] || top_limit != 1_000 {
+        anyhow::bail!("current publisher-ranking product has an unsupported contract");
+    }
+    Ok(CurrentPublisherProduct {
+        product_id: row.get(0),
     })
 }
 

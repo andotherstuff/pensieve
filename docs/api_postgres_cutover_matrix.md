@@ -52,7 +52,7 @@ Status values below mean:
 | `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Postgres adapter and deterministic rounding implemented; accept the product and compare bucket boundaries |
 | `GET /stats/engagement` | semantic engagement daily rows | gated | Postgres adapter implemented; accept the semantic product and compare positional-tag semantics |
 | `GET /stats/longform` | semantic long-form daily rows, exact all-time kind-30023 authors from the enriched kind summary, and kind-30023 flexible-distinct leaves for bounded windows | gated | Postgres adapter implemented; accept all three products in one run and compare bounded/all-time shapes |
-| `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Slice 9 benchmark/build/publication; reject unsupported `days` unless a separate arbitrary-window contract lands |
+| `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Postgres adapter implemented for exact 1/7/30/90/365-day windows; finish Slice 9 build/comparison/publication and compare every supported window/kind shape |
 | `GET /stats/relays/distribution` | dormant relay-distribution product | gated | Slice 8 replacement-semantics comparison and publication |
 | `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Postgres adapter implemented; publish and compare the enriched per-kind summaries |
 | `GET /kinds/{kind}` | enriched per-kind summary plus exact hourly recent counts | gated | Postgres adapter implemented; publish and compare all-time and complete-hour windows |
