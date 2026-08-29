@@ -325,10 +325,10 @@ fn api_timestamp(value: i64, name: &'static str) -> Result<u32, ApiError> {
 }
 
 #[cfg(test)]
-mod postgres_overview_tests {
+mod postgres_analytics_tests {
     use pensieve_core::LatestEventWatermark;
 
-    use super::{api_timestamp, nonnegative_u64, validate_watermark_freshness};
+    use super::{api_timestamp, nonnegative_u64, retention_response, validate_watermark_freshness};
 
     fn watermark() -> LatestEventWatermark {
         LatestEventWatermark {
@@ -361,6 +361,26 @@ mod postgres_overview_tests {
         let mut empty = watermark();
         empty.max_eligible_created_at = None;
         assert_eq!(validate_watermark_freshness(&empty, 101, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn retention_adapter_uses_the_explicit_period_zero_denominator() {
+        let response = retention_response(
+            "2026-01-05".to_owned(),
+            vec![
+                ("2026-01-12".to_owned(), 4),
+                ("2026-01-05".to_owned(), 10),
+                ("2026-01-19".to_owned(), 2),
+            ],
+        );
+        assert_eq!(response.cohort_size, 10);
+        assert_eq!(response.retention, vec![4, 10, 2]);
+        assert_eq!(response.retention_pct, vec![40.0, 100.0, 20.0]);
+
+        let missing_period_zero =
+            retention_response("2026-01-05".to_owned(), vec![("2026-01-12".to_owned(), 4)]);
+        assert_eq!(missing_period_zero.cohort_size, 0);
+        assert_eq!(missing_period_zero.retention_pct, vec![0.0]);
     }
 }
 
@@ -680,6 +700,9 @@ pub async fn active_users_summary(
 
 /// Fetch the most recent daily active users from the pre-computed table.
 async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+        return fetch_latest_postgres_active_users(state, "day").await;
+    }
     state
         .clickhouse
         .query(
@@ -701,6 +724,9 @@ async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsers
 
 /// Fetch the most recent weekly active users from the pre-computed table.
 async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+        return fetch_latest_postgres_active_users(state, "week").await;
+    }
     state
         .clickhouse
         .query(
@@ -722,6 +748,9 @@ async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUser
 
 /// Fetch the most recent monthly active users from the pre-computed table.
 async fn fetch_latest_monthly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+        return fetch_latest_postgres_active_users(state, "month").await;
+    }
     state
         .clickhouse
         .query(
@@ -782,6 +811,9 @@ pub async fn active_users_daily(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+            return fetch_postgres_active_users(&state, "day", since, limit).await;
+        }
         // Fetch all daily data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -833,6 +865,9 @@ pub async fn active_users_weekly(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+            return fetch_postgres_active_users(&state, "week", since, limit).await;
+        }
         // Fetch all weekly data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -884,6 +919,9 @@ pub async fn active_users_monthly(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
+            return fetch_postgres_active_users(&state, "month", since, limit).await;
+        }
         // Fetch all monthly data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -914,6 +952,77 @@ pub async fn active_users_monthly(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_latest_postgres_active_users(
+    state: &AppState,
+    grain: &'static str,
+) -> Result<ActiveUsersCount, ApiError> {
+    let client = state
+        .postgres_client(AnalyticsFamily::ActiveUsers)
+        .await
+        .map_err(ApiError::Internal)?;
+    let row = client
+        .query_one(
+            "SELECT active_users,has_profile,has_follows_list,
+                    has_profile_and_follows_list,total_events
+               FROM pensieve_analytics.current_active_users_period
+              WHERE grain=$1
+              ORDER BY period_start DESC
+              LIMIT 1",
+            &[&grain],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    postgres_active_users_count(&row)
+}
+
+async fn fetch_postgres_active_users(
+    state: &AppState,
+    grain: &'static str,
+    since: Option<NaiveDate>,
+    limit: usize,
+) -> Result<Vec<ActiveUsersRow>, ApiError> {
+    let client = state
+        .postgres_client(AnalyticsFamily::ActiveUsers)
+        .await
+        .map_err(ApiError::Internal)?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("active-user limit exceeds i64")))?;
+    let rows = client
+        .query(
+            "SELECT to_char(period_start,'YYYY-MM-DD'),active_users,has_profile,
+                    has_follows_list,has_profile_and_follows_list,total_events
+               FROM pensieve_analytics.current_active_users_period
+              WHERE grain=$1 AND ($2::date IS NULL OR period_start >= $2)
+              ORDER BY period_start DESC
+              LIMIT $3",
+            &[&grain, &since, &limit],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    rows.iter().map(postgres_active_users_row).collect()
+}
+
+fn postgres_active_users_count(row: &tokio_postgres::Row) -> Result<ActiveUsersCount, ApiError> {
+    Ok(ActiveUsersCount {
+        active_users: nonnegative_u64(row.get(0), "active_users")?,
+        has_profile: nonnegative_u64(row.get(1), "has_profile")?,
+        has_follows_list: nonnegative_u64(row.get(2), "has_follows_list")?,
+        has_profile_and_follows_list: nonnegative_u64(row.get(3), "has_profile_and_follows_list")?,
+        total_events: nonnegative_u64(row.get(4), "total_events")?,
+    })
+}
+
+fn postgres_active_users_row(row: &tokio_postgres::Row) -> Result<ActiveUsersRow, ApiError> {
+    Ok(ActiveUsersRow {
+        period: row.get(0),
+        active_users: nonnegative_u64(row.get(1), "active_users")?,
+        has_profile: nonnegative_u64(row.get(2), "has_profile")?,
+        has_follows_list: nonnegative_u64(row.get(3), "has_follows_list")?,
+        has_profile_and_follows_list: nonnegative_u64(row.get(4), "has_profile_and_follows_list")?,
+        total_events: nonnegative_u64(row.get(5), "total_events")?,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1057,6 +1166,10 @@ pub async fn user_retention(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Retention) {
+            return fetch_postgres_retention(&state, cohort_size, cohort_start, limit as usize)
+                .await;
+        }
         // Build cohort filter clause
         let cohort_filter = match cohort_start {
             Some(date) => format!("WHERE cohort >= '{}'", date),
@@ -1133,6 +1246,82 @@ pub async fn user_retention(
     Ok(Json(result))
 }
 
+async fn fetch_postgres_retention(
+    state: &AppState,
+    grain: &str,
+    cohort_start: Option<NaiveDate>,
+    limit: usize,
+) -> Result<Vec<CohortRetention>, ApiError> {
+    let client = state
+        .postgres_client(AnalyticsFamily::Retention)
+        .await
+        .map_err(ApiError::Internal)?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("retention limit exceeds i64")))?;
+    let rows = client
+        .query(
+            "WITH selected AS (
+                 SELECT DISTINCT cohort_start
+                   FROM pensieve_analytics.current_cohort_retention_period
+                  WHERE grain=$1 AND ($2::date IS NULL OR cohort_start >= $2)
+                  ORDER BY cohort_start DESC
+                  LIMIT $3
+             )
+             SELECT to_char(retention.cohort_start,'YYYY-MM-DD'),
+                    to_char(retention.activity_period,'YYYY-MM-DD'),
+                    retention.active_pubkeys
+               FROM pensieve_analytics.current_cohort_retention_period retention
+               JOIN selected USING (cohort_start)
+              WHERE retention.grain=$1
+              ORDER BY retention.cohort_start DESC, retention.activity_period ASC",
+            &[&grain, &cohort_start, &limit],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let mut groups = Vec::<(String, Vec<(String, u64)>)>::new();
+    for row in rows {
+        let cohort: String = row.get(0);
+        let activity_period: String = row.get(1);
+        let active_count = nonnegative_u64(row.get(2), "active_pubkeys")?;
+        if groups.last().is_none_or(|(current, _)| current != &cohort) {
+            groups.push((cohort.clone(), Vec::new()));
+        }
+        groups
+            .last_mut()
+            .expect("retention group was just inserted")
+            .1
+            .push((activity_period, active_count));
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(cohort, periods)| retention_response(cohort, periods))
+        .collect())
+}
+
+fn retention_response(cohort: String, periods: Vec<(String, u64)>) -> CohortRetention {
+    let cohort_size = periods
+        .iter()
+        .find(|(period, _)| period == &cohort)
+        .map_or(0, |(_, count)| *count);
+    let retention = periods.iter().map(|(_, count)| *count).collect::<Vec<_>>();
+    let retention_pct = retention
+        .iter()
+        .map(|count| {
+            if cohort_size == 0 {
+                0.0
+            } else {
+                (*count as f64 / cohort_size as f64) * 100.0
+            }
+        })
+        .collect();
+    CohortRetention {
+        cohort,
+        cohort_size,
+        retention,
+        retention_pct,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // New Users
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1193,6 +1382,15 @@ pub async fn new_users(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::NewUsers) {
+            return fetch_postgres_new_users(
+                &state,
+                group_by.as_deref().unwrap_or("day"),
+                since,
+                limit as usize,
+            )
+            .await;
+        }
         let since_clause = match since {
             Some(date) => format!("AND date >= '{}'", date),
             None => String::new(),
@@ -1219,6 +1417,50 @@ pub async fn new_users(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_new_users(
+    state: &AppState,
+    grain: &str,
+    since: Option<NaiveDate>,
+    limit: usize,
+) -> Result<Vec<NewUsersRow>, ApiError> {
+    let period = match grain {
+        "day" => "day",
+        "week" => "date_trunc('week',day)::date",
+        "month" => "date_trunc('month',day)::date",
+        _ => {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "invalid new-user grain"
+            )));
+        }
+    };
+    let query = format!(
+        "SELECT to_char({period},'YYYY-MM-DD'),SUM(new_pubkeys)::bigint
+           FROM pensieve_analytics.current_new_users_daily
+          WHERE ($1::date IS NULL OR day >= $1)
+          GROUP BY {period}
+          ORDER BY {period} DESC
+          LIMIT $2"
+    );
+    let limit = i64::try_from(limit)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("new-user limit exceeds i64")))?;
+    let client = state
+        .postgres_client(AnalyticsFamily::NewUsers)
+        .await
+        .map_err(ApiError::Internal)?;
+    client
+        .query(&query, &[&since, &limit])
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?
+        .iter()
+        .map(|row| {
+            Ok(NewUsersRow {
+                period: row.get(0),
+                new_users: nonnegative_u64(row.get(1), "new_users")?,
+            })
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
