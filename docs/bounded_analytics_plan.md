@@ -816,6 +816,11 @@ Implementation status:
   resuming, and canonical materialization recreates it before evidence is
   emitted, avoiding per-row secondary-index amplification without changing
   ranking semantics or retry identity.
+- [x] Avoid a second full fixed-activity validation inside the publisher
+  builder. The standalone CLI has just loaded and validated that immutable
+  product, while the recurring runner has built it in the same process; the
+  publisher scan and final evidence validation remain exact. This removes two
+  redundant full artifact reads from every ranking attempt.
 - [ ] Complete the frozen production ranking build, measure actual durable
   state/refresh cost and Postgres request latency, run the independent
   comparison, and pass dormant publication, retry, and recurring-publication

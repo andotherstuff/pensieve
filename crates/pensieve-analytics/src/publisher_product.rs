@@ -174,7 +174,14 @@ fn build_publisher_ranking(
     config: PublisherRankingConfig,
     baseline_evidence_sha256: Option<String>,
 ) -> Result<BoundedPublisherRanking> {
-    validate_config(activity, &config)?;
+    // `BoundedFixedActivity` is produced by a loader or builder that already
+    // fully validates its immutable artifacts. Revalidating it here would
+    // reread the complete activity and flags artifacts twice before every
+    // publisher scan, without narrowing the trust boundary: the CLI loads the
+    // product immediately before this call and the incremental runner builds
+    // it in the same process. Keep this preflight limited to the publisher
+    // contract; the ranking scan and final evidence validation remain exact.
+    validate_config(&config)?;
     if evidence_path.as_ref().is_file() {
         let completed = load_bounded_publisher_ranking(evidence_path, &config.state_database)?;
         if completed.evidence.baseline_evidence_sha256 != baseline_evidence_sha256 {
@@ -746,11 +753,7 @@ fn visit_state_rankings(
     Ok(())
 }
 
-fn validate_config(activity: &BoundedFixedActivity, config: &PublisherRankingConfig) -> Result<()> {
-    activity.validate_for_publication(
-        &activity.evidence.snapshot_id,
-        activity.evidence.as_of_epoch,
-    )?;
+fn validate_config(config: &PublisherRankingConfig) -> Result<()> {
     if config.windows_days.is_empty()
         || config
             .windows_days
