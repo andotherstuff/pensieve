@@ -328,7 +328,10 @@ fn api_timestamp(value: i64, name: &'static str) -> Result<u32, ApiError> {
 mod postgres_analytics_tests {
     use pensieve_core::LatestEventWatermark;
 
-    use super::{api_timestamp, nonnegative_u64, retention_response, validate_watermark_freshness};
+    use super::{
+        api_timestamp, engagement_response, nonnegative_u64, retention_response,
+        validate_watermark_freshness,
+    };
 
     fn watermark() -> LatestEventWatermark {
         LatestEventWatermark {
@@ -381,6 +384,17 @@ mod postgres_analytics_tests {
             retention_response("2026-01-05".to_owned(), vec![("2026-01-12".to_owned(), 4)]);
         assert_eq!(missing_period_zero.cohort_size, 0);
         assert_eq!(missing_period_zero.retention_pct, vec![0.0]);
+    }
+
+    #[test]
+    fn engagement_adapter_preserves_zero_denominator_behavior() {
+        let populated = engagement_response(30, 10, 4, 5);
+        assert_eq!(populated.replies_per_note, 0.4);
+        assert_eq!(populated.reactions_per_note, 0.5);
+
+        let empty = engagement_response(30, 0, 0, 0);
+        assert_eq!(empty.replies_per_note, 0.0);
+        assert_eq!(empty.reactions_per_note, 0.0);
     }
 }
 
@@ -1882,6 +1896,9 @@ pub async fn engagement(
     let cache_key = format!("engagement:days={}", days);
 
     let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
+        if state.uses_postgres(AnalyticsFamily::Engagement) {
+            return fetch_postgres_engagement(&state, days).await;
+        }
         // Calculate all metrics from events_local consistently.
         // A reply is a kind=1 event that has at least one e-tag (references another event).
         let row: EngagementRow = state
@@ -1918,6 +1935,77 @@ pub async fn engagement(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_engagement(
+    state: &AppState,
+    days: u32,
+) -> Result<EngagementStats, ApiError> {
+    let days = i64::from(days);
+    let client = state
+        .postgres_client(AnalyticsFamily::Engagement)
+        .await
+        .map_err(ApiError::Internal)?;
+    let row = client
+        .query_one(
+            "WITH product AS (
+                 SELECT products.product_id,
+                        (products.as_of_epoch / 86400) * 86400 AS complete_through
+                   FROM pensieve_analytics.semantic_products products
+                   JOIN pensieve_analytics.current_run_metadata current USING (run_id)
+                  WHERE products.evidence_sha256 =
+                        current.validation ->> 'semantic_evidence_sha256'
+             )
+             SELECT COUNT(DISTINCT product.product_id)::bigint,
+                    COALESCE(SUM(daily.original_notes),0)::bigint,
+                    COALESCE(SUM(daily.replies),0)::bigint,
+                    COALESCE(SUM(daily.reactions),0)::bigint
+               FROM product
+               LEFT JOIN pensieve_analytics.semantic_engagement_daily daily
+                 ON daily.product_id=product.product_id
+                AND daily.day_epoch >= product.complete_through - $1 * 86400
+                AND daily.day_epoch < product.complete_through",
+            &[&days],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    if row.get::<_, i64>(0) != 1 {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "current semantic engagement product is unavailable"
+        )));
+    }
+    let original_notes = nonnegative_u64(row.get(1), "original_notes")?;
+    let replies = nonnegative_u64(row.get(2), "replies")?;
+    let reactions = nonnegative_u64(row.get(3), "reactions")?;
+    let period_days = u32::try_from(days)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("engagement days exceeds u32")))?;
+    Ok(engagement_response(
+        period_days,
+        original_notes,
+        replies,
+        reactions,
+    ))
+}
+
+fn engagement_response(
+    period_days: u32,
+    original_notes: u64,
+    replies: u64,
+    reactions: u64,
+) -> EngagementStats {
+    let denominator = if original_notes == 0 {
+        1.0
+    } else {
+        original_notes as f64
+    };
+    EngagementStats {
+        period_days,
+        original_notes,
+        replies,
+        reactions,
+        replies_per_note: replies as f64 / denominator,
+        reactions_per_note: reactions as f64 / denominator,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2038,6 +2126,9 @@ pub async fn relay_distribution(
     let cache_key = format!("relay_distribution:limit={}", limit);
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::RelayDistribution) {
+            return fetch_postgres_relay_distribution(&state, limit).await;
+        }
         let rows: Vec<RelayDistributionRow> = state
             .clickhouse
             .query(&format!(
@@ -2059,6 +2150,62 @@ pub async fn relay_distribution(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_relay_distribution(
+    state: &AppState,
+    limit: u32,
+) -> Result<Vec<RelayDistributionRow>, ApiError> {
+    let limit = i64::from(limit);
+    let client = state
+        .postgres_client(AnalyticsFamily::RelayDistribution)
+        .await
+        .map_err(ApiError::Internal)?;
+    let rows = client
+        .query(
+            "WITH product AS (
+                 SELECT products.product_id
+                   FROM pensieve_analytics.current_run_metadata current
+                   LEFT JOIN pensieve_analytics.relay_distribution_products products
+                     ON products.run_id=current.run_id
+                    AND products.evidence_sha256 =
+                        current.validation ->> 'relay_distribution_evidence_sha256'
+             )
+             SELECT product.product_id,rows.relay_url,rows.user_count,
+                    rows.read_count,rows.write_count
+               FROM product
+               LEFT JOIN LATERAL (
+                    SELECT relay_url,user_count,read_count,write_count
+                      FROM pensieve_analytics.relay_distribution_rows rows
+                     WHERE rows.product_id=product.product_id
+                     ORDER BY rows.user_count DESC,rows.relay_url ASC
+                     LIMIT $1
+               ) rows ON true
+              ORDER BY rows.user_count DESC NULLS LAST,rows.relay_url ASC",
+            &[&limit],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    if rows
+        .first()
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .is_none()
+    {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "current relay-distribution product is unavailable"
+        )));
+    }
+    rows.iter()
+        .filter(|row| row.get::<_, Option<String>>(1).is_some())
+        .map(|row| {
+            Ok(RelayDistributionRow {
+                relay_url: row.get::<_, Option<String>>(1).expect("filtered relay URL"),
+                user_count: nonnegative_u64(row.get(2), "relay user_count")?,
+                read_count: nonnegative_u64(row.get(3), "relay read_count")?,
+                write_count: nonnegative_u64(row.get(4), "relay write_count")?,
+            })
+        })
+        .collect()
 }
 
 /// Publisher statistics.
