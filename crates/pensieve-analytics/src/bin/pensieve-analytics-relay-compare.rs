@@ -285,15 +285,7 @@ async fn query_clickhouse_winners(
         .collect::<Vec<_>>()
         .join(",");
     let as_of = u32::try_from(as_of_epoch).context("relay as-of exceeds DateTime domain")?;
-    let sql = format!(
-        "SELECT pubkey,
-                argMax(id,tuple(created_at,id)) AS event_id,
-                toUInt32(max(created_at)) AS created_at
-           FROM events_local FINAL
-          WHERE kind=10002 AND created_at <= toDateTime({{as_of:UInt32}}, 'UTC')
-            AND pubkey IN ({pubkeys})
-          GROUP BY pubkey ORDER BY pubkey"
-    );
+    let sql = clickhouse_winner_sql(&pubkeys);
     let rows = client
         .query(&sql)
         .param("as_of", as_of)
@@ -304,6 +296,22 @@ async fn query_clickhouse_winners(
         .into_iter()
         .map(|row| (row.pubkey.clone(), row))
         .collect())
+}
+
+fn clickhouse_winner_sql(pubkeys: &str) -> String {
+    format!(
+        "SELECT pubkey,event_id,toUInt32(winner_created_at) AS created_at
+           FROM (
+                SELECT pubkey,
+                       argMax(id,tuple(created_at,id)) AS event_id,
+                       max(created_at) AS winner_created_at
+                  FROM events_local FINAL
+                 WHERE kind=10002
+                   AND created_at <= toDateTime({{as_of:UInt32}}, 'UTC')
+                   AND pubkey IN ({pubkeys})
+                 GROUP BY pubkey
+           ) ORDER BY pubkey"
+    )
 }
 
 fn compare_winners(
@@ -509,6 +517,14 @@ mod tests {
             compare_winners(canonical, &matches)[0].outcome,
             "exact_match"
         );
+    }
+
+    #[test]
+    fn clickhouse_winner_query_does_not_shadow_source_created_at() {
+        let sql = clickhouse_winner_sql("'00'");
+        assert!(sql.contains("max(created_at) AS winner_created_at"));
+        assert!(sql.contains("toUInt32(winner_created_at) AS created_at"));
+        assert!(sql.contains("WHERE kind=10002\n                   AND created_at <="));
     }
 
     #[test]
