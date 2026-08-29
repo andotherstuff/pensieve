@@ -2,15 +2,22 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
 use clickhouse::Row;
-use pensieve_core::{LatestEventWatermark, NOSTR_GENESIS_TIMESTAMP, read_latest_event_watermark};
+use pensieve_core::{
+    LatestEventWatermark, NOSTR_GENESIS_TIMESTAMP, ZAP_HISTOGRAM_UPPER_SATS,
+    read_latest_event_watermark,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
-use crate::postgres_analytics::estimate_current_flexible_distinct;
+use crate::postgres_analytics::{
+    ZapPeriodGrain, current_longform_products, current_zap_products, estimate_flexible_distinct,
+    estimate_zap_distinct_periods, estimate_zap_distinct_roles, zap_period_expression,
+};
 use crate::state::{AnalyticsFamily, AppState};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -331,7 +338,8 @@ mod postgres_analytics_tests {
 
     use super::{
         api_timestamp, engagement_response, longform_response, nonnegative_u64, retention_response,
-        validate_watermark_freshness,
+        rounded_percent, validate_postgres_zap_days, validate_watermark_freshness,
+        zap_aggregate_response, zap_bucket_contract,
     };
 
     fn watermark() -> LatestEventWatermark {
@@ -409,6 +417,39 @@ mod postgres_analytics_tests {
         let empty = longform_response(0, 0, 0);
         assert_eq!(empty.avg_content_length, 0.0);
         assert_eq!(empty.estimated_total_words, 0);
+    }
+
+    #[test]
+    fn zap_adapter_preserves_millisatoshi_totals_and_zero_behavior() {
+        let populated = zap_aggregate_response(2, 2_501, 2, 1);
+        assert_eq!(populated.total_sats, 2);
+        assert_eq!(populated.avg_zap_sats, 1.2505);
+        assert_eq!(populated.unique_senders, 2);
+        assert_eq!(populated.unique_recipients, 1);
+
+        let empty = zap_aggregate_response(0, 0, 0, 0);
+        assert_eq!(empty.avg_zap_sats, 0.0);
+    }
+
+    #[test]
+    fn zap_histogram_contract_matches_public_boundaries_and_rounding() {
+        assert_eq!(zap_bucket_contract(0), ("1-10 sats", 1, 10));
+        assert_eq!(zap_bucket_contract(1), ("11-21 sats", 11, 21));
+        assert_eq!(
+            zap_bucket_contract(16),
+            ("100K+ sats", 100_001, 999_999_999)
+        );
+        assert_eq!(rounded_percent(1, 3), 33.33);
+        assert_eq!(rounded_percent(2, 3), 66.67);
+        assert_eq!(rounded_percent(0, 0), 0.0);
+    }
+
+    #[test]
+    fn postgres_zap_windows_are_strictly_bounded() {
+        assert!(validate_postgres_zap_days(1).is_ok());
+        assert!(validate_postgres_zap_days(366).is_ok());
+        assert!(validate_postgres_zap_days(0).is_err());
+        assert!(validate_postgres_zap_days(367).is_err());
     }
 }
 
@@ -1629,6 +1670,9 @@ pub async fn zap_stats(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Zaps) {
+            return fetch_postgres_zap_stats(&state, days, group_by.as_deref(), limit).await;
+        }
         match group_by.as_deref() {
             Some("day") => {
                 let rows: Vec<ZapStatsByPeriod> = state
@@ -1726,6 +1770,103 @@ pub async fn zap_stats(
     Ok(Json(result))
 }
 
+async fn fetch_postgres_zap_stats(
+    state: &AppState,
+    days: u32,
+    group_by: Option<&str>,
+    limit: u32,
+) -> Result<serde_json::Value, ApiError> {
+    validate_postgres_zap_days(days)?;
+    let client = state
+        .postgres_client(AnalyticsFamily::Zaps)
+        .await
+        .map_err(ApiError::Internal)?;
+    let products = current_zap_products(&client)
+        .await
+        .map_err(ApiError::Internal)?;
+    let until_epoch = products.complete_through_epoch;
+    let since_epoch = until_epoch
+        .checked_sub(i64::from(days) * 86_400)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap window underflow")))?;
+    let Some(group_by) = group_by else {
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(accepted),0)::bigint,
+                        COALESCE(SUM(amount_msats),0)::bigint
+                   FROM pensieve_analytics.semantic_zap_daily
+                  WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3",
+                &[&products.semantic_product_id, &since_epoch, &until_epoch],
+            )
+            .await
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        let total_zaps = nonnegative_u64(row.get(0), "zap count")?;
+        let amount_msats = nonnegative_u64(row.get(1), "zap amount")?;
+        let (unique_senders, unique_recipients) =
+            estimate_zap_distinct_roles(&client, &products, since_epoch, until_epoch)
+                .await
+                .map_err(ApiError::Internal)?;
+        return Ok(serde_json::to_value(zap_aggregate_response(
+            total_zaps,
+            amount_msats,
+            unique_senders,
+            unique_recipients,
+        ))?);
+    };
+
+    let grain = match group_by {
+        "day" => ZapPeriodGrain::Day,
+        "week" => ZapPeriodGrain::Week,
+        "month" => ZapPeriodGrain::Month,
+        _ => unreachable!("group_by was validated before caching"),
+    };
+    let period_expression = zap_period_expression(grain);
+    let query = format!(
+        "SELECT {period_expression} AS period_epoch,
+                SUM(accepted)::bigint,SUM(amount_msats)::bigint
+           FROM pensieve_analytics.semantic_zap_daily
+          WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3
+          GROUP BY period_epoch ORDER BY period_epoch DESC LIMIT $4"
+    );
+    let rows = client
+        .query(
+            &query,
+            &[
+                &products.semantic_product_id,
+                &since_epoch,
+                &until_epoch,
+                &i64::from(limit),
+            ],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let distinct =
+        estimate_zap_distinct_periods(&client, &products, since_epoch, until_epoch, grain)
+            .await
+            .map_err(ApiError::Internal)?
+            .into_iter()
+            .map(|period| {
+                (
+                    period.period_epoch,
+                    (period.unique_senders, period.unique_recipients),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+    let mut response = Vec::with_capacity(rows.len());
+    for row in rows {
+        let period_epoch: i64 = row.get(0);
+        let (unique_senders, unique_recipients) =
+            distinct.get(&period_epoch).copied().unwrap_or((0, 0));
+        response.push(zap_period_response(
+            period_label(period_epoch)?,
+            nonnegative_u64(row.get(1), "period zap count")?,
+            nonnegative_u64(row.get(2), "period zap amount")?,
+            unique_senders,
+            unique_recipients,
+        ));
+    }
+    Ok(serde_json::to_value(response)?)
+}
+
 /// Query parameters for zap histogram.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZapHistogramQuery {
@@ -1776,6 +1917,9 @@ pub async fn zap_histogram(
     let cache_key = format!("zap_histogram:days={}", days);
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Zaps) {
+            return fetch_postgres_zap_histogram(&state, days).await;
+        }
         // Use ClickHouse's multiIf to bucket amounts, then aggregate
         // 17 buckets for granular distribution analysis
         let rows: Vec<ZapHistogramBucket> = state
@@ -1861,6 +2005,167 @@ pub async fn zap_histogram(
     .await?;
 
     Ok(Json(result))
+}
+
+async fn fetch_postgres_zap_histogram(
+    state: &AppState,
+    days: u32,
+) -> Result<Vec<ZapHistogramBucket>, ApiError> {
+    validate_postgres_zap_days(days)?;
+    let client = state
+        .postgres_client(AnalyticsFamily::Zaps)
+        .await
+        .map_err(ApiError::Internal)?;
+    let products = current_zap_products(&client)
+        .await
+        .map_err(ApiError::Internal)?;
+    let until_epoch = products.complete_through_epoch;
+    let since_epoch = until_epoch
+        .checked_sub(i64::from(days) * 86_400)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap window underflow")))?;
+    let rows = client
+        .query(
+            "SELECT bucket,SUM(zap_count)::bigint,SUM(amount_msats)::bigint
+               FROM pensieve_analytics.semantic_zap_histogram_daily
+              WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3
+              GROUP BY bucket ORDER BY bucket",
+            &[&products.semantic_product_id, &since_epoch, &until_epoch],
+        )
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let mut buckets = Vec::new();
+    let mut total_count = 0_u64;
+    let mut total_msats = 0_u64;
+    for row in rows {
+        let bucket = usize::try_from(row.get::<_, i16>(0))
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("zap histogram bucket is negative")))?;
+        let count = nonnegative_u64(row.get(1), "zap histogram count")?;
+        let amount_msats = nonnegative_u64(row.get(2), "zap histogram amount")?;
+        if bucket > ZAP_HISTOGRAM_UPPER_SATS.len() {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "zap histogram bucket exceeds the public contract"
+            )));
+        }
+        total_count = total_count
+            .checked_add(count)
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap histogram count overflow")))?;
+        total_msats = total_msats
+            .checked_add(amount_msats)
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap histogram amount overflow")))?;
+        if count > 0 {
+            buckets.push((bucket, count, amount_msats));
+        }
+    }
+    Ok(buckets
+        .into_iter()
+        .map(|(bucket, count, amount_msats)| {
+            let (label, min_sats, max_sats) = zap_bucket_contract(bucket);
+            ZapHistogramBucket {
+                bucket: label.to_owned(),
+                min_sats,
+                max_sats,
+                count,
+                total_sats: amount_msats / 1_000,
+                pct_count: rounded_percent(count, total_count),
+                pct_sats: rounded_percent(amount_msats, total_msats),
+            }
+        })
+        .collect())
+}
+
+fn validate_postgres_zap_days(days: u32) -> Result<(), ApiError> {
+    if !(1..=366).contains(&days) {
+        return Err(ApiError::BadRequest(format!(
+            "days must be between 1 and 366, got {days}"
+        )));
+    }
+    Ok(())
+}
+
+fn zap_aggregate_response(
+    total_zaps: u64,
+    amount_msats: u64,
+    unique_senders: u64,
+    unique_recipients: u64,
+) -> ZapStatsAggregate {
+    ZapStatsAggregate {
+        total_zaps,
+        total_sats: amount_msats / 1_000,
+        unique_senders,
+        unique_recipients,
+        avg_zap_sats: average_zap_sats(total_zaps, amount_msats),
+    }
+}
+
+fn zap_period_response(
+    period: String,
+    total_zaps: u64,
+    amount_msats: u64,
+    unique_senders: u64,
+    unique_recipients: u64,
+) -> ZapStatsByPeriod {
+    ZapStatsByPeriod {
+        period,
+        total_zaps,
+        total_sats: amount_msats / 1_000,
+        unique_senders,
+        unique_recipients,
+        avg_zap_sats: average_zap_sats(total_zaps, amount_msats),
+    }
+}
+
+fn average_zap_sats(total_zaps: u64, amount_msats: u64) -> f64 {
+    if total_zaps == 0 {
+        0.0
+    } else {
+        amount_msats as f64 / total_zaps as f64 / 1_000.0
+    }
+}
+
+fn period_label(period_epoch: i64) -> Result<String, ApiError> {
+    DateTime::from_timestamp(period_epoch, 0)
+        .map(|timestamp| timestamp.date_naive().to_string())
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap period is outside chrono range")))
+}
+
+fn rounded_percent(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (10_000.0 * value as f64 / total as f64).round() / 100.0
+    }
+}
+
+fn zap_bucket_contract(bucket: usize) -> (&'static str, u64, u64) {
+    const LABELS: [&str; 17] = [
+        "1-10 sats",
+        "11-21 sats",
+        "22-50 sats",
+        "51-100 sats",
+        "101-250 sats",
+        "251-500 sats",
+        "501-750 sats",
+        "751-1K sats",
+        "1K-2.5K sats",
+        "2.5K-5K sats",
+        "5K-7.5K sats",
+        "7.5K-10K sats",
+        "10K-25K sats",
+        "25K-50K sats",
+        "50K-75K sats",
+        "75K-100K sats",
+        "100K+ sats",
+    ];
+    let min_sats = if bucket == 0 {
+        1
+    } else {
+        ZAP_HISTOGRAM_UPPER_SATS[bucket - 1] + 1
+    };
+    let max_sats = ZAP_HISTOGRAM_UPPER_SATS
+        .get(bucket)
+        .copied()
+        .unwrap_or(999_999_999);
+    (LABELS[bucket], min_sats, max_sats)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2102,44 +2407,31 @@ async fn fetch_postgres_longform(
     let (articles, unique_authors, content_bytes) = match days {
         Some(days @ 1..=366) => {
             let days = i64::from(days);
-            let row = client
-                .query_one(
-                    "WITH product AS (
-                         SELECT products.product_id,
-                                (products.as_of_epoch / 86400) * 86400 AS complete_through
-                           FROM pensieve_analytics.semantic_products products
-                           JOIN pensieve_analytics.current_run_metadata current USING (run_id)
-                          WHERE products.evidence_sha256 =
-                                current.validation ->> 'semantic_evidence_sha256'
-                     )
-                     SELECT COUNT(DISTINCT product.product_id)::bigint,
-                            MIN(product.complete_through)::bigint,
-                            COALESCE(SUM(daily.articles),0)::bigint,
-                            COALESCE(SUM(daily.content_bytes),0)::bigint
-                       FROM product
-                       LEFT JOIN pensieve_analytics.semantic_longform_daily daily
-                         ON daily.product_id=product.product_id
-                        AND daily.day_epoch >= product.complete_through - $1 * 86400
-                        AND daily.day_epoch < product.complete_through",
-                    &[&days],
-                )
+            let products = current_longform_products(&client)
                 .await
-                .map_err(|error| ApiError::Internal(error.into()))?;
-            if row.get::<_, i64>(0) != 1 {
-                return Err(ApiError::Internal(anyhow::anyhow!(
-                    "current semantic longform product is unavailable"
-                )));
-            }
-            let complete_through = row.get::<_, Option<i64>>(1).ok_or_else(|| {
-                ApiError::Internal(anyhow::anyhow!(
-                    "current semantic longform boundary is unavailable"
-                ))
-            })?;
+                .map_err(ApiError::Internal)?;
+            let complete_through = products.complete_through_epoch;
             let since_epoch = complete_through
                 .checked_sub(days * 86_400)
                 .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("longform window underflow")))?;
-            let unique_authors = estimate_current_flexible_distinct(
+            let row = client
+                .query_one(
+                    "SELECT COALESCE(SUM(daily.articles),0)::bigint,
+                            COALESCE(SUM(daily.content_bytes),0)::bigint
+                       FROM pensieve_analytics.semantic_longform_daily daily
+                      WHERE daily.product_id=$1
+                        AND daily.day_epoch >= $2 AND daily.day_epoch < $3",
+                    &[
+                        &products.semantic_product_id,
+                        &since_epoch,
+                        &complete_through,
+                    ],
+                )
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
+            let unique_authors = estimate_flexible_distinct(
                 &client,
+                &products,
                 since_epoch,
                 complete_through,
                 Some(30_023),
@@ -2147,9 +2439,9 @@ async fn fetch_postgres_longform(
             .await
             .map_err(ApiError::Internal)?;
             (
-                nonnegative_u64(row.get(2), "longform articles")?,
+                nonnegative_u64(row.get(0), "longform articles")?,
                 unique_authors,
-                nonnegative_u64(row.get(3), "longform content bytes")?,
+                nonnegative_u64(row.get(1), "longform content bytes")?,
             )
         }
         Some(days) => {

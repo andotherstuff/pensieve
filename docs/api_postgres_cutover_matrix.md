@@ -48,10 +48,10 @@ Status values below mean:
 | `GET /stats/users/retention` | `current_cohort_retention_period` | ready | Preserve the intentional newest-cohort-first correction and period-zero semantics |
 | `GET /stats/users/new` | `current_new_users_daily`, composed to day/week/month | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/activity/hourly` | Slice 9.5 hourly event counts plus flexible-distinct leaf unions grouped by UTC hour-of-day | gated | Production publication and accepted sketch comparison for every `days`/kind shape |
-| `GET /stats/zaps` | semantic zap daily rows plus zap-distinct sender/recipient leaves | gated | Slice 7 build, comparison, dormant publication, and recurring publication |
-| `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Slice 7 build, boundary comparison, deterministic percentage rounding, and publication |
-| `GET /stats/engagement` | semantic engagement daily rows | gated | Slice 7 build, positional-tag comparison, and publication |
-| `GET /stats/longform` | semantic long-form daily rows, exact all-time kind-30023 authors from the enriched kind summary, and kind-30023 flexible-distinct leaves for bounded windows | gated | Slice 7 additive, Slice 9.5 exact all-time summary, and Slice 6 bounded-window sketch comparisons |
+| `GET /stats/zaps` | semantic zap daily rows plus zap-distinct sender/recipient leaves | gated | Postgres adapter implemented; accept both products in one recurring run and compare every aggregate/grouped shape |
+| `GET /stats/zaps/histogram` | semantic 17-bucket daily count/amount rows | gated | Postgres adapter and deterministic rounding implemented; accept the product and compare bucket boundaries |
+| `GET /stats/engagement` | semantic engagement daily rows | gated | Postgres adapter implemented; accept the semantic product and compare positional-tag semantics |
+| `GET /stats/longform` | semantic long-form daily rows, exact all-time kind-30023 authors from the enriched kind summary, and kind-30023 flexible-distinct leaves for bounded windows | gated | Postgres adapter implemented; accept all three products in one run and compare bounded/all-time shapes |
 | `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Slice 9 benchmark/build/publication; reject unsupported `days` unless a separate arbitrary-window contract lands |
 | `GET /stats/relays/distribution` | dormant relay-distribution product | gated | Slice 8 replacement-semantics comparison and publication |
 | `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Publish and compare the implemented enriched per-kind summaries |

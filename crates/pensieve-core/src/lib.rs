@@ -27,6 +27,12 @@ pub const NOSTR_GENESIS_TIMESTAMP: u32 = 1604707200; // 2020-11-07 00:00:00 UTC
 /// Nostr genesis date as a string for SQL queries.
 pub const NOSTR_GENESIS_DATE_SQL: &str = "2020-11-07 00:00:00";
 
+/// Inclusive whole-satoshi upper bounds used by the public zap histogram.
+pub const ZAP_HISTOGRAM_UPPER_SATS: [u64; 16] = [
+    10, 21, 50, 100, 250, 500, 750, 1_000, 2_500, 5_000, 7_500, 10_000, 25_000, 50_000, 75_000,
+    100_000,
+];
+
 pub use distinct_sketch::{
     DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
     DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,

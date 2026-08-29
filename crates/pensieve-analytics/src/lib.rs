@@ -86,7 +86,7 @@ pub use input::{ObjectLocation, ResolvedSnapshot, resolve_snapshot};
 pub use pensieve_core::{
     DATASKETCHES_HLL_SERIALIZATION_VERSION, DISTINCT_SKETCH_FORMAT_VERSION, DISTINCT_SKETCH_LG_K,
     DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
-    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K,
+    DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K, ZAP_HISTOGRAM_UPPER_SATS,
 };
 pub use plan::{
     AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta,
@@ -149,8 +149,8 @@ pub use semantic_build::{
 pub use semantic_facts::{
     EngagementDay, EngagementFact, LongformDay, LongformFact, MAX_ZAP_AMOUNT_MSATS,
     SEMANTIC_FACT_BYTES, SEMANTIC_FACT_KEY_BYTES, SemanticFactReader, SemanticFactRecord,
-    SemanticPayload, SemanticRollups, SemanticScanStats, ZAP_HISTOGRAM_UPPER_SATS, ZapDay, ZapFact,
-    ZapRejection, classify_engagement, classify_longform, classify_zap, scan_semantic_facts,
+    SemanticPayload, SemanticRollups, SemanticScanStats, ZapDay, ZapFact, ZapRejection,
+    classify_engagement, classify_longform, classify_zap, scan_semantic_facts,
     write_semantic_facts, zap_histogram_bucket,
 };
 pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};

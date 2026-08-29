@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use duckdb::Connection;
+use pensieve_core::ZAP_HISTOGRAM_UPPER_SATS;
 use serde::{Deserialize, Serialize};
 
 use crate::build::sql_string;
@@ -16,12 +17,6 @@ use crate::{BoundedExecutionError, ObjectLocation};
 
 /// Maximum accepted zap amount, matching the current production safety gate.
 pub const MAX_ZAP_AMOUNT_MSATS: u64 = 1_000_000_000;
-
-/// Inclusive whole-satoshi upper bounds used by the public histogram.
-pub const ZAP_HISTOGRAM_UPPER_SATS: [u64; 16] = [
-    10, 21, 50, 100, 250, 500, 750, 1_000, 2_500, 5_000, 7_500, 10_000, 25_000, 50_000, 75_000,
-    100_000,
-];
 
 /// Encoded bytes in one compact event-ID-keyed semantic fact.
 pub const SEMANTIC_FACT_BYTES: usize = 32 + 8 + 1 + 8 + 32 + 32 + 1 + 1;
