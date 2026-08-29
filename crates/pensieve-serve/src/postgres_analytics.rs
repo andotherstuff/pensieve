@@ -29,6 +29,16 @@ pub struct CurrentLongformProducts {
     flexible_complete_through_epoch: i64,
 }
 
+/// Immutable exact serving-facts identity accepted by one current run.
+pub struct CurrentServingProduct {
+    /// Atomically selected analytics run.
+    pub run_id: String,
+    /// Accepted serving-facts product.
+    pub product_id: String,
+    /// Last complete UTC-hour boundary.
+    pub complete_through_epoch: i64,
+}
+
 /// Supported calendar grouping for bounded zap-distinct unions.
 #[derive(Clone, Copy)]
 pub enum ZapPeriodGrain {
@@ -116,6 +126,33 @@ pub async fn current_longform_products(client: &Client) -> anyhow::Result<Curren
         flexible_product_id: row.get(1),
         complete_through_epoch: as_of_epoch - as_of_epoch % SECONDS_PER_DAY,
         flexible_complete_through_epoch,
+    })
+}
+
+/// Resolve the exact serving-facts product accepted by the current run.
+pub async fn current_serving_product(client: &Client) -> anyhow::Result<CurrentServingProduct> {
+    let row = client
+        .query_opt(
+            "SELECT current.run_id,serving.product_id,
+                    current.as_of_epoch,serving.complete_through_epoch
+               FROM pensieve_analytics.current_run_metadata current
+               JOIN pensieve_analytics.serving_fact_products serving
+                 ON serving.run_id=current.run_id
+                AND serving.evidence_sha256 =
+                    current.validation ->> 'serving_facts_evidence_sha256'",
+            &[],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("current serving-facts product is unavailable"))?;
+    let as_of_epoch: i64 = row.get(2);
+    let complete_through_epoch: i64 = row.get(3);
+    if as_of_epoch < 0 || complete_through_epoch != as_of_epoch - as_of_epoch % SECONDS_PER_HOUR {
+        anyhow::bail!("current serving-facts product has an inconsistent boundary");
+    }
+    Ok(CurrentServingProduct {
+        run_id: row.get(0),
+        product_id: row.get(1),
+        complete_through_epoch,
     })
 }
 

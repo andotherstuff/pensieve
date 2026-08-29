@@ -15,8 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::postgres_analytics::{
-    ZapPeriodGrain, current_longform_products, current_zap_products, estimate_flexible_distinct,
-    estimate_zap_distinct_periods, estimate_zap_distinct_roles, zap_period_expression,
+    ZapPeriodGrain, current_longform_products, current_serving_product, current_zap_products,
+    estimate_flexible_distinct, estimate_zap_distinct_periods, estimate_zap_distinct_roles,
+    zap_period_expression,
 };
 use crate::state::{AnalyticsFamily, AppState};
 
@@ -1136,6 +1137,37 @@ pub async fn throughput(
     );
 
     let result = get_or_compute(&state.cache, &cache_key, || async {
+        if state.uses_postgres(AnalyticsFamily::Events) {
+            let client = state
+                .postgres_client(AnalyticsFamily::Events)
+                .await
+                .map_err(ApiError::Internal)?;
+            let product = current_serving_product(&client)
+                .await
+                .map_err(ApiError::Internal)?;
+            let since_epoch = product.complete_through_epoch - 7 * 86_400;
+            let kind_key = kind.map_or(-1, i32::from);
+            let row = client
+                .query_one(
+                    "SELECT COALESCE(SUM(event_count),0)::bigint
+                       FROM pensieve_analytics.serving_hourly_counts
+                      WHERE product_id=$1 AND kind=$2
+                        AND hour_epoch >= $3 AND hour_epoch < $4",
+                    &[
+                        &product.product_id,
+                        &kind_key,
+                        &since_epoch,
+                        &product.complete_through_epoch,
+                    ],
+                )
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
+            let total_events_7d = nonnegative_u64(row.get(0), "throughput events")?;
+            return Ok(ThroughputResponse {
+                events_per_hour: total_events_7d as f64 / 168.0,
+                total_events_7d,
+            });
+        }
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),

@@ -40,7 +40,7 @@ Status values below mean:
 | `GET /stats/events/earliest` | `current_overview.earliest_event` | ready | Preserve the Nostr-genesis clamp in the route adapter |
 | `GET /stats/events/latest` | latest sealed canonical event watermark | external | Activate the implemented ingestion-owned watermark and validate its freshness objective |
 | `GET /stats/events` | `current_event_daily`, `current_event_daily_kind`, fixed-grain exact distincts, flexible-distinct leaves, and sparse hourly counts | gated | Slice 9.5 production publication and every supported `days`/kind comparison |
-| `GET /stats/throughput` | exact sparse hourly event counts over the last 168 complete hours, optionally by kind | gated | Slice 9.5 production publication and exact 168-hour comparison |
+| `GET /stats/throughput` | exact sparse hourly event counts over the last 168 complete hours, optionally by kind | gated | Postgres adapter implemented; publish Slice 9.5 and compare the exact 168-hour boundary |
 | `GET /stats/users/active` | latest rows from `current_active_users_period` for day/week/month | ready | Route comparison and empty-dataset behavior |
 | `GET /stats/users/active/daily` | `current_active_users_period` with `grain='day'` | ready | Ordering, `since`, and limit comparison |
 | `GET /stats/users/active/weekly` | `current_active_users_period` with `grain='week'` | ready | Ordering, `since`, and limit comparison |
@@ -54,9 +54,9 @@ Status values below mean:
 | `GET /stats/longform` | semantic long-form daily rows, exact all-time kind-30023 authors from the enriched kind summary, and kind-30023 flexible-distinct leaves for bounded windows | gated | Postgres adapter implemented; accept all three products in one run and compare bounded/all-time shapes |
 | `GET /stats/publishers` | exact predefined-window publisher ranking rows | gated | Slice 9 benchmark/build/publication; reject unsupported `days` unless a separate arbitrary-window contract lands |
 | `GET /stats/relays/distribution` | dormant relay-distribution product | gated | Slice 8 replacement-semantics comparison and publication |
-| `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Publish and compare the implemented enriched per-kind summaries |
-| `GET /kinds/{kind}` | enriched per-kind summary plus exact hourly recent counts | gated | Publish and compare the implemented kind-summary and hourly-count products |
-| `GET /kinds/{kind}/activity` | `current_event_daily_kind` plus exact fixed-grain distincts composed for day/week/month | ready | Route comparison, ordering, and limit behavior |
+| `GET /kinds` | all-time kind count, exact/accepted unique-pubkey count, first/last timestamp, and content average | gated | Postgres adapter implemented; publish and compare the enriched per-kind summaries |
+| `GET /kinds/{kind}` | enriched per-kind summary plus exact hourly recent counts | gated | Postgres adapter implemented; publish and compare all-time and complete-hour windows |
+| `GET /kinds/{kind}/activity` | `current_event_daily_kind` plus exact fixed-grain distincts composed for day/week/month | ready | Postgres adapter implemented; compare ordering, limits, and every grain |
 
 ## Slice 9.5 product contract
 
