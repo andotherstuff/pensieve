@@ -4,12 +4,13 @@ use axum::Json;
 use axum::extract::{Query, State};
 use chrono::NaiveDate;
 use clickhouse::Row;
-use pensieve_core::NOSTR_GENESIS_TIMESTAMP;
+use pensieve_core::{LatestEventWatermark, NOSTR_GENESIS_TIMESTAMP, read_latest_event_watermark};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AnalyticsFamily, AppState};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Overview
@@ -38,23 +39,8 @@ pub struct OverviewResponse {
 /// - GET /api/v1/stats/events/earliest
 /// - GET /api/v1/stats/events/latest
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "overview", || async {
-        // Run all queries in parallel
-        let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
-            fetch_total_events(&state),
-            fetch_total_pubkeys(&state),
-            fetch_total_kinds(&state),
-            fetch_earliest_event(&state),
-            fetch_latest_event(&state),
-        );
-
-        Ok(OverviewResponse {
-            total_events,
-            total_pubkeys,
-            total_kinds,
-            earliest_event,
-            latest_event,
-        })
+    let result = get_or_compute_with_ttl(&state.cache, "overview", ttl::OVERVIEW, || async {
+        fetch_overview(&state).await
     })
     .await?;
 
@@ -83,7 +69,7 @@ pub struct TimestampResponse {
 /// Cached for 5 minutes.
 pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
     let result = get_or_compute(&state.cache, "total_events", || async {
-        let count = fetch_total_events(&state).await;
+        let count = fetch_total_events(&state).await?;
         Ok(CountResponse { count })
     })
     .await?;
@@ -97,7 +83,7 @@ pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountRes
 /// Cached for 5 minutes.
 pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
     let result = get_or_compute(&state.cache, "total_pubkeys", || async {
-        let count = fetch_total_pubkeys(&state).await;
+        let count = fetch_total_pubkeys(&state).await?;
         Ok(CountResponse { count })
     })
     .await?;
@@ -110,8 +96,8 @@ pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountRe
 /// Returns distinct event kinds seen in the last 30 days.
 /// Cached for 1 hour (kinds are stable).
 pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "total_kinds", || async {
-        let count = fetch_total_kinds(&state).await;
+    let result = get_or_compute_with_ttl(&state.cache, "total_kinds", ttl::STABLE, || async {
+        let count = fetch_total_kinds(&state).await?;
         Ok(CountResponse { count })
     })
     .await?;
@@ -126,8 +112,8 @@ pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResp
 pub async fn earliest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "earliest_event", || async {
-        let timestamp = fetch_earliest_event(&state).await;
+    let result = get_or_compute_with_ttl(&state.cache, "earliest_event", ttl::STABLE, || async {
+        let timestamp = fetch_earliest_event(&state).await?;
         Ok(TimestampResponse { timestamp })
     })
     .await?;
@@ -142,8 +128,8 @@ pub async fn earliest_event(
 pub async fn latest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "latest_event", || async {
-        let timestamp = fetch_latest_event(&state).await;
+    let result = get_or_compute_with_ttl(&state.cache, "latest_event", ttl::REALTIME, || async {
+        let timestamp = fetch_latest_event(&state).await?;
         Ok(TimestampResponse { timestamp })
     })
     .await?;
@@ -155,53 +141,227 @@ pub async fn latest_event(
 // Internal fetch functions (reused by both combined and granular endpoints)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn fetch_total_events(state: &AppState) -> u64 {
-    state
+async fn fetch_overview(state: &AppState) -> Result<OverviewResponse, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        let client = state
+            .postgres_client(AnalyticsFamily::Overview)
+            .await
+            .map_err(ApiError::Internal)?;
+        let row = client
+            .query_one(
+                "SELECT total_events,total_pubkeys,kinds_30d,earliest_event
+                   FROM pensieve_analytics.current_overview",
+                &[],
+            )
+            .await
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        return Ok(OverviewResponse {
+            total_events: nonnegative_u64(row.get(0), "total_events")?,
+            total_pubkeys: nonnegative_u64(row.get(1), "total_pubkeys")?,
+            total_kinds: nonnegative_u64(row.get(2), "total_kinds")?,
+            earliest_event: api_timestamp(row.get(3), "earliest_event")?
+                .max(NOSTR_GENESIS_TIMESTAMP),
+            latest_event: read_fresh_watermark(state)?,
+        });
+    }
+    let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
+        fetch_total_events(state),
+        fetch_total_pubkeys(state),
+        fetch_total_kinds(state),
+        fetch_earliest_event(state),
+        fetch_latest_event(state),
+    );
+    Ok(OverviewResponse {
+        total_events: total_events?,
+        total_pubkeys: total_pubkeys?,
+        total_kinds: total_kinds?,
+        earliest_event: earliest_event?,
+        latest_event: latest_event?,
+    })
+}
+
+async fn fetch_total_events(state: &AppState) -> Result<u64, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        return fetch_postgres_overview_metric(state, "total_events").await;
+    }
+    Ok(state
         .clickhouse
         .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
         .fetch_one::<u64>()
-        .await
-        .unwrap_or(0)
+        .await?)
 }
 
-async fn fetch_total_pubkeys(state: &AppState) -> u64 {
-    state
+async fn fetch_total_pubkeys(state: &AppState) -> Result<u64, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        return fetch_postgres_overview_metric(state, "total_pubkeys").await;
+    }
+    Ok(state
         .clickhouse
         .query("SELECT count() FROM pubkey_first_seen_data")
         .fetch_one::<u64>()
-        .await
-        .unwrap_or(0)
+        .await?)
 }
 
-async fn fetch_total_kinds(state: &AppState) -> u64 {
-    state
+async fn fetch_total_kinds(state: &AppState) -> Result<u64, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        return fetch_postgres_overview_metric(state, "kinds_30d").await;
+    }
+    Ok(state
         .clickhouse
         .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY")
         .fetch_one::<u64>()
-        .await
-        .unwrap_or(0)
+        .await?)
 }
 
-async fn fetch_earliest_event(state: &AppState) -> u32 {
+async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        let value = fetch_postgres_overview_metric(state, "earliest_event").await?;
+        return Ok(u32::try_from(value)
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("earliest_event exceeds u32")))?
+            .max(NOSTR_GENESIS_TIMESTAMP));
+    }
     // Use min() aggregate, clamp to Nostr genesis for correctness
     let ts = state
         .clickhouse
         .query("SELECT toUInt32(min(created_at)) FROM events_local")
         .fetch_one::<u32>()
-        .await
-        .unwrap_or(0);
+        .await?;
     // Return the later of: actual earliest event or Nostr genesis date
-    ts.max(NOSTR_GENESIS_TIMESTAMP)
+    Ok(ts.max(NOSTR_GENESIS_TIMESTAMP))
 }
 
-async fn fetch_latest_event(state: &AppState) -> u32 {
+async fn fetch_latest_event(state: &AppState) -> Result<u32, ApiError> {
+    if state.uses_postgres(AnalyticsFamily::Overview) {
+        return read_fresh_watermark(state);
+    }
     // Use max() aggregate, excluding future timestamps
-    state
+    Ok(state
         .clickhouse
         .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now()")
         .fetch_one::<u32>()
+        .await?)
+}
+
+async fn fetch_postgres_overview_metric(
+    state: &AppState,
+    column: &'static str,
+) -> Result<u64, ApiError> {
+    let query = match column {
+        "total_events" => "SELECT total_events FROM pensieve_analytics.current_overview",
+        "total_pubkeys" => "SELECT total_pubkeys FROM pensieve_analytics.current_overview",
+        "kinds_30d" => "SELECT kinds_30d FROM pensieve_analytics.current_overview",
+        "earliest_event" => "SELECT earliest_event FROM pensieve_analytics.current_overview",
+        _ => {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "invalid overview metric"
+            )));
+        }
+    };
+    let client = state
+        .postgres_client(AnalyticsFamily::Overview)
         .await
-        .unwrap_or(0)
+        .map_err(ApiError::Internal)?;
+    let row = client
+        .query_one(query, &[])
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    nonnegative_u64(row.get(0), column)
+}
+
+fn read_fresh_watermark(state: &AppState) -> Result<u32, ApiError> {
+    let path = state
+        .config
+        .latest_event_watermark_path
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("latest-event watermark is missing")))?;
+    let watermark = read_latest_event_watermark(path).map_err(|error| {
+        ApiError::Internal(anyhow::anyhow!("read latest-event watermark: {error}"))
+    })?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ApiError::Internal(error.into()))?
+        .as_secs();
+    validate_watermark_freshness(
+        &watermark,
+        now,
+        state.config.latest_event_watermark_max_age_secs,
+    )
+}
+
+fn validate_watermark_freshness(
+    watermark: &LatestEventWatermark,
+    now: u64,
+    maximum_age: u64,
+) -> Result<u32, ApiError> {
+    let age = now
+        .checked_sub(watermark.published_at_epoch)
+        .ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!(
+                "latest-event watermark publication is in the future"
+            ))
+        })?;
+    if age > maximum_age {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "latest-event watermark is stale"
+        )));
+    }
+    metrics::gauge!("api_latest_event_watermark_age_seconds").set(age as f64);
+    watermark
+        .max_eligible_created_at
+        .map_or(Ok(0), |timestamp| {
+            u32::try_from(timestamp).map_err(|_| {
+                ApiError::Internal(anyhow::anyhow!("latest-event watermark exceeds u32"))
+            })
+        })
+}
+
+fn nonnegative_u64(value: i64, name: &'static str) -> Result<u64, ApiError> {
+    u64::try_from(value).map_err(|_| ApiError::Internal(anyhow::anyhow!("{name} is negative")))
+}
+
+fn api_timestamp(value: i64, name: &'static str) -> Result<u32, ApiError> {
+    u32::try_from(value)
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("{name} is outside the API domain")))
+}
+
+#[cfg(test)]
+mod postgres_overview_tests {
+    use pensieve_core::LatestEventWatermark;
+
+    use super::{api_timestamp, nonnegative_u64, validate_watermark_freshness};
+
+    fn watermark() -> LatestEventWatermark {
+        LatestEventWatermark {
+            schema_version: 1,
+            status: "published".to_owned(),
+            max_sealed_segment_number: 7,
+            max_eligible_created_at: Some(90),
+            max_sealed_at_epoch: 100,
+            published_at_epoch: 101,
+        }
+    }
+
+    #[test]
+    fn postgres_scalars_fail_closed_outside_the_api_domain() {
+        assert_eq!(nonnegative_u64(7, "metric").unwrap(), 7);
+        assert!(nonnegative_u64(-1, "metric").is_err());
+        assert_eq!(api_timestamp(7, "timestamp").unwrap(), 7);
+        assert!(api_timestamp(-1, "timestamp").is_err());
+        assert!(api_timestamp(i64::from(u32::MAX) + 1, "timestamp").is_err());
+    }
+
+    #[test]
+    fn watermark_freshness_rejects_stale_future_and_invalid_api_values() {
+        assert_eq!(
+            validate_watermark_freshness(&watermark(), 110, 10).unwrap(),
+            90
+        );
+        assert!(validate_watermark_freshness(&watermark(), 112, 10).is_err());
+        assert!(validate_watermark_freshness(&watermark(), 100, 10).is_err());
+        let mut empty = watermark();
+        empty.max_eligible_created_at = None;
+        assert_eq!(validate_watermark_freshness(&empty, 101, 10).unwrap(), 0);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

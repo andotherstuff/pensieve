@@ -29,7 +29,6 @@ use crossbeam_channel::Sender;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +37,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use super::dedupe::DedupeIndex;
+pub use pensieve_core::{LatestEventWatermark, read_latest_event_watermark};
 
 /// Configuration for the segment writer.
 #[derive(Debug, Clone)]
@@ -74,68 +74,6 @@ impl Default for SegmentConfig {
             latest_event_watermark_path: None,
         }
     }
-}
-
-/// Canonical ingestion-owned evidence for the latest eligible archived event.
-///
-/// The timestamp intentionally follows the existing API's `u32` domain and
-/// excludes events dated after their segment's seal time. All fields are
-/// cumulative so out-of-order completion of concurrent seals cannot regress
-/// the published value.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct LatestEventWatermark {
-    /// Watermark schema version.
-    pub schema_version: u32,
-    /// Publication status; currently always `published`.
-    pub status: String,
-    /// Greatest segment number observed by the publisher.
-    pub max_sealed_segment_number: u64,
-    /// Greatest eligible event timestamp across observed sealed segments.
-    pub max_eligible_created_at: Option<u64>,
-    /// Greatest seal timestamp across observed sealed segments.
-    pub max_sealed_at_epoch: u64,
-    /// Wall-clock timestamp at which this file was atomically published.
-    pub published_at_epoch: u64,
-}
-
-impl LatestEventWatermark {
-    fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 || self.status != "published" {
-            return Err(Error::Validation(
-                "latest-event watermark has an unsupported schema or status".to_owned(),
-            ));
-        }
-        if self.published_at_epoch < self.max_sealed_at_epoch {
-            return Err(Error::Validation(
-                "latest-event watermark predates its latest segment seal".to_owned(),
-            ));
-        }
-        if self.max_eligible_created_at.is_some_and(|created_at| {
-            created_at > self.max_sealed_at_epoch || created_at > u64::from(u32::MAX)
-        }) {
-            return Err(Error::Validation(
-                "latest-event watermark contains an ineligible event timestamp".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Read and strictly validate a canonical latest-event watermark.
-pub fn read_latest_event_watermark(path: impl AsRef<Path>) -> Result<LatestEventWatermark> {
-    let bytes = fs::read(path)?;
-    let watermark: LatestEventWatermark =
-        serde_json::from_slice(&bytes).map_err(|error| Error::Serialization(error.to_string()))?;
-    watermark.validate()?;
-    let mut canonical = serde_json::to_vec_pretty(&watermark)
-        .map_err(|error| Error::Serialization(error.to_string()))?;
-    canonical.push(b'\n');
-    if bytes != canonical {
-        return Err(Error::Validation(
-            "latest-event watermark is not canonically encoded".to_owned(),
-        ));
-    }
-    Ok(watermark)
 }
 
 /// Information about a sealed segment.
@@ -648,7 +586,10 @@ impl SegmentWriter {
         let _guard = self.watermark_publication.lock();
         let result = (|| -> Result<()> {
             let previous = match path.try_exists() {
-                Ok(true) => Some(read_latest_event_watermark(path)?),
+                Ok(true) => Some(
+                    read_latest_event_watermark(path)
+                        .map_err(|error| Error::Validation(error.to_string()))?,
+                ),
                 Ok(false) => None,
                 Err(error) => return Err(error.into()),
             };
@@ -670,7 +611,9 @@ impl SegmentWriter {
                 }),
                 published_at_epoch,
             };
-            watermark.validate()?;
+            watermark
+                .validate()
+                .map_err(|error| Error::Validation(error.to_string()))?;
             pensieve_lake::write_catalog_atomically(path, &watermark)
                 .map_err(|error| Error::Serialization(error.to_string()))?;
             Ok(())

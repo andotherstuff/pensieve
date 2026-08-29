@@ -25,6 +25,8 @@ Generate a token: `openssl rand -hex 32`
 | `POSTGRES_ANALYTICS_PASSWORD` | *(optional)* | Password override kept outside `DATABASE_URL` |
 | `PENSIEVE_POSTGRES_POOL_SIZE` | `4` | Bounded persistent Postgres connections (1-32) |
 | `PENSIEVE_POSTGRES_API_FAMILIES` | *(empty)* | Comma-separated route families selected for Postgres |
+| `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(required for `overview`)* | Canonical ingestion-owned watermark file |
+| `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | `900` | Maximum accepted watermark publication age |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
 | `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints |
 

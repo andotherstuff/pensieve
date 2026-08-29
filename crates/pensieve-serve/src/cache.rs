@@ -190,6 +190,9 @@ pub mod ttl {
     /// Real-time data (e.g., latest event) - 10 seconds
     pub const REALTIME: Duration = Duration::from_secs(10);
 
+    /// Combined overview containing the live watermark - 1 minute.
+    pub const OVERVIEW: Duration = Duration::from_secs(60);
+
     /// Fast-changing aggregates (e.g., total counts) - 5 minutes
     pub const AGGREGATES: Duration = Duration::from_secs(300);
 

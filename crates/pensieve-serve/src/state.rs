@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context, bail};
 use clickhouse::Client;
 use parking_lot::Mutex;
+use pensieve_core::read_latest_event_watermark;
 use rusqlite::Connection;
 use tokio::sync::RwLock;
 use tokio_postgres::{Client as PostgresClient, Config as PostgresConfig, NoTls};
@@ -157,6 +158,12 @@ pub struct Config {
     /// Incremental per-family backend selection.
     pub analytics_backends: AnalyticsBackendSelection,
 
+    /// Canonical ingestion-owned latest-event watermark.
+    pub latest_event_watermark_path: Option<PathBuf>,
+
+    /// Maximum accepted age of the watermark publication.
+    pub latest_event_watermark_max_age_secs: u64,
+
     /// Valid API tokens (loaded from PENSIEVE_API_TOKENS).
     pub api_tokens: HashSet<String>,
 
@@ -178,6 +185,8 @@ impl Config {
     /// - `POSTGRES_ANALYTICS_PASSWORD`: Optional Postgres password override
     /// - `PENSIEVE_POSTGRES_API_FAMILIES`: Comma-separated cutover families
     /// - `PENSIEVE_POSTGRES_POOL_SIZE`: Persistent connection count (default: 4)
+    /// - `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`: Canonical ingestion watermark
+    /// - `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS`: Freshness gate (default: 900)
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_addr =
             std::env::var("PENSIEVE_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
@@ -206,6 +215,24 @@ impl Config {
             .unwrap_or(4);
         if !(1..=32).contains(&postgres_pool_size) {
             bail!("PENSIEVE_POSTGRES_POOL_SIZE must be between 1 and 32");
+        }
+        let latest_event_watermark_path = std::env::var("PENSIEVE_LATEST_EVENT_WATERMARK_PATH")
+            .ok()
+            .map(PathBuf::from);
+        if analytics_backends.uses_postgres(AnalyticsFamily::Overview)
+            && latest_event_watermark_path.is_none()
+        {
+            bail!("PENSIEVE_LATEST_EVENT_WATERMARK_PATH is required for Postgres overview routes");
+        }
+        let latest_event_watermark_max_age_secs =
+            std::env::var("PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS")
+                .ok()
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .context("PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS must be an integer")?
+                .unwrap_or(900);
+        if latest_event_watermark_max_age_secs == 0 {
+            bail!("PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS must be positive");
         }
 
         let tokens_str = std::env::var("PENSIEVE_API_TOKENS")
@@ -244,6 +271,8 @@ impl Config {
             postgres_password,
             postgres_pool_size,
             analytics_backends,
+            latest_event_watermark_path,
+            latest_event_watermark_max_age_secs,
             api_tokens,
             relay_db_path,
         })
@@ -357,6 +386,18 @@ impl AppState {
         } else {
             None
         };
+        if config
+            .analytics_backends
+            .uses_postgres(AnalyticsFamily::Overview)
+        {
+            read_latest_event_watermark(
+                config
+                    .latest_event_watermark_path
+                    .as_ref()
+                    .expect("validated latest-event watermark path"),
+            )
+            .context("preflight latest-event watermark")?;
+        }
 
         // Open SQLite connection if path is configured
         // Use immutable=1 to safely read WAL-mode databases without write access

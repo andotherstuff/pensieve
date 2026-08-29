@@ -12,6 +12,7 @@ mod event;
 pub mod metrics;
 pub mod proto;
 pub mod relay_url;
+mod watermark;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -34,3 +35,4 @@ pub use proto::{
     EventBatch, ProtoEvent, Tag, decode_length_delimited, decode_length_delimited_with_size,
     decode_proto_event, proto_to_json, validate_proto_event,
 };
+pub use watermark::{LatestEventWatermark, read_latest_event_watermark};
