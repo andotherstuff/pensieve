@@ -571,7 +571,7 @@ baseline.
   sparse, median, and dense exact samples. The corrected frozen production
   gate passed all nine samples at a maximum 19,587 ppm error against the
   accepted 20,000 ppm ceiling.
-- [ ] Publish the validated leaves into the dormant versioned Postgres
+- [x] Publish the validated leaves into the dormant versioned Postgres
   relation tied to the exact corrected B3 run. Publication must reconcile all
   rows and bytes in one transaction and must not change `current_run`.
 - [x] Add a fixed-memory Rust-side union over streamed versioned Postgres leaf
@@ -695,7 +695,11 @@ Implementation status:
   including all-or-nothing refresh configuration and generation evidence.
 - [x] Immutable bounded sparse/median/dense production comparison harness with
   explicit cross-store population and legacy zap-parser classifications.
-- [ ] Independent production comparison canary and recurring publication gate.
+- [x] Independent production comparison canary. Frozen production evidence for
+  snapshot `sha256:0beff0d9adaccb680034da2bf00d970c94cacbe59082525d244613e76ac0db7e`
+  passed with zero unclassified differences; canonical evidence SHA-256 is
+  `5a276f17a2666eaca0a8dd8ce8c3e0832c086a457bae211b7e1e6c8271624325`.
+- [ ] One moving recurring all-product publication gate.
 
 ### Slice 8 — current NIP-65 relay distribution
 
@@ -740,7 +744,12 @@ Implementation status:
   all-or-nothing publication alongside B3, Slice 6, and Slice 7.
 - [x] Immutable bounded sparse/median/dense winner and complete serving-row
   comparison harness with explicit legacy-semantic classifications.
-- [ ] Independent production winner/count comparison canary.
+- [x] Independent production winner/count comparison canary. Frozen production
+  evidence for snapshot
+  `sha256:0beff0d9adaccb680034da2bf00d970c94cacbe59082525d244613e76ac0db7e`
+  passed with zero unclassified differences; canonical evidence SHA-256 is
+  `7127977c27f2b8fcc685dcfe81eebe4367144f8599991e6cdefd390528d8be6c`.
+- [ ] One moving recurring all-product publication gate.
 
 ### Slice 9 — publisher benchmark and contract
 
@@ -900,7 +909,9 @@ Implementation status:
   hourly, per-kind hourly, and enriched kind-summary samples. The harness uses
   fixed-as-of `events_local FINAL` reads, preserves cross-store population
   classifications, and fails closed on same-count metric disagreements.
-- [ ] Run the frozen production build and dormant publication canaries.
+- [x] Run the frozen production event-fact build.
+- [ ] Run the frozen production serving-fact build and dormant publication
+  canaries.
 - [ ] Prove one moving recurring all-product successor in production.
 
 Gate: a route-to-product matrix proves every response field and parameter
