@@ -846,10 +846,21 @@ Implementation status:
   request waiting on a transport that ClickHouse has already closed. Each
   bounded comparison query now uses a fresh connection without changing query
   identity or comparison semantics.
-- [ ] Complete the frozen production ranking build, measure actual durable
-  state/refresh cost and Postgres request latency, run the independent
-  comparison, and pass dormant publication, retry, and recurring-publication
-  gates.
+- [x] Complete the frozen production ranking build and independent comparison.
+  Snapshot
+  `sha256:0beff0d9adaccb680034da2bf00d970c94cacbe59082525d244613e76ac0db7e`
+  produced 3,146,821 exact ranking rows across 24,958 ranking groups from
+  604,498,036 ledger rows. Product evidence SHA-256 is
+  `ecb6c43fa327d0a7a5f62a8aa5598fcd7908644e0b3e2aa2b0174de00bc13b2a`;
+  independent fixed-as-of comparison evidence SHA-256 is
+  `4b19450e17e45543bfe8ce78464989c61c3f745543cf56b17a5389b03bacb07a`
+  with eight passing comparisons and zero unclassified differences.
+- [x] Pass dry-run, atomic dormant publication, and idempotent retry gates.
+  Postgres contains one product and exactly 3,146,821 serving rows; both the
+  initial publication and `already_published` retry proved that `current_run`
+  remained on the frozen B3 baseline.
+- [ ] Measure Postgres request latency and prove one moving recurring
+  all-product publication.
 
 ### Slice 9.5 — serving-completeness gate
 
