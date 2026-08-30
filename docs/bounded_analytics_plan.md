@@ -831,6 +831,12 @@ Implementation status:
   proved that the all-kind 30-day exact aggregation exceeds both 4 GiB and
   8 GiB without spilling; comparison correctness does not require retaining
   that cardinality-sized state in memory.
+- [x] Disable HTTP connection reuse for independent ClickHouse comparisons.
+  Production proved that Docker's localhost proxy can retain a half-closed
+  keep-alive connection after a long query has completed, leaving the next
+  request waiting on a transport that ClickHouse has already closed. Each
+  bounded comparison query now uses a fresh connection without changing query
+  identity or comparison semantics.
 - [ ] Complete the frozen production ranking build, measure actual durable
   state/refresh cost and Postgres request latency, run the independent
   comparison, and pass dormant publication, retry, and recurring-publication
