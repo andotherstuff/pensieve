@@ -208,6 +208,7 @@ fn validate_args(args: &Args) -> Result<()> {
 }
 
 fn connect_clickhouse(args: &Args) -> clickhouse::Client {
+    let external_spill_threshold = args.clickhouse_max_memory_usage / 2;
     let mut client = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_database)
@@ -219,6 +220,14 @@ fn connect_clickhouse(args: &Args) -> clickhouse::Client {
         .with_option(
             "max_execution_time",
             args.clickhouse_max_execution_time.to_string(),
+        )
+        .with_option(
+            "max_bytes_before_external_group_by",
+            external_spill_threshold.to_string(),
+        )
+        .with_option(
+            "max_bytes_before_external_sort",
+            external_spill_threshold.to_string(),
         );
     if let Some(user) = args.clickhouse_user.as_deref() {
         client = client.with_user(user);

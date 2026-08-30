@@ -826,6 +826,11 @@ Implementation status:
   over the complete durable ledger. The 65,537-kind domain and five accepted
   windows are fixed, each lookup is capped at the published top limit, and the
   canonical all-kind/kind ordering is preserved exactly.
+- [x] Bound the independent ClickHouse comparison with external group-by and
+  sort spill thresholds at half of its explicit query-memory limit. Production
+  proved that the all-kind 30-day exact aggregation exceeds both 4 GiB and
+  8 GiB without spilling; comparison correctness does not require retaining
+  that cardinality-sized state in memory.
 - [ ] Complete the frozen production ranking build, measure actual durable
   state/refresh cost and Postgres request latency, run the independent
   comparison, and pass dormant publication, retry, and recurring-publication
