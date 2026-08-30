@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"name":"overview","path_and_query":"/api/v1/stats","policy":{"classification":"exact_match"}},
+    {"name":"events-total","path_and_query":"/api/v1/stats/events/total","policy":{"classification":"exact_match"}},
+    {"name":"pubkeys-total","path_and_query":"/api/v1/stats/pubkeys/total","policy":{"classification":"exact_match"}},
+    {"name":"kinds-total","path_and_query":"/api/v1/stats/kinds/total","policy":{"classification":"exact_match"}},
+    {"name":"events-earliest","path_and_query":"/api/v1/stats/events/earliest","policy":{"classification":"exact_match"}},
+    {"name":"events-latest","path_and_query":"/api/v1/stats/events/latest","policy":{"classification":"exact_match"}},
+    {"name":"events","path_and_query":"/api/v1/stats/events","policy":{"classification":"exact_match"}},
+    {"name":"throughput","path_and_query":"/api/v1/stats/throughput","policy":{"classification":"exact_match"}},
+    {"name":"active-users","path_and_query":"/api/v1/stats/users/active","policy":{"classification":"exact_match"}},
+    {"name":"active-users-daily","path_and_query":"/api/v1/stats/users/active/daily","policy":{"classification":"exact_match"}},
+    {"name":"active-users-weekly","path_and_query":"/api/v1/stats/users/active/weekly","policy":{"classification":"exact_match"}},
+    {"name":"active-users-monthly","path_and_query":"/api/v1/stats/users/active/monthly","policy":{"classification":"exact_match"}},
+    {"name":"retention","path_and_query":"/api/v1/stats/users/retention","policy":{"classification":"exact_match"}},
+    {"name":"new-users","path_and_query":"/api/v1/stats/users/new","policy":{"classification":"exact_match"}},
+    {"name":"hourly-activity","path_and_query":"/api/v1/stats/activity/hourly","policy":{"classification":"exact_match"}},
+    {"name":"zaps","path_and_query":"/api/v1/stats/zaps","policy":{"classification":"exact_match"}},
+    {"name":"zap-histogram","path_and_query":"/api/v1/stats/zaps/histogram","policy":{"classification":"exact_match"}},
+    {"name":"engagement","path_and_query":"/api/v1/stats/engagement","policy":{"classification":"exact_match"}},
+    {"name":"longform","path_and_query":"/api/v1/stats/longform","policy":{"classification":"exact_match"}},
+    {"name":"publishers","path_and_query":"/api/v1/stats/publishers","policy":{"classification":"exact_match"}},
+    {"name":"relay-distribution","path_and_query":"/api/v1/stats/relays/distribution","policy":{"classification":"exact_match"}},
+    {"name":"kinds","path_and_query":"/api/v1/kinds","policy":{"classification":"exact_match"}},
+    {"name":"kind-detail","path_and_query":"/api/v1/kinds/1","policy":{"classification":"exact_match"}},
+    {"name":"kind-activity","path_and_query":"/api/v1/kinds/1/activity","policy":{"classification":"exact_match"}}
+  ]
+}
