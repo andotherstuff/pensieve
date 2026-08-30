@@ -18,6 +18,7 @@ const SCHEMA_VERSION: u32 = 1;
 const RUNNER_VERSION: &str = "pensieve-api-cutover-comparison-v1";
 const MAX_CASES: usize = 128;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const ROUTE_CONTRACTS: [&str; 24] = [
     "/api/v1/stats",
     "/api/v1/stats/events/total",
@@ -95,13 +96,21 @@ struct Manifest {
 struct Case {
     name: String,
     path_and_query: String,
+    #[serde(default = "default_request_timeout_secs")]
+    request_timeout_secs: u64,
     #[serde(default = "ok_status")]
-    expected_status: u16,
+    expected_clickhouse_status: u16,
+    #[serde(default = "ok_status")]
+    expected_postgres_status: u16,
     policy: Policy,
 }
 
 const fn ok_status() -> u16 {
     200
+}
+
+const fn default_request_timeout_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,6 +151,9 @@ struct CaseEvidence {
     name: String,
     path_and_query: String,
     classification: &'static str,
+    request_timeout_secs: u64,
+    expected_clickhouse_status: u16,
+    expected_postgres_status: u16,
     passed: bool,
     reason: Option<String>,
     max_absolute_difference: Option<f64>,
@@ -178,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
     validate_manifest(&manifest, &args.accepted_evidence_sha256)?;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(MAX_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -191,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             &args.clickhouse_base_url,
             &case.path_and_query,
             &args.bearer_token,
+            case.request_timeout_secs,
         )
         .await?;
         let postgres = observe(
@@ -198,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
             &args.postgres_base_url,
             &case.path_and_query,
             &args.bearer_token,
+            case.request_timeout_secs,
         )
         .await?;
         case_evidence.push(compare_case(case, clickhouse, postgres));
@@ -285,13 +299,19 @@ fn validate_manifest(manifest: &Manifest, accepted: &[String]) -> anyhow::Result
         if case.name.is_empty() || !names.insert(&case.name) {
             bail!("comparison case names must be nonempty and unique");
         }
+        if case.request_timeout_secs == 0 || case.request_timeout_secs > MAX_REQUEST_TIMEOUT_SECS {
+            bail!("request timeout must be between 1 and {MAX_REQUEST_TIMEOUT_SECS} seconds");
+        }
         if !case.path_and_query.starts_with("/api/v1/")
             || case.path_and_query.contains('#')
             || case.path_and_query.chars().any(char::is_whitespace)
         {
             bail!("comparison paths must be canonical /api/v1 paths without fragments");
         }
-        StatusCode::from_u16(case.expected_status).context("invalid expected HTTP status")?;
+        StatusCode::from_u16(case.expected_clickhouse_status)
+            .context("invalid expected ClickHouse HTTP status")?;
+        let expected_postgres_status = StatusCode::from_u16(case.expected_postgres_status)
+            .context("invalid expected Postgres HTTP status")?;
         let path = case.path_and_query.split('?').next().unwrap_or_default();
         let Some(contract) = route_contract(path) else {
             bail!("comparison case does not map to one of the 24 analytics routes");
@@ -335,6 +355,15 @@ fn validate_manifest(manifest: &Manifest, accepted: &[String]) -> anyhow::Result
             }
             _ => {}
         }
+        if matches!(&case.policy, Policy::ExpectedRejection) {
+            if !expected_postgres_status.is_client_error() {
+                bail!("expected rejections require a Postgres 4xx status");
+            }
+        } else if case.expected_clickhouse_status != case.expected_postgres_status
+            || !expected_postgres_status.is_success()
+        {
+            bail!("non-rejection policies require matching successful statuses");
+        }
     }
     let required_routes = ROUTE_CONTRACTS.into_iter().collect::<BTreeSet<_>>();
     if covered_routes != required_routes {
@@ -371,12 +400,14 @@ async fn observe(
     base_url: &str,
     path_and_query: &str,
     bearer_token: &str,
+    request_timeout_secs: u64,
 ) -> anyhow::Result<Observation> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
     let started = Instant::now();
     let observed_at_epoch_ms = now_epoch_ms()?;
     let response = match client
         .get(url)
+        .timeout(std::time::Duration::from_secs(request_timeout_secs))
         .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
         .header(CACHE_CONTROL, "no-cache")
         .send()
@@ -445,8 +476,8 @@ async fn observe(
 }
 
 fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> CaseEvidence {
-    let statuses_match = clickhouse.status == Some(case.expected_status)
-        && postgres.status == Some(case.expected_status);
+    let statuses_match = clickhouse.status == Some(case.expected_clickhouse_status)
+        && postgres.status == Some(case.expected_postgres_status);
     let (classification, body_passed, reason, difference) = match case.policy {
         Policy::ExactMatch => (
             "exact_match",
@@ -505,11 +536,7 @@ fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> C
         }
         Policy::ExpectedRejection => (
             "expected_rejection",
-            clickhouse
-                .body
-                .as_ref()
-                .zip(postgres.body.as_ref())
-                .is_some_and(|(clickhouse, postgres)| compatible_shape(clickhouse, postgres)),
+            clickhouse.body.is_some() && postgres.body.is_some(),
             None,
             None,
         ),
@@ -518,6 +545,9 @@ fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> C
         name: case.name,
         path_and_query: case.path_and_query,
         classification,
+        request_timeout_secs: case.request_timeout_secs,
+        expected_clickhouse_status: case.expected_clickhouse_status,
+        expected_postgres_status: case.expected_postgres_status,
         passed: statuses_match && body_passed,
         reason,
         max_absolute_difference: difference.as_ref().map(|value| value.max_absolute),
@@ -733,7 +763,9 @@ mod tests {
                 .map(|(index, contract)| Case {
                     name: format!("case-{index}"),
                     path_and_query: contract.replace("{kind}", "1"),
-                    expected_status: 200,
+                    request_timeout_secs: default_request_timeout_secs(),
+                    expected_clickhouse_status: 200,
+                    expected_postgres_status: 200,
                     policy: Policy::ExactMatch,
                 })
                 .collect(),
@@ -835,6 +867,31 @@ mod tests {
     }
 
     #[test]
+    fn expected_rejection_supports_backend_specific_statuses() {
+        let mut manifest = complete_manifest();
+        manifest.cases[0].policy = Policy::ExpectedRejection;
+        manifest.cases[0].expected_postgres_status = 400;
+        assert!(validate_manifest(&manifest, &[]).is_ok());
+
+        manifest.cases[0].expected_postgres_status = 200;
+        assert!(validate_manifest(&manifest, &[]).is_err());
+        manifest.cases[0].policy = Policy::ExactMatch;
+        manifest.cases[0].expected_postgres_status = 201;
+        assert!(validate_manifest(&manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn request_timeouts_are_explicitly_bounded() {
+        let mut manifest = complete_manifest();
+        manifest.cases[0].request_timeout_secs = MAX_REQUEST_TIMEOUT_SECS;
+        assert!(validate_manifest(&manifest, &[]).is_ok());
+        manifest.cases[0].request_timeout_secs = 0;
+        assert!(validate_manifest(&manifest, &[]).is_err());
+        manifest.cases[0].request_timeout_secs = MAX_REQUEST_TIMEOUT_SECS + 1;
+        assert!(validate_manifest(&manifest, &[]).is_err());
+    }
+
+    #[test]
     fn manifest_requires_all_24_route_contracts() {
         let mut manifest = complete_manifest();
         assert!(validate_manifest(&manifest, &[]).is_ok());
@@ -848,12 +905,13 @@ mod tests {
             "../../../../ops/api-cutover-cases.example.json"
         ))
         .expect("parse checked-in comparison manifest");
-        assert_eq!(manifest.cases.len(), 24);
+        assert!(manifest.cases.len() > 24);
         assert!(validate_manifest(&manifest, &[]).is_ok());
         assert!(
             manifest
                 .cases
                 .iter()
+                .take(24)
                 .all(|case| matches!(case.policy, Policy::ExactMatch))
         );
     }
@@ -880,7 +938,9 @@ mod tests {
             Case {
                 name: "total".into(),
                 path_and_query: "/api/v1/stats/events/total".into(),
-                expected_status: 200,
+                request_timeout_secs: default_request_timeout_secs(),
+                expected_clickhouse_status: 200,
+                expected_postgres_status: 200,
                 policy: Policy::ExactMatch,
             },
             failed,

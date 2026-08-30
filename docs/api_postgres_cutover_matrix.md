@@ -143,11 +143,21 @@ bounded approximations that name the only numeric fields allowed to vary, and
 intentional corrections linked to an explicitly accepted lower-level evidence
 SHA-256 and naming the only response fields allowed to vary are the only
 passing policies. Unlisted fields, object keys, and array lengths remain exact.
+Expected-rejection cases record backend-specific statuses so the gate can
+prove that a bounded Postgres contract returns a deliberate 4xx even when the
+legacy ClickHouse route still accepts that shape; every other policy requires
+matching successful statuses.
+Each case also records an explicit request timeout: 10 seconds by default and
+at most 30 minutes for a named legacy ClickHouse shape whose accepted lower
+level comparison already proves that a long scan is expected. A timeout remains
+a failed observation; it is never reclassified as parity.
 Transport, status, shape, tolerance, oversized-response, and JSON failures are
 all preserved in an immutable failed evidence file. The checked-in
-`ops/api-cutover-cases.example.json` is deliberately fail-closed: it starts all
-24 defaults as exact matches and must be expanded and classified from the
-accepted frozen/recurring evidence before production use.
+`ops/api-cutover-cases.example.json` is deliberately fail-closed: it covers all
+24 defaults plus representative aggregate, grouped, filtered, limit, boundary,
+and backend-specific rejection shapes (76 cases total). Successful shapes start
+as exact matches and must be classified only from accepted frozen/recurring
+evidence before production use.
 
 For every row in the matrix, the Slice 10 gate records:
 
