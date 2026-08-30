@@ -139,8 +139,9 @@ candidates. Its manifest must cover all 24 analytics route contracts and may
 add parameter-shape and expected-rejection cases up to a hard 128-case bound.
 Each response is capped at 2 MiB. The bearer token is read from
 `PENSIEVE_API_COMPARISON_TOKEN` and is never written to evidence. Exact matches,
-bounded numeric approximations, and intentional corrections linked to an
-explicitly accepted lower-level evidence SHA-256 are the only passing policies.
+bounded approximations that name the only numeric fields allowed to vary, and
+intentional corrections linked to an explicitly accepted lower-level evidence
+SHA-256 are the only passing policies. Unlisted numeric fields remain exact.
 Transport, status, shape, tolerance, oversized-response, and JSON failures are
 all preserved in an immutable failed evidence file. The checked-in
 `ops/api-cutover-cases.example.json` is deliberately fail-closed: it starts all

@@ -110,6 +110,7 @@ enum Policy {
     ExactMatch,
     AcceptedApproximation {
         max_relative_error_ppm: u64,
+        numeric_fields: Vec<String>,
     },
     IntentionalCorrection {
         reason: String,
@@ -166,7 +167,9 @@ struct NumericDifference {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.accepted_evidence_sha256.sort_unstable();
+    args.accepted_evidence_sha256.dedup();
     validate_args(&args)?;
     let manifest_bytes = fs::read(&args.manifest).context("read comparison manifest")?;
     let manifest: Manifest =
@@ -296,8 +299,24 @@ fn validate_manifest(manifest: &Manifest, accepted: &[String]) -> anyhow::Result
         match &case.policy {
             Policy::AcceptedApproximation {
                 max_relative_error_ppm,
+                numeric_fields: _,
             } if *max_relative_error_ppm == 0 || *max_relative_error_ppm > 1_000_000 => {
                 bail!("approximation tolerance must be between 1 and 1000000 ppm");
+            }
+            Policy::AcceptedApproximation { numeric_fields, .. } => {
+                if numeric_fields.is_empty()
+                    || !numeric_fields.windows(2).all(|pair| pair[0] < pair[1])
+                    || numeric_fields.iter().any(|field| {
+                        field.is_empty()
+                            || !field
+                                .bytes()
+                                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    })
+                {
+                    bail!(
+                        "approximation numeric fields must be nonempty, lowercase, sorted, and unique"
+                    );
+                }
             }
             Policy::IntentionalCorrection {
                 reason,
@@ -435,8 +454,13 @@ fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> C
         ),
         Policy::AcceptedApproximation {
             max_relative_error_ppm,
+            numeric_fields,
         } => {
             let mut difference = NumericDifference::default();
+            let numeric_fields = numeric_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
             let compatible = clickhouse
                 .body
                 .as_ref()
@@ -446,6 +470,8 @@ fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> C
                         clickhouse,
                         postgres,
                         max_relative_error_ppm,
+                        &numeric_fields,
+                        None,
                         &mut difference,
                     )
                 });
@@ -492,23 +518,17 @@ fn compare_approximate(
     left: &Value,
     right: &Value,
     tolerance_ppm: u64,
+    numeric_fields: &BTreeSet<&str>,
+    field: Option<&str>,
     difference: &mut NumericDifference,
 ) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
-            let Some(left) = left.as_f64() else {
+            if !field.is_some_and(|field| numeric_fields.contains(field)) {
+                return left == right;
+            }
+            let Some((absolute, ppm)) = numeric_difference(left, right) else {
                 return false;
-            };
-            let Some(right) = right.as_f64() else {
-                return false;
-            };
-            let absolute = (left - right).abs();
-            let ppm = if left == 0.0 && right == 0.0 {
-                0
-            } else if left == 0.0 {
-                1_000_000
-            } else {
-                ((absolute / left.abs()) * 1_000_000.0).ceil() as u64
             };
             difference.max_absolute = difference.max_absolute.max(absolute);
             difference.max_relative_ppm = difference.max_relative_ppm.max(ppm);
@@ -517,19 +537,67 @@ fn compare_approximate(
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    compare_approximate(left, right, tolerance_ppm, difference)
+                    compare_approximate(
+                        left,
+                        right,
+                        tolerance_ppm,
+                        numeric_fields,
+                        field,
+                        difference,
+                    )
                 })
         }
         (Value::Object(left), Value::Object(right)) => {
             left.len() == right.len()
                 && left.iter().all(|(key, left)| {
                     right.get(key).is_some_and(|right| {
-                        compare_approximate(left, right, tolerance_ppm, difference)
+                        compare_approximate(
+                            left,
+                            right,
+                            tolerance_ppm,
+                            numeric_fields,
+                            Some(key),
+                            difference,
+                        )
                     })
                 })
         }
         _ => left == right,
     }
+}
+
+fn numeric_difference(left: &serde_json::Number, right: &serde_json::Number) -> Option<(f64, u64)> {
+    if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+        let absolute = (i128::from(left) - i128::from(right)).unsigned_abs();
+        let denominator = i128::from(left).unsigned_abs();
+        return Some((absolute as f64, relative_ppm(absolute, denominator)));
+    }
+    if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+        let absolute = u128::from(left.abs_diff(right));
+        return Some((absolute as f64, relative_ppm(absolute, u128::from(left))));
+    }
+    let (left, right) = (left.as_f64()?, right.as_f64()?);
+    let absolute = (left - right).abs();
+    let ppm = if left == 0.0 && right == 0.0 {
+        0
+    } else if left == 0.0 {
+        1_000_000
+    } else {
+        ((absolute / left.abs()) * 1_000_000.0).ceil() as u64
+    };
+    Some((absolute, ppm))
+}
+
+fn relative_ppm(absolute: u128, denominator: u128) -> u64 {
+    if absolute == 0 {
+        return 0;
+    }
+    if denominator == 0 {
+        return 1_000_000;
+    }
+    let numerator = absolute * 1_000_000;
+    let rounded_up = numerator.div_ceil(denominator);
+    u64::try_from(rounded_up).unwrap_or(u64::MAX)
 }
 
 fn compatible_shape(left: &Value, right: &Value) -> bool {
@@ -620,11 +688,59 @@ mod tests {
     fn approximate_comparison_is_recursive_and_bounded() {
         let left = serde_json::json!({"rows": [{"count": 1000, "name": "x"}]});
         let right = serde_json::json!({"rows": [{"count": 1019, "name": "x"}]});
+        let numeric_fields = BTreeSet::from(["count"]);
         let mut difference = NumericDifference::default();
-        assert!(compare_approximate(&left, &right, 20_000, &mut difference));
+        assert!(compare_approximate(
+            &left,
+            &right,
+            20_000,
+            &numeric_fields,
+            None,
+            &mut difference
+        ));
         assert_eq!(difference.max_relative_ppm, 19_000);
         let mut difference = NumericDifference::default();
-        assert!(!compare_approximate(&left, &right, 10_000, &mut difference));
+        assert!(!compare_approximate(
+            &left,
+            &right,
+            10_000,
+            &numeric_fields,
+            None,
+            &mut difference
+        ));
+    }
+
+    #[test]
+    fn approximation_keeps_large_integer_precision() {
+        let left = serde_json::json!(18_446_744_073_709_551_000_u64);
+        let right = serde_json::json!(18_446_744_073_709_551_001_u64);
+        let numeric_fields = BTreeSet::from(["count"]);
+        let mut difference = NumericDifference::default();
+        assert!(compare_approximate(
+            &left,
+            &right,
+            1,
+            &numeric_fields,
+            Some("count"),
+            &mut difference
+        ));
+        assert_eq!(difference.max_relative_ppm, 1);
+    }
+
+    #[test]
+    fn approximation_rejects_drift_in_unlisted_numbers() {
+        let left = serde_json::json!({"unique_pubkeys": 1000, "event_count": 2000});
+        let right = serde_json::json!({"unique_pubkeys": 1010, "event_count": 2001});
+        let numeric_fields = BTreeSet::from(["unique_pubkeys"]);
+        let mut difference = NumericDifference::default();
+        assert!(!compare_approximate(
+            &left,
+            &right,
+            20_000,
+            &numeric_fields,
+            None,
+            &mut difference
+        ));
     }
 
     #[test]
