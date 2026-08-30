@@ -115,6 +115,7 @@ enum Policy {
     IntentionalCorrection {
         reason: String,
         evidence_sha256: String,
+        variant_fields: Vec<String>,
     },
     ExpectedRejection,
 }
@@ -321,10 +322,12 @@ fn validate_manifest(manifest: &Manifest, accepted: &[String]) -> anyhow::Result
             Policy::IntentionalCorrection {
                 reason,
                 evidence_sha256,
+                variant_fields,
             } => {
                 if reason.trim().is_empty() {
                     bail!("intentional corrections require a nonempty reason");
                 }
+                validate_field_names(variant_fields, "intentional correction variant fields")?;
                 validate_sha256(evidence_sha256)?;
                 if !accepted.contains(evidence_sha256) {
                     bail!("intentional correction references unaccepted evidence");
@@ -480,16 +483,26 @@ fn compare_case(case: Case, clickhouse: Observation, postgres: Observation) -> C
         Policy::IntentionalCorrection {
             reason,
             evidence_sha256,
-        } => (
-            "intentional_correction",
-            clickhouse
+            variant_fields,
+        } => {
+            let variant_fields = variant_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let compatible = clickhouse
                 .body
                 .as_ref()
                 .zip(postgres.body.as_ref())
-                .is_some_and(|(clickhouse, postgres)| compatible_shape(clickhouse, postgres)),
-            Some(format!("{reason}; evidence_sha256={evidence_sha256}")),
-            None,
-        ),
+                .is_some_and(|(clickhouse, postgres)| {
+                    compare_intentional_correction(clickhouse, postgres, &variant_fields, None)
+                });
+            (
+                "intentional_correction",
+                compatible,
+                Some(format!("{reason}; evidence_sha256={evidence_sha256}")),
+                None,
+            )
+        }
         Policy::ExpectedRejection => (
             "expected_rejection",
             clickhouse
@@ -623,6 +636,49 @@ fn compatible_shape(left: &Value, right: &Value) -> bool {
     }
 }
 
+fn compare_intentional_correction(
+    left: &Value,
+    right: &Value,
+    variant_fields: &BTreeSet<&str>,
+    field: Option<&str>,
+) -> bool {
+    if field.is_some_and(|field| variant_fields.contains(field)) {
+        return compatible_shape(left, right);
+    }
+    match (left, right) {
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    compare_intentional_correction(left, right, variant_fields, field)
+                })
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right.get(key).is_some_and(|right| {
+                        compare_intentional_correction(left, right, variant_fields, Some(key))
+                    })
+                })
+        }
+        _ => left == right,
+    }
+}
+
+fn validate_field_names(fields: &[String], label: &str) -> anyhow::Result<()> {
+    if fields.is_empty()
+        || !fields.windows(2).all(|pair| pair[0] < pair[1])
+        || fields.iter().any(|field| {
+            field.is_empty()
+                || !field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        })
+    {
+        bail!("{label} must be nonempty, lowercase, sorted, and unique");
+    }
+    Ok(())
+}
+
 fn publish_noclobber(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -744,14 +800,25 @@ mod tests {
     }
 
     #[test]
-    fn intentional_correction_requires_compatible_shape() {
-        assert!(compatible_shape(
-            &serde_json::json!({"rows": [{"count": 1}]}),
-            &serde_json::json!({"rows": [{"count": 2}, {"count": 3}]})
+    fn intentional_correction_varies_only_named_fields() {
+        let fields = BTreeSet::from(["count"]);
+        assert!(compare_intentional_correction(
+            &serde_json::json!({"rows": [{"count": 1, "period": "x"}]}),
+            &serde_json::json!({"rows": [{"count": 9000, "period": "x"}]}),
+            &fields,
+            None,
         ));
-        assert!(!compatible_shape(
+        assert!(!compare_intentional_correction(
+            &serde_json::json!({"rows": [{"count": 1, "period": "x"}]}),
+            &serde_json::json!({"rows": [{"count": 2, "period": "y"}]}),
+            &fields,
+            None,
+        ));
+        assert!(!compare_intentional_correction(
             &serde_json::json!({"rows": [{"count": 1}]}),
-            &serde_json::json!({"rows": [{"total": 1}]})
+            &serde_json::json!({"rows": [{"count": 2}, {"count": 3}]}),
+            &fields,
+            None,
         ));
     }
 
@@ -761,6 +828,7 @@ mod tests {
         manifest.cases[0].policy = Policy::IntentionalCorrection {
             reason: "canonical population".into(),
             evidence_sha256: "a".repeat(64),
+            variant_fields: vec!["count".into()],
         };
         assert!(validate_manifest(&manifest, &["b".repeat(64)]).is_err());
         assert!(validate_manifest(&manifest, &["a".repeat(64)]).is_ok());

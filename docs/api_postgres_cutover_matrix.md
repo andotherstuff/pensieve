@@ -141,7 +141,8 @@ Each response is capped at 2 MiB. The bearer token is read from
 `PENSIEVE_API_COMPARISON_TOKEN` and is never written to evidence. Exact matches,
 bounded approximations that name the only numeric fields allowed to vary, and
 intentional corrections linked to an explicitly accepted lower-level evidence
-SHA-256 are the only passing policies. Unlisted numeric fields remain exact.
+SHA-256 and naming the only response fields allowed to vary are the only
+passing policies. Unlisted fields, object keys, and array lengths remain exact.
 Transport, status, shape, tolerance, oversized-response, and JSON failures are
 all preserved in an immutable failed evidence file. The checked-in
 `ops/api-cutover-cases.example.json` is deliberately fail-closed: it starts all
