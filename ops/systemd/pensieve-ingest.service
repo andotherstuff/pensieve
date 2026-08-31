@@ -10,6 +10,8 @@ User=pensieve
 Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve
 EnvironmentFile=-/etc/pensieve/parquet-shadow.env
+StateDirectory=pensieve
+StateDirectoryMode=0750
 
 # Binary location (after cargo build --release)
 # Tor proxy enabled by default - .onion relays route through Tor, clearnet connects directly
@@ -58,7 +60,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
 # Allow writes to data directories (includes negentropy sync-state in /data)
-ReadWritePaths=/data /archive
+ReadWritePaths=/data /archive /var/lib/pensieve
 
 [Install]
 WantedBy=multi-user.target
