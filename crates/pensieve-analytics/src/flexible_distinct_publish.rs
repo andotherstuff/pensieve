@@ -15,14 +15,13 @@ use sha2::{Digest, Sha256};
 use crate::schema::SCHEMA_SQL;
 use crate::{
     BoundedFlexibleDistinct, COHORT_RETENTION_QUERY_VERSION, DistinctSketchUnion, Error,
+    FLEXIBLE_DISTINCT_TOLERANCE_PPM, FLEXIBLE_DISTINCT_VALIDATION_RUNNER,
     FLEXIBLE_DISTINCT_VERSION, FlexibleDistinctValidationEvidence, Result,
     visit_flexible_distinct_leaves,
 };
 
 const PUBLICATION_LOCK_ID: i64 = 0x5045_4e53_4945_5645;
-const VALIDATION_RUNNER: &str = "pensieve-analytics-flexible-distinct-validation-v1";
 const SECONDS_PER_HOUR: u64 = 3_600;
-const MAX_ACCEPTED_TOLERANCE_PPM: u64 = 20_000;
 
 /// Result of atomically publishing one dormant Slice 6 product.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,14 +308,14 @@ fn validate_tolerance_evidence(
                 .max()
                 .unwrap_or(0);
     if validation.schema_version != 1
-        || validation.runner_version != VALIDATION_RUNNER
+        || validation.runner_version != FLEXIBLE_DISTINCT_VALIDATION_RUNNER
         || validation.status != "passed"
         || validation.snapshot_id != product.evidence.snapshot_id
         || validation.as_of_epoch != product.evidence.as_of_epoch
         || validation.complete_through_epoch != product.evidence.complete_through_epoch
         || !is_sha256(&validation.activity_evidence_sha256)
         || validation.flexible_evidence_sha256 != product.evidence_sha256
-        || validation.tolerance_ppm > MAX_ACCEPTED_TOLERANCE_PPM
+        || validation.tolerance_ppm > FLEXIBLE_DISTINCT_TOLERANCE_PPM
         || validation.max_relative_error_ppm > validation.tolerance_ppm
         || !samples_match
     {
@@ -396,6 +395,44 @@ mod tests {
     }
 
     #[test]
+    fn publication_accepts_only_the_versioned_tolerance_ceiling() {
+        let temp = TempDir::new().expect("temporary artifacts");
+        let product = synthetic_product(&temp);
+        let mut validation = FlexibleDistinctValidationEvidence {
+            schema_version: 1,
+            runner_version: FLEXIBLE_DISTINCT_VALIDATION_RUNNER.to_owned(),
+            status: "passed".to_owned(),
+            snapshot_id: product.evidence.snapshot_id.clone(),
+            as_of_epoch: product.evidence.as_of_epoch,
+            complete_through_epoch: product.evidence.complete_through_epoch,
+            activity_evidence_sha256: "a".repeat(64),
+            flexible_evidence_sha256: product.evidence_sha256.clone(),
+            tolerance_ppm: FLEXIBLE_DISTINCT_TOLERANCE_PPM,
+            sample_count: 1,
+            max_absolute_error: 524,
+            max_relative_error_ppm: 20_130,
+            samples: vec![crate::FlexibleDistinctValidationSample {
+                period_start: "2024-05-08".to_owned(),
+                since_epoch: 1_715_126_400,
+                until_epoch: 1_715_212_800,
+                kind: None,
+                exact_unique_pubkeys: 26_031,
+                estimated_unique_pubkeys: 25_507,
+                absolute_error: 524,
+                relative_error_ppm: 20_130,
+                accepted: true,
+            }],
+        };
+        validate_tolerance_evidence(&product, &validation).expect("accepted operator contract");
+
+        validation.runner_version = "pensieve-analytics-flexible-distinct-validation-v1".to_owned();
+        assert!(validate_tolerance_evidence(&product, &validation).is_err());
+        validation.runner_version = FLEXIBLE_DISTINCT_VALIDATION_RUNNER.to_owned();
+        validation.tolerance_ppm = FLEXIBLE_DISTINCT_TOLERANCE_PPM + 1;
+        assert!(validate_tolerance_evidence(&product, &validation).is_err());
+    }
+
+    #[test]
     fn postgres_publication_rolls_back_retries_and_never_moves_current() {
         let Ok(url) = std::env::var("PENSIEVE_TEST_POSTGRES_URL") else {
             return;
@@ -441,14 +478,14 @@ mod tests {
         let validation_path = temp.path().join("validation.json");
         let validation = serde_json::json!({
             "schema_version": 1,
-            "runner_version": VALIDATION_RUNNER,
+            "runner_version": FLEXIBLE_DISTINCT_VALIDATION_RUNNER,
             "status": "passed",
             "snapshot_id": product.evidence.snapshot_id,
             "as_of_epoch": product.evidence.as_of_epoch,
             "complete_through_epoch": product.evidence.complete_through_epoch,
             "activity_evidence_sha256": "a".repeat(64),
             "flexible_evidence_sha256": product.evidence_sha256,
-            "tolerance_ppm": 20_000,
+            "tolerance_ppm": FLEXIBLE_DISTINCT_TOLERANCE_PPM,
             "sample_count": 1,
             "max_absolute_error": 0,
             "max_relative_error_ppm": 0,

@@ -9,11 +9,11 @@ use pensieve_analytics::{
     AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
     AllRecurringProductsWithRelay, AllRecurringProductsWithServing, BatchLimits, BuildConfig,
     COHORT_RETENTION_QUERY_VERSION, CatalogDeltaPlan, CohortRetentionEvidence,
-    FIXED_ACTIVITY_QUERY_VERSION, FixedActivityConfig, FlexibleDistinctConfig,
-    FlexibleDistinctPublication, IDENTITY_QUERY_VERSION, PubkeyFirstSeenConfig, PublishOutcome,
-    PublisherRankingConfig, RelayDistributionConfig, SemanticFactsConfig, SemanticPublication,
-    ServingFactsConfig, ZapDistinctConfig, acquire_publication_lock,
-    advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
+    FIXED_ACTIVITY_QUERY_VERSION, FLEXIBLE_DISTINCT_TOLERANCE_PPM, FixedActivityConfig,
+    FlexibleDistinctConfig, FlexibleDistinctPublication, IDENTITY_QUERY_VERSION,
+    PubkeyFirstSeenConfig, PublishOutcome, PublisherRankingConfig, RelayDistributionConfig,
+    SemanticFactsConfig, SemanticPublication, ServingFactsConfig, ZapDistinctConfig,
+    acquire_publication_lock, advance_bounded_fixed_activity, advance_bounded_flexible_distinct,
     advance_bounded_pubkey_first_seen, advance_bounded_publisher_ranking,
     advance_bounded_relay_distribution, advance_bounded_semantic_facts,
     advance_bounded_serving_facts, apply_incremental, build_bounded_cohort_retention,
@@ -149,7 +149,7 @@ struct Args {
     #[arg(long, default_value_t = 107_374_182_400)]
     flexible_disk_reserve_bytes: u64,
     /// Maximum accepted representative Slice 6 relative error in ppm.
-    #[arg(long, default_value_t = 20_000)]
+    #[arg(long, default_value_t = FLEXIBLE_DISTINCT_TOLERANCE_PPM)]
     flexible_tolerance_ppm: u64,
     /// Current immutable semantic evidence; enables recurring Slice 7.
     #[arg(long)]
