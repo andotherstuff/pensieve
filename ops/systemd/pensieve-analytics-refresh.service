@@ -23,7 +23,10 @@ IOWeight=25
 MemoryAccounting=true
 MemoryHigh=20G
 MemoryMax=24G
-TimeoutStartSec=6h
+# A full all-product catch-up can legitimately exceed six hours while each
+# bounded successor is built and validated. The refresh lock and atomic
+# publication keep the previous generation current throughout the run.
+TimeoutStartSec=24h
 UMask=0027
 
 NoNewPrivileges=true
