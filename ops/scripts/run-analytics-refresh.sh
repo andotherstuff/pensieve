@@ -313,6 +313,7 @@ status_file="$run_dir/status.json"
 partial_backup=""
 partial_generation=""
 partial_link=""
+work_database_backup=""
 
 finish() {
     exit_code=$?
@@ -328,6 +329,28 @@ finish() {
     fi
     if [ -n "$partial_link" ] && [ -L "$partial_link" ]; then
         rm -f -- "$partial_link"
+    fi
+    if [ "$exit_code" -ne 0 ] && [ -n "$work_database_backup" ]; then
+        backup_name="$(basename "$work_database_backup")"
+        restore_partial="$work_database.restore.partial.$$"
+        if [[ "$backup_name" =~ ^slice-a-before-[0-9a-f]{64}\.duckdb$ ]] \
+            && [ "$work_database_backup" = "$backups_root/$backup_name" ] \
+            && [ -s "$work_database_backup" ]; then
+            rm -f -- "$restore_partial"
+            if cp --reflink=auto --sparse=always \
+                -- "$work_database_backup" "$restore_partial"; then
+                chmod 0644 "$restore_partial"
+                mv "$restore_partial" "$work_database"
+                sync -f "$work_database"
+                sync -f "$(dirname "$work_database")"
+                echo "Restored analytics work database after failed refresh: $work_database"
+            else
+                rm -f -- "$restore_partial"
+                echo "Failed to restore analytics work database from $work_database_backup" >&2
+            fi
+        else
+            echo "Refusing invalid analytics work database backup: $work_database_backup" >&2
+        fi
     fi
     if [ "$exit_code" -ne 0 ] && [ ! -e "$run_dir/SUCCESS" ]; then
         jq -n \
@@ -601,6 +624,7 @@ case "$run_kind" in
             sync -f "$backups_root"
             partial_backup=""
         fi
+        work_database_backup="$backup"
 
         incremental_args=(
             --catalog "$target_snapshot"
@@ -700,6 +724,7 @@ case "$run_kind" in
             "$run_dir/apply.json" >/dev/null
 
         promote_generation
+        work_database_backup=""
         prune_backups
         prune_deltas
         jq -n \
