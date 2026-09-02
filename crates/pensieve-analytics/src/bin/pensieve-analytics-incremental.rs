@@ -546,6 +546,65 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    // Validate every immutable predecessor before advancing DuckDB or building
+    // any successor product. A late predecessor failure would otherwise waste
+    // hours rebuilding unrelated products even though publication must fail
+    // closed. Keep these loaded products for the later advancement calls so
+    // the full validations are not repeated.
+    let identity_baseline = args
+        .identity_baseline_evidence
+        .as_ref()
+        .map(load_bounded_pubkey_first_seen)
+        .transpose()
+        .context("preflight baseline first-seen evidence")?;
+    let activity_baseline = args
+        .activity_baseline_evidence
+        .as_ref()
+        .map(load_bounded_fixed_activity)
+        .transpose()
+        .context("preflight baseline fixed-activity evidence")?;
+    let flexible_baseline = args
+        .flexible_baseline_evidence
+        .as_ref()
+        .map(load_bounded_flexible_distinct)
+        .transpose()
+        .context("preflight baseline flexible-distinct evidence")?;
+    let semantic_baseline = match (
+        args.semantic_baseline_evidence.as_ref(),
+        args.semantic_baseline_artifact.as_ref(),
+    ) {
+        (Some(evidence), Some(artifact)) => Some(
+            load_bounded_semantic_facts(evidence, artifact)
+                .context("preflight baseline semantic evidence")?,
+        ),
+        _ => None,
+    };
+    let relay_baseline = match (
+        args.relay_baseline_evidence.as_ref(),
+        args.relay_state_database.as_ref(),
+    ) {
+        (Some(evidence), Some(state)) => Some(
+            load_bounded_relay_distribution_for_advance(evidence, state, &target)
+                .context("preflight baseline relay-distribution evidence and state")?,
+        ),
+        _ => None,
+    };
+    let publisher_baseline = match (
+        args.publisher_baseline_evidence.as_ref(),
+        args.publisher_baseline_state_database.as_ref(),
+    ) {
+        (Some(evidence), Some(state)) => Some(
+            load_bounded_publisher_ranking(evidence, state)
+                .context("preflight baseline publisher ranking evidence and state")?,
+        ),
+        _ => None,
+    };
+    let serving_baseline = args
+        .serving_baseline_evidence
+        .as_ref()
+        .map(load_bounded_serving_facts)
+        .transpose()
+        .context("preflight baseline serving-facts evidence")?;
     let config = BuildConfig {
         as_of_epoch,
         code_version: args.code_version,
@@ -564,17 +623,15 @@ fn run() -> Result<()> {
         args.dry_run,
     )
     .context("advance DuckDB checkpoint")?;
-    let identity = if let (Some(baseline_path), Some(evidence_path), Some(work_root)) = (
-        args.identity_baseline_evidence.as_ref(),
+    let identity = if let (Some(baseline), Some(evidence_path), Some(work_root)) = (
+        identity_baseline.as_ref(),
         args.identity_evidence.as_ref(),
         args.identity_work_root.as_ref(),
     ) {
-        let baseline = load_bounded_pubkey_first_seen(baseline_path)
-            .context("load baseline first-seen evidence")?;
         Some(
             advance_bounded_pubkey_first_seen(
                 evidence_path,
-                &baseline,
+                baseline,
                 target.clone(),
                 &persisted_plan,
                 &delta_locations,
@@ -594,14 +651,8 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    let baseline_activity = args
-        .activity_baseline_evidence
-        .as_ref()
-        .map(load_bounded_fixed_activity)
-        .transpose()
-        .context("load baseline fixed-activity evidence")?;
     let activity = if let (Some(baseline), Some(evidence_path), Some(work_root)) = (
-        baseline_activity.as_ref(),
+        activity_baseline.as_ref(),
         args.activity_evidence.as_ref(),
         args.activity_work_root.as_ref(),
     ) {
@@ -646,24 +697,22 @@ fn run() -> Result<()> {
         None
     };
     let flexible = if let (
-        Some(baseline_path),
+        Some(baseline),
         Some(evidence_path),
         Some(work_root),
         Some(baseline_activity),
         Some(activity),
     ) = (
-        args.flexible_baseline_evidence.as_ref(),
+        flexible_baseline.as_ref(),
         args.flexible_evidence.as_ref(),
         args.flexible_work_root.as_ref(),
-        baseline_activity.as_ref(),
+        activity_baseline.as_ref(),
         activity.as_ref(),
     ) {
-        let baseline = load_bounded_flexible_distinct(baseline_path)
-            .context("load baseline flexible-distinct evidence")?;
         Some(
             advance_bounded_flexible_distinct(
                 evidence_path,
-                &baseline,
+                baseline,
                 baseline_activity,
                 activity,
                 FlexibleDistinctConfig {
@@ -702,23 +751,15 @@ fn run() -> Result<()> {
         .map(pensieve_lake::sha256_file)
         .transpose()
         .context("hash flexible-distinct tolerance evidence")?;
-    let semantic = if let (
-        Some(baseline_evidence),
-        Some(baseline_artifact),
-        Some(evidence_path),
-        Some(work_root),
-    ) = (
-        args.semantic_baseline_evidence.as_ref(),
-        args.semantic_baseline_artifact.as_ref(),
+    let semantic = if let (Some(baseline), Some(evidence_path), Some(work_root)) = (
+        semantic_baseline.as_ref(),
         args.semantic_evidence.as_ref(),
         args.semantic_work_root.as_ref(),
     ) {
-        let baseline = load_bounded_semantic_facts(baseline_evidence, baseline_artifact)
-            .context("load baseline semantic evidence")?;
         Some(
             advance_bounded_semantic_facts(
                 evidence_path,
-                &baseline,
+                baseline,
                 target.clone(),
                 &persisted_plan,
                 &delta_locations,
@@ -759,18 +800,15 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    let relay = if let (Some(baseline_path), Some(state_database), Some(evidence_path)) = (
-        args.relay_baseline_evidence.as_ref(),
+    let relay = if let (Some(baseline), Some(state_database), Some(evidence_path)) = (
+        relay_baseline.as_ref(),
         args.relay_state_database.as_ref(),
         args.relay_evidence.as_ref(),
     ) {
-        let baseline =
-            load_bounded_relay_distribution_for_advance(baseline_path, state_database, &target)
-                .context("load baseline relay-distribution evidence and state")?;
         Some(
             advance_bounded_relay_distribution(
                 evidence_path,
-                &baseline,
+                baseline,
                 target.clone(),
                 build.config.clone(),
                 RelayDistributionConfig {
@@ -791,26 +829,22 @@ fn run() -> Result<()> {
         None
     };
     let publisher = if let (
-        Some(baseline_evidence),
-        Some(baseline_state),
+        Some(baseline),
         Some(state_database),
         Some(artifact),
         Some(evidence_path),
         Some(activity),
     ) = (
-        args.publisher_baseline_evidence.as_ref(),
-        args.publisher_baseline_state_database.as_ref(),
+        publisher_baseline.as_ref(),
         args.publisher_state_database.as_ref(),
         args.publisher_artifact.as_ref(),
         args.publisher_evidence.as_ref(),
         activity.as_ref(),
     ) {
-        let baseline = load_bounded_publisher_ranking(baseline_evidence, baseline_state)
-            .context("load baseline publisher ranking evidence and state")?;
         Some(
             advance_bounded_publisher_ranking(
                 evidence_path,
-                &baseline,
+                baseline,
                 activity,
                 PublisherRankingConfig {
                     state_database: state_database.clone(),
@@ -828,43 +862,37 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    let serving = if let (
-        Some(baseline_evidence),
-        Some(evidence_path),
-        Some(work_root),
-        Some(activity_evidence),
-    ) = (
-        args.serving_baseline_evidence.as_ref(),
-        args.serving_evidence.as_ref(),
-        args.serving_work_root.as_ref(),
-        args.activity_evidence.as_ref(),
-    ) {
-        let baseline = load_bounded_serving_facts(baseline_evidence)
-            .context("load baseline serving-facts evidence")?;
-        Some(
-            advance_bounded_serving_facts(
-                evidence_path,
-                &baseline,
-                target.clone(),
-                &persisted_plan,
-                &delta_locations,
-                build.config.clone(),
-                ServingFactsConfig {
-                    work_root: work_root.clone(),
-                    batch_limits: BatchLimits {
-                        max_bytes: args.serving_batch_bytes,
-                        max_rows: args.serving_batch_rows,
+    let serving =
+        if let (Some(baseline), Some(evidence_path), Some(work_root), Some(activity_evidence)) = (
+            serving_baseline.as_ref(),
+            args.serving_evidence.as_ref(),
+            args.serving_work_root.as_ref(),
+            args.activity_evidence.as_ref(),
+        ) {
+            Some(
+                advance_bounded_serving_facts(
+                    evidence_path,
+                    baseline,
+                    target.clone(),
+                    &persisted_plan,
+                    &delta_locations,
+                    build.config.clone(),
+                    ServingFactsConfig {
+                        work_root: work_root.clone(),
+                        batch_limits: BatchLimits {
+                            max_bytes: args.serving_batch_bytes,
+                            max_rows: args.serving_batch_rows,
+                        },
+                        merge_fan_in: args.serving_merge_fan_in,
+                        disk_reserve_bytes: args.serving_disk_reserve_bytes,
                     },
-                    merge_fan_in: args.serving_merge_fan_in,
-                    disk_reserve_bytes: args.serving_disk_reserve_bytes,
-                },
-                activity_evidence,
+                    activity_evidence,
+                )
+                .context("advance bounded serving facts")?,
             )
-            .context("advance bounded serving facts")?,
-        )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let completed_at = Utc::now();
     let publication = if args.dry_run {
         None

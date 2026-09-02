@@ -867,6 +867,11 @@ Implementation status:
   Postgres contains one product and exactly 3,146,821 serving rows; both the
   initial publication and `already_published` retry proved that `current_run`
   remained on the frozen B3 baseline.
+- [x] Validate every enabled predecessor product before advancing DuckDB or
+  building any successor. The validated products are retained in-process for
+  their later advancement calls, so a missing, partial, or misconfigured
+  durable ledger fails before unrelated multi-hour work without adding a
+  second full validation pass.
 - [ ] Measure Postgres request latency and prove one moving recurring
   all-product publication.
 
