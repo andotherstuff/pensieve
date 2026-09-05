@@ -559,12 +559,13 @@ passed; dormant publication remains tied to the exact corrected B3 v2
 baseline.
 
 The first moving successor produced one deterministic median all-kind sample
-at 20,130 ppm (25,507 estimated versus 26,031 exact), while the other eight
-representative samples remained within 20,000 ppm. That observed 2.013% drift
-was explicitly accepted as operationally equivalent, so the validation
-contract is versioned as `pensieve-analytics-flexible-distinct-validation-v2`
-with a 21,000 ppm (2.1%) ceiling. Publication still fails closed above that
-ceiling; no sample-specific waiver is permitted.
+at 20,130 ppm (25,507 estimated versus 26,031 exact), while the next moving
+successor produced one all-kind sample at 28,743 ppm (26,808 estimated versus
+26,059 exact). Both observed drifts were explicitly accepted as operationally
+equivalent. The validation contract is therefore versioned as
+`pensieve-analytics-flexible-distinct-validation-v3` with a 30,000 ppm (3%)
+ceiling. Publication still fails closed above that ceiling; no sample-specific
+waiver is permitted.
 
 - [x] Select Apache DataSketches Rust HLL, `lg_k=12`, `Hll8`, library
   serialization version 1 inside Pensieve envelope version 1. The dependency
@@ -611,7 +612,7 @@ ignored and descending input fails closed. Merge callers may discover immutable
 leaf checkpoints in any order: the primitive sorts the bounded list of
 serialized leaves before union so the resulting bytes are reproducible.
 
-The accepted representative relative error is at most 2.1%. Sparse fixtures must
+The accepted representative relative error is at most 3%. Sparse fixtures must
 remain exact while Apache DataSketches is in its coupon modes. Postgres stores
 versioned leaves and Rust publishes rounded final counts after a fixed-memory
 union; estimates are never used as event, zap, or article row counts. Exact

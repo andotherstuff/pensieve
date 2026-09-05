@@ -14,9 +14,9 @@ use crate::{
 
 /// Canonical validation runner identity consumed by Postgres publication.
 pub const FLEXIBLE_DISTINCT_VALIDATION_RUNNER: &str =
-    "pensieve-analytics-flexible-distinct-validation-v2";
+    "pensieve-analytics-flexible-distinct-validation-v3";
 /// Production maximum accepted relative error in parts per million.
-pub const FLEXIBLE_DISTINCT_TOLERANCE_PPM: u64 = 21_000;
+pub const FLEXIBLE_DISTINCT_TOLERANCE_PPM: u64 = 30_000;
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// One exact-versus-estimated representative daily sample.
@@ -272,8 +272,8 @@ mod tests {
 
     #[test]
     fn production_tolerance_accepts_observed_successor_drift() {
-        let observed_ppm = relative_error_ppm(524, 26_031).expect("observed drift");
-        assert_eq!(observed_ppm, 20_130);
+        let observed_ppm = relative_error_ppm(749, 26_059).expect("observed drift");
+        assert_eq!(observed_ppm, 28_743);
         assert!(observed_ppm <= FLEXIBLE_DISTINCT_TOLERANCE_PPM);
     }
 

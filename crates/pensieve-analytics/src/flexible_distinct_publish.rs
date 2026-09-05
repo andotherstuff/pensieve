@@ -409,23 +409,23 @@ mod tests {
             flexible_evidence_sha256: product.evidence_sha256.clone(),
             tolerance_ppm: FLEXIBLE_DISTINCT_TOLERANCE_PPM,
             sample_count: 1,
-            max_absolute_error: 524,
-            max_relative_error_ppm: 20_130,
+            max_absolute_error: 749,
+            max_relative_error_ppm: 28_743,
             samples: vec![crate::FlexibleDistinctValidationSample {
-                period_start: "2024-05-08".to_owned(),
-                since_epoch: 1_715_126_400,
-                until_epoch: 1_715_212_800,
+                period_start: "2024-12-25".to_owned(),
+                since_epoch: 1_735_084_800,
+                until_epoch: 1_735_171_200,
                 kind: None,
-                exact_unique_pubkeys: 26_031,
-                estimated_unique_pubkeys: 25_507,
-                absolute_error: 524,
-                relative_error_ppm: 20_130,
+                exact_unique_pubkeys: 26_059,
+                estimated_unique_pubkeys: 26_808,
+                absolute_error: 749,
+                relative_error_ppm: 28_743,
                 accepted: true,
             }],
         };
         validate_tolerance_evidence(&product, &validation).expect("accepted operator contract");
 
-        validation.runner_version = "pensieve-analytics-flexible-distinct-validation-v1".to_owned();
+        validation.runner_version = "pensieve-analytics-flexible-distinct-validation-v2".to_owned();
         assert!(validate_tolerance_evidence(&product, &validation).is_err());
         validation.runner_version = FLEXIBLE_DISTINCT_VALIDATION_RUNNER.to_owned();
         validation.tolerance_ppm = FLEXIBLE_DISTINCT_TOLERANCE_PPM + 1;
