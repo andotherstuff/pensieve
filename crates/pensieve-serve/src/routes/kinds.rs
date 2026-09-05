@@ -321,11 +321,11 @@ async fn fetch_postgres_kind(state: &AppState, kind: u16) -> Result<KindDetail, 
     let recent = client
         .query_one(
             "SELECT
-                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3 - 86400),0)::bigint,
-                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3 - 7*86400),0)::bigint,
-                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3 - 30*86400),0)::bigint
+                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3::bigint / 3600 - 24),0)::bigint,
+                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3::bigint / 3600 - 7*24),0)::bigint,
+                 COALESCE(SUM(event_count) FILTER (WHERE hour_epoch >= $3::bigint / 3600 - 30*24),0)::bigint
                FROM pensieve_analytics.serving_hourly_counts
-              WHERE product_id=$1 AND kind=$2 AND hour_epoch < $3",
+              WHERE product_id=$1 AND kind=$2 AND hour_epoch < $3::bigint / 3600",
             &[
                 &product.product_id,
                 &kind_key,
@@ -379,10 +379,17 @@ async fn fetch_postgres_kind_activity(
         .map_err(ApiError::Internal)?;
     let kind_key = i32::from(kind);
     let query = format!(
-        "WITH counts AS (
+        "WITH hours AS (
+             SELECT (to_timestamp(hour_epoch * 3600) AT TIME ZONE 'UTC')::date AS day,
+                    event_count
+               FROM pensieve_analytics.serving_hourly_counts
+              WHERE product_id=$5 AND kind=$2
+                AND hour_epoch < EXTRACT(EPOCH FROM
+                    (date_trunc($3, to_timestamp($6::bigint) AT TIME ZONE 'UTC')
+                     AT TIME ZONE 'UTC'))::bigint / 3600
+         ), counts AS (
              SELECT {period} AS period,SUM(event_count)::bigint AS event_count
-               FROM pensieve_analytics.event_daily_kind
-              WHERE run_id=$1 AND kind=$2 GROUP BY {period}
+               FROM hours GROUP BY {period}
          )
          SELECT to_char(counts.period,'YYYY-MM-DD'),counts.event_count,
                 distincts.unique_pubkeys
@@ -395,7 +402,14 @@ async fn fetch_postgres_kind_activity(
     client
         .query(
             &query,
-            &[&product.run_id, &kind_key, &grain, &i64::from(limit)],
+            &[
+                &product.run_id,
+                &kind_key,
+                &grain,
+                &i64::from(limit),
+                &product.product_id,
+                &product.complete_through_epoch,
+            ],
         )
         .await
         .map_err(|error| ApiError::Internal(error.into()))?

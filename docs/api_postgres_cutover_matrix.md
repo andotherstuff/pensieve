@@ -134,6 +134,22 @@ not make a partial analytics generation current.
 
 ## Cutover evidence
 
+### Serving corrections identified September 5
+
+The HTTP status smoke test is not a parity gate. It exposed SQL integer
+parameter inference failures in engagement and kind detail. Subsequent value
+inspection found that `serving_hourly_counts.hour_epoch` is an hour ordinal,
+while flexible-distinct leaf timestamps and API boundaries use Unix seconds.
+Serving queries must divide boundaries by 3600 and convert ordinals to seconds
+before calendar grouping. Preserve indexed comparisons on the stored column.
+
+Kind activity uses eligible serving-hour counts and matching exact author
+counts for completed UTC calendar days, weeks or months. The ongoing calendar
+period is excluded so partial-hour counts cannot be paired with whole-period
+author counts. Future-dated raw daily rows are not eligible API activity.
+Missing distinct rows in an eligible completed period still fail closed.
+These boundary differences require explicit classification during parity review.
+
 `pensieve-api-cutover-compare` executes the matrix against two isolated API
 candidates. Its manifest must cover all 24 analytics route contracts and may
 add parameter-shape and expected-rejection cases up to a hard 128-case bound.

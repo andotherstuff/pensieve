@@ -781,7 +781,7 @@ async fn fetch_postgres_events(
                 "SELECT COALESCE(SUM(event_count),0)::bigint
                    FROM pensieve_analytics.serving_hourly_counts
                   WHERE product_id=$1 AND kind=$2
-                    AND hour_epoch >= $3 AND hour_epoch < $4",
+                    AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600",
                 &[
                     &products.serving_product_id,
                     &kind_key,
@@ -807,12 +807,14 @@ async fn fetch_postgres_events(
         "month" => EventDistinctGrain::Month,
         _ => unreachable!("group_by was validated before caching"),
     };
-    let period_expression = event_period_expression(grain);
+    // Serving facts store hour ordinals; sketch leaves store Unix seconds.
+    let period_expression =
+        event_period_expression(grain).replace("hour_epoch", "(hour_epoch * 3600)");
     let query = format!(
         "SELECT {period_expression} AS period_key,SUM(event_count)::bigint
            FROM pensieve_analytics.serving_hourly_counts
           WHERE product_id=$1 AND kind=$2
-            AND hour_epoch >= $3 AND hour_epoch < $4
+            AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600
           GROUP BY period_key ORDER BY period_key DESC LIMIT $5"
     );
     let counts = client
@@ -1327,7 +1329,7 @@ pub async fn throughput(
                     "SELECT COALESCE(SUM(event_count),0)::bigint
                        FROM pensieve_analytics.serving_hourly_counts
                       WHERE product_id=$1 AND kind=$2
-                        AND hour_epoch >= $3 AND hour_epoch < $4",
+                        AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600",
                     &[
                         &product.product_id,
                         &kind_key,
@@ -1834,11 +1836,11 @@ async fn fetch_postgres_hourly_activity(
     let kind_key = kind.map_or(-1, i32::from);
     let rows = client
         .query(
-            "SELECT (hour_epoch / 3600) % 24 AS hour_of_day,
+            "SELECT hour_epoch % 24 AS hour_of_day,
                     SUM(event_count)::bigint
                FROM pensieve_analytics.serving_hourly_counts
               WHERE product_id=$1 AND kind=$2
-                AND hour_epoch >= $3 AND hour_epoch < $4
+                AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600
               GROUP BY hour_of_day ORDER BY hour_of_day",
             &[
                 &products.serving_product_id,
@@ -2560,7 +2562,7 @@ async fn fetch_postgres_engagement(
                FROM product
                LEFT JOIN pensieve_analytics.semantic_engagement_daily daily
                  ON daily.product_id=product.product_id
-                AND daily.day_epoch >= product.complete_through - $1 * 86400
+                AND daily.day_epoch >= product.complete_through - $1::bigint * 86400
                 AND daily.day_epoch < product.complete_through",
             &[&days],
         )
