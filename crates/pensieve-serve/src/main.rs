@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         // Keep a finite cap while incremental serving summaries are evaluated.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(30),
         ));
 
     // Start server
