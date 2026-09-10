@@ -72,10 +72,11 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        // Cap total request handling time to bound slow/expensive requests.
+        // Temporary headroom for cold ClickHouse analytics queries to populate the cache.
+        // Keep a finite cap while incremental serving summaries are evaluated.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(20),
         ));
 
     // Start server
