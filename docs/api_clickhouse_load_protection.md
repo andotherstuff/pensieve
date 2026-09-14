@@ -31,4 +31,24 @@ freshness, and deliberate overload responses. Back up the API service override a
 restart only the API on promotion. Preserve the previous binary for rollback.
 Verify ingestion sealing/indexing/Parquet publication and restart count afterwards.
 
-Deployment status: not yet deployed.
+## Deployment: 2026-09-14
+
+- Code commit: `7ac5121`; full `just precommit` passed.
+- Linux binary SHA-256: `fed87958c79c5531343ac145a3e2a2b761fd0dee1a497c53912e5419070a54bb`.
+- Release: `/home/pensieve/pensieve/releases/api-7ac5121/pensieve-serve`.
+- One-CPU build completed in 58 seconds with 1.3 GiB peak memory.
+- Localhost-only canary on port 18082 passed; stopped after promotion.
+- Root-only rollback override:
+  `/etc/pensieve/api-cutover-backups/20260914-load-7ac5121/90-postgres-cutover.conf`.
+- Only `pensieve-api` restarted. Ingestion PID 1683 and NRestarts=0 unchanged.
+- Live smoke checks: latest-event 200; kind-1 activity 200/143 ms cold;
+  overview 200/583 ms cold and 1 ms cached; active-users 200/4 ms.
+  Engagement returns intended 503. Canary additionally checked earliest-event,
+  kinds listing, weekly/monthly kind activity, new users and throughput.
+- Archive free 751 GiB; data free 483 GiB. Recent segment 21725 published
+  33,387 Parquet rows from 33,387 events, zero rejected.
+- Observed load was 0.98/8.13/58.04 after deployment. Load was already falling
+  before deployment; this is not a causal benchmark or sustained-load proof.
+
+The cancellation/concurrency invariant has unit-test coverage; a broader live
+load/overload soak remains distinct from these endpoint smoke checks.
