@@ -61,7 +61,8 @@ pub async fn list_kinds(
         sort.as_deref().unwrap_or("count")
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Kinds) {
             let client = state
                 .postgres_client(AnalyticsFamily::Kinds)
@@ -155,7 +156,8 @@ pub async fn get_kind(
 ) -> Result<Json<KindDetail>, ApiError> {
     let cache_key = format!("kind_detail:{}", kind);
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Kinds) {
             return fetch_postgres_kind(&state, kind).await;
         }
@@ -255,6 +257,7 @@ pub async fn kind_activity(
     };
 
     let limit = limit.min(max_limit);
+    let window_start = activity_window_start(group_by.as_deref().unwrap_or("day"), limit);
 
     let cache_key = format!(
         "kind_activity:kind={}&group_by={}&limit={}",
@@ -263,39 +266,50 @@ pub async fn kind_activity(
         limit
     );
 
-    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
-        if state.uses_postgres(AnalyticsFamily::Kinds) {
-            return fetch_postgres_kind_activity(
-                &state,
-                kind,
-                group_by.as_deref().unwrap_or("day"),
-                limit,
-            )
-            .await;
-        }
-        let rows: Vec<KindTimeSeriesRow> = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
+    let cache = state.cache.clone();
+    let result =
+        get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
+            if state.uses_postgres(AnalyticsFamily::Kinds) {
+                return fetch_postgres_kind_activity(
+                    &state,
+                    kind,
+                    group_by.as_deref().unwrap_or("day"),
+                    limit,
+                )
+                .await;
+            }
+            let rows: Vec<KindTimeSeriesRow> = state
+                .clickhouse
+                .query(&format!(
+                    "SELECT
                     {} AS period,
                     count() AS event_count,
                     uniqExact(pubkey) AS unique_pubkeys
                 FROM events_local
-                WHERE kind = ?
+                WHERE kind = ? AND created_at >= {} AND created_at <= now()
                 GROUP BY period
                 ORDER BY period DESC
                 LIMIT {}",
-                group_expr, limit
-            ))
-            .bind(kind)
-            .fetch_all()
-            .await?;
+                    group_expr, window_start, limit
+                ))
+                .bind(kind)
+                .fetch_all()
+                .await?;
 
-        Ok(rows)
-    })
-    .await?;
+            Ok(rows)
+        })
+        .await?;
 
     Ok(Json(result))
+}
+
+fn activity_window_start(grain: &str, limit: u32) -> String {
+    let (start, unit) = match grain {
+        "week" => ("toMonday(now())", "WEEK"),
+        "month" => ("toStartOfMonth(now())", "MONTH"),
+        _ => ("toStartOfDay(now())", "DAY"),
+    };
+    format!("{start} - INTERVAL {} {unit}", limit.saturating_sub(1))
 }
 
 async fn fetch_postgres_kind(state: &AppState, kind: u16) -> Result<KindDetail, ApiError> {
@@ -447,4 +461,29 @@ fn postgres_u64(value: i64, name: &'static str) -> Result<u64, ApiError> {
 fn postgres_u32(value: i64, name: &'static str) -> Result<u32, ApiError> {
     u32::try_from(value)
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("{name} exceeds the API timestamp")))
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::activity_window_start;
+
+    #[test]
+    fn recent_calendar_windows_include_current_period() {
+        assert_eq!(
+            activity_window_start("day", 30),
+            "toStartOfDay(now()) - INTERVAL 29 DAY"
+        );
+        assert_eq!(
+            activity_window_start("week", 1),
+            "toMonday(now()) - INTERVAL 0 WEEK"
+        );
+        assert_eq!(
+            activity_window_start("month", 24),
+            "toStartOfMonth(now()) - INTERVAL 23 MONTH"
+        );
+        assert_eq!(
+            activity_window_start("day", 0),
+            "toStartOfDay(now()) - INTERVAL 0 DAY"
+        );
+    }
 }

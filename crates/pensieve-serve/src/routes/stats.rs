@@ -50,7 +50,8 @@ pub struct OverviewResponse {
 /// - GET /api/v1/stats/events/earliest
 /// - GET /api/v1/stats/events/latest
 pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    let result = get_or_compute_with_ttl(&state.cache, "overview", ttl::OVERVIEW, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute_with_ttl(&cache, "overview", ttl::OVERVIEW, move || async move {
         fetch_overview(&state).await
     })
     .await?;
@@ -79,7 +80,8 @@ pub struct TimestampResponse {
 /// Returns approximate total event count (from system.parts, instant).
 /// Cached for 5 minutes.
 pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "total_events", || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, "total_events", move || async move {
         let count = fetch_total_events(&state).await?;
         Ok(CountResponse { count })
     })
@@ -93,7 +95,8 @@ pub async fn total_events(State(state): State<AppState>) -> Result<Json<CountRes
 /// Returns total unique pubkeys (from pre-aggregated table, instant).
 /// Cached for 5 minutes.
 pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let result = get_or_compute(&state.cache, "total_pubkeys", || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, "total_pubkeys", move || async move {
         let count = fetch_total_pubkeys(&state).await?;
         Ok(CountResponse { count })
     })
@@ -107,7 +110,8 @@ pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountRe
 /// Returns distinct event kinds seen in the last 30 days.
 /// Cached for 1 hour (kinds are stable).
 pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
-    let result = get_or_compute_with_ttl(&state.cache, "total_kinds", ttl::STABLE, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute_with_ttl(&cache, "total_kinds", ttl::STABLE, move || async move {
         let count = fetch_total_kinds(&state).await?;
         Ok(CountResponse { count })
     })
@@ -123,11 +127,13 @@ pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResp
 pub async fn earliest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let result = get_or_compute_with_ttl(&state.cache, "earliest_event", ttl::STABLE, || async {
-        let timestamp = fetch_earliest_event(&state).await?;
-        Ok(TimestampResponse { timestamp })
-    })
-    .await?;
+    let cache = state.cache.clone();
+    let result =
+        get_or_compute_with_ttl(&cache, "earliest_event", ttl::STABLE, move || async move {
+            let timestamp = fetch_earliest_event(&state).await?;
+            Ok(TimestampResponse { timestamp })
+        })
+        .await?;
 
     Ok(Json(result))
 }
@@ -139,11 +145,13 @@ pub async fn earliest_event(
 pub async fn latest_event(
     State(state): State<AppState>,
 ) -> Result<Json<TimestampResponse>, ApiError> {
-    let result = get_or_compute_with_ttl(&state.cache, "latest_event", ttl::REALTIME, || async {
-        let timestamp = fetch_latest_event(&state).await?;
-        Ok(TimestampResponse { timestamp })
-    })
-    .await?;
+    let cache = state.cache.clone();
+    let result =
+        get_or_compute_with_ttl(&cache, "latest_event", ttl::REALTIME, move || async move {
+            let timestamp = fetch_latest_event(&state).await?;
+            Ok(TimestampResponse { timestamp })
+        })
+        .await?;
 
     Ok(Json(result))
 }
@@ -195,33 +203,33 @@ async fn fetch_total_events(state: &AppState) -> Result<u64, ApiError> {
     if state.uses_postgres(AnalyticsFamily::Overview) {
         return fetch_postgres_overview_metric(state, "total_events").await;
     }
-    Ok(state
+    state
         .clickhouse
         .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
         .fetch_one::<u64>()
-        .await?)
+        .await
 }
 
 async fn fetch_total_pubkeys(state: &AppState) -> Result<u64, ApiError> {
     if state.uses_postgres(AnalyticsFamily::Overview) {
         return fetch_postgres_overview_metric(state, "total_pubkeys").await;
     }
-    Ok(state
+    state
         .clickhouse
         .query("SELECT count() FROM pubkey_first_seen_data")
         .fetch_one::<u64>()
-        .await?)
+        .await
 }
 
 async fn fetch_total_kinds(state: &AppState) -> Result<u64, ApiError> {
     if state.uses_postgres(AnalyticsFamily::Overview) {
         return fetch_postgres_overview_metric(state, "kinds_30d").await;
     }
-    Ok(state
+    state
         .clickhouse
         .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY")
         .fetch_one::<u64>()
-        .await?)
+        .await
 }
 
 async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
@@ -231,26 +239,35 @@ async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("earliest_event exceeds u32")))?
             .max(NOSTR_GENESIS_TIMESTAMP));
     }
-    // Use min() aggregate, clamp to Nostr genesis for correctness
-    let ts = state
-        .clickhouse
-        .query("SELECT toUInt32(min(created_at)) FROM events_local")
-        .fetch_one::<u32>()
-        .await?;
-    // Return the later of: actual earliest event or Nostr genesis date
-    Ok(ts.max(NOSTR_GENESIS_TIMESTAMP))
+    // Share this stable result with overview, which otherwise repeats the full scan.
+    let client = state.clickhouse.clone();
+    get_or_compute_with_ttl(
+        &state.cache,
+        "earliest_event_scan",
+        ttl::STABLE,
+        move || async move {
+            let ts = client
+                .query("SELECT toUInt32(min(created_at)) FROM events_local")
+                .fetch_one::<u32>()
+                .await?;
+            Ok(ts.max(NOSTR_GENESIS_TIMESTAMP))
+        },
+    )
+    .await
 }
 
 async fn fetch_latest_event(state: &AppState) -> Result<u32, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
+    if state.uses_postgres(AnalyticsFamily::Overview)
+        || state.config.latest_event_watermark_path.is_some()
+    {
         return read_fresh_watermark(state);
     }
     // Use max() aggregate, excluding future timestamps
-    Ok(state
+    state
         .clickhouse
         .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now()")
         .fetch_one::<u32>()
-        .await?)
+        .await
 }
 
 async fn fetch_postgres_overview_metric(
@@ -566,7 +583,8 @@ pub async fn events(
         limit
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Events) {
             return fetch_postgres_events(
                 &state,
@@ -926,7 +944,8 @@ pub struct ActiveUsersCount {
 pub async fn active_users_summary(
     State(state): State<AppState>,
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
-    let result = get_or_compute(&state.cache, "active_users_summary", || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, "active_users_summary", move || async move {
         // Run all three queries in parallel - each fetches from tiny summary tables
         let (daily, weekly, monthly) = tokio::join!(
             fetch_latest_daily_active_users(&state),
@@ -966,7 +985,6 @@ async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsers
         )
         .fetch_one()
         .await
-        .map_err(ApiError::from)
 }
 
 /// Fetch the most recent weekly active users from the pre-computed table.
@@ -990,7 +1008,6 @@ async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUser
         )
         .fetch_one()
         .await
-        .map_err(ApiError::from)
 }
 
 /// Fetch the most recent monthly active users from the pre-computed table.
@@ -1014,7 +1031,6 @@ async fn fetch_latest_monthly_active_users(state: &AppState) -> Result<ActiveUse
         )
         .fetch_one()
         .await
-        .map_err(ApiError::from)
 }
 
 /// Query parameters for active users time series.
@@ -1057,7 +1073,8 @@ pub async fn active_users_daily(
         since.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
             return fetch_postgres_active_users(&state, "day", since, limit).await;
         }
@@ -1111,7 +1128,8 @@ pub async fn active_users_weekly(
         since.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
             return fetch_postgres_active_users(&state, "week", since, limit).await;
         }
@@ -1165,7 +1183,8 @@ pub async fn active_users_monthly(
         since.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
             return fetch_postgres_active_users(&state, "month", since, limit).await;
         }
@@ -1313,7 +1332,8 @@ pub async fn throughput(
         kind.map(|k| k.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Events) {
             let client = state
                 .postgres_client(AnalyticsFamily::Events)
@@ -1425,9 +1445,9 @@ pub async fn user_retention(
 
     // Validate before caching
     let cohort_size = cohort_size_param.as_deref().unwrap_or("week");
-    let (view_name, interval_unit) = match cohort_size {
-        "month" => ("cohort_retention_monthly_view", "MONTH"),
-        "week" => ("cohort_retention_weekly_view", "WEEK"),
+    let (cohort_size, view_name, interval_unit) = match cohort_size {
+        "month" => ("month", "cohort_retention_monthly_view", "MONTH"),
+        "week" => ("week", "cohort_retention_weekly_view", "WEEK"),
         other => {
             return Err(ApiError::BadRequest(format!(
                 "invalid cohort_size value: '{}'. Valid options: week, month",
@@ -1443,7 +1463,8 @@ pub async fn user_retention(
         cohort_start.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Retention) {
             return fetch_postgres_retention(&state, cohort_size, cohort_start, limit as usize)
                 .await;
@@ -1659,7 +1680,8 @@ pub async fn new_users(
         since.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::NewUsers) {
             return fetch_postgres_new_users(
                 &state,
@@ -1782,19 +1804,21 @@ pub async fn hourly_activity(
         kind.map(|k| k.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
-        if state.uses_postgres(AnalyticsFamily::Activity) {
-            return fetch_postgres_hourly_activity(&state, days, kind).await;
-        }
-        let kind_clause = match kind {
-            Some(kind) => format!("AND kind = {}", kind),
-            None => String::new(),
-        };
+    let cache = state.cache.clone();
+    let result =
+        get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
+            if state.uses_postgres(AnalyticsFamily::Activity) {
+                return fetch_postgres_hourly_activity(&state, days, kind).await;
+            }
+            let kind_clause = match kind {
+                Some(kind) => format!("AND kind = {}", kind),
+                None => String::new(),
+            };
 
-        let rows: Vec<HourlyActivityRow> = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
+            let rows: Vec<HourlyActivityRow> = state
+                .clickhouse
+                .query(&format!(
+                    "SELECT
                     toHour(created_at) AS hour,
                     count() AS event_count,
                     uniq(pubkey) AS unique_pubkeys,
@@ -1804,14 +1828,14 @@ pub async fn hourly_activity(
                 {}
                 GROUP BY hour
                 ORDER BY hour ASC",
-                days, days, kind_clause
-            ))
-            .fetch_all()
-            .await?;
+                    days, days, kind_clause
+                ))
+                .fetch_all()
+                .await?;
 
-        Ok(rows)
-    })
-    .await?;
+            Ok(rows)
+        })
+        .await?;
 
     Ok(Json(result))
 }
@@ -1949,7 +1973,8 @@ pub async fn zap_stats(
         limit
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Zaps) {
             return fetch_postgres_zap_stats(&state, days, group_by.as_deref(), limit).await;
         }
@@ -2196,7 +2221,8 @@ pub async fn zap_histogram(
     let days = params.days.unwrap_or(30);
     let cache_key = format!("zap_histogram:days={}", days);
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Zaps) {
             return fetch_postgres_zap_histogram(&state, days).await;
         }
@@ -2491,47 +2517,54 @@ pub async fn engagement(
     State(state): State<AppState>,
     Query(params): Query<EngagementQuery>,
 ) -> Result<Json<EngagementStats>, ApiError> {
+    // Temporarily fail explicitly instead of launching an unbounded raw tag scan.
+    // Postgres serving is not selected or enabled by this guard.
+    if !state.uses_postgres(AnalyticsFamily::Engagement) {
+        return Err(ApiError::MetricUnavailable);
+    }
     let days = params.days.unwrap_or(30);
     let cache_key = format!("engagement:days={}", days);
 
-    let result = get_or_compute_with_ttl(&state.cache, &cache_key, ttl::TIME_SERIES, || async {
-        if state.uses_postgres(AnalyticsFamily::Engagement) {
-            return fetch_postgres_engagement(&state, days).await;
-        }
-        // Calculate all metrics from events_local consistently.
-        // A reply is a kind=1 event that has at least one e-tag (references another event).
-        let row: EngagementRow = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
+    let cache = state.cache.clone();
+    let result =
+        get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
+            if state.uses_postgres(AnalyticsFamily::Engagement) {
+                return fetch_postgres_engagement(&state, days).await;
+            }
+            // Calculate all metrics from events_local consistently.
+            // A reply is a kind=1 event that has at least one e-tag (references another event).
+            let row: EngagementRow = state
+                .clickhouse
+                .query(&format!(
+                    "SELECT
                     countIf(kind = 1) AS total_notes,
                     countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
                     countIf(kind = 7) AS total_reactions
                 FROM events_local
                 WHERE created_at >= now() - INTERVAL {} DAY",
-                days
-            ))
-            .fetch_one()
-            .await?;
+                    days
+                ))
+                .fetch_one()
+                .await?;
 
-        // Original notes = total kind=1 events minus replies
-        let original_notes = row.total_notes.saturating_sub(row.total_replies);
-        let base = if original_notes > 0 {
-            original_notes as f64
-        } else {
-            1.0
-        };
+            // Original notes = total kind=1 events minus replies
+            let original_notes = row.total_notes.saturating_sub(row.total_replies);
+            let base = if original_notes > 0 {
+                original_notes as f64
+            } else {
+                1.0
+            };
 
-        Ok(EngagementStats {
-            period_days: days,
-            original_notes,
-            replies: row.total_replies,
-            reactions: row.total_reactions,
-            replies_per_note: row.total_replies as f64 / base,
-            reactions_per_note: row.total_reactions as f64 / base,
+            Ok(EngagementStats {
+                period_days: days,
+                original_notes,
+                replies: row.total_replies,
+                reactions: row.total_reactions,
+                replies_per_note: row.total_replies as f64 / base,
+                reactions_per_note: row.total_reactions as f64 / base,
+            })
         })
-    })
-    .await?;
+        .await?;
 
     Ok(Json(result))
 }
@@ -2643,7 +2676,8 @@ pub async fn longform(
         days.map(|d| d.to_string()).unwrap_or_default()
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Longform) {
             return fetch_postgres_longform(&state, days).await;
         }
@@ -2834,7 +2868,8 @@ pub async fn relay_distribution(
     let limit = params.limit.unwrap_or(100).min(1000);
     let cache_key = format!("relay_distribution:limit={}", limit);
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::RelayDistribution) {
             return fetch_postgres_relay_distribution(&state, limit).await;
         }
@@ -2946,7 +2981,8 @@ pub async fn publishers(
         limit
     );
 
-    let result = get_or_compute(&state.cache, &cache_key, || async {
+    let cache = state.cache.clone();
+    let result = get_or_compute(&cache, &cache_key, move || async move {
         if state.uses_postgres(AnalyticsFamily::Publishers) {
             return fetch_postgres_publishers(&state, days, kind, limit).await;
         }

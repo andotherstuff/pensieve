@@ -16,6 +16,7 @@
 //! - **Routes**: Endpoint handlers grouped by domain
 
 mod auth;
+pub mod bounded_clickhouse;
 pub mod cache;
 mod error;
 mod postgres_analytics;
