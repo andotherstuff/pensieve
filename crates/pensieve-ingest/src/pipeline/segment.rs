@@ -33,7 +33,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use super::dedupe::DedupeIndex;
@@ -181,6 +181,8 @@ pub struct SegmentWriter {
     injected_failure: AtomicUsize,
     /// Serialize archive mutations and latch uncertain I/O failures.
     admission_gate: Mutex<Option<String>>,
+    /// Read-only health observation must never wait for archive fsyncs.
+    recovery_latched: AtomicBool,
     config: SegmentConfig,
     current: Mutex<Option<CurrentSegment>>,
     segment_number: AtomicU64,
@@ -242,6 +244,7 @@ impl SegmentWriter {
             #[cfg(test)]
             injected_failure: AtomicUsize::new(0),
             admission_gate: Mutex::new(None),
+            recovery_latched: AtomicBool::new(false),
             config,
             current: Mutex::new(None),
             segment_number: AtomicU64::new(next_segment),
@@ -283,7 +286,7 @@ impl SegmentWriter {
 
     /// Whether archive admission has latched an uncertain write or seal fault.
     pub fn recovery_required(&self) -> bool {
-        self.admission_gate.lock().is_some()
+        self.recovery_latched.load(Ordering::SeqCst)
     }
 
     /// Find the next segment number by scanning existing files.
@@ -518,6 +521,7 @@ impl SegmentWriter {
             Ok(result) => result,
             Err(panic) => {
                 *failure = Some("archive operation panicked".to_string());
+                self.recovery_latched.store(true, Ordering::SeqCst);
                 metrics::gauge!("archive_recovery_required").set(1.0);
                 tracing::error!("archive operation panicked; admission blocked pending recovery");
                 if let Err(error) = self.persist_recovery_marker() {
@@ -529,6 +533,7 @@ impl SegmentWriter {
         if let Err(error) = &result {
             let reason = compact_error(error);
             *failure = Some(reason.to_string());
+            self.recovery_latched.store(true, Ordering::SeqCst);
             metrics::gauge!("archive_recovery_required").set(1.0);
             metrics::counter!("archive_admission_failures_total").increment(1);
             tracing::error!(error = %reason, marker = %self.recovery_marker().display(),
@@ -977,6 +982,40 @@ pub struct SegmentStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn recovery_observation_does_not_wait_for_archive_lock() {
+        let dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let gate = writer.admission_gate.lock();
+        let observer = Arc::clone(&writer);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sender.send(observer.recovery_required()).unwrap();
+        });
+        let observed = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        // Release even on regression so the test can reap its observer thread.
+        drop(gate);
+        thread.join().unwrap();
+        assert!(!observed.unwrap());
+
+        let failed: Result<()> =
+            writer.archive_operation(|| Err(Error::Segment("injected fault".to_string())));
+        assert!(failed.is_err());
+        assert!(writer.recovery_required());
+        assert!(writer.seal().is_err());
+        assert!(writer.recovery_required());
+    }
 
     #[test]
     fn recovery_preflight_is_read_only_and_checks_matching_namespace() {

@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_open_failure_releases_claim_for_retry() {
+    fn segment_open_failure_releases_claim_but_blocks_writer() {
         use crate::pipeline::{PackedEvent, SegmentConfig, SegmentWriter};
         let dir = tempfile::tempdir().unwrap();
         let dedupe = DedupeIndex::open(dir.path().join("dedupe")).unwrap();
@@ -102,5 +102,7 @@ mod tests {
                 .is_err()
         );
         assert!(dedupe.is_new(&id).unwrap());
+        assert!(writer.recovery_required());
+        assert!(writer.seal().is_err());
     }
 }
