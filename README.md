@@ -77,6 +77,15 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 - Disconnects from paid/whitelist relays that reject auth
 - **Relay quality tracking** (SQLite) with scoring and optimization
 - Optional Parquet shadow publication from durably sealed notepack work units
+
+Live archive segments are periodically sealed independently of Parquet. Configure
+`--archive-seal-interval-secs` / `PENSIEVE_ARCHIVE_SEAL_INTERVAL_SECS` (default 300).
+Zero disables this archive timer. An active Parquet shadow's nonzero
+`PENSIEVE_PARQUET_SHADOW_MAX_BATCH_AGE_SECS` can request a shorter cadence; disabling
+that legacy timer alone no longer disables archive sealing. Set both to zero to
+disable periodic sealing entirely (not suitable for isolated reconciliation).
+The timer performs one synchronous seal at a time and is joined at shutdown;
+its cadence is not a hard wall-clock bound on slow disk operations.
 - Graceful shutdown on Ctrl+C
 
 **Options:**
