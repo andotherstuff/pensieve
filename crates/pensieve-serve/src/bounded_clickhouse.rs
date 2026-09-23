@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clickhouse::{Client, Row, query::Query, sql::Bind};
 use serde::de::DeserializeOwned;
@@ -59,6 +60,19 @@ where
     T: Send + 'static,
     F: Future<Output = clickhouse::error::Result<T>> + Send + 'static,
 {
+    admitted_with_timeout(permits, admission, work, Duration::from_secs(25)).await
+}
+
+async fn admitted_with_timeout<T, F>(
+    permits: Arc<Semaphore>,
+    admission: Arc<Semaphore>,
+    work: F,
+    deadline: Duration,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: Future<Output = clickhouse::error::Result<T>> + Send + 'static,
+{
     let slot = admission
         .try_acquire_owned()
         .map_err(|_| ApiError::Overloaded)?;
@@ -70,7 +84,12 @@ where
     tokio::spawn(async move {
         let _permit = permit;
         let _slot = slot;
-        work.await.map_err(ApiError::from)
+        // The server's 20-second deadline is cooperative. Bound connection and
+        // body-read stalls too, even after the original HTTP caller disconnects.
+        tokio::time::timeout(deadline, work)
+            .await
+            .map_err(|_| ApiError::Overloaded)?
+            .map_err(ApiError::from)
     })
     .await
     .map_err(|error| ApiError::Internal(error.into()))?
@@ -111,6 +130,27 @@ impl BoundedQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_work_is_dropped_and_all_slots_are_released() {
+        let permits = Arc::new(Semaphore::new(1));
+        let admission = Arc::new(Semaphore::new(1));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let result = admitted_with_timeout(
+            permits.clone(),
+            admission.clone(),
+            async move {
+                let _tx = tx;
+                std::future::pending::<clickhouse::error::Result<()>>().await
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(result, Err(ApiError::Overloaded)));
+        assert!(rx.await.is_err());
+        assert_eq!(permits.available_permits(), 1);
+        assert_eq!(admission.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn cancelled_caller_does_not_release_running_slot() {

@@ -127,7 +127,7 @@ where
     // Never serve stale real-time watermarks.
     let stale: Option<T> = match cache.get(key).await {
         Some(entry)
-            if ttl >= ttl::AGGREGATES
+            if ttl > ttl::REALTIME
                 && chrono::Utc::now()
                     <= entry.expires_at + chrono::Duration::from_std(ttl).unwrap_or_default() =>
         {
@@ -155,7 +155,9 @@ where
     let refresh = tokio::spawn(async move {
         let _guard = guard;
         tracing::trace!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
-        let value = compute().await?;
+        let value = compute().await.inspect_err(|error| {
+            tracing::warn!(key = %key, error = %error, "cache refresh failed");
+        })?;
 
         match serde_json::to_string(&value) {
             Ok(json) => {
@@ -241,6 +243,52 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn stale_overview_is_bounded_and_realtime_never_uses_stale() {
+        for (key, ttl, age, expected) in [
+            ("overview_stale", ttl::OVERVIEW, 1, 1),
+            ("overview_expired", ttl::OVERVIEW, 61, 2),
+            ("watermark_stale", ttl::REALTIME, 1, 2),
+        ] {
+            let cache = new_cache();
+            cache
+                .insert(
+                    key.to_owned(),
+                    CachedEntry {
+                        json: "1".to_owned(),
+                        cached_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+                        expires_at: chrono::Utc::now() - chrono::Duration::seconds(age),
+                    },
+                )
+                .await;
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let request_cache = cache.clone();
+            let request = tokio::spawn(async move {
+                get_or_compute_with_ttl(&request_cache, key, ttl, || async move {
+                    wait.await.unwrap();
+                    Ok(2u64)
+                })
+                .await
+                .unwrap()
+            });
+            if expected == 1 {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), request)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    1
+                );
+                release.send(()).unwrap();
+            } else {
+                tokio::task::yield_now().await;
+                assert!(!request.is_finished());
+                release.send(()).unwrap();
+                assert_eq!(request.await.unwrap(), 2);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn stale_aggregate_returns_while_single_refresh_runs() {

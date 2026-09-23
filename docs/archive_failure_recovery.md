@@ -16,7 +16,15 @@ Before detaching a segment for seal, the writer fsyncs a
 that checkpoint only after the synchronous seal succeeds. A write failure also
 attempts to persist the marker. If a full disk prevents marker creation, the
 retained `.notepack.open` file still prevents startup. Startup refuses either
-condition. This is intentionally conservative after a process/machine crash.
+condition. The live daemon checks this before opening RocksDB and remains
+resident with admission disabled and monitoring available until an operator
+stops it. It does not poll for marker removal or automatically resume. This is
+intentionally conservative after a process/machine crash.
+
+An in-process writer fault stops live intake and signals shutdown of the
+in-process reconciliation task. Later events are not counted as novel relay
+traffic. A dedupe lookup error rejects that event without terminating healthy
+live subscriptions; this is not a promise that the event will be redelivered.
 
 Buffered bytes may flush when a failed writer is dropped, but the file is not
 promoted to a sealed archive segment. Preserve it unchanged for inspection.
@@ -28,7 +36,8 @@ has been sealed; compression fallback is distinct from uncertain frame I/O.
 This is a recovery **acceptance checklist**, not an executable repair procedure.
 The current tools do not implement recovery for every complete `.open` orphan or
 post-rename failure. Do not deploy this change until those procedures are tested
-and the service lifecycle prevents a recovery-required restart loop. Preserve the
+and their reconciliation has been verified. The live service now remains
+observable instead of exiting repeatedly on a known recovery obligation. Preserve the
 blocked state; do not remove markers just to restore availability.
 
 1. Inspect logs, disk/inode space, filesystem health and failed paths. Do not
@@ -61,6 +70,19 @@ latched fault. Rules are in `ops/production/prometheus/archive-alerts.yml`, with
 a separate ingester-unavailable rule for process/startup failure. These changes
 are not deployed automatically. Verify rule loading and the site's notification
 receiver routing before claiming operator notifications are delivered.
-The repository currently configures no Alertmanager target. Rule loading alone
-does not deliver notifications. An operator-selected receiver and a verified
-end-to-end firing/resolution test are mandatory deployment prerequisites.
+The selected notification system is Uptime Kuma. Configure an HTTP monitor for
+`http://<private-ingester-address>:9091/health/archive-admission`, accepting only
+HTTP 200. It returns 503 during startup, recovery-required state, and shutdown.
+This endpoint is served on the existing metrics port; do not expose that port
+publicly just to monitor it. A disabled metrics port also disables this endpoint.
+
+This is an **archive-admission** check, not a guarantee that relays are delivering
+events or that ClickHouse, Parquet, and remote storage are current. Keep separate
+freshness/storage checks. The metrics listener must bind successfully before
+ingestion starts; bind errors are returned rather than hidden in a detached task.
+
+During deployment, configure Kuma's notification destination and prove both
+firing and resolution against a non-production fault fixture. A failed process
+or unreachable host must also make the monitor fail. Do not claim notifications
+are delivered until that test passes. The Prometheus rules remain useful for
+diagnostics, but have no configured Alertmanager receiver.

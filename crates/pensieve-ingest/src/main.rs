@@ -31,7 +31,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use metrics::{counter, gauge};
-use pensieve_core::metrics::{init_metrics, start_metrics_server};
+use pensieve_core::metrics::{init_metrics, start_metrics_server_with_archive_health};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
     NegentropySyncer, ParquetShadowConfig, ParquetShadowPublisher, RelayManager,
@@ -438,23 +438,41 @@ async fn main() -> Result<()> {
 
     tracing::info!("Pensieve live ingestion daemon starting...");
 
+    let archive_ready = Arc::new(AtomicBool::new(false));
     // Initialize metrics
     if args.metrics_port > 0 {
         let metrics_handle = init_metrics();
-        start_metrics_server(args.metrics_port, metrics_handle).await?;
-        gauge!("ingestion_running").set(1.0);
+        start_metrics_server_with_archive_health(
+            args.metrics_port,
+            metrics_handle,
+            Arc::clone(&archive_ready),
+        )
+        .await?;
+        gauge!("ingestion_running").set(0.0);
         tracing::info!(port = args.metrics_port, "metrics server listening");
     }
 
     // Set up graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = Arc::clone(&running);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = Arc::clone(&shutdown_requested);
+    let signal_ready = Arc::clone(&archive_ready);
 
     ctrlc::set_handler(move || {
         tracing::info!("Shutdown signal received, stopping gracefully...");
+        signal_shutdown.store(true, Ordering::SeqCst);
+        signal_ready.store(false, Ordering::SeqCst);
         running_clone.store(false, Ordering::SeqCst);
     })
     .context("Failed to set Ctrl+C handler")?;
+
+    // Keep metrics available without repeatedly opening RocksDB for a recovery
+    // obligation that cannot be cleared by restarting the process.
+    if let Err(error) = SegmentWriter::check_recovery(&args.output_dir, "segment") {
+        wait_for_archive_recovery(&shutdown_requested, &error.to_string()).await;
+        return Ok(());
+    }
 
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle, parquet_shadow_handle) = init_pipeline(&args)?;
@@ -774,7 +792,27 @@ async fn main() -> Result<()> {
     // - Recording connection attempts/disconnections
     // - Periodic score recomputation
     // - Swapping low-scoring relays for higher-scoring ones
-    let relay_source = RelaySource::with_manager(relay_config, Arc::clone(&relay_manager));
+    let relay_source = Arc::new(RelaySource::with_manager(
+        relay_config,
+        Arc::clone(&relay_manager),
+    ));
+    let fault_writer = Arc::clone(&segment_writer);
+    let fault_source = Arc::clone(&relay_source);
+    let fault_running = Arc::clone(&running);
+    let fault_ready = Arc::clone(&archive_ready);
+    let archive_fault_watch = tokio::spawn(async move {
+        loop {
+            if fault_writer.recovery_required() {
+                fault_ready.store(false, Ordering::SeqCst);
+                gauge!("ingestion_running").set(0.0);
+                fault_running.store(false, Ordering::SeqCst);
+                fault_source.stop();
+            } else if !fault_running.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
 
     // Clone running flag for the handler
     let handler_running = Arc::clone(&running);
@@ -971,7 +1009,9 @@ async fn main() -> Result<()> {
             if let Err(e) = negentropy_syncer
                 .run_periodic(|event| {
                     // Check if we should stop
-                    if !negentropy_running.load(Ordering::SeqCst) {
+                    if !negentropy_running.load(Ordering::SeqCst)
+                        || negentropy_segment_writer.recovery_required()
+                    {
                         return Ok(false);
                     }
 
@@ -1032,8 +1072,9 @@ async fn main() -> Result<()> {
                                 error = %compact_error(&e),
                                 "failed to write negentropy event"
                             );
-                            // Return error so event is NOT recorded in sync state
-                            // and will be re-fetched on next sync cycle
+                            // Do not advance sync state. A partial admission can
+                            // retain its claim; offline recovery must reconcile
+                            // it before any later sync may retry it.
                             return Err(e);
                         }
 
@@ -1084,10 +1125,14 @@ async fn main() -> Result<()> {
         );
     }
 
+    if running.load(Ordering::SeqCst) && !segment_writer.recovery_required() {
+        archive_ready.store(true, Ordering::SeqCst);
+        gauge!("ingestion_running").set(1.0);
+    }
     let stats = relay_source
         .run_async(|relay_url: String, event: &nostr_sdk::Event| {
             // Check if we should stop
-            if !handler_running.load(Ordering::SeqCst) {
+            if !handler_running.load(Ordering::SeqCst) || segment_writer.recovery_required() {
                 return Ok(false);
             }
 
@@ -1113,12 +1158,12 @@ async fn main() -> Result<()> {
                         error = %compact_error(&e),
                         "dedupe check failed for live event"
                     );
-                    return Err(e);
+                    // No admission occurred; fail this event closed without
+                    // terminating healthy relay subscriptions.
+                    counter!("live_dedupe_errors_total").increment(1);
+                    return Ok(true);
                 }
             };
-
-            // Record event for relay quality tracking
-            handler_relay_manager.record_event(&relay_url, admission.is_some());
 
             // Reference-coverage sampling (sampled + cheap): does our archive
             // already contain the events this one references?
@@ -1140,8 +1185,11 @@ async fn main() -> Result<()> {
                                 error = %compact_error(&e),
                                 "failed to write live event"
                             );
-                            // Continue processing despite write errors
+                            handler_running.store(false, Ordering::SeqCst);
+                            archive_ready.store(false, Ordering::SeqCst);
+                            return Ok(false);
                         } else {
+                            handler_relay_manager.record_event(&relay_url, true);
                             handler_events_processed.fetch_add(1, Ordering::Relaxed);
                             // Emit relay-specific counter in real-time
                             counter!("relay_events_written_total").increment(1);
@@ -1176,6 +1224,7 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Duplicate - skip (no packing needed!)
+                handler_relay_manager.record_event(&relay_url, false);
                 handler_events_deduplicated.fetch_add(1, Ordering::Relaxed);
                 // Emit relay-specific counter in real-time
                 counter!("relay_events_deduplicated_total").increment(1);
@@ -1187,6 +1236,10 @@ async fn main() -> Result<()> {
 
     // Shutdown sequence
     tracing::info!("Shutting down...");
+    archive_ready.store(false, Ordering::SeqCst);
+    running.store(false, Ordering::SeqCst);
+    archive_fault_watch.abort();
+    let _ = archive_fault_watch.await;
 
     // Stop negentropy sync if running
     if let Some(ref syncer) = negentropy_syncer {
@@ -1199,6 +1252,7 @@ async fn main() -> Result<()> {
         // Give it a moment to clean up
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort(); // Force stop if still running
+        let _ = handle.await;
     }
 
     // Flush negentropy sync state
@@ -1220,7 +1274,22 @@ async fn main() -> Result<()> {
 
     // Seal final segment. Its events are marked archived inside seal() now (the
     // writer holds a dedupe reference), so we don't mark them again here.
-    if let Some(sealed) = segment_writer.seal()? {
+    if segment_writer.recovery_required() {
+        wait_for_archive_recovery(
+            &shutdown_requested,
+            "archive writer fault; preserve open files and marker",
+        )
+        .await;
+        return Ok(());
+    }
+    let final_seal = match segment_writer.seal() {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            wait_for_archive_recovery(&shutdown_requested, &error.to_string()).await;
+            return Ok(());
+        }
+    };
+    if let Some(sealed) = final_seal {
         tracing::info!(
             segment_number = sealed.segment_number,
             event_count = sealed.event_count,
@@ -1297,6 +1366,20 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Remain observable but never resume admission in a failed process. Recovery
+/// must be performed offline and followed by an explicit restart.
+async fn wait_for_archive_recovery(shutdown: &AtomicBool, reason: &str) {
+    gauge!("ingestion_running").set(0.0);
+    gauge!("archive_recovery_required").set(1.0);
+    tracing::error!(
+        reason,
+        "archive recovery required; intake stopped, metrics remain available; awaiting operator shutdown"
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Live archive pipeline and optional derived sink handles.
@@ -1530,6 +1613,22 @@ fn start_parquet_batch_timer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_wait_is_resident_until_explicit_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let request = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            wait_for_archive_recovery(&request, "injected recovery obligation").await;
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!task.is_finished());
+        shutdown.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn shadow_target_requires_an_explicit_replay_policy() {

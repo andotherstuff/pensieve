@@ -183,19 +183,19 @@ async fn fetch_overview(state: &AppState) -> Result<OverviewResponse, ApiError> 
             latest_event: read_fresh_watermark(state)?,
         });
     }
-    let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
-        fetch_total_events(state),
-        fetch_total_pubkeys(state),
-        fetch_total_kinds(state),
-        fetch_earliest_event(state),
-        fetch_latest_event(state),
-    );
+    // A single refresh must not exhaust the two-query pool with siblings that
+    // time out waiting for each other. Fail before starting later reads on error.
+    let total_events = fetch_total_events(state).await?;
+    let total_pubkeys = fetch_total_pubkeys(state).await?;
+    let total_kinds = fetch_total_kinds(state).await?;
+    let earliest_event = fetch_earliest_event(state).await?;
+    let latest_event = fetch_latest_event(state).await?;
     Ok(OverviewResponse {
-        total_events: total_events?,
-        total_pubkeys: total_pubkeys?,
-        total_kinds: total_kinds?,
-        earliest_event: earliest_event?,
-        latest_event: latest_event?,
+        total_events,
+        total_pubkeys,
+        total_kinds,
+        earliest_event,
+        latest_event,
     })
 }
 
@@ -946,17 +946,15 @@ pub async fn active_users_summary(
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, "active_users_summary", move || async move {
-        // Run all three queries in parallel - each fetches from tiny summary tables
-        let (daily, weekly, monthly) = tokio::join!(
-            fetch_latest_daily_active_users(&state),
-            fetch_latest_weekly_active_users(&state),
-            fetch_latest_monthly_active_users(&state),
-        );
+        // Do not let sibling reads compete for the two-query admission pool.
+        let daily = fetch_latest_daily_active_users(&state).await?;
+        let weekly = fetch_latest_weekly_active_users(&state).await?;
+        let monthly = fetch_latest_monthly_active_users(&state).await?;
 
         Ok(ActiveUsersSummary {
-            daily: daily?,
-            weekly: weekly?,
-            monthly: monthly?,
+            daily,
+            weekly,
+            monthly,
         })
     })
     .await?;
@@ -2502,13 +2500,6 @@ pub struct EngagementStats {
     pub reactions_per_note: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Row)]
-struct EngagementRow {
-    total_notes: u64,
-    total_replies: u64,
-    total_reactions: u64,
-}
-
 /// `GET /api/v1/stats/engagement`
 ///
 /// Returns reply and reaction ratios relative to original notes.
@@ -2528,41 +2519,7 @@ pub async fn engagement(
     let cache = state.cache.clone();
     let result =
         get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            if state.uses_postgres(AnalyticsFamily::Engagement) {
-                return fetch_postgres_engagement(&state, days).await;
-            }
-            // Calculate all metrics from events_local consistently.
-            // A reply is a kind=1 event that has at least one e-tag (references another event).
-            let row: EngagementRow = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                    countIf(kind = 1) AS total_notes,
-                    countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
-                    countIf(kind = 7) AS total_reactions
-                FROM events_local
-                WHERE created_at >= now() - INTERVAL {} DAY",
-                    days
-                ))
-                .fetch_one()
-                .await?;
-
-            // Original notes = total kind=1 events minus replies
-            let original_notes = row.total_notes.saturating_sub(row.total_replies);
-            let base = if original_notes > 0 {
-                original_notes as f64
-            } else {
-                1.0
-            };
-
-            Ok(EngagementStats {
-                period_days: days,
-                original_notes,
-                replies: row.total_replies,
-                reactions: row.total_reactions,
-                replies_per_note: row.total_replies as f64 / base,
-                reactions_per_note: row.total_reactions as f64 / base,
-            })
+            fetch_postgres_engagement(&state, days).await
         })
         .await?;
 

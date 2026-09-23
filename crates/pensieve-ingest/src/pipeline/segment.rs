@@ -226,27 +226,7 @@ impl SegmentWriter {
         // Create output directory if it doesn't exist
         fs::create_dir_all(&config.output_dir)?;
 
-        let marker = config
-            .output_dir
-            .join(format!("{}.recovery-required", config.segment_prefix));
-        if marker.exists() {
-            return Err(Error::Segment(format!(
-                "archive recovery required: {}",
-                marker.display()
-            )));
-        }
-        for entry in fs::read_dir(&config.output_dir)? {
-            let path = entry?.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with(&format!("{}-", config.segment_prefix))
-                && name.ends_with(".notepack.open")
-            {
-                return Err(Error::Segment(format!(
-                    "unrecovered open segment: {}",
-                    path.display()
-                )));
-            }
-        }
+        Self::check_recovery(&config.output_dir, &config.segment_prefix)?;
 
         // Find the next segment number by scanning existing files
         let next_segment = Self::find_next_segment_number(&config)?;
@@ -273,6 +253,37 @@ impl SegmentWriter {
             dedupe,
             watermark_publication: Mutex::new(()),
         })
+    }
+
+    /// Inspect recovery evidence before opening databases or starting admission.
+    /// This is read-only and never clears a recovery obligation.
+    pub fn check_recovery(output_dir: &Path, prefix: &str) -> Result<()> {
+        let marker = output_dir.join(format!("{prefix}.recovery-required"));
+        if marker.try_exists()? {
+            return Err(Error::Segment(format!(
+                "archive recovery required: {}",
+                marker.display()
+            )));
+        }
+        if !output_dir.try_exists()? {
+            return Ok(());
+        }
+        for entry in fs::read_dir(output_dir)? {
+            let path = entry?.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with(&format!("{prefix}-")) && name.ends_with(".notepack.open") {
+                return Err(Error::Segment(format!(
+                    "unrecovered open segment: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether archive admission has latched an uncertain write or seal fault.
+    pub fn recovery_required(&self) -> bool {
+        self.admission_gate.lock().is_some()
     }
 
     /// Find the next segment number by scanning existing files.
@@ -966,6 +977,27 @@ pub struct SegmentStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn recovery_preflight_is_read_only_and_checks_matching_namespace() {
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("absent");
+        SegmentWriter::check_recovery(&absent, "segment").unwrap();
+        assert!(!absent.exists());
+        let unrelated = dir.path().join("backfill-000000001.notepack.open");
+        fs::write(&unrelated, b"preserve").unwrap();
+        SegmentWriter::check_recovery(dir.path(), "segment").unwrap();
+        let open = dir.path().join("segment-000000001.notepack.open");
+        fs::write(&open, b"preserve open").unwrap();
+        assert!(SegmentWriter::check_recovery(dir.path(), "segment").is_err());
+        assert_eq!(fs::read(&open).unwrap(), b"preserve open");
+        fs::remove_file(&open).unwrap();
+        let marker = dir.path().join("segment.recovery-required");
+        fs::write(&marker, b"preserve marker").unwrap();
+        assert!(SegmentWriter::check_recovery(dir.path(), "segment").is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"preserve marker");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+    }
 
     #[test]
     fn archive_io_failure_blocks_write_flush_seal_and_restart() {
