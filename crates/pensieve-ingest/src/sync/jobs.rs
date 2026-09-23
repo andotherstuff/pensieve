@@ -16,6 +16,8 @@ const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
 /// Maximum receipt rows examined in one archive reconciliation transaction.
 pub const MAX_RECEIPT_BATCH: u32 = 256;
+/// Bound unsealed finished uploads before pausing new leases.
+const MAX_AWAITING_DURABILITY: u32 = 2;
 
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
@@ -311,7 +313,7 @@ impl JobLedger {
             [],
             |r| r.get(0),
         )?;
-        if awaiting >= 2 {
+        if awaiting >= MAX_AWAITING_DURABILITY {
             return Ok(None);
         }
         let id=tx.query_row("SELECT id FROM jobs WHERE state IN ('queued','retry_wait') AND next_eligible<=?1 ORDER BY id LIMIT 1",[now],|r|r.get::<_,i64>(0)).optional()?;
@@ -532,6 +534,8 @@ impl JobLedger {
     /// count/bytes/digest/protocol summaries and all unresolved IDs remain durable.
     /// Recovery/compaction bypass admission ceilings, but actual I/O errors roll
     /// back. No live attempt is compacted. This does not perform network recovery.
+    /// Continue periodic checks until complete; zero satisfied rows means only
+    /// that this batch has no new durable evidence, not that polling should stop.
     pub fn reconcile_archived(
         &mut self,
         job: i64,
@@ -584,7 +588,10 @@ impl JobLedger {
                 satisfied += 1;
             }
         }
-        let (next_attempt, next_sequence) = rows.last().map_or((0, 0), |r| (r.0, r.1));
+        let (next_attempt, next_sequence) = match rows.last() {
+            Some(row) if rows.len() == limit as usize => (row.0, row.1),
+            _ => (0, 0),
+        };
         tx.execute(
             "UPDATE jobs SET scan_attempt=?2,scan_sequence=?3 WHERE id=?1",
             params![job, next_attempt, next_sequence],

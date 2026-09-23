@@ -21,7 +21,17 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_legacy_pending(None)
+    }
+
+    fn with_legacy_pending(legacy_id: Option<&[u8; 32]>) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        if let Some(id) = legacy_id {
+            let db = rocksdb::DB::open_default(dir.path().join("dedupe")).unwrap();
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            db.put_opt(id, [1], &options).unwrap();
+        }
         let dedupe = Arc::new(DedupeIndex::open(dir.path().join("dedupe")).unwrap());
         let writer = SegmentWriter::new(
             SegmentConfig {
@@ -142,6 +152,94 @@ fn event(text: &str) -> Event {
 }
 
 #[test]
+fn legacy_pending_is_readmitted_without_inventing_archive_proof() {
+    let candidate = event("legacy pending");
+    let mut h = Harness::with_legacy_pending(Some(candidate.id.as_bytes()));
+    assert_eq!(
+        h.dedupe.get_status(candidate.id.as_bytes()).unwrap(),
+        Some(EventStatus::Pending)
+    );
+    assert!(!h.dedupe.has_archive_owner(candidate.id.as_bytes()).unwrap());
+    // A dropped reservation must not erase the legacy marker or block recovery.
+    drop(
+        h.dedupe
+            .reserve_unarchived(candidate.id.as_bytes())
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(
+        h.dedupe.get_status(candidate.id.as_bytes()).unwrap(),
+        Some(EventStatus::Pending)
+    );
+    let lease = h.lease("legacy", 10);
+    let mut session = UploadSession::new(lease.clone());
+    for seq in 1..=2 {
+        let received = h.receive(&mut session, &lease, seq, &candidate, 11);
+        h.admit(&mut session, received, 12);
+    }
+    assert!(h.dedupe.has_archive_owner(candidate.id.as_bytes()).unwrap());
+    h.done(&mut session, &lease, 13);
+    assert!(!h.reconcile(lease.job().id, 4).complete);
+    assert_eq!(h.writer.seal().unwrap().unwrap().event_count, 1);
+    h.reconcile(lease.job().id, 4);
+    assert!(h.reconcile(lease.job().id, 4).complete);
+    assert_eq!(
+        h.dedupe.get_status(candidate.id.as_bytes()).unwrap(),
+        Some(EventStatus::Archived)
+    );
+    assert!(
+        h.dedupe
+            .reserve_unarchived(candidate.id.as_bytes())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn foreign_revocable_claim_cannot_ack_and_dropped_claim_is_recoverable() {
+    let mut h = Harness::new();
+    let candidate = event("live source has not written yet");
+    let live_index = h.dedupe.clone();
+    let live_claim = live_index
+        .reserve(candidate.id.as_bytes())
+        .unwrap()
+        .unwrap();
+    let lease = h.lease("foreign", 10);
+    let mut session = UploadSession::new(lease.clone());
+    let received = h.receive(&mut session, &lease, 1, &candidate, 11);
+    assert!(
+        session
+            .admit_and_accept(&mut h.ledger, received, &h.dedupe, &h.writer, || 12)
+            .is_err()
+    );
+    assert_eq!(
+        h.ledger.get(lease.job().id).unwrap().state,
+        JobState::Leased
+    );
+    assert!(h.writer.seal().unwrap().is_none());
+    drop(live_claim);
+    h.ledger
+        .retry(&lease, 13, 60, RetryReason::RelayFailure)
+        .unwrap();
+    let retry = h.ledger.lease_next(73, 60).unwrap().unwrap();
+    let mut session = UploadSession::new(retry.clone());
+    let received = h.receive(&mut session, &retry, 1, &candidate, 74);
+    h.admit(&mut session, received, 75);
+    h.done(&mut session, &retry, 76);
+    assert!(!h.reconcile(retry.job().id, 4).complete);
+    assert_eq!(h.writer.seal().unwrap().unwrap().event_count, 1);
+    h.reconcile(retry.job().id, 4);
+    assert!(h.reconcile(retry.job().id, 4).complete);
+    assert_eq!(
+        h.ledger
+            .attempt_progress(retry.job().id, 1)
+            .unwrap()
+            .archived,
+        1
+    );
+}
+
+#[test]
 fn pending_duplicates_wait_for_seal_then_compact_without_parquet_or_notifications() {
     let mut h = Harness::new();
     for cycle in 0..3 {
@@ -170,7 +268,6 @@ fn pending_duplicates_wait_for_seal_then_compact_without_parquet_or_notification
             h.dedupe.get_status(candidate.id.as_bytes()).unwrap(),
             Some(EventStatus::Archived)
         );
-        h.reconcile(lease.job().id, 4); // wrap the persisted scan cursor
         assert!(h.reconcile(lease.job().id, 4).complete);
         let progress = h.ledger.attempt_progress(lease.job().id, 1).unwrap();
         assert_eq!((progress.received, progress.archived), (2, 2));

@@ -400,17 +400,15 @@ impl UploadSession {
         if writer.recovery_required() {
             return Err(ProtocolError::State);
         }
-        match dedupe.reserve(event.event.id.as_bytes())? {
+        match dedupe.reserve_unarchived(event.event.id.as_bytes())? {
             Some(claim) => {
                 let packed = crate::pack_nostr_event(&event.event)?;
                 writer.write_reserved(packed, claim)?;
             }
             None => {
-                // Legacy persisted Pending is neither a current writer claim nor
-                // archive proof. Do not acknowledge an owner that does not exist.
-                if dedupe.get_status(event.event.id.as_bytes())?
-                    == Some(crate::EventStatus::Pending)
-                {
+                // A live source may still abandon its reservation before writing.
+                // Only a retained writer claim or durable marker owns this receipt.
+                if !dedupe.has_archive_owner(event.event.id.as_bytes())? {
                     return Err(ProtocolError::State);
                 }
             }

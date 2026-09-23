@@ -11,7 +11,11 @@ reconciler remains the only runtime caller until the later integration gates pas
 2. `admit_and_accept` uses the shared reservation, notepack encoder, and writer.
    Only that admission path can release public upload credit. An already archived
    duplicate need not be written again; an in-flight duplicate still waits for
-   archive proof. Legacy on-disk Pending is not an acknowledged archive owner.
+   archive proof. A revocable live-source reservation is not an acknowledged
+   archive owner: reject it and retain the receipt for retry. Legacy on-disk
+   Pending is re-admitted under the shared admission mutex, without deleting its
+   marker; only a new durable seal upgrades it to Archived. A possible duplicate
+   archive copy is preferable to permanently suppressing an unrecovered event.
    Errors poison the session, preserve the receipt, and never produce an ACK.
    The lease clock is checked before admission and again before acknowledgement.
 3. A matching ProtocolDone atomically releases the capability and moves the job
@@ -34,8 +38,9 @@ The caller must supply the actual shared writer/index pair, not independent stor
 ## Bounded cleanup, recovery, and retained accounting
 
 Each call scans a bounded, ordered batch using a persisted `(attempt, sequence)`
-cursor. At the end it wraps; one missing early ID therefore cannot starve later
-IDs. Calls with no rows may only reset the cursor. No live upload is compacted.
+cursor. An empty or short batch wraps; one missing early ID therefore cannot starve
+later IDs. Keep polling incomplete jobs even when no rows were satisfied this time.
+Calls with no rows may only reset the cursor. No live upload is compacted.
 
 After an attempt has ended (protocol success, retry, split, or block), an
 archive-confirmed receipt's detail can be removed. In the same FULL transaction,
