@@ -1,8 +1,8 @@
 //! Durable, ingester-owned reconciliation obligations. Not wired to ingestion.
 //!
-//! This first increment deliberately cannot complete a job: worker success is
-//! not archive durability. Receipt accounting and completion belong to the next
-//! increment. All mutations use immediate transactions; unfinished work is never
+//! This increment deliberately cannot complete a job: received-frame accounting
+//! is not archive durability. Archive satisfaction and completion belong to the
+//! next increment. All mutations use immediate transactions; unfinished work is never
 //! aged out or deleted to make room. Call from a bounded blocking executor.
 
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use thiserror::Error;
 
 const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
+const MAX_RECEIPTS: i64 = 100_000;
 
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
@@ -105,6 +106,9 @@ pub struct Lease {
 }
 
 impl Lease {
+    pub(super) fn token(&self) -> [u8; 32] {
+        self.token
+    }
     /// Leased job and attempt number.
     pub fn job(&self) -> &Job {
         &self.job
@@ -190,11 +194,30 @@ impl JobLedger {
                         );
                         CREATE UNIQUE INDEX one_active_lease ON jobs(state) WHERE state='leased';
                         CREATE INDEX due_jobs ON jobs(state,next_eligible,id);
-                        CREATE INDEX child_jobs ON jobs(parent);")?;
+                        CREATE INDEX child_jobs ON jobs(parent);
+                    CREATE TABLE attempts (
+                        job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
+                        received INTEGER NOT NULL, bytes INTEGER NOT NULL, digest BLOB NOT NULL,
+                        protocol_done INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(job,attempt)
+                    );
+                    CREATE TABLE receipts (
+                        job INTEGER NOT NULL, attempt INTEGER NOT NULL, sequence INTEGER NOT NULL,
+                        event_id BLOB NOT NULL, created_at INTEGER NOT NULL,
+                        frame_bytes INTEGER NOT NULL, frame_digest BLOB NOT NULL,
+                        PRIMARY KEY(job,attempt,sequence),
+                        FOREIGN KEY(job,attempt) REFERENCES attempts(job,attempt)
+                    );
+                    CREATE TABLE receipt_totals (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                        retained INTEGER NOT NULL CHECK(retained>=0)
+                    );
+                    INSERT INTO receipt_totals VALUES(1,0);")?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-                    tx.pragma_update(None, "user_version", 1)?;
+                    tx.pragma_update(None, "user_version", 2)?;
+                    check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 1) => {}
+                (APPLICATION_ID, 2) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -371,6 +394,146 @@ impl JobLedger {
     pub fn get(&self, id: i64) -> Result<Job, LedgerError> {
         read_job(&self.db, id)
     }
+
+    /// Bounded persisted accounting for one attempt. Receipt registration is not
+    /// evidence of archive durability or novelty. No payloads are stored here.
+    pub fn attempt_progress(&self, job: i64, attempt: i64) -> Result<AttemptProgress, LedgerError> {
+        attempt_progress(&self.db, job, attempt)
+    }
+
+    pub(super) fn verify_active(&mut self, lease: &Lease, now: i64) -> Result<(), LedgerError> {
+        verify_lease(&self.db, lease, now)
+    }
+
+    pub(super) fn register_received(
+        &mut self,
+        lease: &Lease,
+        received: &super::ipc::ReceiptRecord,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_lease(&tx, lease, now)?;
+        if received.created_at < lease.job.since as u64
+            || received.created_at > lease.job.until as u64
+            || received.frame_bytes == 0
+            || received.frame_bytes > super::ipc::MAX_FRAME_BYTES as u64 + 4
+        {
+            return Err(LedgerError::Invalid("invalid receipt metadata"));
+        }
+        let progress = attempt_progress(&tx, lease.job.id, lease.job.attempt)?;
+        if progress.protocol_done {
+            return Err(LedgerError::Invalid("protocol already ended"));
+        }
+        if received.sequence != progress.received + 1
+            || received.sequence > super::ipc::MAX_EVENTS
+            || progress.bytes.saturating_add(received.frame_bytes) > super::ipc::MAX_ATTEMPT_BYTES
+        {
+            return Err(LedgerError::Invalid("receipt sequence or attempt limit"));
+        }
+        let count: i64 = tx.query_row(
+            "SELECT retained FROM receipt_totals WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if count >= MAX_RECEIPTS {
+            return Err(LedgerError::Budget);
+        }
+        let digest = super::ipc::extend_digest(progress.digest, received.frame_digest);
+        tx.execute(
+            "INSERT INTO attempts(job,attempt,received,bytes,digest) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(job,attempt) DO UPDATE SET received=excluded.received,bytes=excluded.bytes,digest=excluded.digest",
+            params![lease.job.id, lease.job.attempt, received.sequence, progress.bytes + received.frame_bytes, digest.as_slice()],
+        )?;
+        tx.execute(
+            "INSERT INTO receipts VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                lease.job.id,
+                lease.job.attempt,
+                received.sequence,
+                received.event_id.as_slice(),
+                received.created_at,
+                received.frame_bytes,
+                received.frame_digest.as_slice()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE receipt_totals SET retained=retained+1 WHERE singleton=1",
+            [],
+        )?;
+        commit(tx, &self.path, self.limits)
+    }
+
+    pub(super) fn record_protocol_done(
+        &mut self,
+        lease: &Lease,
+        sequence: u64,
+        count: u64,
+        digest: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_lease(&tx, lease, now)?;
+        let progress = attempt_progress(&tx, lease.job.id, lease.job.attempt)?;
+        if sequence != progress.received + 1
+            || count != progress.received
+            || digest != progress.digest
+        {
+            return Err(LedgerError::Invalid("protocol receipt summary mismatch"));
+        }
+        if progress.protocol_done {
+            return Err(LedgerError::Invalid("protocol already ended"));
+        }
+        tx.execute(
+            "INSERT INTO attempts(job,attempt,received,bytes,digest,protocol_done) VALUES(?1,?2,0,0,?3,1)
+             ON CONFLICT(job,attempt) DO UPDATE SET protocol_done=1",
+            params![lease.job.id, lease.job.attempt, digest.as_slice()],
+        )?;
+        commit(tx, &self.path, self.limits)
+    }
+}
+
+/// Received-frame accounting, explicitly not a durable archive receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptProgress {
+    /// Event frames durably registered, including duplicate event IDs.
+    pub received: u64,
+    /// Framed wire bytes for those events.
+    pub bytes: u64,
+    /// Domain-separated ordered digest chain over exact event frames.
+    pub digest: [u8; 32],
+    /// The worker's final count and digest matched; not job completion.
+    pub protocol_done: bool,
+}
+
+fn attempt_progress(
+    db: &Connection,
+    job: i64,
+    attempt: i64,
+) -> Result<AttemptProgress, LedgerError> {
+    Ok(db
+        .query_row(
+            "SELECT received,bytes,digest,protocol_done FROM attempts WHERE job=?1 AND attempt=?2",
+            params![job, attempt],
+            |r| {
+                Ok(AttemptProgress {
+                    received: r.get(0)?,
+                    bytes: r.get(1)?,
+                    digest: r.get(2)?,
+                    protocol_done: r.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or(AttemptProgress {
+            received: 0,
+            bytes: 0,
+            digest: super::ipc::initial_digest(),
+            protocol_done: false,
+        }))
 }
 
 fn retry_due(now: i64, delay: u32) -> Result<i64, LedgerError> {
@@ -384,7 +547,7 @@ fn retry_job(tx: &Transaction<'_>, id: i64, due: i64, reason: &str) -> Result<()
     Ok(())
 }
 
-fn verify_lease(tx: &Transaction<'_>, lease: &Lease, now: i64) -> Result<(), LedgerError> {
+fn verify_lease(tx: &Connection, lease: &Lease, now: i64) -> Result<(), LedgerError> {
     if now < 0 {
         return Err(LedgerError::Invalid("negative clock"));
     }
@@ -652,7 +815,7 @@ mod tests {
             )
             .is_ok()
         );
-        db.db.pragma_update(None, "user_version", 2).unwrap();
+        db.db.pragma_update(None, "user_version", 3).unwrap();
         assert!(matches!(
             JobLedger::open(&db.path, LedgerLimits::default()),
             Err(LedgerError::Invalid(_))
@@ -722,7 +885,8 @@ mod tests {
         if let Some(path) = std::env::var_os(CHILD_PATH) {
             let mut db = JobLedger::open(Path::new(&path), LedgerLimits::default()).unwrap();
             db.enqueue("s", RELAY, 0, 9).unwrap();
-            db.lease_next(10, 60).unwrap().unwrap();
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            db.register_received(&lease, &receipt(1), 11).unwrap();
             db.db.execute_batch("BEGIN IMMEDIATE; UPDATE jobs SET state='retry_wait',token=NULL,expires_at=NULL;").unwrap();
             // No Rust destructors or SQLite close/checkpoint. This simulates
             // process loss, not a power-loss or filesystem durability test.
@@ -739,7 +903,161 @@ mod tests {
         let job = db.get(1).unwrap();
         assert_eq!(job.state, JobState::Leased);
         assert_eq!(job.attempt, 1);
+        assert_eq!(db.attempt_progress(job.id, 1).unwrap().received, 1);
         assert!(db.expire(70, 60).unwrap());
         assert_eq!(db.get(1).unwrap().state, JobState::RetryWait);
+    }
+
+    fn receipt(sequence: u64) -> super::super::ipc::ReceiptRecord {
+        super::super::ipc::ReceiptRecord {
+            sequence,
+            event_id: [1; 32],
+            created_at: 1,
+            frame_bytes: 500,
+            frame_digest: [sequence as u8; 32],
+        }
+    }
+
+    #[test]
+    fn undeployed_v1_schema_is_rejected_without_mutating_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        let job = db.enqueue("s", RELAY, 0, 9).unwrap();
+        db.lease_next(10, 60).unwrap().unwrap();
+        // Recreate the exact v1 schema shape: it has neither receipt table.
+        db.db
+            .execute_batch("DROP TABLE receipts; DROP TABLE attempts; DROP TABLE receipt_totals; PRAGMA user_version=1;")
+            .unwrap();
+        let path = db.path.clone();
+        drop(db);
+        assert!(matches!(
+            JobLedger::open(&path, LedgerLimits::default()),
+            Err(LedgerError::Invalid(_))
+        ));
+        let raw = Connection::open(path).unwrap();
+        assert_eq!(read_job(&raw, job.id).unwrap().state, JobState::Leased);
+        assert_eq!(
+            raw.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn receipt_replay_is_rejected_and_old_attempt_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        let job = db.enqueue("s", RELAY, 0, 9).unwrap();
+        let first = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&first, &receipt(1), 11).unwrap();
+        assert!(db.register_received(&first, &receipt(1), 11).is_err());
+        let mut conflict = receipt(1);
+        conflict.frame_digest[0] ^= 1;
+        assert!(db.register_received(&first, &conflict, 11).is_err());
+        assert_eq!(db.attempt_progress(job.id, 1).unwrap().received, 1);
+        db.retry(&first, 12, 60, RetryReason::WorkerLost).unwrap();
+        let second = db.lease_next(72, 60).unwrap().unwrap();
+        assert!(matches!(
+            db.register_received(&first, &receipt(2), 73),
+            Err(LedgerError::StaleLease)
+        ));
+        db.register_received(&second, &receipt(1), 73).unwrap();
+        assert_eq!(db.attempt_progress(job.id, 1).unwrap().received, 1);
+        assert_eq!(db.attempt_progress(job.id, 2).unwrap().received, 1);
+        let digest = db.attempt_progress(job.id, 2).unwrap().digest;
+        db.record_protocol_done(&second, 2, 1, digest, 74).unwrap();
+        assert!(db.record_protocol_done(&second, 2, 1, digest, 74).is_err());
+        assert!(db.register_received(&second, &receipt(2), 75).is_err());
+    }
+
+    #[test]
+    fn receipt_insert_failure_rolls_back_summary_and_emits_no_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.db.execute_batch("CREATE TRIGGER reject_receipt BEFORE INSERT ON receipts BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        assert!(matches!(
+            db.register_received(&lease, &receipt(1), 11),
+            Err(LedgerError::Database(_))
+        ));
+        drop(db);
+        let db = ledger(&dir);
+        assert_eq!(db.attempt_progress(lease.job.id, 1).unwrap().received, 0);
+        assert_eq!(
+            db.db
+                .query_row("SELECT retained FROM receipt_totals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM attempts", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.get(lease.job.id).unwrap().state, JobState::Leased);
+    }
+
+    #[test]
+    fn receipt_budget_failure_keeps_previous_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&lease, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(lease.job.id, 1).unwrap();
+        db.limits.max_bytes = file_bytes(&db.path).unwrap();
+        assert!(matches!(
+            db.register_received(&lease, &receipt(2), 12),
+            Err(LedgerError::Budget)
+        ));
+        assert!(matches!(
+            db.record_protocol_done(&lease, 2, 1, prior.digest, 12),
+            Err(LedgerError::Budget)
+        ));
+        assert_eq!(db.attempt_progress(lease.job.id, 1).unwrap(), prior);
+    }
+
+    #[test]
+    fn global_receipt_ceiling_and_persisted_attempt_limits_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&lease, &receipt(1), 11).unwrap();
+        db.db
+            .execute(
+                "UPDATE attempts SET received=?1 WHERE job=?2",
+                params![super::super::ipc::MAX_EVENTS, lease.job.id],
+            )
+            .unwrap();
+        assert!(
+            db.register_received(&lease, &receipt(super::super::ipc::MAX_EVENTS + 1), 12)
+                .is_err()
+        );
+        db.db
+            .execute(
+                "UPDATE attempts SET received=1,bytes=?1 WHERE job=?2",
+                params![super::super::ipc::MAX_ATTEMPT_BYTES, lease.job.id],
+            )
+            .unwrap();
+        assert!(db.register_received(&lease, &receipt(2), 12).is_err());
+        db.db
+            .execute("UPDATE attempts SET bytes=500 WHERE job=?1", [lease.job.id])
+            .unwrap();
+        // Seed only the authoritative counter to exercise the admission bound.
+        db.db
+            .execute("UPDATE receipt_totals SET retained=?1", [MAX_RECEIPTS])
+            .unwrap();
+        // A new attempt must not evade the retained-receipt ceiling.
+        db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();
+        let next = db.lease_next(72, 60).unwrap().unwrap();
+        assert!(matches!(
+            db.register_received(&next, &receipt(1), 73),
+            Err(LedgerError::Budget)
+        ));
+        assert_eq!(db.attempt_progress(lease.job.id, 2).unwrap().received, 0);
     }
 }
