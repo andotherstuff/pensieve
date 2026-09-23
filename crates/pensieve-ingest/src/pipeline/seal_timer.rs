@@ -209,6 +209,9 @@ mod tests {
         })
         .unwrap();
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Enqueue stop before releasing the seal, independently of when the
+        // joiner thread is scheduled. A second callback cannot start.
+        timer.stop.try_send(()).unwrap();
         let (finished, done) = mpsc::sync_channel(1);
         let joiner = thread::spawn(move || {
             timer.shutdown().unwrap();

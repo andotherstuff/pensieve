@@ -219,10 +219,10 @@ struct Args {
     )]
     parquet_shadow_max_event_bytes: usize,
 
-    /// Maximum age of an open live batch while the Parquet shadow is enabled.
-    ///
-    /// The timer force-seals the authoritative notepack segment; the resulting
-    /// sealed file is then the durable Parquet work unit. Zero disables the timer.
+    /// Request this seal cadence while the Parquet shadow is active.
+    /// The effective interval is the minimum positive value of this and
+    /// --archive-seal-interval-secs (default 300). Zero withdraws this request;
+    /// it does not disable the independent archive cadence.
     #[arg(
         long,
         env = "PENSIEVE_PARQUET_SHADOW_MAX_BATCH_AGE_SECS",
@@ -231,7 +231,9 @@ struct Args {
     parquet_shadow_max_batch_age_secs: u64,
 
     /// Periodically seal the authoritative archive, independently of Parquet.
-    /// Zero disables this timer; isolated reconciliation requires a nonzero cadence.
+    /// Zero withdraws this request; an active shadow can still request sealing.
+    /// Set both cadence flags to zero to disable periodic sealing entirely.
+    /// Isolated reconciliation requires a nonzero effective cadence.
     #[arg(
         long,
         env = "PENSIEVE_ARCHIVE_SEAL_INTERVAL_SECS",
