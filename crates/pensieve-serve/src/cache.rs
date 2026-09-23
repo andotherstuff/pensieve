@@ -59,7 +59,8 @@ static IN_FLIGHT: std::sync::LazyLock<InFlightMap> =
 pub fn new_cache() -> ResponseCache {
     Cache::builder()
         .max_capacity(DEFAULT_CACHE_CAPACITY)
-        .time_to_live(DEFAULT_TTL)
+        // Freshness is enforced by each entry's expires_at, not a shorter global TTL.
+        .time_to_idle(ttl::STABLE)
         .build()
 }
 
@@ -91,9 +92,9 @@ pub async fn get_or_compute<T, F, Fut>(
     compute: F,
 ) -> Result<T, ApiError>
 where
-    T: Serialize + DeserializeOwned,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T, ApiError>>,
+    T: Serialize + DeserializeOwned + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
     get_or_compute_with_ttl(cache, key, DEFAULT_TTL, compute).await
 }
@@ -106,9 +107,9 @@ pub async fn get_or_compute_with_ttl<T, F, Fut>(
     compute: F,
 ) -> Result<T, ApiError>
 where
-    T: Serialize + DeserializeOwned,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<T, ApiError>>,
+    T: Serialize + DeserializeOwned + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
     if let Some(value) = try_get_cached(cache, key).await? {
         return Ok(value);
@@ -116,39 +117,74 @@ where
 
     let key_lock = {
         let mut map = IN_FLIGHT.lock().await;
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
         map.entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
 
-    let _guard = key_lock.lock().await;
+    // Serve at most one additional TTL of stale aggregate data while a refresh runs.
+    // Never serve stale real-time watermarks.
+    let stale: Option<T> = match cache.get(key).await {
+        Some(entry)
+            if ttl > ttl::REALTIME
+                && chrono::Utc::now()
+                    <= entry.expires_at + chrono::Duration::from_std(ttl).unwrap_or_default() =>
+        {
+            serde_json::from_str(&entry.json).ok()
+        }
+        _ => None,
+    };
+    let guard = match key_lock.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some(value) = stale {
+                return Ok(value);
+            }
+            key_lock.lock_owned().await
+        }
+    };
 
     if let Some(value) = try_get_cached(cache, key).await? {
         return Ok(value);
     }
 
-    tracing::trace!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
-    let value = compute().await?;
+    let cache = cache.clone();
+    let key = key.to_owned();
+    // Own the refresh and its lock independently of the HTTP request lifetime.
+    let refresh = tokio::spawn(async move {
+        let _guard = guard;
+        tracing::trace!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
+        let value = compute().await.inspect_err(|error| {
+            tracing::warn!(key = %key, error = %error, "cache refresh failed");
+        })?;
 
-    match serde_json::to_string(&value) {
-        Ok(json) => {
-            let now = chrono::Utc::now();
-            let expires_at = now
-                + chrono::Duration::from_std(ttl)
-                    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
-            let entry = CachedEntry {
-                json,
-                cached_at: now,
-                expires_at,
-            };
-            cache.insert(key.to_string(), entry).await;
+        match serde_json::to_string(&value) {
+            Ok(json) => {
+                let now = chrono::Utc::now();
+                let expires_at = now
+                    + chrono::Duration::from_std(ttl)
+                        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+                let entry = CachedEntry {
+                    json,
+                    cached_at: now,
+                    expires_at,
+                };
+                cache.insert(key.to_string(), entry).await;
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "failed to serialize for cache");
+            }
         }
-        Err(e) => {
-            tracing::warn!(key = %key, error = %e, "failed to serialize for cache");
-        }
+
+        Ok(value)
+    });
+    if let Some(value) = stale {
+        return Ok(value);
     }
-
-    Ok(value)
+    refresh
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?
 }
 
 async fn try_get_cached<T>(cache: &ResponseCache, key: &str) -> Result<Option<T>, ApiError>
@@ -157,7 +193,6 @@ where
 {
     if let Some(entry) = cache.get(key).await {
         if chrono::Utc::now() > entry.expires_at {
-            cache.invalidate(key).await;
             tracing::trace!(key = %key, expired_at = %entry.expires_at, "cache expired");
             return Ok(None);
         }
@@ -208,6 +243,111 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn stale_overview_is_bounded_and_realtime_never_uses_stale() {
+        for (key, ttl, age, expected) in [
+            ("overview_stale", ttl::OVERVIEW, 1, 1),
+            ("overview_expired", ttl::OVERVIEW, 61, 2),
+            ("watermark_stale", ttl::REALTIME, 1, 2),
+        ] {
+            let cache = new_cache();
+            cache
+                .insert(
+                    key.to_owned(),
+                    CachedEntry {
+                        json: "1".to_owned(),
+                        cached_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+                        expires_at: chrono::Utc::now() - chrono::Duration::seconds(age),
+                    },
+                )
+                .await;
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let request_cache = cache.clone();
+            let request = tokio::spawn(async move {
+                get_or_compute_with_ttl(&request_cache, key, ttl, || async move {
+                    wait.await.unwrap();
+                    Ok(2u64)
+                })
+                .await
+                .unwrap()
+            });
+            if expected == 1 {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), request)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    1
+                );
+                release.send(()).unwrap();
+            } else {
+                tokio::task::yield_now().await;
+                assert!(!request.is_finished());
+                release.send(()).unwrap();
+                assert_eq!(request.await.unwrap(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_aggregate_returns_while_single_refresh_runs() {
+        let cache = new_cache();
+        cache
+            .insert(
+                "stale_aggregate".to_owned(),
+                CachedEntry {
+                    json: "1".to_owned(),
+                    cached_at: chrono::Utc::now() - chrono::Duration::seconds(301),
+                    expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+            )
+            .await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let value: u64 = get_or_compute(&cache, "stale_aggregate", move || async move {
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            Ok(2u64)
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 1);
+        started_rx.await.unwrap();
+        let value: u64 = get_or_compute(&cache, "stale_aggregate", || async {
+            panic!("duplicate refresh")
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 1);
+        finish_tx.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_survives_cancelled_http_caller() {
+        let cache = new_cache();
+        let request_cache = cache.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            get_or_compute(&request_cache, "cancelled_refresh", move || async move {
+                started_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                Ok(42u64)
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        finish_tx.send(()).unwrap();
+        let result: u64 = get_or_compute(&cache, "cancelled_refresh", || async {
+            panic!("must reuse the surviving refresh")
+        })
+        .await
+        .unwrap();
+        assert_eq!(42u64, result);
+    }
 
     #[tokio::test]
     async fn test_cache_hit() {

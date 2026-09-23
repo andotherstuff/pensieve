@@ -8,6 +8,13 @@ use serde::Serialize;
 /// API error type that converts to appropriate HTTP responses.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    /// API database capacity is currently exhausted.
+    #[error("analytics capacity exhausted; retry later")]
+    Overloaded,
+
+    /// A metric is temporarily disabled until a bounded implementation is available.
+    #[error("metric temporarily unavailable")]
+    MetricUnavailable,
     /// Authentication failed (missing or invalid token).
     #[error("unauthorized")]
     Unauthorized,
@@ -44,6 +51,10 @@ struct ErrorResponse {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error, message) = match &self {
+            Self::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "analytics_busy", None),
+            Self::MetricUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "metric_unavailable", None)
+            }
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", None),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", Some(msg.clone())),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", Some(msg.clone())),

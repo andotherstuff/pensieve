@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::bounded_clickhouse::BoundedClickHouse;
 use anyhow::{Context, bail};
-use clickhouse::Client;
 use parking_lot::Mutex;
 use pensieve_core::read_latest_event_watermark;
 use rusqlite::Connection;
@@ -349,7 +349,7 @@ impl PostgresAnalytics {
 #[derive(Clone)]
 pub struct AppState {
     /// ClickHouse client for database queries.
-    pub clickhouse: Client,
+    pub clickhouse: BoundedClickHouse,
 
     /// Optional Postgres analytics connections for explicitly selected routes.
     postgres: Option<PostgresAnalytics>,
@@ -367,9 +367,8 @@ pub struct AppState {
 impl AppState {
     /// Create a new application state from configuration.
     pub async fn new(config: Config) -> anyhow::Result<Self> {
-        let clickhouse = Client::default()
-            .with_url(&config.clickhouse_url)
-            .with_database(&config.clickhouse_database);
+        let clickhouse =
+            BoundedClickHouse::new(&config.clickhouse_url, &config.clickhouse_database);
 
         let postgres = if config.analytics_backends.any_postgres() {
             Some(
