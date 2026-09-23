@@ -2502,13 +2502,6 @@ pub struct EngagementStats {
     pub reactions_per_note: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, Row)]
-struct EngagementRow {
-    total_notes: u64,
-    total_replies: u64,
-    total_reactions: u64,
-}
-
 /// `GET /api/v1/stats/engagement`
 ///
 /// Returns reply and reaction ratios relative to original notes.
@@ -2528,41 +2521,7 @@ pub async fn engagement(
     let cache = state.cache.clone();
     let result =
         get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            if state.uses_postgres(AnalyticsFamily::Engagement) {
-                return fetch_postgres_engagement(&state, days).await;
-            }
-            // Calculate all metrics from events_local consistently.
-            // A reply is a kind=1 event that has at least one e-tag (references another event).
-            let row: EngagementRow = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                    countIf(kind = 1) AS total_notes,
-                    countIf(kind = 1 AND arrayExists(t -> t[1] = 'e', tags)) AS total_replies,
-                    countIf(kind = 7) AS total_reactions
-                FROM events_local
-                WHERE created_at >= now() - INTERVAL {} DAY",
-                    days
-                ))
-                .fetch_one()
-                .await?;
-
-            // Original notes = total kind=1 events minus replies
-            let original_notes = row.total_notes.saturating_sub(row.total_replies);
-            let base = if original_notes > 0 {
-                original_notes as f64
-            } else {
-                1.0
-            };
-
-            Ok(EngagementStats {
-                period_days: days,
-                original_notes,
-                replies: row.total_replies,
-                reactions: row.total_reactions,
-                replies_per_note: row.total_replies as f64 / base,
-                reactions_per_note: row.total_reactions as f64 / base,
-            })
+            fetch_postgres_engagement(&state, days).await
         })
         .await?;
 

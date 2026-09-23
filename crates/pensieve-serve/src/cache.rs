@@ -155,7 +155,9 @@ where
     let refresh = tokio::spawn(async move {
         let _guard = guard;
         tracing::trace!(key = %key, ttl_secs = ttl.as_secs(), "cache miss, computing");
-        let value = compute().await?;
+        let value = compute().await.inspect_err(|error| {
+            tracing::warn!(key = %key, error = %error, "cache refresh failed");
+        })?;
 
         match serde_json::to_string(&value) {
             Ok(json) => {
