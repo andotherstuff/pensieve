@@ -27,6 +27,20 @@ use crate::Result;
 use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options};
 use std::path::Path;
 
+/// Maximum examined inventory IDs for one isolated reconciliation window.
+pub const MAX_WINDOW_ITEMS: usize = 250_000;
+// Non-event key, after every timestamp/ID key (including prune's exclusive end).
+const REPLAY_CURSOR_KEY: [u8; 41] = [u8::MAX; 41];
+
+/// A complete bounded interval or an explicit requirement to split it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchivedWindow {
+    /// Only durable archive-confirmed IDs, in timestamp/ID order.
+    Complete(Vec<([u8; 32], u64)>),
+    /// The interval exceeded the examined-row budget. No truncated set is usable.
+    TooDense,
+}
+
 /// Sync state database for negentropy reconciliation.
 ///
 /// Stores (timestamp, event_id) pairs to enable efficient time-range queries.
@@ -42,9 +56,88 @@ use std::path::Path;
 /// Big-endian timestamp enables efficient range scans.
 pub struct SyncStateDb {
     db: DBWithThreadMode<MultiThreaded>,
+    pub(super) replay_lock: parking_lot::Mutex<()>,
 }
 
 impl SyncStateDb {
+    pub(super) fn replay_cursor(&self) -> Result<Option<Vec<u8>>> {
+        let cursor = self.db.get(REPLAY_CURSOR_KEY)?;
+        if cursor.as_ref().is_some_and(|bytes| bytes.len() > 8192) {
+            return Err(crate::Error::Validation(
+                "oversized replay cursor".to_owned(),
+            ));
+        }
+        Ok(cursor)
+    }
+
+    pub(super) fn save_replay_cursor(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > 8192 {
+            return Err(crate::Error::Config("oversized replay cursor".to_owned()));
+        }
+        // All earlier inventory puts reach stable WAL before its completion cursor.
+        // A crash in between repeats valid puts, never skips unflushed inventory.
+        self.db.flush_wal(true)?;
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db.put_opt(REPLAY_CURSOR_KEY, bytes, &options)?;
+        Ok(())
+    }
+
+    /// Export a fixed inclusive window for the isolated worker, verifying legacy
+    /// inventory against the shared durable dedupe index. Missing/Pending entries
+    /// are omitted so the relay can send them again. This does not certify coverage.
+    ///
+    /// Bounds both returned and examined rows; split TooDense rather than truncate.
+    /// Call from the bounded database executor, not an async reactor thread.
+    pub fn archived_window(
+        &self,
+        since: u64,
+        until: u64,
+        max_items: usize,
+        dedupe: &crate::DedupeIndex,
+    ) -> Result<ArchivedWindow> {
+        if since > until
+            || until > i64::MAX as u64
+            || max_items == 0
+            || max_items > MAX_WINDOW_ITEMS
+        {
+            return Err(crate::Error::Config(
+                "invalid inventory window bounds".to_owned(),
+            ));
+        }
+        let start = Self::make_key(since, &[0; 32]);
+        let end = Self::make_key(until, &[u8::MAX; 32]);
+        let mut items = Vec::new();
+        // This range crosses timestamp prefixes. Do not depend on the current
+        // bloom-filter/memtable configuration for complete cross-prefix reads.
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        for (examined, item) in self
+            .db
+            .iterator_opt(
+                IteratorMode::From(&start, rocksdb::Direction::Forward),
+                options,
+            )
+            .enumerate()
+        {
+            let (key, _) = item?;
+            // Timestamp-first ordering allows stopping without reading the rest
+            // of history. Reserved replay metadata sorts beyond all valid times.
+            if key.as_ref() > end.as_slice() {
+                break;
+            }
+            let (id, timestamp) = Self::parse_key(&key)
+                .ok_or_else(|| crate::Error::Validation("invalid inventory key".to_owned()))?;
+            if examined == max_items {
+                return Ok(ArchivedWindow::TooDense);
+            }
+            if dedupe.get_status(&id)? == Some(crate::EventStatus::Archived) {
+                items.push((id, timestamp));
+            }
+        }
+        Ok(ArchivedWindow::Complete(items))
+    }
+
     /// Open or create a sync state database at the given path.
     ///
     /// # Arguments
@@ -77,7 +170,10 @@ impl SyncStateDb {
 
         let db = DBWithThreadMode::<MultiThreaded>::open(&opts, path)?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            replay_lock: parking_lot::Mutex::new(()),
+        })
     }
 
     /// Build a 40-byte key from timestamp and event_id.

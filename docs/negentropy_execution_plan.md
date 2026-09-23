@@ -32,7 +32,7 @@ analytics architecture. The existing SDK remains pinned; no SDK fork is required
 | 1b, #46 | Bounded framed uploads, credits, received receipts | Review/CI gate; library only |
 | 2a, #48 | Shared archive admission, durable receipt reconciliation and compaction | Review/CI gate; no runtime consumer yet |
 | 2b | Independent periodic archive sealing | Current implementation; Parquet-disabled durability and joined shutdown tests |
-| 2c | Bounded sealed-segment inventory replay/export | Next; explicit rollout floor, durable cursor, gap detection and archived-only advertisement |
+| 2c | Bounded sealed-segment inventory replay/export | Library implemented; review/CI gate, no runtime replay enabled |
 | 3 | Worker executable, authenticated IPC and parent scheduler | Not implemented; fake relay flood/hang/partial-fetch/cancellation tests |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |
 | 5 | Controlled production canary and soak | Not started; separate readiness decision |
