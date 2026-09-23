@@ -52,10 +52,11 @@
 //! }).await?;
 //! ```
 
+pub mod inventory;
 pub mod ipc;
 pub mod jobs;
 mod negentropy;
 mod state;
 
 pub use negentropy::{NegentropySyncConfig, NegentropySyncer, SyncStats, seed_from_clickhouse};
-pub use state::SyncStateDb;
+pub use state::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};
