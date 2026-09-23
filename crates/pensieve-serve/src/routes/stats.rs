@@ -183,19 +183,19 @@ async fn fetch_overview(state: &AppState) -> Result<OverviewResponse, ApiError> 
             latest_event: read_fresh_watermark(state)?,
         });
     }
-    let (total_events, total_pubkeys, total_kinds, earliest_event, latest_event) = tokio::join!(
-        fetch_total_events(state),
-        fetch_total_pubkeys(state),
-        fetch_total_kinds(state),
-        fetch_earliest_event(state),
-        fetch_latest_event(state),
-    );
+    // A single refresh must not exhaust the two-query pool with siblings that
+    // time out waiting for each other. Fail before starting later reads on error.
+    let total_events = fetch_total_events(state).await?;
+    let total_pubkeys = fetch_total_pubkeys(state).await?;
+    let total_kinds = fetch_total_kinds(state).await?;
+    let earliest_event = fetch_earliest_event(state).await?;
+    let latest_event = fetch_latest_event(state).await?;
     Ok(OverviewResponse {
-        total_events: total_events?,
-        total_pubkeys: total_pubkeys?,
-        total_kinds: total_kinds?,
-        earliest_event: earliest_event?,
-        latest_event: latest_event?,
+        total_events,
+        total_pubkeys,
+        total_kinds,
+        earliest_event,
+        latest_event,
     })
 }
 
@@ -946,17 +946,15 @@ pub async fn active_users_summary(
 ) -> Result<Json<ActiveUsersSummary>, ApiError> {
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, "active_users_summary", move || async move {
-        // Run all three queries in parallel - each fetches from tiny summary tables
-        let (daily, weekly, monthly) = tokio::join!(
-            fetch_latest_daily_active_users(&state),
-            fetch_latest_weekly_active_users(&state),
-            fetch_latest_monthly_active_users(&state),
-        );
+        // Do not let sibling reads compete for the two-query admission pool.
+        let daily = fetch_latest_daily_active_users(&state).await?;
+        let weekly = fetch_latest_weekly_active_users(&state).await?;
+        let monthly = fetch_latest_monthly_active_users(&state).await?;
 
         Ok(ActiveUsersSummary {
-            daily: daily?,
-            weekly: weekly?,
-            monthly: monthly?,
+            daily,
+            weekly,
+            monthly,
         })
     })
     .await?;

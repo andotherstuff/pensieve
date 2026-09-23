@@ -7,10 +7,14 @@ This change affects the API client only, not ingestion or ClickHouse server defa
 - Each query sends `max_threads=4`, `max_execution_time=20`,
   `timeout_overflow_mode=throw`, and disconnect cancellation. Server execution
   deadlines are cooperative, not hard wall-clock guarantees.
-- A detached database task retains its permit until completion even if its HTTP
+- A detached database task retains its permit until completion or a hard
+  25-second client deadline, even if its HTTP
   caller disconnects. Detached cache refreshes likewise retain their per-key lock
   and can populate the cache after an HTTP timeout. No unbounded task queue is used
   for database admission.
+- Overview and active-user summary read their component queries sequentially,
+  so one refresh cannot overload itself with sibling queries. A cold multi-query
+  refresh can outlive the HTTP timeout; its detached cache task can still finish.
 - Per-entry freshness is no longer capped by a global five-minute TTL. Aggregate
   responses may be served stale for one additional endpoint TTL while refreshing;
   real-time watermarks never use this stale allowance.
@@ -32,6 +36,10 @@ restart only the API on promotion. Preserve the previous binary for rollback.
 Verify ingestion sealing/indexing/Parquet publication and restart count afterwards.
 
 ## Deployment: 2026-09-14
+
+This historical deployment predates the later client deadline, summary-query
+sequencing, overview stale-cache allowance, and refresh-error logging fixes.
+It is not evidence that those later changes have been deployed or canaried.
 
 - Code commit: `7ac5121`; full `just precommit` passed.
 - Linux binary SHA-256: `fed87958c79c5531343ac145a3e2a2b761fd0dee1a497c53912e5419070a54bb`.
