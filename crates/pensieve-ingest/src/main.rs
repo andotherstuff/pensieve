@@ -980,8 +980,8 @@ async fn main() -> Result<()> {
 
                     // Dedupe check - same logic as live ingestion
                     // The atomic mutex ensures only one source can "win" for a given event ID
-                    let is_novel = match negentropy_dedupe.check_and_mark_pending(event_id) {
-                        Ok(novel) => novel,
+                    let admission = match negentropy_dedupe.reserve(event_id) {
+                        Ok(admission) => admission,
                         Err(e) => {
                             tracing::warn!(
                                 event_id = %event.id,
@@ -992,13 +992,12 @@ async fn main() -> Result<()> {
                                 error = %compact_error(&e),
                                 "negentropy dedupe check failed"
                             );
-                            // Treat as novel on a transient dedupe error rather than
-                            // dropping a possibly-new event; ClickHouse de-dups by id.
-                            true
+                            // Retry rather than bypass exclusive admission ownership.
+                            return Err(e);
                         }
                     };
 
-                    if is_novel {
+                    if let Some(admission) = admission {
                         // New event - pack and write
                         let packed = match pack_nostr_event(event) {
                             Ok(p) => p,
@@ -1018,8 +1017,12 @@ async fn main() -> Result<()> {
                             }
                         };
 
+                        // Packing failures release the claim. Once the writer owns
+                        // bytes, an error may mean partial admission: retain the claim
+                        // until writer recovery or durable sealing resolves it.
                         // Write to segment - must succeed for event to be recorded in sync state
-                        if let Err(e) = negentropy_segment_writer.write(packed) {
+                        if let Err(e) = negentropy_segment_writer.write_reserved(packed, admission)
+                        {
                             tracing::error!(
                                 event_id = %event.id,
                                 kind = event.kind.as_u16(),
@@ -1097,8 +1100,8 @@ async fn main() -> Result<()> {
             let event_id = event.id.as_bytes();
 
             // Dedupe check FIRST - before expensive packing
-            let is_novel = match dedupe.check_and_mark_pending(event_id) {
-                Ok(novel) => novel,
+            let admission = match dedupe.reserve(event_id) {
+                Ok(admission) => admission,
                 Err(e) => {
                     tracing::warn!(
                         relay_url = %relay_url,
@@ -1110,26 +1113,23 @@ async fn main() -> Result<()> {
                         error = %compact_error(&e),
                         "dedupe check failed for live event"
                     );
-                    // Treat as novel on a (rare, transient) dedupe error: writing a
-                    // possible duplicate is safe (ClickHouse de-dups by id), whereas
-                    // dropping it would silently lose a potentially-new event.
-                    true
+                    return Err(e);
                 }
             };
 
             // Record event for relay quality tracking
-            handler_relay_manager.record_event(&relay_url, is_novel);
+            handler_relay_manager.record_event(&relay_url, admission.is_some());
 
             // Reference-coverage sampling (sampled + cheap): does our archive
             // already contain the events this one references?
             coverage.observe(event);
 
-            if is_novel {
+            if let Some(admission) = admission {
                 // New event - NOW pack it (only for novel events)
                 match pack_nostr_event(event) {
                     Ok(packed) => {
                         // Write to segment
-                        if let Err(e) = segment_writer.write(packed) {
+                        if let Err(e) = segment_writer.write_reserved(packed, admission) {
                             tracing::error!(
                                 relay_url = %relay_url,
                                 event_id = %event.id,

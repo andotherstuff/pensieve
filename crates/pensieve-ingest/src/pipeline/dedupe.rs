@@ -74,7 +74,43 @@ pub struct DedupeIndex {
     pending: Mutex<HashSet<[u8; 32]>>,
 }
 
+/// An exclusive in-memory admission claim, released on pre-admission failure.
+///
+/// Call [`Self::retain`] before transferring bytes to a writer whose error may
+/// mean partial admission. Never release a claim on an ambiguous write failure.
+pub struct PendingAdmission<'a> {
+    index: &'a DedupeIndex,
+    event_id: [u8; 32],
+    retained: bool,
+}
+
+impl PendingAdmission<'_> {
+    /// Transfer ownership to the archive writer until durable segment sealing.
+    pub fn retain(mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for PendingAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.index.pending.lock().remove(&self.event_id);
+        }
+    }
+}
+
 impl DedupeIndex {
+    /// Reserve an event until the writer takes responsibility for its bytes.
+    /// A duplicate never owns a guard and therefore cannot release another claim.
+    pub fn reserve(&self, event_id: &[u8; 32]) -> Result<Option<PendingAdmission<'_>>> {
+        Ok(self
+            .check_and_mark_pending(event_id)?
+            .then(|| PendingAdmission {
+                index: self,
+                event_id: *event_id,
+                retained: false,
+            }))
+    }
     /// Open or create a dedupe index at the given path.
     ///
     /// # Arguments
