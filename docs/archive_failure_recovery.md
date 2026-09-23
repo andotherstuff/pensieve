@@ -31,14 +31,18 @@ promoted to a sealed archive segment. Preserve it unchanged for inspection.
 Automatic compression runs only after the authoritative uncompressed segment
 has been sealed; compression fallback is distinct from uncertain frame I/O.
 
-## Operator recovery gate
+## Incident-specific operator recovery
 
-This is a recovery **acceptance checklist**, not an executable repair procedure.
-The current tools do not implement recovery for every complete `.open` orphan or
-post-rename failure. Do not deploy this change until those procedures are tested
-and their reconciliation has been verified. The live service now remains
-observable instead of exiting repeatedly on a known recovery obligation. Preserve the
-blocked state; do not remove markers just to restore availability.
+Operator decision, 2026-09-23: recovery is manual and specific to the incident.
+A universal repair tool or prewritten procedure for every failure is not a merge
+or deployment prerequisite. The required behavior is safe stopping, observable
+failure, evidence preservation, and no automatic resumption. Operators investigate
+and verify the appropriate repair before explicitly restarting admission.
+
+The following checklist describes safety constraints, not executable repair
+instructions. Preserve the blocked state; do not remove markers just to restore
+availability. The current tools do not implement recovery for every complete
+`.open` orphan or post-rename failure.
 
 1. Inspect logs, disk/inode space, filesystem health and failed paths. Do not
    delete evidence, clear the dedupe database, or repeatedly restart ingestion.
@@ -52,6 +56,8 @@ blocked state; do not remove markers just to restore availability.
    durable dedupe state, and account explicitly for incomplete/invalid data.
    For post-rename failure, verify the sealed file and repair missing downstream
    indexing/inventory notifications without deleting the authoritative file.
+   Check each downstream sink before replay: event-table deduplication alone
+   does not make additive ClickHouse materialized counters safe to replay.
 5. Only after recovery and reconciliation succeed, move the recovered `.open`
    evidence out of the active segment namespace, preserve the marker as incident
    evidence, and remove its active-path entry. This is an explicit operator gate;
