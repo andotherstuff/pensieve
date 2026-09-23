@@ -25,7 +25,7 @@
 
 use crate::Result;
 use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Sync state database for negentropy reconciliation.
 ///
@@ -42,6 +42,7 @@ use std::path::Path;
 /// Big-endian timestamp enables efficient range scans.
 pub struct SyncStateDb {
     db: DBWithThreadMode<MultiThreaded>,
+    seed_marker: PathBuf,
 }
 
 impl SyncStateDb {
@@ -77,7 +78,30 @@ impl SyncStateDb {
 
         let db = DBWithThreadMode::<MultiThreaded>::open(&opts, path)?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            seed_marker: path.join("seed-in-progress"),
+        })
+    }
+
+    /// Retry interrupted seeds even when earlier streamed batches are present.
+    pub fn needs_seed(&self) -> Result<bool> {
+        Ok(self.seed_marker.try_exists()? || self.is_empty()?)
+    }
+
+    /// Persist the retry obligation before admitting any seed rows.
+    pub fn begin_seed(&self) -> Result<()> {
+        std::fs::File::create(&self.seed_marker)?.sync_all()?;
+        std::fs::File::open(self.seed_marker.parent().expect("database directory"))?.sync_all()?;
+        Ok(())
+    }
+
+    /// Clear the retry obligation only after every seed row is durable.
+    pub fn complete_seed(&self) -> Result<()> {
+        self.db.flush()?;
+        std::fs::remove_file(&self.seed_marker)?;
+        std::fs::File::open(self.seed_marker.parent().expect("database directory"))?.sync_all()?;
+        Ok(())
     }
 
     /// Build a 40-byte key from timestamp and event_id.
@@ -128,6 +152,51 @@ impl SyncStateDb {
             }
         }
 
+        Ok(items)
+    }
+
+    /// Read a complete inclusive interval, or fail without returning a partial set.
+    ///
+    /// At most `max_items` records are buffered. One extra record is inspected to
+    /// detect overflow, including when many IDs share a timestamp. A truncated
+    /// inventory must never masquerade as a complete local reconciliation set.
+    pub fn get_items_range(
+        &self,
+        since: u64,
+        until: u64,
+        max_items: usize,
+    ) -> Result<Vec<([u8; 32], u64)>> {
+        if since > until || max_items == 0 {
+            return Err(crate::Error::Config(
+                "invalid bounded inventory interval or cap".to_string(),
+            ));
+        }
+        let start_key = Self::make_key(since, &[0; 32]);
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
+        if let Some(end) = until.checked_add(1) {
+            options.set_iterate_upper_bound(Self::make_key(end, &[0; 32]).to_vec());
+        }
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+            options,
+        );
+        let mut items = Vec::with_capacity(max_items.min(1024));
+        for item in iter {
+            let (key, _) = item?;
+            let (id, timestamp) = Self::parse_key(&key).ok_or_else(|| {
+                crate::Error::Database("malformed sync inventory key".to_string())
+            })?;
+            if timestamp > until {
+                break;
+            }
+            if items.len() == max_items {
+                return Err(crate::Error::Config(format!(
+                    "sync inventory interval [{since}, {until}] exceeds {max_items} items; reconciliation incomplete"
+                )));
+            }
+            items.push((id, timestamp));
+        }
         Ok(items)
     }
 
@@ -240,6 +309,29 @@ impl SyncStateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_seed_retries_after_reopen_and_completes_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SyncStateDb::open(dir.path()).unwrap();
+            db.begin_seed().unwrap();
+            for n in 0..200u64 {
+                db.record(&[1; 32], n).unwrap();
+            }
+            assert!(!db.is_empty().unwrap());
+            assert!(db.needs_seed().unwrap());
+        }
+        {
+            let db = SyncStateDb::open(dir.path()).unwrap();
+            assert!(db.needs_seed().unwrap());
+            db.begin_seed().unwrap();
+            db.complete_seed().unwrap();
+        }
+        let db = SyncStateDb::open(dir.path()).unwrap();
+        assert!(!db.needs_seed().unwrap());
+        assert_eq!(db.get_items_range(0, 199, 200).unwrap().len(), 200);
+    }
     use tempfile::TempDir;
 
     fn test_event_id(n: u8) -> [u8; 32] {
@@ -252,6 +344,55 @@ mod tests {
     fn test_open_and_close() {
         let tmp = TempDir::new().unwrap();
         let _db = SyncStateDb::open(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn bounded_inventory_is_inclusive_and_never_truncates_ties() {
+        let tmp = TempDir::new().unwrap();
+        let db = SyncStateDb::open(tmp.path()).unwrap();
+        for (n, ts) in [(1, 9), (2, 10), (3, 10), (4, 11), (5, 12)] {
+            db.record(&test_event_id(n), ts).unwrap();
+        }
+        assert_eq!(
+            db.get_items_range(10, 11, 3).unwrap(),
+            vec![
+                (test_event_id(2), 10),
+                (test_event_id(3), 10),
+                (test_event_id(4), 11)
+            ]
+        );
+        assert!(db.get_items_range(10, 10, 1).is_err());
+        assert_eq!(db.get_items_range(10, 10, 2).unwrap().len(), 2);
+        assert!(db.get_items_range(10, 11, 2).is_err());
+        assert!(db.get_items_range(13, 14, 1).unwrap().is_empty());
+        assert!(db.get_items_range(11, 10, 1).is_err());
+        assert!(db.get_items_range(10, 11, 0).is_err());
+        // Overflow is read-only; all source records remain available for retry.
+        assert_eq!(db.get_items_range(0, u64::MAX, 5).unwrap().len(), 5);
+        db.record(&test_event_id(6), u64::MAX).unwrap();
+        assert_eq!(
+            db.get_items_range(u64::MAX, u64::MAX, 1).unwrap(),
+            vec![(test_event_id(6), u64::MAX)]
+        );
+    }
+
+    #[test]
+    fn bounded_inventory_survives_reopen_and_rejects_malformed_keys() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let db = SyncStateDb::open(tmp.path()).unwrap();
+            db.record(&test_event_id(1), 100).unwrap();
+            db.flush().unwrap();
+        }
+        let db = SyncStateDb::open(tmp.path()).unwrap();
+        assert_eq!(db.get_items_range(100, 100, 1).unwrap().len(), 1);
+        let mut key = SyncStateDb::make_key(100, &test_event_id(2)).to_vec();
+        key.push(0);
+        db.db.put(key, []).unwrap();
+        assert!(matches!(
+            db.get_items_range(100, 100, 2),
+            Err(crate::Error::Database(_))
+        ));
     }
 
     #[test]

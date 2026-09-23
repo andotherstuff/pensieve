@@ -700,12 +700,12 @@ async fn main() -> Result<()> {
             "negentropy sync state opened"
         );
 
-        // Seed from ClickHouse if sync state is empty and ClickHouse is available
-        if sync_state.is_empty().unwrap_or(true) {
+        // Retry a partial streaming seed as well as an initially empty database.
+        if sync_state.needs_seed()? {
             if let Some(ref ch_url) = args.clickhouse_url {
                 tracing::info!(
                     lookback_days = args.negentropy_lookback_days,
-                    "sync state is empty, seeding from ClickHouse"
+                    "sync state needs initial or interrupted seed from ClickHouse"
                 );
                 match seed_from_clickhouse(
                     &sync_state,
@@ -1194,11 +1194,15 @@ async fn main() -> Result<()> {
     }
 
     // Wait for negentropy task to finish
-    if let Some(handle) = negentropy_handle {
+    if let Some(mut handle) = negentropy_handle {
         tracing::info!("Waiting for negentropy sync to finish...");
-        // Give it a moment to clean up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        handle.abort(); // Force stop if still running
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     // Flush negentropy sync state
