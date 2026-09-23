@@ -25,7 +25,7 @@
 
 use crate::Result;
 use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Sync state database for negentropy reconciliation.
 ///
@@ -42,6 +42,7 @@ use std::path::Path;
 /// Big-endian timestamp enables efficient range scans.
 pub struct SyncStateDb {
     db: DBWithThreadMode<MultiThreaded>,
+    seed_marker: PathBuf,
 }
 
 impl SyncStateDb {
@@ -77,7 +78,30 @@ impl SyncStateDb {
 
         let db = DBWithThreadMode::<MultiThreaded>::open(&opts, path)?;
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            seed_marker: path.join("seed-in-progress"),
+        })
+    }
+
+    /// Retry interrupted seeds even when earlier streamed batches are present.
+    pub fn needs_seed(&self) -> Result<bool> {
+        Ok(self.seed_marker.try_exists()? || self.is_empty()?)
+    }
+
+    /// Persist the retry obligation before admitting any seed rows.
+    pub fn begin_seed(&self) -> Result<()> {
+        std::fs::File::create(&self.seed_marker)?.sync_all()?;
+        std::fs::File::open(self.seed_marker.parent().expect("database directory"))?.sync_all()?;
+        Ok(())
+    }
+
+    /// Clear the retry obligation only after every seed row is durable.
+    pub fn complete_seed(&self) -> Result<()> {
+        self.db.flush()?;
+        std::fs::remove_file(&self.seed_marker)?;
+        std::fs::File::open(self.seed_marker.parent().expect("database directory"))?.sync_all()?;
+        Ok(())
     }
 
     /// Build a 40-byte key from timestamp and event_id.
@@ -285,6 +309,29 @@ impl SyncStateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_seed_retries_after_reopen_and_completes_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = SyncStateDb::open(dir.path()).unwrap();
+            db.begin_seed().unwrap();
+            for n in 0..200u64 {
+                db.record(&[1; 32], n).unwrap();
+            }
+            assert!(!db.is_empty().unwrap());
+            assert!(db.needs_seed().unwrap());
+        }
+        {
+            let db = SyncStateDb::open(dir.path()).unwrap();
+            assert!(db.needs_seed().unwrap());
+            db.begin_seed().unwrap();
+            db.complete_seed().unwrap();
+        }
+        let db = SyncStateDb::open(dir.path()).unwrap();
+        assert!(!db.needs_seed().unwrap());
+        assert_eq!(db.get_items_range(0, 199, 200).unwrap().len(), 200);
+    }
     use tempfile::TempDir;
 
     fn test_event_id(n: u8) -> [u8; 32] {

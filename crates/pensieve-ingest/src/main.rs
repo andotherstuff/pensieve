@@ -700,12 +700,12 @@ async fn main() -> Result<()> {
             "negentropy sync state opened"
         );
 
-        // Seed from ClickHouse if sync state is empty and ClickHouse is available
-        if sync_state.is_empty().unwrap_or(true) {
+        // Retry a partial streaming seed as well as an initially empty database.
+        if sync_state.needs_seed()? {
             if let Some(ref ch_url) = args.clickhouse_url {
                 tracing::info!(
                     lookback_days = args.negentropy_lookback_days,
-                    "sync state is empty, seeding from ClickHouse"
+                    "sync state needs initial or interrupted seed from ClickHouse"
                 );
                 match seed_from_clickhouse(
                     &sync_state,

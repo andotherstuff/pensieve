@@ -219,21 +219,22 @@ impl NostrDatabase for SyncStateAdapter {
         event: &'a Event,
     ) -> BoxedFuture<'a, std::result::Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
-            // Never block an SDK notification loop on archive backpressure.
-            // A rejected event makes this relay incomplete even if SDK sync returns Ok.
-            let result = (|| {
+            // Backpressure only this relay's connection task. Its outer lifecycle
+            // deadline still bounds the wait; ordinary bursts must not drop events.
+            let result = async {
                 if event.as_json().len() > self.max_event_bytes {
                     return Err(DatabaseError::backend(std::io::Error::other(
                         "negentropy event exceeds admission size cap",
                     )));
                 }
                 crate::pipeline::validate_archive_event(event).map_err(DatabaseError::backend)?;
-                self.event_sender.try_send(event.clone()).map_err(|_| {
+                self.event_sender.send(event.clone()).await.map_err(|_| {
                     DatabaseError::backend(std::io::Error::other(
-                        "negentropy admission queue full or closed",
+                        "negentropy admission queue closed",
                     ))
                 })
-            })();
+            }
+            .await;
             if result.is_err() {
                 self.admission_failed.store(true, Ordering::SeqCst);
             }
@@ -675,6 +676,8 @@ pub async fn seed_from_clickhouse(
         .with_url(clickhouse_url)
         .with_database(clickhouse_db);
 
+    sync_state.begin_seed()?;
+
     // Query events from the lookback window
     let query = format!(
         "SELECT id, toUnixTimestamp(created_at) AS created_at \
@@ -721,6 +724,7 @@ pub async fn seed_from_clickhouse(
         count += batch_count;
     }
 
+    sync_state.complete_seed()?;
     tracing::info!("Seeded sync state with {} events from ClickHouse", count);
     counter!("negentropy_seed_events_total").increment(count as u64);
 
@@ -942,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_backpressure_and_oversize_fail_closed() {
+    async fn adapter_backpressure_waits_and_oversize_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let (mut adapter, mut receiver) =
             SyncStateAdapter::new(Arc::new(SyncStateDb::open(dir.path()).unwrap()));
@@ -954,10 +958,31 @@ mod tests {
             .sign_with_keys(&Keys::generate())
             .unwrap();
         adapter.save_event(&event).await.unwrap();
-        assert!(adapter.save_event(&event).await.is_err());
-        assert!(adapter.admission_failed.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), adapter.save_event(&event))
+                .await
+                .is_err()
+        );
+        assert!(!adapter.admission_failed.load(Ordering::SeqCst));
         assert_eq!(receiver.len(), 1);
         receiver.recv().await.unwrap();
+        // Two SDK-sized batches must flow through even a single-slot queue.
+        let producer = async {
+            for _ in 0..200 {
+                adapter.save_event(&event).await.unwrap();
+            }
+        };
+        let consumer = async {
+            for _ in 0..200 {
+                assert_eq!(receiver.recv().await.unwrap().id, event.id);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(producer, consumer);
+        })
+        .await
+        .unwrap();
+        assert!(!adapter.admission_failed.load(Ordering::SeqCst));
         adapter.max_event_bytes = 1;
         assert!(adapter.save_event(&event).await.is_err());
         assert!(receiver.try_recv().is_err());
