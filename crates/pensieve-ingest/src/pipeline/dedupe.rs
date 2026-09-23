@@ -61,11 +61,10 @@ pub struct DedupeIndex {
     /// In-flight event IDs: claimed (written to the current, unsealed segment) but
     /// not yet durably archived. Tracked in memory ONLY — never persisted.
     ///
-    /// This is deliberate for crash-safety. On a crash, the unsealed segment's
-    /// buffered bytes are lost; because these markers live only in memory, they are
-    /// lost too, so the affected events are simply "not seen" on the next start and
-    /// get re-fetched (by live ingestion and negentropy), then de-duplicated
-    /// downstream by ClickHouse's ReplacingMergeTree. Only durably-sealed events are
+    /// These reservations disappear on a crash, but some unsealed bytes can remain
+    /// in an `.open` file. Preserve that file: startup blocks until the recovery
+    /// gate in `docs/archive_failure_recovery.md` is satisfied. Never delete an
+    /// orphan merely to force refetching. Only durably-sealed events are
     /// written to disk as `Archived`, and that on-disk state is what actually
     /// suppresses re-fetching.
     ///

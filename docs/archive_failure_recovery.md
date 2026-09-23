@@ -25,6 +25,12 @@ has been sealed; compression fallback is distinct from uncertain frame I/O.
 
 ## Operator recovery gate
 
+This is a recovery **acceptance checklist**, not an executable repair procedure.
+The current tools do not implement recovery for every complete `.open` orphan or
+post-rename failure. Do not deploy this change until those procedures are tested
+and the service lifecycle prevents a recovery-required restart loop. Preserve the
+blocked state; do not remove markers just to restore availability.
+
 1. Inspect logs, disk/inode space, filesystem health and failed paths. Do not
    delete evidence, clear the dedupe database, or repeatedly restart ingestion.
 2. Stop the ingester before inspecting or recovering mutable archive files.
@@ -33,7 +39,7 @@ has been sealed; compression fallback is distinct from uncertain frame I/O.
    repair. Enumerate complete length-prefixed frames; validate event IDs and
    signatures and identify any incomplete trailing frame. Never rename a raw
    `.open` file to a sealed name merely to make startup pass.
-4. Recover complete valid events through the canonical recovery path, reconcile
+4. Using an incident-specific, verified recovery procedure, recover valid events and reconcile
    durable dedupe state, and account explicitly for incomplete/invalid data.
    For post-rename failure, verify the sealed file and repair missing downstream
    indexing/inventory notifications without deleting the authoritative file.
@@ -55,3 +61,6 @@ latched fault. Rules are in `ops/production/prometheus/archive-alerts.yml`, with
 a separate ingester-unavailable rule for process/startup failure. These changes
 are not deployed automatically. Verify rule loading and the site's notification
 receiver routing before claiming operator notifications are delivered.
+The repository currently configures no Alertmanager target. Rule loading alone
+does not deliver notifications. An operator-selected receiver and a verified
+end-to-end firing/resolution test are mandatory deployment prerequisites.

@@ -29,6 +29,21 @@ provisioning). The ingester exposes Prometheus metrics on `:9091`.
 
 ## Routine deploy
 
+### Archive hardening deployment hold
+
+Do not deploy the archive-admission hardening merely because CI passes. Follow
+[the recovery policy](../docs/archive_failure_recovery.md) and resolve these gates:
+
+- Tested recovery procedures for complete and truncated `.open` files and
+  post-rename failures, preserving original evidence.
+- A recovery-required service state that stops intake without a systemd restart
+  loop, with a persistent observable fault signal.
+- An operator-configured notification receiver and an end-to-end alert test;
+  the checked-in Prometheus rules alone do not notify anyone.
+- Read-only preflight accounting for existing recovery markers/orphan segments.
+
+The routine restart instructions below do not override this hold.
+
 1. **Pull:** `cd ~/pensieve && git pull origin master`
 2. **Build (if Rust changed):** `just build-release`
 3. **Install/reload units (only if `ops/systemd/` changed):**
