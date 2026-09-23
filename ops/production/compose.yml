@@ -23,7 +23,9 @@ services:
   postgres-analytics:
     image: postgres:16-alpine
     container_name: pensieve-postgres-analytics
-    restart: unless-stopped
+    # Retained for manual use only; excluded from normal boot-time compose up.
+    profiles: ["manual-postgres"]
+    restart: "no"
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -204,5 +206,10 @@ networks:
   default:
     name: pensieve-deploy_default
     driver: bridge
+    # Match the existing network and host firewall rules after recreation.
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+          gateway: 172.18.0.1
     driver_opts:
       com.docker.network.bridge.name: br-pensieve
