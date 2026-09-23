@@ -17,10 +17,29 @@ See `negentropy_audit_20260923.md` for the original findings and limitations.
   are not yet verified.
 - [ ] Bounded independent relay workers: full-lifecycle deadline, idle deadline,
   structured child ownership, bounded streaming admission, per-relay results.
+  Lifecycle/queue slice implemented: three concurrent single-relay futures,
+  independent 900-second deadlines spanning setup through shutdown, synchronous
+  disconnect-on-drop, no detached collector, immediate streaming admission,
+  128-event shared queue and 1 MiB normalized event cap. Overflow/oversize/invalid
+  delivery makes a relay incomplete. Parent cancellation drops worker futures;
+  shutdown now awaits the periodic task after cancellation/abort. Tests cover
+  independent progress, timeout/panic/drop, backpressure, restart after abort,
+  and a silent loopback WebSocket relay. Full workspace precommit passed; final
+  verification is rerun after the added admission-failure regression before commit.
+  This is NOT an end-to-end memory or coverage bound: SDK reconciliation ID sets
+  and local inventory scans remain unbounded. Async deadlines cannot interrupt
+  synchronous RocksDB/filesystem calls. Protocol-progress idle deadlines and
+  durable windowing remain rollout prerequisites; do not deploy this slice alone.
 - [ ] Durable inventory: sealed-receipt updates, bounded scans/windows and
   resumable coverage. Never equate pending with durable.
 - [ ] Operations: truthful metrics, supervisor, alerts, persisted relay backoff,
   explicit allowlist that does not silently expand through the catalog.
+  Lifecycle results now distinguish each relay's error/timeout from success;
+  `negentropy_last_sync_unix` advances only for a nonempty all-relay success,
+  and `negentropy_last_cycle_unix` tracks completed attempts. Neither timestamp
+  proves durable coverage. Old batch success/failure gauges are no longer emitted;
+  their dashboards/alerts need the operations slice. Automatic inventory pruning
+  is disabled pending the durable coverage policy (monitor sync-state disk use).
 - [ ] Canary: controlled deployment only after tests and `just precommit` pass;
   several completed cycles with healthy live sealing/Parquet/ClickHouse indexing.
 

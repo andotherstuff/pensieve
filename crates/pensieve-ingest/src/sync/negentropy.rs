@@ -11,8 +11,8 @@
 //! 1. Negentropy reconciliation identifies missing event IDs
 //! 2. nostr-sdk automatically fetches those events via REQ
 //! 3. As events arrive, `save_event()` forwards them to a channel
-//! 4. `sync_once()` collects events from the channel
-//! 5. Events are passed to the handler for dedupe/segment writing
+//! 4. `sync_once()` streams a bounded queue directly to archive admission
+//! 5. Each relay has an independent deadline and terminal result
 //! 6. Only after successful segment write is the event recorded in sync-state
 //!
 //! This ensures that sync-state only contains events we've actually archived,
@@ -22,13 +22,14 @@ use super::SyncStateDb;
 use crate::Result;
 use crate::logging::compact_error;
 use crate::pipeline::{DedupeIndex, EventStatus};
+use futures_util::{FutureExt, StreamExt, stream};
 use metrics::{counter, gauge, histogram};
 use nostr_sdk::prelude::*;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Configuration for negentropy sync.
 #[derive(Debug, Clone)]
@@ -43,9 +44,17 @@ pub struct NegentropySyncConfig {
     /// This creates the `since` filter for negentropy reconciliation.
     pub lookback: Duration,
 
-    /// Timeout for the negentropy protocol and event fetching.
-    /// Events stream through as they're fetched, so this is the overall timeout.
+    /// Per-relay deadline including setup, connection, reconciliation and shutdown.
     pub protocol_timeout: Duration,
+
+    /// Maximum simultaneously active relay lifecycles.
+    pub max_concurrent_relays: usize,
+
+    /// Maximum queued events across all relay workers.
+    pub event_queue_capacity: usize,
+
+    /// Maximum normalized event JSON size admitted by the adapter.
+    pub max_event_bytes: usize,
 
     /// Direction for sync (default: Down = receive only).
     pub direction: SyncDirection,
@@ -67,6 +76,9 @@ impl Default for NegentropySyncConfig {
             interval: Duration::from_secs(1800), // 30 minutes
             lookback: Duration::from_secs(14 * 24 * 3600), // 14 days
             protocol_timeout: Duration::from_secs(900), // 15 min for full sync
+            max_concurrent_relays: 3,
+            event_queue_capacity: 128,
+            max_event_bytes: 1024 * 1024,
             direction: SyncDirection::Down,
         }
     }
@@ -89,6 +101,66 @@ pub struct SyncStats {
     pub relays_responded: usize,
     /// Number of relays that errored.
     pub relays_errored: usize,
+    /// Independent terminal result for each attempted relay.
+    pub relay_results: Vec<RelaySyncResult>,
+}
+
+/// Terminal result for one relay; protocol completion is not durable admission.
+#[derive(Debug, Clone)]
+pub struct RelaySyncResult {
+    /// Relay URL.
+    pub relay_url: String,
+    /// Received IDs reported by the SDK on successful reconciliation.
+    pub received: usize,
+    /// Failure, timeout, or panic description; absent only on completion.
+    pub error: Option<String>,
+}
+
+// No detached collector or worker tasks: dropping the cycle drops its futures.
+struct CycleGuard;
+impl Drop for CycleGuard {
+    fn drop(&mut self) {
+        gauge!("negentropy_sync_in_progress").set(0.0);
+        gauge!("negentropy_events_receiving").set(0.0);
+    }
+}
+
+struct RunningGuard<'a>(&'a AtomicBool);
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+// SDK disconnect signals termination synchronously, including its notification loops.
+struct RelayGuard(Relay);
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        self.0.disconnect();
+    }
+}
+
+async fn bounded_relay<F>(relay_url: String, deadline: Duration, work: F) -> RelaySyncResult
+where
+    F: std::future::Future<Output = std::result::Result<usize, String>>,
+{
+    let result =
+        tokio::time::timeout(deadline, std::panic::AssertUnwindSafe(work).catch_unwind()).await;
+    let result = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("relay worker panicked".to_string()),
+        Err(_) => Err("relay lifecycle deadline exceeded".to_string()),
+    };
+    let (received, error) = match result {
+        Ok(count) => (count, None),
+        Err(error) => (0, Some(error)),
+    };
+    tracing::info!(%relay_url, phase = "finished", ?error, received, "Negentropy relay result");
+    RelaySyncResult {
+        relay_url,
+        received,
+        error,
+    }
 }
 
 /// NostrDatabase adapter that captures events during negentropy sync.
@@ -101,7 +173,9 @@ pub struct SyncStateAdapter {
     /// Reference to sync state for querying what we have (negentropy_items).
     sync_state: Arc<SyncStateDb>,
     /// Channel to send captured events to the collector.
-    event_sender: mpsc::UnboundedSender<Event>,
+    event_sender: mpsc::Sender<Event>,
+    admission_failed: Arc<AtomicBool>,
+    max_event_bytes: usize,
 }
 
 impl Debug for SyncStateAdapter {
@@ -110,16 +184,19 @@ impl Debug for SyncStateAdapter {
     }
 }
 
+#[cfg(test)]
 impl SyncStateAdapter {
     /// Create a new adapter with an event capture channel.
     ///
     /// Returns the adapter and a receiver for captured events.
-    pub fn new(sync_state: Arc<SyncStateDb>) -> (Self, mpsc::UnboundedReceiver<Event>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn new(sync_state: Arc<SyncStateDb>) -> (Self, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel(128);
         (
             Self {
                 sync_state,
                 event_sender: tx,
+                admission_failed: Arc::new(AtomicBool::new(false)),
+                max_event_bytes: 1024 * 1024,
             },
             rx,
         )
@@ -136,19 +213,25 @@ impl NostrDatabase for SyncStateAdapter {
         event: &'a Event,
     ) -> BoxedFuture<'a, std::result::Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
-            crate::pipeline::validate_archive_event(event).map_err(DatabaseError::backend)?;
-            // Forward the event to the channel for processing.
-            // DO NOT record to sync-state here - that happens only after
-            // successful segment write in the event handler.
-            //
-            // This ensures that if segment write fails, the event is NOT
-            // recorded in sync-state and will be re-fetched on the next cycle.
-            self.event_sender.send(event.clone()).map_err(|_| {
-                DatabaseError::backend(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "negentropy admission channel closed",
-                ))
-            })?;
+            // Never block an SDK notification loop on archive backpressure.
+            // A rejected event makes this relay incomplete even if SDK sync returns Ok.
+            let result = (|| {
+                if event.as_json().len() > self.max_event_bytes {
+                    return Err(DatabaseError::backend(std::io::Error::other(
+                        "negentropy event exceeds admission size cap",
+                    )));
+                }
+                crate::pipeline::validate_archive_event(event).map_err(DatabaseError::backend)?;
+                self.event_sender.try_send(event.clone()).map_err(|_| {
+                    DatabaseError::backend(std::io::Error::other(
+                        "negentropy admission queue full or closed",
+                    ))
+                })
+            })();
+            if result.is_err() {
+                self.admission_failed.store(true, Ordering::SeqCst);
+            }
+            result?;
             Ok(SaveEventStatus::Success)
         })
     }
@@ -233,6 +316,7 @@ pub struct NegentropySyncer {
     config: NegentropySyncConfig,
     sync_state: Arc<SyncStateDb>,
     running: Arc<AtomicBool>,
+    stop_signal: watch::Sender<bool>,
     /// Optional dedupe index, used to confirm an event is DURABLY archived before
     /// advancing sync-state. Without this gate, sync-state could record an event
     /// that was only written to an unsealed segment; a crash would then drop it
@@ -256,6 +340,7 @@ impl NegentropySyncer {
             config,
             sync_state,
             running: Arc::new(AtomicBool::new(false)),
+            stop_signal: watch::channel(false).0,
             dedupe,
             target_provider: None,
         }
@@ -291,6 +376,7 @@ impl NegentropySyncer {
     /// Signal the syncer to stop.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop_signal.send_replace(true);
     }
 
     /// Get the sync state database.
@@ -298,317 +384,227 @@ impl NegentropySyncer {
         &self.sync_state
     }
 
-    /// Run a single sync cycle.
+    async fn relay_worker(
+        &self,
+        relay_url: String,
+        filter: Filter,
+        sender: mpsc::Sender<Event>,
+    ) -> RelaySyncResult {
+        let url = relay_url.clone();
+        bounded_relay(relay_url, self.config.protocol_timeout, async {
+            tracing::info!(relay_url = %url, phase = "setup", "Negentropy relay phase");
+            let failed = Arc::new(AtomicBool::new(false));
+            let adapter = SyncStateAdapter {
+                sync_state: Arc::clone(&self.sync_state),
+                event_sender: sender,
+                admission_failed: Arc::clone(&failed),
+                max_event_bytes: self.config.max_event_bytes,
+            };
+            let client = Client::builder()
+                .signer(Keys::generate())
+                .database(Arc::new(adapter) as Arc<dyn NostrDatabase>)
+                .build();
+            client
+                .add_relay(&url)
+                .await
+                .map_err(|e| compact_error(&e))?;
+            let relay = RelayGuard(client.relay(&url).await.map_err(|e| compact_error(&e))?);
+            tracing::info!(relay_url = %url, phase = "connect", "Negentropy relay phase");
+            relay.0.connect();
+            relay.0.wait_for_connection(Duration::from_secs(10)).await;
+            tracing::info!(relay_url = %url, phase = "reconcile", "Negentropy relay phase");
+            let opts = SyncOptions::default().direction(self.config.direction);
+            // Single relay API: no pool-wide join_all and no misleading Output.success.
+            let output = relay
+                .0
+                .sync(filter, &opts)
+                .await
+                .map_err(|e| compact_error(&e))?;
+            if !output.remote.is_subset(&output.received) {
+                return Err("relay reconciliation left remote events unfetched".to_string());
+            }
+            tracing::info!(relay_url = %url, phase = "disconnect", "Negentropy relay phase");
+            relay.0.disconnect();
+            client.shutdown().await;
+            if failed.load(Ordering::SeqCst) {
+                return Err(
+                    "relay admission incomplete: rejected, oversized, or backpressured event"
+                        .to_string(),
+                );
+            }
+            Ok(output.received.len())
+        })
+        .await
+    }
+
+    /// Reconcile independently while streaming events directly to archive admission.
     ///
-    /// Returns statistics about the sync and the events that were captured
-    /// as they streamed through during reconciliation.
-    ///
-    /// Events are captured directly from the nostr-sdk `save_event()` callback,
-    /// eliminating the need for a separate fetch step.
-    pub async fn sync_once(&self) -> Result<(SyncStats, Vec<Event>)> {
+    /// The synchronous handler must return promptly; async deadlines cannot preempt
+    /// blocking filesystem calls. Queued events are not proof of durable storage.
+    pub async fn sync_once<F>(&self, mut event_handler: F) -> Result<SyncStats>
+    where
+        F: FnMut(&Event) -> Result<bool> + Send,
+    {
+        if self.config.max_concurrent_relays == 0
+            || self.config.event_queue_capacity == 0
+            || self.config.max_event_bytes == 0
+            || self.config.protocol_timeout.is_zero()
+        {
+            return Err(crate::Error::Config(
+                "negentropy limits must be positive".to_string(),
+            ));
+        }
+        let mut stop = self.stop_signal.subscribe();
+        if *stop.borrow() {
+            return Err(crate::Error::Config("negentropy stopped".to_string()));
+        }
         let start = Instant::now();
         let mut stats = SyncStats::default();
-
-        // Resolve targets fresh each cycle: configured base + dynamic catalog targets,
-        // so catalog growth is followed without a restart.
         let relays = self.effective_relays();
         gauge!("ingest_negentropy_targets").set(relays.len() as f64);
-
-        // Mark sync as in progress
         gauge!("negentropy_sync_in_progress").set(1.0);
-
-        tracing::debug!(
-            "Starting negentropy sync with {} relays, lookback {}s",
-            relays.len(),
-            self.config.lookback.as_secs()
-        );
-
-        // Build filter for the lookback window
+        let _guard = CycleGuard;
         let now = Timestamp::now();
         let since = Timestamp::from(now.as_secs().saturating_sub(self.config.lookback.as_secs()));
-        let filter = Filter::new().since(since);
-
-        // Create the database adapter with event capture channel
-        let (adapter, mut event_receiver) = SyncStateAdapter::new(Arc::clone(&self.sync_state));
-
-        // Collect events as they stream through
-        let collected_events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let events_received_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let collector_events = Arc::clone(&collected_events);
-        let collector_counter = Arc::clone(&events_received_count);
-
-        // Spawn a task to collect events from the channel
-        // This updates the "receiving" gauge in real-time as events stream in
-        let collector_handle = tokio::spawn(async move {
-            while let Some(event) = event_receiver.recv().await {
-                let count = collector_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                // Update receiving progress gauge every 100 events
-                if count.is_multiple_of(100) {
-                    gauge!("negentropy_events_receiving").set(count as f64);
-                }
-                collector_events.lock().await.push(event);
-            }
-            // Final update
-            let final_count = collector_counter.load(Ordering::Relaxed);
-            gauge!("negentropy_events_receiving").set(final_count as f64);
-        });
-
-        // Create a client with our sync state database
-        let keys = Keys::generate();
-        let client = Client::builder()
-            .signer(keys)
-            .database(Arc::new(adapter) as Arc<dyn NostrDatabase>)
-            .build();
-
-        // Add trusted relays
-        for relay_url in &relays {
-            if let Err(e) = client.add_relay(relay_url).await {
-                tracing::warn!(
-                    relay_url = %relay_url,
-                    error = %compact_error(&e),
-                    "failed to add negentropy relay"
-                );
-                stats.relays_errored += 1;
-            }
-        }
-
-        // Connect to relays
-        client.connect().await;
-
-        // Wait for connections to establish
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Build sync options
-        let opts = SyncOptions::default().direction(self.config.direction);
-
-        // Run negentropy reconciliation
-        // Events stream through save_event() as they're fetched by nostr-sdk
-        let sync_result = tokio::time::timeout(
-            self.config.protocol_timeout,
-            client.sync(filter.clone(), &opts),
+        let filter = Filter::new().since(since).until(now);
+        let (sender, mut receiver) = mpsc::channel(self.config.event_queue_capacity);
+        let workers = stream::iter(
+            relays
+                .into_iter()
+                .map(|url| self.relay_worker(url, filter.clone(), sender.clone())),
         )
-        .await;
-
-        match sync_result {
-            Ok(Ok(output)) => {
-                stats.events_discovered = output.received.len();
-                stats.relays_responded = relays.len() - stats.relays_errored;
-
-                tracing::debug!(
-                    "Negentropy reconciliation complete: {} events discovered",
-                    stats.events_discovered
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %compact_error(&e), "negentropy sync failed");
-                stats.relays_errored = relays.len();
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Negentropy sync timed out after {:?}",
-                    self.config.protocol_timeout
-                );
-                stats.relays_errored = relays.len();
-            }
-        }
-
-        // Disconnect - this closes the adapter's channel sender
-        client.disconnect().await;
-
-        // Drop the client to ensure the adapter (and its sender) is dropped
-        drop(client);
-
-        // Wait for collector to finish receiving all events
-        // The channel will close when the adapter is dropped
-        if let Err(e) = collector_handle.await {
-            tracing::warn!(error = %compact_error(&e), "event collector task failed");
-        }
-
-        // Get collected events
-        let discovered_events = Arc::try_unwrap(collected_events)
-            .expect("collector handle finished, should be sole owner")
-            .into_inner();
-
-        stats.events_received = discovered_events.len();
+        .buffer_unordered(self.config.max_concurrent_relays);
+        self.drive_workers(
+            workers,
+            &mut receiver,
+            &mut stop,
+            &mut event_handler,
+            &mut stats,
+        )
+        .await?;
         stats.duration = start.elapsed();
-
-        tracing::debug!(
-            "Negentropy sync captured {} events in {:?}",
-            stats.events_received,
-            stats.duration
-        );
-
-        // Update metrics
         counter!("negentropy_syncs_total").increment(1);
         counter!("negentropy_events_discovered_total").increment(stats.events_discovered as u64);
         counter!("negentropy_events_received_total").increment(stats.events_received as u64);
         histogram!("negentropy_sync_duration_seconds").record(stats.duration.as_secs_f64());
-        gauge!("negentropy_last_sync_unix").set(Timestamp::now().as_secs() as f64);
-
-        // Mark sync as complete
-        gauge!("negentropy_sync_in_progress").set(0.0);
-        gauge!("negentropy_events_receiving").set(0.0);
-
-        Ok((stats, discovered_events))
+        gauge!("negentropy_last_cycle_unix").set(Timestamp::now().as_secs() as f64);
+        if stats.relays_responded > 0 && stats.relays_errored == 0 {
+            gauge!("negentropy_last_sync_unix").set(Timestamp::now().as_secs() as f64);
+        }
+        gauge!("negentropy_last_batch_total").set(stats.events_received as f64);
+        Ok(stats)
     }
 
-    /// Run periodic sync in the background.
-    ///
-    /// The `event_handler` is called for each discovered event. It should
-    /// return `Ok(true)` to continue, `Ok(false)` to stop, or `Err` on error.
-    ///
-    /// The handler is responsible for:
-    /// - Dedupe checking via DedupeIndex
-    /// - Packing and writing to segments
-    ///
-    /// Sync state is updated ONLY after the handler returns `Ok(true)`,
-    /// ensuring that failed events will be re-fetched on the next sync cycle.
+    async fn drive_workers<S, F>(
+        &self,
+        workers: S,
+        receiver: &mut mpsc::Receiver<Event>,
+        stop: &mut watch::Receiver<bool>,
+        event_handler: &mut F,
+        stats: &mut SyncStats,
+    ) -> Result<()>
+    where
+        S: futures_util::Stream<Item = RelaySyncResult>,
+        F: FnMut(&Event) -> Result<bool> + Send,
+    {
+        tokio::pin!(workers);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.changed() => return Err(crate::Error::Config("negentropy cancelled".to_string())),
+                result = workers.next() => {
+                    match result {
+                        Some(result) => {
+                            if result.error.is_some() {
+                                stats.relays_errored += 1;
+                            } else {
+                                stats.relays_responded += 1;
+                                stats.events_discovered += result.received;
+                            }
+                            stats.relay_results.push(result);
+                        }
+                        None => break,
+                    }
+                }
+                Some(event) = receiver.recv() => self.admit_event(&event, event_handler, stats)?,
+            }
+        }
+        // Explicitly close, then drain only the bounded backlog. Do not wait for
+        // SDK background tasks to release their database/channel references.
+        receiver.close();
+        while let Ok(event) = receiver.try_recv() {
+            if *stop.borrow() {
+                return Err(crate::Error::Config("negentropy cancelled".to_string()));
+            }
+            self.admit_event(&event, event_handler, stats)?;
+        }
+        Ok(())
+    }
+
+    fn admit_event<F>(&self, event: &Event, handler: &mut F, stats: &mut SyncStats) -> Result<()>
+    where
+        F: FnMut(&Event) -> Result<bool>,
+    {
+        stats.events_received += 1;
+        gauge!("negentropy_events_receiving").set(stats.events_received as f64);
+        if !handler(event)? {
+            self.stop();
+            return Err(crate::Error::Config(
+                "negentropy handler requested stop".to_string(),
+            ));
+        }
+        let durable = match &self.dedupe {
+            Some(dedupe) => matches!(
+                dedupe.get_status(event.id.as_bytes())?,
+                Some(EventStatus::Archived)
+            ),
+            None => true,
+        };
+        if durable {
+            self.sync_state
+                .record(event.id.as_bytes(), event.created_at.as_secs())?;
+        }
+        Ok(())
+    }
+
+    /// Run cycles until stopped. Admission errors fail the task closed.
     pub async fn run_periodic<F>(&self, mut event_handler: F) -> Result<()>
     where
         F: FnMut(&Event) -> Result<bool> + Send,
     {
-        self.running.store(true, Ordering::SeqCst);
-
-        tracing::info!(
-            "Starting periodic negentropy sync (interval: {}s, lookback: {}s)",
-            self.config.interval.as_secs(),
-            self.config.lookback.as_secs()
-        );
-
-        while self.running.load(Ordering::SeqCst) {
-            // Run a sync cycle
-            match self.sync_once().await {
-                Ok((stats, events)) => {
-                    tracing::info!(
-                        "Negentropy sync complete: {} discovered, {} received in {:?}",
-                        stats.events_discovered,
-                        stats.events_received,
-                        stats.duration
-                    );
-
-                    // Track batch processing statistics
-                    let total_events = events.len();
-                    let mut events_succeeded = 0usize;
-                    let mut events_failed = 0usize;
-                    let process_start = Instant::now();
-
-                    // Process discovered events through the handler
-                    // Note: The handler is responsible for emitting detailed metrics
-                    // (written vs deduplicated) since it knows the distinction.
-                    // We only track success/failure here at the batch level.
-                    for event in events {
-                        match event_handler(&event) {
-                            Ok(true) => {
-                                // Only advance sync-state once the event is DURABLY
-                                // archived (its segment sealed + fsync'd). Recording an
-                                // event that is merely in-flight would let a crash drop
-                                // it from the archive while sync-state still claims we
-                                // have it — negentropy would then never re-fetch it (H4).
-                                // Not-yet-durable events are simply re-evaluated on the
-                                // next cycle and recorded once their segment seals.
-                                let durable = match &self.dedupe {
-                                    Some(dedupe) => matches!(
-                                        dedupe.get_status(event.id.as_bytes()),
-                                        Ok(Some(EventStatus::Archived))
-                                    ),
-                                    None => true,
-                                };
-                                if durable {
-                                    if let Err(e) = self
-                                        .sync_state
-                                        .record(event.id.as_bytes(), event.created_at.as_secs())
-                                    {
-                                        tracing::warn!(
-                                            event_id = %event.id,
-                                            kind = event.kind.as_u16(),
-                                            pubkey = %event.pubkey,
-                                            error = %compact_error(&e),
-                                            "failed to record negentropy event in sync state"
-                                        );
-                                    }
-                                    events_succeeded += 1;
-                                }
-                            }
-                            Ok(false) => {
-                                tracing::debug!("Event handler signaled stop");
-                                self.running.store(false, Ordering::SeqCst);
-                                break;
-                            }
-                            Err(e) => {
-                                // Event failed to process - do NOT record in sync state.
-                                // It will be re-fetched on the next sync cycle.
-                                tracing::debug!(
-                                    event_id = %event.id,
-                                    kind = event.kind.as_u16(),
-                                    pubkey = %event.pubkey,
-                                    tag_count = event.tags.len(),
-                                    content_len = event.content.len(),
-                                    error = %compact_error(&e),
-                                    "negentropy event handler failed; will retry next sync"
-                                );
-                                events_failed += 1;
-                                counter!("negentropy_events_failed_total").increment(1);
-                            }
-                        }
-                    }
-
-                    let process_duration = process_start.elapsed();
-
-                    // Log batch summary
-                    tracing::debug!(
-                        "Negentropy batch processed: {} events → {} succeeded, {} failed in {:?}",
-                        total_events,
-                        events_succeeded,
-                        events_failed,
-                        process_duration
-                    );
-
-                    // Update batch metrics (gauges for last-batch visibility)
-                    // Note: succeeded includes both novel (written) and deduplicated events
-                    gauge!("negentropy_last_batch_total").set(total_events as f64);
-                    gauge!("negentropy_last_batch_succeeded").set(events_succeeded as f64);
-                    gauge!("negentropy_last_batch_failed").set(events_failed as f64);
-                    histogram!("negentropy_batch_process_duration_seconds")
-                        .record(process_duration.as_secs_f64());
-
-                    // Prune sync state entries older than the lookback window
-                    // This bounds storage to approximately lookback_duration worth of events
-                    let prune_before = Timestamp::now()
-                        .as_secs()
-                        .saturating_sub(self.config.lookback.as_secs());
-                    match self.sync_state.prune_before(prune_before) {
-                        Ok(pruned) => {
-                            if pruned > 0 {
-                                tracing::debug!("Pruned {} old entries from sync state", pruned);
-                                counter!("negentropy_sync_state_pruned_total")
-                                    .increment(pruned as u64);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %compact_error(&e), "failed to prune sync state");
-                        }
-                    }
-
-                    // Update sync state size metric
-                    if let Ok(count) = self.sync_state.approximate_count() {
-                        gauge!("negentropy_sync_state_items").set(count as f64);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %compact_error(&e), "negentropy sync cycle failed");
-                    counter!("negentropy_sync_errors_total").increment(1);
-                }
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Err(crate::Error::Config(
+                "negentropy already running".to_string(),
+            ));
+        }
+        let _guard = RunningGuard(&self.running);
+        let mut stop = self.stop_signal.subscribe();
+        loop {
+            if *stop.borrow() {
+                break;
             }
-
-            // Wait for the next interval (or until stopped)
-            let interval = self.config.interval;
-            let start = Instant::now();
-            while start.elapsed() < interval && self.running.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            let stats = match self.sync_once(&mut event_handler).await {
+                Ok(stats) => stats,
+                Err(_) if *stop.borrow() => break,
+                Err(error) => {
+                    counter!("negentropy_sync_errors_total").increment(1);
+                    return Err(error);
+                }
+            };
+            tracing::info!(
+                received = stats.events_received,
+                completed = stats.relays_responded,
+                failed = stats.relays_errored,
+                elapsed_secs = stats.duration.as_secs_f64(),
+                "Negentropy cycle finished"
+            );
+            // Inventory pruning/coverage policy is a separate slice. Do not prune
+            // automatically after a partial or failed reconciliation cycle.
+            tokio::select! {
+                _ = stop.changed() => break,
+                _ = tokio::time::sleep(self.config.interval) => {}
             }
         }
-
-        tracing::info!("Negentropy sync stopped");
         Ok(())
     }
 }
@@ -711,6 +707,243 @@ pub async fn seed_from_clickhouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_syncer(dir: &tempfile::TempDir) -> NegentropySyncer {
+        NegentropySyncer::new(
+            NegentropySyncConfig::default(),
+            Arc::new(SyncStateDb::open(dir.path()).unwrap()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn silent_loopback_relay_times_out_and_disconnects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut saw_neg_open = false;
+            while let Some(message) = websocket.next().await {
+                match message {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        saw_neg_open |= text.contains("NEG-OPEN");
+                    }
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            saw_neg_open
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut syncer = test_syncer(&dir);
+        syncer.config.relays = vec![format!("ws://{address}")];
+        syncer.config.protocol_timeout = Duration::from_secs(1);
+        let stats = tokio::time::timeout(Duration::from_secs(3), syncer.sync_once(|_| Ok(true)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.relays_responded, 0);
+        assert_eq!(stats.relays_errored, 1);
+        assert!(
+            stats.relay_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("deadline")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), peer)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_deadline_and_panic_drop_owned_work() {
+        for phase in ["connect", "reconcile", "disconnect"] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(Arc::clone(&dropped));
+            let result = bounded_relay(phase.to_string(), Duration::from_millis(10), async move {
+                let _guard = guard;
+                std::future::pending().await
+            })
+            .await;
+            assert!(result.error.unwrap().contains("deadline"));
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let result = bounded_relay("panic".to_string(), Duration::from_secs(1), async move {
+            let _guard = guard;
+            panic!("injected relay panic");
+        })
+        .await;
+        assert!(result.error.unwrap().contains("panicked"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn healthy_event_is_admitted_before_silent_relay_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let syncer = test_syncer(&dir);
+        let (tx, mut rx) = mpsc::channel(2);
+        let silent_done = Arc::new(AtomicBool::new(false));
+        let silent_guard = DropFlag(Arc::clone(&silent_done));
+        let silent = bounded_relay(
+            "silent".to_string(),
+            Duration::from_millis(100),
+            async move {
+                let _guard = silent_guard;
+                std::future::pending().await
+            },
+        )
+        .boxed();
+        let healthy = bounded_relay("healthy".to_string(), Duration::from_secs(1), async move {
+            tx.send(
+                EventBuilder::text_note("streamed")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            Ok(1)
+        })
+        .boxed();
+        let workers = stream::iter([silent, healthy]).buffer_unordered(2);
+        let mut stats = SyncStats::default();
+        syncer
+            .drive_workers(
+                workers,
+                &mut rx,
+                &mut syncer.stop_signal.subscribe(),
+                &mut |_| {
+                    assert!(!silent_done.load(Ordering::SeqCst));
+                    Ok(true)
+                },
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.events_received, 1);
+        assert_eq!(stats.relays_responded, 1);
+        assert_eq!(stats.relays_errored, 1);
+        assert!(silent_done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_workers_without_waiting_for_sender_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let syncer = test_syncer(&dir);
+        let (_tx, mut rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let worker = bounded_relay("silent".to_string(), Duration::from_secs(60), async move {
+            let _guard = guard;
+            std::future::pending().await
+        });
+        let mut stats = SyncStats::default();
+        let mut stop = syncer.stop_signal.subscribe();
+        let mut handler = |_: &Event| Ok(true);
+        let work = syncer.drive_workers(
+            stream::once(worker),
+            &mut rx,
+            &mut stop,
+            &mut handler,
+            &mut stats,
+        );
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            syncer.stop();
+        };
+        let (result, ()) = tokio::join!(work, cancel);
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn adapter_backpressure_and_oversize_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut adapter, mut receiver) =
+            SyncStateAdapter::new(Arc::new(SyncStateDb::open(dir.path()).unwrap()));
+        let (tx, rx) = mpsc::channel(1);
+        adapter.event_sender = tx;
+        receiver.close();
+        receiver = rx;
+        let event = EventBuilder::text_note("valid")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        adapter.save_event(&event).await.unwrap();
+        assert!(adapter.save_event(&event).await.is_err());
+        assert!(adapter.admission_failed.load(Ordering::SeqCst));
+        assert_eq!(receiver.len(), 1);
+        receiver.recv().await.unwrap();
+        adapter.max_event_bytes = 1;
+        assert!(adapter.save_event(&event).await.is_err());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn admission_failure_cancels_workers_without_recording_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let syncer = test_syncer(&dir);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(
+            EventBuilder::text_note("not archived")
+                .sign_with_keys(&Keys::generate())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let worker = bounded_relay("silent".to_string(), Duration::from_secs(60), async move {
+            let _guard = guard;
+            std::future::pending().await
+        });
+        let result = syncer
+            .drive_workers(
+                stream::once(worker),
+                &mut rx,
+                &mut syncer.stop_signal.subscribe(),
+                &mut |_| Err(crate::Error::Segment("injected archive fault".to_string())),
+                &mut SyncStats::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(crate::Error::Segment(_))));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(syncer.sync_state.get_items_since(0).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn periodic_abort_clears_running_and_can_start_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut syncer = test_syncer(&dir);
+        syncer.config.relays.clear();
+        let syncer = Arc::new(syncer);
+        for _ in 0..2 {
+            let worker = Arc::clone(&syncer);
+            let handle = tokio::spawn(async move { worker.run_periodic(|_| Ok(true)).await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !syncer.is_running() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+            assert!(!syncer.is_running());
+        }
+    }
 
     #[tokio::test]
     async fn adapter_rejects_forgery_and_closed_admission_channel() {

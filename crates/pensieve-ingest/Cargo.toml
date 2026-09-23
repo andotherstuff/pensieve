@@ -103,3 +103,6 @@ ctrlc.workspace = true
 
 # TLS (for rustls crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.26.2"

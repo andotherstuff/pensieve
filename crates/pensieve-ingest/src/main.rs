@@ -1194,11 +1194,15 @@ async fn main() -> Result<()> {
     }
 
     // Wait for negentropy task to finish
-    if let Some(handle) = negentropy_handle {
+    if let Some(mut handle) = negentropy_handle {
         tracing::info!("Waiting for negentropy sync to finish...");
-        // Give it a moment to clean up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        handle.abort(); // Force stop if still running
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     // Flush negentropy sync state

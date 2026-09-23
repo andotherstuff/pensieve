@@ -55,5 +55,7 @@
 mod negentropy;
 mod state;
 
-pub use negentropy::{NegentropySyncConfig, NegentropySyncer, SyncStats, seed_from_clickhouse};
+pub use negentropy::{
+    NegentropySyncConfig, NegentropySyncer, RelaySyncResult, SyncStats, seed_from_clickhouse,
+};
 pub use state::SyncStateDb;
