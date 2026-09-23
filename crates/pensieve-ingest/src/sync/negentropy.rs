@@ -56,6 +56,9 @@ pub struct NegentropySyncConfig {
     /// Maximum normalized event JSON size admitted by the adapter.
     pub max_event_bytes: usize,
 
+    /// Maximum local inventory IDs per relay request. Overflow fails closed.
+    pub max_inventory_items: usize,
+
     /// Direction for sync (default: Down = receive only).
     pub direction: SyncDirection,
 }
@@ -79,6 +82,7 @@ impl Default for NegentropySyncConfig {
             max_concurrent_relays: 3,
             event_queue_capacity: 128,
             max_event_bytes: 1024 * 1024,
+            max_inventory_items: 250_000,
             direction: SyncDirection::Down,
         }
     }
@@ -176,6 +180,7 @@ pub struct SyncStateAdapter {
     event_sender: mpsc::Sender<Event>,
     admission_failed: Arc<AtomicBool>,
     max_event_bytes: usize,
+    max_inventory_items: usize,
 }
 
 impl Debug for SyncStateAdapter {
@@ -197,6 +202,7 @@ impl SyncStateAdapter {
                 event_sender: tx,
                 admission_failed: Arc::new(AtomicBool::new(false)),
                 max_event_bytes: 1024 * 1024,
+                max_inventory_items: 250_000,
             },
             rx,
         )
@@ -273,14 +279,32 @@ impl NostrDatabase for SyncStateAdapter {
         filter: Filter,
     ) -> BoxedFuture<'_, std::result::Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
         Box::pin(async move {
-            // Get the `since` timestamp from the filter
-            let since = filter.since.map(|t| t.as_secs()).unwrap_or(0);
-
-            // Query all items since that timestamp from sync-state.
-            // These are events we've successfully archived.
+            // This adapter only supports finite, unqualified time intervals.
+            // Refuse richer filters rather than advertising IDs outside them.
+            let since = filter
+                .since
+                .ok_or_else(|| {
+                    DatabaseError::backend(std::io::Error::other("inventory requires since"))
+                })?
+                .as_secs();
+            let until = filter
+                .until
+                .ok_or_else(|| {
+                    DatabaseError::backend(std::io::Error::other("inventory requires until"))
+                })?
+                .as_secs();
+            if filter
+                != Filter::new()
+                    .since(Timestamp::from(since))
+                    .until(Timestamp::from(until))
+            {
+                return Err(DatabaseError::backend(std::io::Error::other(
+                    "unsupported inventory filter",
+                )));
+            }
             let items = self
                 .sync_state
-                .get_items_since(since)
+                .get_items_range(since, until, self.max_inventory_items)
                 .map_err(DatabaseError::backend)?;
 
             // Convert to (EventId, Timestamp) pairs
@@ -399,6 +423,7 @@ impl NegentropySyncer {
                 event_sender: sender,
                 admission_failed: Arc::clone(&failed),
                 max_event_bytes: self.config.max_event_bytes,
+                max_inventory_items: self.config.max_inventory_items,
             };
             let client = Client::builder()
                 .signer(Keys::generate())
@@ -448,6 +473,7 @@ impl NegentropySyncer {
         if self.config.max_concurrent_relays == 0
             || self.config.event_queue_capacity == 0
             || self.config.max_event_bytes == 0
+            || self.config.max_inventory_items == 0
             || self.config.protocol_timeout.is_zero()
         {
             return Err(crate::Error::Config(
@@ -657,19 +683,16 @@ pub async fn seed_from_clickhouse(
         lookback_days
     );
 
-    let rows: Vec<SeedRow> = client
+    let mut rows = client
         .query(&query)
-        .fetch_all()
-        .await
+        .fetch::<SeedRow>()
         .map_err(crate::Error::ClickHouse)?;
-
-    tracing::info!("Fetched {} events from ClickHouse for seeding", rows.len());
 
     // Convert and insert into sync state
     let mut count = 0usize;
     let mut batch = Vec::with_capacity(10_000);
 
-    for row in rows {
+    while let Some(row) = rows.next().await.map_err(crate::Error::ClickHouse)? {
         // Decode hex ID to bytes
         let id_bytes = match hex::decode(&row.id) {
             Ok(bytes) if bytes.len() == 32 => {
@@ -721,6 +744,55 @@ mod tests {
             Arc::new(SyncStateDb::open(dir.path()).unwrap()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn adapter_requires_exact_finite_interval_and_rejects_inventory_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SyncStateDb::open(dir.path()).unwrap());
+        state.record(&[1; 32], 100).unwrap();
+        state.record(&[2; 32], 101).unwrap();
+        state.record(&[3; 32], 101).unwrap();
+        state.record(&[4; 32], 102).unwrap();
+        let (mut adapter, _rx) = SyncStateAdapter::new(state);
+        adapter.max_inventory_items = 2;
+        let filter = Filter::new()
+            .since(Timestamp::from(101))
+            .until(Timestamp::from(101));
+        assert_eq!(
+            adapter
+                .negentropy_items(filter.clone())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            adapter
+                .negentropy_items(filter.clone().limit(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .negentropy_items(filter.clone().kind(Kind::TextNote))
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .negentropy_items(Filter::new().since(Timestamp::from(101)))
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .negentropy_items(Filter::new().until(Timestamp::from(101)))
+                .await
+                .is_err()
+        );
+        adapter.max_inventory_items = 1;
+        assert!(adapter.negentropy_items(filter).await.is_err());
     }
 
     #[tokio::test]

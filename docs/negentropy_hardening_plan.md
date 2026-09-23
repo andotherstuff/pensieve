@@ -32,6 +32,16 @@ See `negentropy_audit_20260923.md` for the original findings and limitations.
   durable windowing remain rollout prerequisites; do not deploy this slice alone.
 - [ ] Durable inventory: sealed-receipt updates, bounded scans/windows and
   resumable coverage. Never equate pending with durable.
+  Local-read foundation implemented: finite inclusive `since`/`until`, a
+  250,000-item cap per relay request, and explicit overflow errors rather than
+  truncated inventories. Unsupported filter predicates fail closed. The
+  ClickHouse seed now streams into 10,000-row write batches instead of fetching
+  the entire response. This does not establish a completed seed/coverage cursor;
+  failed streams may leave valid partial inventory, which is not proof of coverage.
+  Boundary, tied-timestamp overflow, malformed-key and reopen regressions pass.
+  Resumable window scheduling and sealed-receipt inventory updates are NOT yet
+  implemented. A dense current 14-day request may now fail the local cap; this
+  branch must not deploy before the window scheduler and remote bound exist.
 - [ ] Operations: truthful metrics, supervisor, alerts, persisted relay backoff,
   explicit allowlist that does not silently expand through the catalog.
   Lifecycle results now distinguish each relay's error/timeout from success;
@@ -69,6 +79,24 @@ Use `CARGO_TARGET_DIR=/Volumes/Worktrees/pensieve-negentropy-target` and
 The worktree volume had approximately 787 GiB free at start. Full workspace gates
 compile bundled DuckDB and RocksDB. Do not build on or restart production to
 work around local verification failures.
+
+## SDK hard-bound decision required before window scheduling
+
+The pinned `nostr-relay-pool` 0.44.3 exposes no hard reconciliation-ID budget.
+`InnerRelay::handle_neg_msg` inserts IDs into `Reconciliation.local/remote` and
+`have_ids/need_ids` before updating the optional progress watch channel.
+`Relay::sync_with_items` also clones local inventory. A progress watcher is
+therefore not a pre-allocation limit, and shorter timestamp windows cannot bound
+the number of remote IDs, particularly for a faulty relay. No remote-memory
+bound is claimed by the local-read cap.
+
+Recommended prerequisite: a small reviewed patch to the pinned SDK enforcing
+ID budgets before accumulation, including decoded frame and pending-ID bounds,
+with an explicit resource-limit error. Integrating a maintained fork or vendored
+patch adds dependency maintenance; choose that deliberately rather than silently
+switching SDK major versions. Then add resumable windows which preserve failed
+intervals beyond the rolling lookback and only checkpoint durable coverage.
+No production changes or SDK fork publication have been made by this slice.
 
 ## Required failure tests before rollout
 
