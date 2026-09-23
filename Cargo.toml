@@ -58,7 +58,7 @@ parking_lot = "0.12"
 num_cpus = "1.16"
 
 # Nostr
-nostr = "0.44"
+nostr = "0.44.7"
 nostr-sdk = "0.44"
 notepack = { git = "https://github.com/erskingardner/notepack" }
 

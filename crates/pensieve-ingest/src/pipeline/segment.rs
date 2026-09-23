@@ -33,7 +33,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use super::dedupe::DedupeIndex;
@@ -177,6 +177,12 @@ struct CurrentSegment {
 ///
 /// Thread-safe: uses internal locking for writes.
 pub struct SegmentWriter {
+    #[cfg(test)]
+    injected_failure: AtomicUsize,
+    /// Serialize archive mutations and latch uncertain I/O failures.
+    admission_gate: Mutex<Option<String>>,
+    /// Read-only health observation must never wait for archive fsyncs.
+    recovery_latched: AtomicBool,
     config: SegmentConfig,
     current: Mutex<Option<CurrentSegment>>,
     segment_number: AtomicU64,
@@ -222,6 +228,8 @@ impl SegmentWriter {
         // Create output directory if it doesn't exist
         fs::create_dir_all(&config.output_dir)?;
 
+        Self::check_recovery(&config.output_dir, &config.segment_prefix)?;
+
         // Find the next segment number by scanning existing files
         let next_segment = Self::find_next_segment_number(&config)?;
 
@@ -233,6 +241,10 @@ impl SegmentWriter {
         );
 
         Ok(Self {
+            #[cfg(test)]
+            injected_failure: AtomicUsize::new(0),
+            admission_gate: Mutex::new(None),
+            recovery_latched: AtomicBool::new(false),
             config,
             current: Mutex::new(None),
             segment_number: AtomicU64::new(next_segment),
@@ -244,6 +256,37 @@ impl SegmentWriter {
             dedupe,
             watermark_publication: Mutex::new(()),
         })
+    }
+
+    /// Inspect recovery evidence before opening databases or starting admission.
+    /// This is read-only and never clears a recovery obligation.
+    pub fn check_recovery(output_dir: &Path, prefix: &str) -> Result<()> {
+        let marker = output_dir.join(format!("{prefix}.recovery-required"));
+        if marker.try_exists()? {
+            return Err(Error::Segment(format!(
+                "archive recovery required: {}",
+                marker.display()
+            )));
+        }
+        if !output_dir.try_exists()? {
+            return Ok(());
+        }
+        for entry in fs::read_dir(output_dir)? {
+            let path = entry?.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with(&format!("{prefix}-")) && name.ends_with(".notepack.open") {
+                return Err(Error::Segment(format!(
+                    "unrecovered open segment: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether archive admission has latched an uncertain write or seal fault.
+    pub fn recovery_required(&self) -> bool {
+        self.recovery_latched.load(Ordering::SeqCst)
     }
 
     /// Find the next segment number by scanning existing files.
@@ -336,6 +379,24 @@ impl SegmentWriter {
     ///
     /// Returns `true` if a segment was sealed as a result.
     pub fn write(&self, event: PackedEvent) -> Result<bool> {
+        self.archive_operation(|| self.write_inner(event, None))
+    }
+
+    /// Write a reserved event, releasing its claim if opening a segment fails.
+    /// Once frame I/O begins, failures are ambiguous and retain writer ownership.
+    pub fn write_reserved(
+        &self,
+        event: PackedEvent,
+        admission: super::PendingAdmission<'_>,
+    ) -> Result<bool> {
+        self.archive_operation(|| self.write_inner(event, Some(admission)))
+    }
+
+    fn write_inner(
+        &self,
+        event: PackedEvent,
+        admission: Option<super::PendingAdmission<'_>>,
+    ) -> Result<bool> {
         self.ensure_current_segment()?;
 
         let mut current = self.current.lock();
@@ -344,8 +405,14 @@ impl SegmentWriter {
             .ok_or_else(|| Error::Segment("No current segment".to_string()))?;
 
         // Write length-prefixed format: [u32 length][notepack bytes]
-        let len_bytes = (event.data.len() as u32).to_le_bytes();
+        let len_bytes = u32::try_from(event.data.len())
+            .map_err(|_| Error::Segment("event exceeds frame length limit".to_string()))?
+            .to_le_bytes();
+        if let Some(admission) = admission {
+            admission.retain();
+        }
         segment.writer.write_all(&len_bytes)?;
+        self.inject_failure(1)?;
         segment.writer.write_all(&event.data)?;
 
         // Update stats
@@ -366,7 +433,7 @@ impl SegmentWriter {
         drop(current);
 
         if should_seal {
-            self.seal()?;
+            self.seal_checkpointed()?;
             return Ok(true);
         }
 
@@ -408,6 +475,92 @@ impl SegmentWriter {
     /// for marking as archived). Downstream notifications are sent after
     /// compression completes (from the background thread).
     pub fn seal(&self) -> Result<Option<SealedSegment>> {
+        self.archive_operation(|| self.seal_checkpointed())
+    }
+
+    fn recovery_marker(&self) -> PathBuf {
+        self.config
+            .output_dir
+            .join(format!("{}.recovery-required", self.config.segment_prefix))
+    }
+
+    fn inject_failure(&self, point: usize) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .injected_failure
+            .compare_exchange(point, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(Error::Io(std::io::Error::other(
+                "injected archive I/O failure",
+            )));
+        }
+        let _ = point;
+        Ok(())
+    }
+
+    fn persist_recovery_marker(&self) -> Result<()> {
+        let mut marker = File::create(self.recovery_marker())?;
+        marker.write_all(
+            b"Archive operation interrupted. Inspect and recover before removing this marker.\n",
+        )?;
+        marker.sync_all()?;
+        File::open(&self.config.output_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    fn archive_operation<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut failure = self.admission_gate.lock();
+        if let Some(reason) = failure.as_ref() {
+            return Err(Error::Segment(format!(
+                "archive admission blocked pending recovery: {reason}"
+            )));
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                *failure = Some("archive operation panicked".to_string());
+                self.recovery_latched.store(true, Ordering::SeqCst);
+                metrics::gauge!("archive_recovery_required").set(1.0);
+                tracing::error!("archive operation panicked; admission blocked pending recovery");
+                if let Err(error) = self.persist_recovery_marker() {
+                    tracing::error!(error = %compact_error(&error), "could not persist archive recovery marker");
+                }
+                std::panic::resume_unwind(panic);
+            }
+        };
+        if let Err(error) = &result {
+            let reason = compact_error(error);
+            *failure = Some(reason.to_string());
+            self.recovery_latched.store(true, Ordering::SeqCst);
+            metrics::gauge!("archive_recovery_required").set(1.0);
+            metrics::counter!("archive_admission_failures_total").increment(1);
+            tracing::error!(error = %reason, marker = %self.recovery_marker().display(),
+                "archive admission blocked; preserve files and recover before restart");
+            // A full disk may prevent the marker. The unsealed .open file also
+            // blocks startup, and the in-memory latch blocks this process.
+            if let Err(marker_error) = self.persist_recovery_marker() {
+                tracing::error!(error = %compact_error(&marker_error), "could not persist archive recovery marker");
+            }
+        }
+        result
+    }
+
+    fn seal_checkpointed(&self) -> Result<Option<SealedSegment>> {
+        if self.current.lock().is_none() {
+            return Ok(None);
+        }
+        // Persist BEFORE detaching/renaming: even a post-rename failure must
+        // remain blocked across process restarts, when no .open file remains.
+        self.persist_recovery_marker()?;
+        let sealed = self.seal_inner()?;
+        fs::remove_file(self.recovery_marker())?;
+        File::open(&self.config.output_dir)?.sync_all()?;
+        Ok(sealed)
+    }
+
+    fn seal_inner(&self) -> Result<Option<SealedSegment>> {
         let (segment, segment_number) = match self.take_current_for_seal() {
             Some(segment) => segment,
             None => return Ok(None),
@@ -429,6 +582,7 @@ impl SegmentWriter {
         let file = writer
             .into_inner()
             .map_err(|e| Error::Segment(format!("failed to flush segment on seal: {e}")))?;
+        self.inject_failure(2)?;
         file.sync_all()?;
         drop(file);
 
@@ -443,6 +597,7 @@ impl SegmentWriter {
             )));
         }
         fs::rename(&open_path, &path)?;
+        self.inject_failure(3)?;
         File::open(
             path.parent()
                 .ok_or_else(|| Error::Segment("segment has no parent directory".to_string()))?,
@@ -756,6 +911,10 @@ impl SegmentWriter {
 
     /// Flush the current segment without sealing.
     pub fn flush(&self) -> Result<()> {
+        self.archive_operation(|| self.flush_inner())
+    }
+
+    fn flush_inner(&self) -> Result<()> {
         let mut current = self.current.lock();
         if let Some(ref mut segment) = *current {
             segment.writer.flush()?;
@@ -823,6 +982,151 @@ pub struct SegmentStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn recovery_observation_does_not_wait_for_archive_lock() {
+        let dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let gate = writer.admission_gate.lock();
+        let observer = Arc::clone(&writer);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sender.send(observer.recovery_required()).unwrap();
+        });
+        let observed = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        // Release even on regression so the test can reap its observer thread.
+        drop(gate);
+        thread.join().unwrap();
+        assert!(!observed.unwrap());
+
+        let failed: Result<()> =
+            writer.archive_operation(|| Err(Error::Segment("injected fault".to_string())));
+        assert!(failed.is_err());
+        assert!(writer.recovery_required());
+        assert!(writer.seal().is_err());
+        assert!(writer.recovery_required());
+    }
+
+    #[test]
+    fn recovery_preflight_is_read_only_and_checks_matching_namespace() {
+        let dir = TempDir::new().unwrap();
+        let absent = dir.path().join("absent");
+        SegmentWriter::check_recovery(&absent, "segment").unwrap();
+        assert!(!absent.exists());
+        let unrelated = dir.path().join("backfill-000000001.notepack.open");
+        fs::write(&unrelated, b"preserve").unwrap();
+        SegmentWriter::check_recovery(dir.path(), "segment").unwrap();
+        let open = dir.path().join("segment-000000001.notepack.open");
+        fs::write(&open, b"preserve open").unwrap();
+        assert!(SegmentWriter::check_recovery(dir.path(), "segment").is_err());
+        assert_eq!(fs::read(&open).unwrap(), b"preserve open");
+        fs::remove_file(&open).unwrap();
+        let marker = dir.path().join("segment.recovery-required");
+        fs::write(&marker, b"preserve marker").unwrap();
+        assert!(SegmentWriter::check_recovery(dir.path(), "segment").is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"preserve marker");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn archive_io_failure_blocks_write_flush_seal_and_restart() {
+        for point in 1..=3 {
+            let tmp = TempDir::new().unwrap();
+            let config = SegmentConfig {
+                output_dir: tmp.path().join("segments"),
+                compress: false,
+                ..Default::default()
+            };
+            let writer = SegmentWriter::new(config.clone(), None, None).unwrap();
+            writer.write(test_event(1)).unwrap();
+            writer.flush().unwrap();
+            writer.injected_failure.store(point, Ordering::SeqCst);
+            let failure = if point == 1 {
+                writer.write(test_event(2)).map(|_| ())
+            } else {
+                writer.seal().map(|_| ())
+            };
+            assert!(failure.is_err());
+            assert!(writer.recovery_marker().exists());
+            assert!(writer.write(test_event(3)).is_err());
+            assert!(writer.flush().is_err());
+            assert!(writer.seal().is_err());
+            assert!(SegmentWriter::new(config.clone(), None, None).is_err());
+            drop(writer);
+            assert!(SegmentWriter::new(config.clone(), None, None).is_err());
+            let evidence = if point == 3 {
+                "segment-000000000.notepack"
+            } else {
+                "segment-000000000.notepack.open"
+            };
+            assert!(config.output_dir.join(evidence).exists());
+            assert!(
+                !config
+                    .output_dir
+                    .join("segment-000000001.notepack.open")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn unrecovered_open_file_blocks_startup_without_a_marker() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("segment-000000000.notepack.open");
+        fs::write(&path, b"partial frame").unwrap();
+        let config = SegmentConfig {
+            output_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        assert!(SegmentWriter::new(config, None, None).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"partial frame");
+    }
+
+    #[test]
+    fn archive_panic_latches_failure() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SegmentWriter::new(
+            SegmentConfig {
+                output_dir: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = writer.archive_operation(|| panic!("injected failure"));
+        }));
+        assert!(result.is_err());
+        assert!(writer.write(test_event(1)).is_err());
+        assert!(writer.recovery_marker().exists());
+    }
+
+    #[test]
+    fn successful_seal_clears_checkpoint_and_allows_restart() {
+        let tmp = TempDir::new().unwrap();
+        let config = SegmentConfig {
+            output_dir: tmp.path().to_path_buf(),
+            compress: false,
+            ..Default::default()
+        };
+        let writer = SegmentWriter::new(config.clone(), None, None).unwrap();
+        writer.write(test_event(1)).unwrap();
+        writer.seal().unwrap();
+        assert!(!writer.recovery_marker().exists());
+        drop(writer);
+        assert!(SegmentWriter::new(config, None, None).is_ok());
+    }
 
     fn test_event(n: u8) -> PackedEvent {
         test_event_at(n, u64::from(n))

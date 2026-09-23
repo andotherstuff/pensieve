@@ -136,16 +136,19 @@ impl NostrDatabase for SyncStateAdapter {
         event: &'a Event,
     ) -> BoxedFuture<'a, std::result::Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
+            crate::pipeline::validate_archive_event(event).map_err(DatabaseError::backend)?;
             // Forward the event to the channel for processing.
             // DO NOT record to sync-state here - that happens only after
             // successful segment write in the event handler.
             //
             // This ensures that if segment write fails, the event is NOT
             // recorded in sync-state and will be re-fetched on the next cycle.
-            if self.event_sender.send(event.clone()).is_err() {
-                // Channel closed, receiver dropped - sync is ending
-                tracing::debug!("Event channel closed, sync ending");
-            }
+            self.event_sender.send(event.clone()).map_err(|_| {
+                DatabaseError::backend(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "negentropy admission channel closed",
+                ))
+            })?;
             Ok(SaveEventStatus::Success)
         })
     }
@@ -708,6 +711,26 @@ pub async fn seed_from_clickhouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn adapter_rejects_forgery_and_closed_admission_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SyncStateDb::open(dir.path()).unwrap());
+        let (adapter, mut receiver) = SyncStateAdapter::new(state);
+        let event = EventBuilder::text_note("valid")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut forged = event.clone();
+        forged.content = "forged".to_string();
+        for _ in 0..2 {
+            assert!(adapter.save_event(&forged).await.is_err());
+        }
+        assert!(receiver.try_recv().is_err());
+        adapter.save_event(&event).await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap().id, event.id);
+        drop(receiver);
+        assert!(adapter.save_event(&event).await.is_err());
+    }
 
     #[test]
     fn test_config_defaults() {

@@ -585,13 +585,20 @@ impl RelaySource {
                     relay_url, event, ..
                 } => {
                     self.stats.total_events.fetch_add(1, Ordering::Relaxed);
-                    self.stats.valid_events.fetch_add(1, Ordering::Relaxed);
                     event_count += 1;
 
                     // Extract relay URL as string for attribution
                     let relay_url_str = relay_url.to_string();
 
-                    // Check for NIP-65 relay list events for discovery
+                    // Never trust an SDK verification cache at our admission boundary.
+                    // Reject before discovery or any caller-owned side effects.
+                    if crate::pipeline::validate_archive_event(&event).is_err() {
+                        self.stats.invalid_events.fetch_add(1, Ordering::Relaxed);
+                        metrics::counter!("relay_events_invalid_total").increment(1);
+                        continue;
+                    }
+                    self.stats.valid_events.fetch_add(1, Ordering::Relaxed);
+
                     // Discovery only registers relays - the optimization loop connects to them
                     if self.config.discovery_enabled
                         && event.kind == Kind::RelayList

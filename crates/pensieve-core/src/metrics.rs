@@ -34,6 +34,10 @@ use axum::{Router, routing::get};
 use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// Initialize the Prometheus metrics recorder.
 ///
@@ -75,21 +79,63 @@ pub async fn start_metrics_server(
     port: u16,
     handle: PrometheusHandle,
 ) -> Result<(), std::io::Error> {
-    let app = Router::new().route(
+    serve_metrics(port, handle, None).await
+}
+
+/// Serve metrics plus `/health/archive-admission` for an ingestion monitor.
+///
+/// The owner must initialize readiness to false, enable it only when admission
+/// starts, and clear it on recovery-required state or shutdown. This is not a
+/// claim about relay connectivity or freshness of derived indexes.
+pub async fn start_metrics_server_with_archive_health(
+    port: u16,
+    handle: PrometheusHandle,
+    ready: Arc<AtomicBool>,
+) -> Result<(), std::io::Error> {
+    serve_metrics(port, handle, Some(ready)).await
+}
+
+fn archive_health_status(ready: &AtomicBool) -> axum::http::StatusCode {
+    if ready.load(Ordering::SeqCst) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn serve_metrics(
+    port: u16,
+    handle: PrometheusHandle,
+    ready: Option<Arc<AtomicBool>>,
+) -> Result<(), std::io::Error> {
+    let mut app = Router::new().route(
         "/metrics",
         get(move || {
             let handle = handle.clone();
             async move { handle.render() }
         }),
     );
+    if let Some(ready) = ready {
+        app = app.route(
+            "/health/archive-admission",
+            get(move || {
+                let ready = Arc::clone(&ready);
+                async move { archive_health_status(&ready) }
+            }),
+        );
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Surface bind failures to the caller instead of silently losing monitoring
+    // in a detached task while the ingester continues to run.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Metrics server listening on http://{}/metrics", addr);
 
     // Spawn the server in the background
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "metrics server stopped");
+        }
     });
 
     Ok(())
@@ -411,6 +457,36 @@ pub fn set_gauge(name: &'static str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_health_fails_closed_until_ready_and_after_fault() {
+        let ready = AtomicBool::new(false);
+        assert_eq!(
+            archive_health_status(&ready),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        ready.store(true, Ordering::SeqCst);
+        assert_eq!(archive_health_status(&ready), axum::http::StatusCode::OK);
+        ready.store(false, Ordering::SeqCst);
+        assert_eq!(
+            archive_health_status(&ready),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_bind_failure_is_returned_to_caller() {
+        let occupied = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let result = start_metrics_server_with_archive_health(
+            port,
+            recorder.handle(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+    }
     use std::sync::Once;
 
     // Ensure metrics are initialized exactly once for all tests

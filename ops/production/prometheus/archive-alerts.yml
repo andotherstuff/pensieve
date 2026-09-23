@@ -1,0 +1,19 @@
+groups:
+  - name: pensieve-archive-integrity
+    rules:
+      - alert: PensieveArchiveRecoveryRequired
+        expr: archive_recovery_required{job="ingest"} == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pensieve archive admission is blocked pending recovery"
+          description: "Preserve archive files and the recovery marker. Follow the archive recovery runbook; restarting must not bypass recovery."
+      - alert: PensieveIngesterUnavailable
+        expr: up{job="ingest"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pensieve ingester is unavailable"
+          description: "Inspect systemd journal and archive recovery state before restarting."

@@ -29,6 +29,23 @@ provisioning). The ingester exposes Prometheus metrics on `:9091`.
 
 ## Routine deploy
 
+### Archive admission monitoring and recovery
+
+Follow [the recovery policy](../docs/archive_failure_recovery.md). Recovery is
+intentionally manual and incident-specific; a universal repair procedure is not
+required. For deployment:
+
+- Verify that recovery-required state stops intake and remains observable
+  without a systemd restart loop.
+- Configure Uptime Kuma to monitor `/health/archive-admission` on the private
+  ingester metrics port, accepting only HTTP 200; test notification firing and
+  resolution. The checked-in Prometheus rules alone do not notify anyone.
+- Run a read-only preflight for existing recovery markers/orphan segments and
+  account for them before restarting. Preserve files and markers during an
+  incident; investigate and repair before explicitly resuming admission.
+
+The routine restart instructions below do not override an active recovery fault.
+
 1. **Pull:** `cd ~/pensieve && git pull origin master`
 2. **Build (if Rust changed):** `just build-release`
 3. **Install/reload units (only if `ops/systemd/` changed):**
