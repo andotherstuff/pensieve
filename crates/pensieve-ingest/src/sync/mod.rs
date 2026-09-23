@@ -52,6 +52,7 @@
 //! }).await?;
 //! ```
 
+pub mod jobs;
 mod negentropy;
 mod state;
 
