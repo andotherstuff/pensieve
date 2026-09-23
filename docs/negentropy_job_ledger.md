@@ -64,9 +64,12 @@ full-disk integration test.
 
 ## Remaining slices and rollout gates
 
-1. Versioned, length-bounded authenticated local IPC; durable per-attempt receipt
-   accounting and archive-confirmed completion. No worker ACK alone completes a
-   job. Freeze the protocol limits before adding runtime callers.
+Increment 1b adds the [bounded upload and received-receipt foundation](negentropy_upload_protocol.md),
+without a listener or archive integration. Remaining work:
+
+1. Authenticated local IPC, handshake/assignment/inventory exchange, and
+   archive-confirmed completion. No worker ACK alone completes a job. Freeze the
+   complete protocol and transport limits before adding runtime callers.
 2. Bounded sealed-archive inventory and receipt integration, including replay
    cursors and crash tests around admission, sealing, and acknowledgement.
 3. Isolated one-relay/window worker and fair bounded scheduler. Add small relay
