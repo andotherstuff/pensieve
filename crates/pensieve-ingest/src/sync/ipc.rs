@@ -1,6 +1,7 @@
 //! Bounded worker upload protocol and durable received-frame registration.
 //!
-//! No socket listener or archive admission is wired here. A future authenticated
+//! No socket listener is wired here. Admission uses the existing shared archive
+//! writer and dedupe index before returning credit. A future authenticated
 //! Unix transport must impose lifecycle/idle deadlines and use a bounded blocking
 //! executor for this synchronous codec and ledger. Wire credits bound payload
 //! bytes, not allocator overhead. Never log frames or their lease capabilities.
@@ -49,6 +50,9 @@ pub enum ProtocolError {
     /// Registration did not yield a durable received-frame acknowledgement.
     #[error(transparent)]
     Ledger(#[from] LedgerError),
+    /// Admission failed; preserve the received obligation and stop this upload.
+    #[error("archive admission failed")]
+    Archive(#[from] crate::Error),
 }
 
 /// Common upload identity. Not Debug: contains the lease capability.
@@ -372,15 +376,72 @@ impl UploadSession {
         }
     }
 
-    /// Release credit only after the caller establishes admission ownership.
-    /// Receipt registration alone cannot establish that future runtime guarantee.
-    /// ACKs are ordered, single-use, and do not imply archival or completion.
-    pub fn accepted(
+    /// Admit a durably registered candidate through the ingester's shared
+    /// dedupe/reservation/notepack writer, then release credit. Use the same index
+    /// the writer seals into. No second archive or dedupe handle is opened here.
+    ///
+    /// Pending duplicates can be accepted but cannot satisfy archive receipts.
+    /// Errors poison the upload and preserve the ledger obligation. The clock is
+    /// sampled before admission and again before ACK; a slow write cannot extend
+    /// the lease. Run on a bounded blocking executor, never the async reactor.
+    pub fn admit_and_accept<C>(
+        &mut self,
+        ledger: &mut JobLedger,
+        event: RegisteredEvent,
+        dedupe: &crate::DedupeIndex,
+        writer: &crate::SegmentWriter,
+        mut clock: C,
+    ) -> Result<Accepted, ProtocolError>
+    where
+        C: FnMut() -> i64,
+    {
+        self.check_ack(ledger, &event, clock())?;
+        self.closed = true;
+        if writer.recovery_required() {
+            return Err(ProtocolError::State);
+        }
+        match dedupe.reserve_unarchived(event.event.id.as_bytes())? {
+            Some(claim) => {
+                let packed = crate::pack_nostr_event(&event.event)?;
+                writer.write_reserved(packed, claim)?;
+            }
+            None => {
+                // A live source may still abandon its reservation before writing.
+                // Only a retained writer claim or durable marker owns this receipt.
+                if !dedupe.has_archive_owner(event.event.id.as_bytes())? {
+                    return Err(ProtocolError::State);
+                }
+            }
+        }
+        self.closed = false;
+        self.accepted(ledger, event, clock())
+    }
+
+    // Only this module's admission path may release credit; protocol unit tests
+    // exercise ordering separately. There is no public ACK-without-admission API.
+    fn accepted(
         &mut self,
         ledger: &mut JobLedger,
         event: RegisteredEvent,
         now: i64,
     ) -> Result<Accepted, ProtocolError> {
+        self.check_ack(ledger, &event, now)?;
+        let (bytes, _) = self
+            .outstanding
+            .remove(&event.header.sequence)
+            .ok_or(ProtocolError::State)?;
+        self.outstanding_bytes -= bytes;
+        Ok(Accepted {
+            header: event.header,
+        })
+    }
+
+    fn check_ack(
+        &mut self,
+        ledger: &mut JobLedger,
+        event: &RegisteredEvent,
+        now: i64,
+    ) -> Result<(), ProtocolError> {
         if self.closed
             || now < 0
             || now >= self.lease.expires_at()
@@ -401,14 +462,7 @@ impl UploadSession {
             self.closed = true;
             return Err(ProtocolError::State);
         }
-        let (bytes, _) = self
-            .outstanding
-            .remove(&event.header.sequence)
-            .ok_or(ProtocolError::State)?;
-        self.outstanding_bytes -= bytes;
-        Ok(Accepted {
-            header: event.header,
-        })
+        Ok(())
     }
 }
 
@@ -578,7 +632,10 @@ mod tests {
             ),
             (2, total_bytes, digest, true)
         );
-        assert_eq!(db.get(lease.job().id).unwrap().state, JobState::Leased);
+        assert_eq!(
+            db.get(lease.job().id).unwrap().state,
+            JobState::AwaitingDurability
+        );
     }
 
     #[test]
@@ -595,7 +652,9 @@ mod tests {
                 .unwrap()
                 .protocol_done
         );
-        assert!(db.expire(lease.expires_at(), 60).unwrap());
+        assert!(!db.expire(lease.expires_at(), 60).unwrap());
+        db.retry_durability(lease.job().id, 1, lease.expires_at(), 60)
+            .unwrap();
         assert_eq!(db.get(lease.job().id).unwrap().state, JobState::RetryWait);
         assert!(
             db.attempt_progress(lease.job().id, 1)

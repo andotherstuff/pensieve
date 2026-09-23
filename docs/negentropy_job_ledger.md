@@ -25,9 +25,9 @@ prerequisite.
 - Explicit resource splits atomically retain the parent and create `[a,m]` and
   `[m+1,b]`. A one-second interval becomes blocked, not complete. Only a live
   lease can perform these transitions.
-- There is deliberately no completed state or completion API. A successful
-  network exchange will not prove durable archive admission. Receipt accounting
-  must implement that proof before completion is added.
+- The stacked [archive receipt consumer](negentropy_archive_receipts.md) adds
+  awaiting-durability and complete states. Network success alone never completes
+  a job; every retained receipt must be archive-confirmed first.
 
 ## Bounds and failure behavior
 
@@ -43,8 +43,8 @@ during commit or rollback. Deployment still needs free-space preflight,
 monitoring, and process/filesystem limits. Exceeding the admission ceiling
 rejects new admissions and leases, while retry/expiry can still release an old
 lease. Those writes may still fail on an actually full filesystem. Existing jobs
-remain available for inspection and recovery. No automatic pruning,
-vacuum, or unresolved-job deletion is provided.
+remain available for inspection and recovery. The archive consumer compacts only
+confirmed receipt detail; no vacuum or unresolved-job deletion is provided.
 
 Database errors roll back the transaction where SQLite permits rollback. A
 commit I/O error must be treated as uncertain by future callers: reopen and

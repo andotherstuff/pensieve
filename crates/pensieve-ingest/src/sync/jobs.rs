@@ -1,9 +1,9 @@
 //! Durable, ingester-owned reconciliation obligations. Not wired to ingestion.
 //!
-//! This increment deliberately cannot complete a job: received-frame accounting
-//! is not archive durability. Archive satisfaction and completion belong to the
-//! next increment. All mutations use immediate transactions; unfinished work is never
-//! aged out or deleted to make room. Call from a bounded blocking executor.
+//! Completion requires both a checked protocol summary and durable archive markers
+//! for every received obligation, including older attempts. Bounded reconciliation
+//! compacts only archive-confirmed receipt detail, preserving attempt summaries and
+//! unfinished windows. Call from a bounded blocking executor after archive recovery.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,7 +14,10 @@ use thiserror::Error;
 
 const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
-const MAX_RECEIPTS: i64 = 100_000;
+/// Maximum receipt rows examined in one archive reconciliation transaction.
+pub const MAX_RECEIPT_BATCH: u32 = 256;
+/// Bound unsealed finished uploads before pausing new leases.
+const MAX_AWAITING_DURABILITY: u32 = 2;
 
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
@@ -25,6 +28,9 @@ pub enum LedgerError {
     /// Filesystem accounting failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Archive/index failure; no receipt or job completion is inferred.
+    #[error(transparent)]
+    Archive(#[from] crate::Error),
     /// Invalid input or an incompatible database.
     #[error("invalid ledger input: {0}")]
     Invalid(&'static str),
@@ -41,7 +47,9 @@ pub enum LedgerError {
 pub struct LedgerLimits {
     /// Includes split parents; no automatic history deletion.
     pub max_jobs: u32,
-    /// Checked before mutations and before commit, including WAL, shared memory,
+    /// Retained, not-yet-archive-confirmed receipt rows across all attempts.
+    pub max_receipts: u32,
+    /// Checked for admissions, including WAL, shared memory,
     /// and a write reserve. This is an admission ceiling, not a filesystem quota:
     /// SQLite can allocate additional pages during commit or rollback.
     pub max_bytes: u64,
@@ -51,18 +59,23 @@ impl Default for LedgerLimits {
     fn default() -> Self {
         Self {
             max_jobs: 100_000,
+            max_receipts: 100_000,
             max_bytes: 1024 * 1024 * 1024,
         }
     }
 }
 
-/// Persisted nonterminal states. No worker message can declare completion yet.
+/// Persisted job states. Only archive reconciliation can declare completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     /// Eligible for a future lease.
     Queued,
     /// A single worker owns an expiring attempt.
     Leased,
+    /// Protocol finished; local archive durability is still outstanding.
+    AwaitingDurability,
+    /// Protocol and every retained receipt (or both split children) are durable.
+    Complete,
     /// The same window remains due after backoff.
     RetryWait,
     /// A one-second window cannot be subdivided; operator attention required.
@@ -149,7 +162,8 @@ pub enum SplitOutcome {
     Blocked,
 }
 
-/// SQLite WAL/FULL ledger. It does not open the archive, RocksDB or any relay.
+/// SQLite WAL/FULL ledger. Borrows the ingester's archive authority for completion;
+/// never opens a second RocksDB handle or connects to a relay.
 pub struct JobLedger {
     db: Connection,
     path: PathBuf,
@@ -161,6 +175,7 @@ impl JobLedger {
     /// Limits are runtime policy: an operator may raise them after capacity review.
     pub fn open(path: &Path, limits: LedgerLimits) -> Result<Self, LedgerError> {
         if limits.max_jobs == 0
+            || limits.max_receipts == 0
             || limits.max_bytes < 4 * WRITE_RESERVE
             || limits.max_bytes > i64::MAX as u64
         {
@@ -186,9 +201,10 @@ impl JobLedger {
                     tx.execute_batch("CREATE TABLE jobs (
                             id INTEGER PRIMARY KEY, sweep TEXT NOT NULL, relay TEXT NOT NULL,
                             since INTEGER NOT NULL CHECK(since>=0), until INTEGER NOT NULL CHECK(until>=since),
-                            parent INTEGER REFERENCES jobs(id), state TEXT NOT NULL CHECK(state IN ('queued','leased','retry_wait','blocked','split')),
+                            parent INTEGER REFERENCES jobs(id), state TEXT NOT NULL CHECK(state IN ('queued','leased','awaiting_durability','complete','retry_wait','blocked','split')),
                             attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt>=0), token BLOB, expires_at INTEGER,
                             next_eligible INTEGER NOT NULL DEFAULT 0, reason TEXT,
+                            scan_attempt INTEGER NOT NULL DEFAULT 0, scan_sequence INTEGER NOT NULL DEFAULT 0,
                             UNIQUE(sweep,relay,since,until),
                             CHECK((state='leased' AND token IS NOT NULL AND typeof(token)='blob' AND length(token)=32 AND expires_at IS NOT NULL) OR (state!='leased' AND token IS NULL AND expires_at IS NULL))
                         );
@@ -199,6 +215,7 @@ impl JobLedger {
                         job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
                         received INTEGER NOT NULL, bytes INTEGER NOT NULL, digest BLOB NOT NULL,
                         protocol_done INTEGER NOT NULL DEFAULT 0,
+                        archived INTEGER NOT NULL DEFAULT 0 CHECK(archived>=0 AND archived<=received),
                         PRIMARY KEY(job,attempt)
                     );
                     CREATE TABLE receipts (
@@ -214,10 +231,10 @@ impl JobLedger {
                     );
                     INSERT INTO receipt_totals VALUES(1,0);")?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-                    tx.pragma_update(None, "user_version", 2)?;
+                    tx.pragma_update(None, "user_version", 3)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 2) => {}
+                (APPLICATION_ID, 3) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -272,7 +289,8 @@ impl JobLedger {
         Ok(job)
     }
 
-    /// Lease the oldest eligible job. An active lease blocks all other leases.
+    /// Lease the oldest eligible job. An active lease or two jobs awaiting archive
+    /// durability block new leases.
     /// Expired work must first be moved to retry via `expire`; never stolen.
     pub fn lease_next(&mut self, now: i64, ttl_secs: u32) -> Result<Option<Lease>, LedgerError> {
         let expiry = now
@@ -288,6 +306,14 @@ impl JobLedger {
             |r| r.get(0),
         )?;
         if active {
+            return Ok(None);
+        }
+        let awaiting: u32 = tx.query_row(
+            "SELECT count(*) FROM jobs WHERE state='awaiting_durability'",
+            [],
+            |r| r.get(0),
+        )?;
+        if awaiting >= MAX_AWAITING_DURABILITY {
             return Ok(None);
         }
         let id=tx.query_row("SELECT id FROM jobs WHERE state IN ('queued','retry_wait') AND next_eligible<=?1 ORDER BY id LIMIT 1",[now],|r|r.get::<_,i64>(0)).optional()?;
@@ -437,7 +463,7 @@ impl JobLedger {
             [],
             |r| r.get(0),
         )?;
-        if count >= MAX_RECEIPTS {
+        if count >= i64::from(self.limits.max_receipts) {
             return Err(LedgerError::Budget);
         }
         let digest = super::ipc::extend_digest(progress.digest, received.frame_digest);
@@ -492,11 +518,162 @@ impl JobLedger {
              ON CONFLICT(job,attempt) DO UPDATE SET protocol_done=1",
             params![lease.job.id, lease.job.attempt, digest.as_slice()],
         )?;
+        tx.execute(
+            "UPDATE jobs SET state='awaiting_durability',token=NULL,expires_at=NULL WHERE id=?1",
+            [lease.job.id],
+        )?;
         commit(tx, &self.path, self.limits)
+    }
+
+    /// Inspect at most `limit` retained receipts against the *same* durable index
+    /// used by `writer`. The caller must finish startup recovery before calling.
+    /// Never accepts worker-provided booleans or pending dedupe as archive proof.
+    ///
+    /// A persisted keyset cursor wraps, so one missing early event cannot starve
+    /// later receipts. Confirmed IDs are removed atomically with archived counters;
+    /// count/bytes/digest/protocol summaries and all unresolved IDs remain durable.
+    /// Recovery/compaction bypass admission ceilings, but actual I/O errors roll
+    /// back. No live attempt is compacted. This does not perform network recovery.
+    /// Continue periodic checks until complete; zero satisfied rows means only
+    /// that this batch has no new durable evidence, not that polling should stop.
+    pub fn reconcile_archived(
+        &mut self,
+        job: i64,
+        dedupe: &crate::DedupeIndex,
+        writer: &crate::SegmentWriter,
+        limit: u32,
+    ) -> Result<ReceiptReconciliation, LedgerError> {
+        if limit == 0 || limit > MAX_RECEIPT_BATCH || writer.recovery_required() {
+            return Err(LedgerError::Invalid(
+                "invalid receipt batch or archive recovery required",
+            ));
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if read_job(&tx, job)?.state == JobState::Leased {
+            return Err(LedgerError::Invalid("upload still active"));
+        }
+        let (after_attempt, after_sequence): (i64, i64) = tx.query_row(
+            "SELECT scan_attempt,scan_sequence FROM jobs WHERE id=?1",
+            [job],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let rows = {
+            let mut query = tx.prepare(
+                "SELECT attempt,sequence,event_id FROM receipts WHERE job=?1
+                 AND (attempt,sequence)>(?2,?3) ORDER BY attempt,sequence LIMIT ?4",
+            )?;
+            query
+                .query_map(params![job, after_attempt, after_sequence, limit], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, [u8; 32]>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut satisfied = 0;
+        for (attempt, sequence, event_id) in &rows {
+            if dedupe.get_status(event_id)? == Some(crate::EventStatus::Archived) {
+                tx.execute(
+                    "DELETE FROM receipts WHERE job=?1 AND attempt=?2 AND sequence=?3",
+                    params![job, attempt, sequence],
+                )?;
+                tx.execute(
+                    "UPDATE attempts SET archived=archived+1 WHERE job=?1 AND attempt=?2",
+                    params![job, attempt],
+                )?;
+                satisfied += 1;
+            }
+        }
+        let (next_attempt, next_sequence) = match rows.last() {
+            Some(row) if rows.len() == limit as usize => (row.0, row.1),
+            _ => (0, 0),
+        };
+        tx.execute(
+            "UPDATE jobs SET scan_attempt=?2,scan_sequence=?3 WHERE id=?1",
+            params![job, next_attempt, next_sequence],
+        )?;
+        tx.execute(
+            "UPDATE receipt_totals SET retained=retained-?1 WHERE singleton=1",
+            [satisfied],
+        )?;
+        complete_if_durable(&tx, job)?;
+        let complete = read_job(&tx, job)?.state == JobState::Complete;
+        if writer.recovery_required() {
+            return Err(LedgerError::Invalid("archive recovery required"));
+        }
+        tx.commit()?;
+        Ok(ReceiptReconciliation {
+            checked: rows.len() as u32,
+            satisfied,
+            complete,
+        })
+    }
+
+    /// Explicit parent recovery when a finished upload cannot reach durability.
+    /// Preserves every receipt and retries the same interval with a new capability.
+    /// The attempt number fences stale recovery decisions. Not a worker message.
+    pub fn retry_durability(
+        &mut self,
+        job: i64,
+        attempt: i64,
+        now: i64,
+        delay_secs: u32,
+    ) -> Result<(), LedgerError> {
+        let due = retry_due(now, delay_secs)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_job(&tx, job)?;
+        if current.state != JobState::AwaitingDurability || current.attempt != attempt {
+            return Err(LedgerError::StaleLease);
+        }
+        retry_job(&tx, job, due, "durability_retry")?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
-/// Received-frame accounting, explicitly not a durable archive receipt.
+/// Result of one bounded reconciliation call; checked rows can still be missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptReconciliation {
+    /// Durable-index lookups performed, bounded by the caller's batch limit.
+    pub checked: u32,
+    /// Archive-confirmed rows atomically compacted into their attempt summaries.
+    pub satisfied: u32,
+    /// This job is durably complete, not merely protocol-complete.
+    pub complete: bool,
+}
+
+fn complete_if_durable(tx: &Transaction<'_>, mut job: i64) -> Result<(), LedgerError> {
+    // An i64-second inclusive interval can split at most 63 times. Bound parent
+    // propagation even in the presence of an invalid externally edited database.
+    for _ in 0..=63 {
+        let changed = tx.execute(
+            "UPDATE jobs SET state='complete',reason=NULL WHERE id=?1
+             AND NOT EXISTS(SELECT 1 FROM receipts WHERE job=?1)
+             AND ((state='awaiting_durability' AND EXISTS(
+                 SELECT 1 FROM attempts WHERE job=?1 AND attempt=jobs.attempt
+                 AND protocol_done=1 AND archived=received))
+               OR (state='split' AND (SELECT count(*) FROM jobs child WHERE child.parent=?1)=2
+                 AND NOT EXISTS(SELECT 1 FROM jobs child WHERE child.parent=?1 AND child.state!='complete')))",
+            [job],
+        )?;
+        if changed == 0 {
+            break;
+        }
+        match read_job(tx, job)?.parent {
+            Some(parent) => job = parent,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Received-frame accounting and separately archive-confirmed frame totals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptProgress {
     /// Event frames durably registered, including duplicate event IDs.
@@ -507,6 +684,9 @@ pub struct AttemptProgress {
     pub digest: [u8; 32],
     /// The worker's final count and digest matched; not job completion.
     pub protocol_done: bool,
+    /// Received frames independently confirmed by durable archive markers.
+    /// Duplicate IDs count per received frame, not as novel archived events.
+    pub archived: u64,
 }
 
 fn attempt_progress(
@@ -516,7 +696,7 @@ fn attempt_progress(
 ) -> Result<AttemptProgress, LedgerError> {
     Ok(db
         .query_row(
-            "SELECT received,bytes,digest,protocol_done FROM attempts WHERE job=?1 AND attempt=?2",
+            "SELECT received,bytes,digest,protocol_done,archived FROM attempts WHERE job=?1 AND attempt=?2",
             params![job, attempt],
             |r| {
                 Ok(AttemptProgress {
@@ -524,6 +704,7 @@ fn attempt_progress(
                     bytes: r.get(1)?,
                     digest: r.get(2)?,
                     protocol_done: r.get(3)?,
+                    archived: r.get(4)?,
                 })
             },
         )
@@ -533,6 +714,7 @@ fn attempt_progress(
             bytes: 0,
             digest: super::ipc::initial_digest(),
             protocol_done: false,
+            archived: 0,
         }))
 }
 
@@ -564,6 +746,7 @@ fn read_job(db: &Connection, id: i64) -> Result<Job, LedgerError> {
         let state=match state.as_str() {
             "queued"=>JobState::Queued,"leased"=>JobState::Leased,"retry_wait"=>JobState::RetryWait,
             "blocked"=>JobState::Blocked,"split"=>JobState::Split,
+            "awaiting_durability"=>JobState::AwaitingDurability,"complete"=>JobState::Complete,
             _=>return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(Job {id:r.get(0)?,sweep:r.get(1)?,relay:r.get(2)?,since:r.get(3)?,until:r.get(4)?,parent:r.get(5)?,state,attempt:r.get(7)?,next_eligible:r.get(8)?,reason:r.get(9)?})
@@ -815,7 +998,34 @@ mod tests {
             )
             .is_ok()
         );
-        db.db.pragma_update(None, "user_version", 3).unwrap();
+        for limits in [
+            LedgerLimits {
+                max_jobs: 0,
+                ..LedgerLimits::default()
+            },
+            LedgerLimits {
+                max_receipts: 0,
+                ..LedgerLimits::default()
+            },
+        ] {
+            assert!(matches!(
+                JobLedger::open(&db.path, limits),
+                Err(LedgerError::Invalid(_))
+            ));
+        }
+        // The previous undeployed receipt schema is not silently reinterpreted.
+        db.db.pragma_update(None, "user_version", 2).unwrap();
+        assert!(matches!(
+            JobLedger::open(&db.path, LedgerLimits::default()),
+            Err(LedgerError::Invalid(_))
+        ));
+        assert_eq!(
+            db.db
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        db.db.pragma_update(None, "user_version", 99).unwrap();
         assert!(matches!(
             JobLedger::open(&db.path, LedgerLimits::default()),
             Err(LedgerError::Invalid(_))
@@ -1049,7 +1259,10 @@ mod tests {
             .unwrap();
         // Seed only the authoritative counter to exercise the admission bound.
         db.db
-            .execute("UPDATE receipt_totals SET retained=?1", [MAX_RECEIPTS])
+            .execute(
+                "UPDATE receipt_totals SET retained=?1",
+                [db.limits.max_receipts],
+            )
             .unwrap();
         // A new attempt must not evade the retained-receipt ceiling.
         db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();

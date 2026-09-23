@@ -1,8 +1,10 @@
 # Isolated reconciliation: bounded upload and received receipts (increment 1b)
 
 Builds on the merged job-ledger foundation from PR #45. This is library code and temporary
-database tests only: **no listener, worker executable, admission wiring, service
+database tests only: **no listener, worker executable, runtime wiring, service
 changes, or production migration**. It does not replace the existing reconciler.
+The stacked [archive consumer increment](negentropy_archive_receipts.md) adds
+`admit_and_accept`, durable completion, and bounded receipt compaction.
 
 ## Implemented boundary
 
@@ -25,8 +27,8 @@ not implemented here. Possession of a header is not proof of Unix peer identity.
   event frames / 64 MiB per attempt. Duplicate event IDs still consume frame and
   byte budgets. These are wire/row limits, not a bound on Rust allocator overhead.
 - A received record commits with FULL SQLite durability **before** the caller
-  receives the candidate for archive admission. Only after establishing admission
-  ownership may the caller request an ordered, single-use Accepted acknowledgement.
+  receives the candidate for archive admission. `admit_and_accept` establishes
+  admission ownership before an ordered, single-use Accepted acknowledgement.
   Returned credit does not reset total attempt budgets. The Accepted value is a
   typed result, not yet a complete parent-to-worker transport implementation.
 
@@ -45,11 +47,10 @@ incompatible prototype databases fail closed without modification. No event payl
 records job/attempt/sequence, event ID, timestamp, framed byte count and frame hash.
 Attempt summaries store count, bytes, digest and whether ProtocolDone matched.
 
-The global retained-receipt limit is 100,000 rows, in addition to existing job and
-SQLite/WAL byte admission ceilings. Historical failed-attempt records are retained.
-Exhaustion pauses mutations; no unresolved receipts are discarded to make room.
-Future verified archival/completion and bounded terminal compaction are required
-before this can run continuously or receive merge approval as a runtime feature.
+The global retained-receipt limit defaults to 100,000 rows, in addition to existing
+job and SQLite/WAL byte admission ceilings. The archive consumer compacts only
+confirmed receipts into durable attempt summaries; missing IDs are retained.
+Exhaustion pauses admission, not recovery; no unresolved receipts are discarded.
 All receipt replay is rejected: errors poison the session and require a fresh
 attempt, including an uncertain commit outcome. A single transaction performs the
 persisted sequence check, receipt insertion, summary and counter update; there is
@@ -64,11 +65,10 @@ not a reserialization. ProtocolDone must match the ordered count/digest and cann
 arrive with outstanding acknowledgements. Empty success explicitly records count
 zero and D0. Failed attempts and EOF never record protocol success.
 
-**ProtocolDone does not complete a job**, even with zero events. The job remains
-leased in this intermediate implementation. Expiry preserves it for retry, along
-with the previous attempt's receipts. There is no archive-confirmed state or
-completion API yet. A crash after receipt commit but before archive admission
-therefore leaves an unresolved obligation, not a claim that data was recovered.
+**ProtocolDone does not complete a job**, even with zero events. It moves the job
+to awaiting durability and fences the upload capability. Only the archive consumer
+can complete it. A crash after receipt commit but before archive admission leaves
+an unresolved obligation, not a claim that data was recovered.
 
 ## Tests and remaining integration gates
 
@@ -81,9 +81,8 @@ The abrupt-process-exit regression now also retains a committed receipt while
 discarding uncommitted changes. Seeded counters/rows exercise large boundaries
 without claiming a 50,000-event throughput or full-disk production test.
 
-Next is the archive integration boundary: receipt satisfaction from durable
-archived markers (never pending dedupe), completion transitions, independent seal
-cadence, and bounded sealed inventory replay. The complete authenticated socket
+The archive consumer adds satisfaction from durable markers and completion.
+Independent seal cadence and bounded sealed inventory replay remain. The complete authenticated socket
 protocol must also add Hello, assignment, inventory chunks/end, cancellation and
 parent response framing before a real worker can run. No live worker, success
 metric, listener or deployment should be enabled on this intermediate library.

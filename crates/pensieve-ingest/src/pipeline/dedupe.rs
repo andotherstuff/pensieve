@@ -20,7 +20,7 @@
 use crate::Result;
 use parking_lot::Mutex;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -70,7 +70,8 @@ pub struct DedupeIndex {
     ///
     /// The mutex also serializes check-and-mark so two sources (live and negentropy)
     /// cannot both claim the same novel event ID.
-    pending: Mutex<HashSet<[u8; 32]>>,
+    // false = revocable reservation; true = retained archive obligation.
+    pending: Mutex<HashMap<[u8; 32], bool>>,
 }
 
 /// An exclusive in-memory admission claim, released on pre-admission failure.
@@ -86,6 +87,9 @@ pub struct PendingAdmission<'a> {
 impl PendingAdmission<'_> {
     /// Transfer ownership to the archive writer until durable segment sealing.
     pub fn retain(mut self) {
+        if let Some(owned) = self.index.pending.lock().get_mut(&self.event_id) {
+            *owned = true;
+        }
         self.retained = true;
     }
 }
@@ -109,6 +113,37 @@ impl DedupeIndex {
                 event_id: *event_id,
                 retained: false,
             }))
+    }
+
+    /// Re-admit a legacy on-disk Pending ID without deleting or trusting its marker.
+    ///
+    /// Only use after the archive startup recovery gate. Shares the live admission
+    /// mutex, so a concurrent source cannot acquire the same ID. A new durable seal
+    /// overwrites Pending with Archived; pre-admission failure leaves it retryable.
+    /// This may preserve a duplicate archive copy, never invent archive proof.
+    pub fn reserve_unarchived(&self, event_id: &[u8; 32]) -> Result<Option<PendingAdmission<'_>>> {
+        let mut pending = self.pending.lock();
+        if self.get_status(event_id)? == Some(EventStatus::Archived)
+            || pending.contains_key(event_id)
+        {
+            return Ok(None);
+        }
+        pending.insert(*event_id, false);
+        Ok(Some(PendingAdmission {
+            index: self,
+            event_id: *event_id,
+            retained: false,
+        }))
+    }
+
+    /// Whether bytes have a non-revocable archive owner (not merely a reservation).
+    ///
+    /// A retained claim is still not durability proof. Only Archived satisfies
+    /// completion; a failed writer preserves retained claims behind its recovery gate.
+    pub fn has_archive_owner(&self, event_id: &[u8; 32]) -> Result<bool> {
+        let pending = self.pending.lock();
+        Ok(pending.get(event_id) == Some(&true)
+            || self.get_status(event_id)? == Some(EventStatus::Archived))
     }
     /// Open or create a dedupe index at the given path.
     ///
@@ -157,7 +192,7 @@ impl DedupeIndex {
 
         Ok(Self {
             db: Arc::new(db),
-            pending: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,7 +222,7 @@ impl DedupeIndex {
     /// Uses bloom filters for fast rejection of seen events.
     pub fn is_new(&self, event_id: &[u8; 32]) -> Result<bool> {
         // An event is "not new" if it's either durably on disk or currently in-flight.
-        if self.pending.lock().contains(event_id) {
+        if self.pending.lock().contains_key(event_id) {
             return Ok(false);
         }
         Ok(self.get_status(event_id)?.is_none())
@@ -215,8 +250,13 @@ impl DedupeIndex {
 
         // Claim it in-flight. This is in memory only and becomes a durable
         // `Archived` entry when the segment is sealed (see `mark_archived`).
-        // `insert` returns false if another source already claimed it this run.
-        Ok(pending.insert(*event_id))
+        match pending.entry(*event_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(false);
+                Ok(true)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+        }
     }
 
     /// Mark multiple events as archived (batch operation).
