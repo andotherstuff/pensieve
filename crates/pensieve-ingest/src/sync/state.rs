@@ -108,9 +108,16 @@ impl SyncStateDb {
         let start = Self::make_key(since, &[0; 32]);
         let end = Self::make_key(until, &[u8::MAX; 32]);
         let mut items = Vec::new();
+        // This range crosses timestamp prefixes. Do not depend on the current
+        // bloom-filter/memtable configuration for complete cross-prefix reads.
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_total_order_seek(true);
         for (examined, item) in self
             .db
-            .iterator(IteratorMode::From(&start, rocksdb::Direction::Forward))
+            .iterator_opt(
+                IteratorMode::From(&start, rocksdb::Direction::Forward),
+                options,
+            )
             .enumerate()
         {
             let (key, _) = item?;

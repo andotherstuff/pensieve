@@ -25,6 +25,15 @@ completed segment. Gzip decoding checks all members and the stream trailer. Deco
 object overhead is not claimed to equal the wire-byte limit. There is no hard
 wall-clock deadline on a blocking disk call.
 
+Runtime integration must distinguish a seal still in progress from corruption:
+the final filename is visible before the writer finishes marking IDs Archived.
+A missing marker leaves the cursor unchanged; it is not permission to skip the
+segment. Before enabling replay, bind its directory/prefix to the actual writer
+and add a retryable seal-in-progress outcome. Persistent missing markers after
+sealing completes must remain an actionable fault, not an infinite silent retry.
+Cursor identity changes also require an explicit operator repair path before
+activation; do not delete the inventory database to fix a mistyped floor/path.
+
 Valid partial batches may enter inventory before segment completion. They are
 safe, incomplete inventory, not coverage. On EOF the inventory WAL is synchronized
 **before** a synchronous cursor update. Crash before that update repeats the same
