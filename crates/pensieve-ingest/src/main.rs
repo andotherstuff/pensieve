@@ -32,6 +32,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server_with_archive_health};
+use pensieve_ingest::pipeline::ArchiveSealTimer;
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
     NegentropySyncer, ParquetShadowConfig, ParquetShadowPublisher, RelayManager,
@@ -218,16 +219,27 @@ struct Args {
     )]
     parquet_shadow_max_event_bytes: usize,
 
-    /// Maximum age of an open live batch while the Parquet shadow is enabled.
-    ///
-    /// The timer force-seals the authoritative notepack segment; the resulting
-    /// sealed file is then the durable Parquet work unit. Zero disables the timer.
+    /// Request this seal cadence while the Parquet shadow is active.
+    /// The effective interval is the minimum positive value of this and
+    /// --archive-seal-interval-secs (default 300). Zero withdraws this request;
+    /// it does not disable the independent archive cadence.
     #[arg(
         long,
         env = "PENSIEVE_PARQUET_SHADOW_MAX_BATCH_AGE_SECS",
         default_value = "300"
     )]
     parquet_shadow_max_batch_age_secs: u64,
+
+    /// Periodically seal the authoritative archive, independently of Parquet.
+    /// Zero withdraws this request; an active shadow can still request sealing.
+    /// Set both cadence flags to zero to disable periodic sealing entirely.
+    /// Isolated reconciliation requires a nonzero effective cadence.
+    #[arg(
+        long,
+        env = "PENSIEVE_ARCHIVE_SEAL_INTERVAL_SECS",
+        default_value = "300"
+    )]
+    archive_seal_interval_secs: u64,
 
     /// Replay only sealed segment numbers at or above this inclusive floor.
     ///
@@ -476,12 +488,12 @@ async fn main() -> Result<()> {
 
     // Initialize pipeline components
     let (segment_writer, dedupe, indexer_handle, parquet_shadow_handle) = init_pipeline(&args)?;
-    let parquet_batch_timer = start_parquet_batch_timer(
-        &args,
-        parquet_shadow_handle.is_some(),
-        Arc::clone(&segment_writer),
-        Arc::clone(&running),
-    );
+    let archive_seal_timer = archive_seal_interval(&args, parquet_shadow_handle.is_some())
+        .map(|interval| {
+            ArchiveSealTimer::start(interval, Arc::clone(&segment_writer), Arc::clone(&running))
+        })
+        .transpose()
+        .context("Failed to start archive seal timer")?;
 
     // Initialize relay manager for quality tracking
     let relay_manager_config = RelayManagerConfig {
@@ -1267,9 +1279,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(handle) = parquet_batch_timer {
-        handle.abort();
-        let _ = handle.await;
+    if let Some(timer) = archive_seal_timer {
+        tokio::task::spawn_blocking(move || timer.shutdown())
+            .await
+            .context("archive seal timer join task failed")?
+            .map_err(|_| anyhow::anyhow!("archive seal timer panicked"))?;
     }
 
     // Seal final segment. Its events are marked archived inside seal() now (the
@@ -1576,43 +1590,50 @@ fn start_optional_parquet_shadow(
     }
 }
 
-fn start_parquet_batch_timer(
-    args: &Args,
-    parquet_shadow_active: bool,
-    segment_writer: Arc<SegmentWriter>,
-    running: Arc<AtomicBool>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !parquet_shadow_active || args.parquet_shadow_max_batch_age_secs == 0 {
-        return None;
-    }
-    let interval = Duration::from_secs(args.parquet_shadow_max_batch_age_secs);
-    Some(tokio::spawn(async move {
-        let start = tokio::time::Instant::now() + interval;
-        let mut timer = tokio::time::interval_at(start, interval);
-        while running.load(Ordering::SeqCst) {
-            timer.tick().await;
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-            match segment_writer.seal() {
-                Ok(Some(sealed)) => tracing::info!(
-                    segment_number = sealed.segment_number,
-                    event_count = sealed.event_count,
-                    "force-sealed live batch at Parquet shadow maximum age"
-                ),
-                Ok(None) => {}
-                Err(error) => tracing::error!(
-                    error = %compact_error(&error),
-                    "failed to force-seal live batch for Parquet shadow"
-                ),
-            }
-        }
-    }))
+fn archive_seal_interval(args: &Args, parquet_shadow_active: bool) -> Option<Duration> {
+    [
+        args.archive_seal_interval_secs,
+        if parquet_shadow_active {
+            args.parquet_shadow_max_batch_age_secs
+        } else {
+            0
+        },
+    ]
+    .into_iter()
+    .filter(|secs| *secs > 0)
+    .min()
+    .map(Duration::from_secs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_cadence_is_independent_of_optional_shadow() {
+        let mut args = Args::try_parse_from(["pensieve-ingest"]).unwrap();
+        assert_eq!(
+            archive_seal_interval(&args, false),
+            Some(Duration::from_secs(300))
+        );
+        args.parquet_shadow_max_batch_age_secs = 60;
+        assert_eq!(
+            archive_seal_interval(&args, true),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            archive_seal_interval(&args, false),
+            Some(Duration::from_secs(300))
+        );
+        args.archive_seal_interval_secs = 0;
+        assert_eq!(archive_seal_interval(&args, false), None);
+        assert_eq!(
+            archive_seal_interval(&args, true),
+            Some(Duration::from_secs(60))
+        );
+        args.parquet_shadow_max_batch_age_secs = 0;
+        assert_eq!(archive_seal_interval(&args, true), None);
+    }
 
     #[tokio::test]
     async fn recovery_wait_is_resident_until_explicit_shutdown() {

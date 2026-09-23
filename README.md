@@ -79,6 +79,15 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 - Optional Parquet shadow publication from durably sealed notepack work units
 - Graceful shutdown on Ctrl+C
 
+Live archive segments are periodically sealed independently of Parquet. Configure
+`--archive-seal-interval-secs` / `PENSIEVE_ARCHIVE_SEAL_INTERVAL_SECS` (default 300).
+Zero disables this archive timer. An active Parquet shadow's nonzero
+`PENSIEVE_PARQUET_SHADOW_MAX_BATCH_AGE_SECS` can request a shorter cadence; disabling
+that legacy timer alone no longer disables archive sealing. Set both to zero to
+disable periodic sealing entirely (not suitable for isolated reconciliation).
+The timer performs one synchronous seal at a time and is joined at shutdown;
+its cadence is not a hard wall-clock bound on slow disk operations.
+
 **Options:**
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -90,6 +99,7 @@ Connect to Nostr relays via WebSocket and stream events in real-time. Includes a
 | `--max-relays` | `30` | Maximum concurrent relay connections |
 | `--no-discovery` | `false` | Disable NIP-65 relay discovery |
 | `--segment-size` | `268435456` | Max segment size before sealing (256MB) |
+| `--archive-seal-interval-secs` | `300` | Archive seal cadence independent of Parquet; zero withdraws this cadence request |
 | `--no-compress` | `false` | Disable gzip compression |
 | `--metrics-port` | `9091` | Prometheus metrics port (0 to disable) |
 | `--relay-db-path` | `./data/relay-stats.db` | SQLite path for relay quality tracking |
