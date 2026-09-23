@@ -34,14 +34,16 @@ prerequisite.
 Default admission limits are 100,000 rows (including split parents) and 1 GiB.
 The byte check accounts for database/WAL/shared-memory files, allocated blocks
 on Unix, logical database pages, and a 64 KiB write reserve. WAL auto-checkpoint
-is set to 16 pages. Limits are persisted; reopening with different limits or an
-unsupported schema fails closed.
+is set to 16 pages. Limits are runtime policy; after checking available capacity,
+an operator can reopen with larger limits without deleting existing obligations.
+An unsupported schema fails closed.
 
 The byte limit is **not a hard filesystem quota**. SQLite can allocate pages
 during commit or rollback. Deployment still needs free-space preflight,
 monitoring, and process/filesystem limits. Exceeding the admission ceiling
-rejects mutations, including lease recovery, while retaining existing jobs for
-inspection and recovery after capacity is restored. No automatic pruning,
+rejects new admissions and leases, while retry/expiry can still release an old
+lease. Those writes may still fail on an actually full filesystem. Existing jobs
+remain available for inspection and recovery. No automatic pruning,
 vacuum, or unresolved-job deletion is provided.
 
 Database errors roll back the transaction where SQLite permits rollback. A

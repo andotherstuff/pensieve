@@ -154,7 +154,7 @@ pub struct JobLedger {
 
 impl JobLedger {
     /// Open or initialize a dedicated ledger. Parent directory must exist.
-    /// Different limits require an explicit future migration, not silent drift.
+    /// Limits are runtime policy: an operator may raise them after capacity review.
     pub fn open(path: &Path, limits: LedgerLimits) -> Result<Self, LedgerError> {
         if limits.max_jobs == 0
             || limits.max_bytes < 4 * WRITE_RESERVE
@@ -179,8 +179,7 @@ impl JobLedger {
                     if tables != 0 {
                         return Err(LedgerError::Invalid("database is not an empty ledger"));
                     }
-                    tx.execute_batch("CREATE TABLE settings (singleton INTEGER PRIMARY KEY CHECK(singleton=1), max_jobs INTEGER NOT NULL, max_bytes INTEGER NOT NULL);
-                        CREATE TABLE jobs (
+                    tx.execute_batch("CREATE TABLE jobs (
                             id INTEGER PRIMARY KEY, sweep TEXT NOT NULL, relay TEXT NOT NULL,
                             since INTEGER NOT NULL CHECK(since>=0), until INTEGER NOT NULL CHECK(until>=since),
                             parent INTEGER REFERENCES jobs(id), state TEXT NOT NULL CHECK(state IN ('queued','leased','retry_wait','blocked','split')),
@@ -192,23 +191,11 @@ impl JobLedger {
                         CREATE UNIQUE INDEX one_active_lease ON jobs(state) WHERE state='leased';
                         CREATE INDEX due_jobs ON jobs(state,next_eligible,id);
                         CREATE INDEX child_jobs ON jobs(parent);")?;
-                    tx.execute(
-                        "INSERT INTO settings VALUES (1,?1,?2)",
-                        params![limits.max_jobs, limits.max_bytes as i64],
-                    )?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                     tx.pragma_update(None, "user_version", 1)?;
                 }
                 (APPLICATION_ID, 1) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
-            }
-            let saved: (u32, i64) = tx.query_row(
-                "SELECT max_jobs,max_bytes FROM settings WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            if saved != (limits.max_jobs, limits.max_bytes as i64) {
-                return Err(LedgerError::Invalid("ledger limits differ"));
             }
             tx.commit()?;
         }
@@ -315,9 +302,12 @@ impl JobLedger {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_lease(&tx, lease, now)?;
-        check_budget(&tx, &self.path, self.limits, 0)?;
         retry_job(&tx, lease.job.id, due, reason.label())?;
-        commit(tx, &self.path, self.limits)
+        // Recovery releases ownership without admitting new work. SQLite may
+        // still fail on a genuinely full filesystem; an admission ceiling alone
+        // must not make this durable obligation impossible to recover.
+        tx.commit()?;
+        Ok(())
     }
 
     /// Recover a lost/expired worker after restart. Does not delete its window or
@@ -335,9 +325,8 @@ impl JobLedger {
             )
             .optional()?;
         let Some(id) = id else { return Ok(false) };
-        check_budget(&tx, &self.path, self.limits, 0)?;
         retry_job(&tx, id, due, RetryReason::WorkerLost.label())?;
-        commit(tx, &self.path, self.limits)?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -617,21 +606,24 @@ mod tests {
         let lease = db.lease_next(10, 60).unwrap().unwrap();
         assert!(matches!(db.split(&lease, 11), Err(LedgerError::Budget)));
         assert_eq!(db.get(job.id).unwrap().state, JobState::Leased);
-        // Inject a smaller admission ceiling, not a full filesystem. Production
-        // limits are persisted and cannot silently change on reopen.
+        // Admission limits are not a full filesystem: recovery remains possible.
         db.limits.max_bytes = file_bytes(&db.path).unwrap();
-        assert!(matches!(
-            db.retry(&lease, 11, 60, RetryReason::Cancelled),
-            Err(LedgerError::Budget)
-        ));
+        db.retry(&lease, 11, 60, RetryReason::Cancelled).unwrap();
         assert!(matches!(
             db.enqueue("s", RELAY, 10, 19),
             Err(LedgerError::Budget)
         ));
-        assert_eq!(db.get(job.id).unwrap().state, JobState::Leased);
+        assert_eq!(db.get(job.id).unwrap().state, JobState::RetryWait);
         drop(db);
-        let db = JobLedger::open(&dir.path().join("jobs.sqlite"), limits).unwrap();
-        assert_eq!(db.get(job.id).unwrap().state, JobState::Leased);
+        let mut db = JobLedger::open(&dir.path().join("jobs.sqlite"), limits).unwrap();
+        let lease = db.lease_next(71, 60).unwrap().unwrap();
+        db.limits.max_bytes = file_bytes(&db.path).unwrap();
+        assert!(db.expire(lease.expires_at(), 60).unwrap());
+        assert_eq!(db.get(job.id).unwrap().state, JobState::RetryWait);
+        assert!(matches!(db.lease_next(191, 60), Err(LedgerError::Budget)));
+        drop(db);
+        let mut db = ledger(&dir);
+        assert_eq!(db.lease_next(191, 60).unwrap().unwrap().job.id, job.id);
     }
 
     #[test]
@@ -650,16 +642,16 @@ mod tests {
                 Err(LedgerError::Invalid(_))
             ));
         }
-        assert!(matches!(
+        assert!(
             JobLedger::open(
                 &db.path,
                 LedgerLimits {
                     max_jobs: 1,
                     ..LedgerLimits::default()
                 }
-            ),
-            Err(LedgerError::Invalid(_))
-        ));
+            )
+            .is_ok()
+        );
         db.db.pragma_update(None, "user_version", 2).unwrap();
         assert!(matches!(
             JobLedger::open(&db.path, LedgerLimits::default()),
