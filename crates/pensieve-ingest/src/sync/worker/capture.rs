@@ -91,6 +91,12 @@ impl Capture {
             return Err(WorkerError::Incomplete);
         }
         crate::pipeline::validate_archive_event(event).map_err(|_| WorkerError::Incomplete)?;
+        // The SDK can call save_event repeatedly for the same verified event.
+        // Retransmissions are not novel volume and consume no upload budget.
+        if state.ids.contains(&event.id) {
+            state.failed = false;
+            return Ok(());
+        }
         let sequence = state.count + 1;
         let wire = Frame::encode(&Message::Event {
             header: Header {
@@ -106,9 +112,12 @@ impl Capture {
             }
             other => WorkerError::Protocol(other),
         })?;
-        if state.count >= ipc::MAX_EVENTS
-            || state.bytes + wire.len() as u64 > ipc::MAX_ATTEMPT_BYTES
-        {
+        // The diff is already capped at MAX_EVENTS. More distinct callbacks
+        // cannot prove an honest dense window; do not turn them into a split.
+        if state.count >= ipc::MAX_EVENTS {
+            return Err(WorkerError::Incomplete);
+        }
+        if state.bytes + wire.len() as u64 > ipc::MAX_ATTEMPT_BYTES {
             state.rejection = Some(Rejection::Volume);
             return Err(WorkerError::Volume);
         }
@@ -139,39 +148,25 @@ impl Capture {
         Ok(())
     }
 
-    pub async fn finish(
+    pub async fn finish_download(
         &self,
-        result: Option<&DownloadProof>,
+        result: Result<DownloadProof, WorkerError>,
     ) -> Result<(u64, [u8; 32]), WorkerError> {
         let mut state = self.state.lock().await;
         state.sender.take();
         if let Some(reason) = state.rejection {
             return Err(reason.error());
         }
-        let result = result.ok_or(WorkerError::Incomplete)?;
-        if state.failed
-            || !result.remote.is_subset(&result.received)
-            || !result.remote.is_subset(&state.ids)
-        {
+        if state.failed {
+            return Err(WorkerError::Incomplete);
+        }
+        // A rejected/cancelled callback is sticky even when the SDK suppresses
+        // its notification and the fetch subsequently reports EOSE missing IDs.
+        let result = result?;
+        if !result.remote.is_subset(&result.received) || !result.remote.is_subset(&state.ids) {
             return Err(WorkerError::Incomplete);
         }
         Ok((state.count, state.digest))
-    }
-
-    pub async fn finish_download(
-        &self,
-        result: Result<DownloadProof, WorkerError>,
-    ) -> Result<(u64, [u8; 32]), WorkerError> {
-        let summary = self.finish(result.as_ref().ok()).await;
-        // The SDK suppresses the notification when our callback rejects an event.
-        // Preserve the first verified local cause instead of losing it to EOSE.
-        match summary {
-            Err(error @ (WorkerError::Volume | WorkerError::EventSize)) => Err(error),
-            summary => {
-                result?;
-                summary
-            }
-        }
     }
 }
 
@@ -255,20 +250,25 @@ mod tests {
             } else {
                 capture.state.lock().await.bytes = ipc::MAX_ATTEMPT_BYTES;
             }
-            assert!(matches!(
-                capture.capture(&event).await,
-                Err(WorkerError::Volume)
-            ));
+            let expected = if by_count { 1 } else { 3 };
+            assert_eq!(
+                capture.capture(&event).await.unwrap_err().exit_code(),
+                expected
+            );
             let mut invalid = event;
             invalid.content.push('x');
-            assert!(matches!(
-                capture.capture(&invalid).await,
-                Err(WorkerError::Volume)
-            ));
-            assert!(matches!(
-                capture.finish_download(Err(WorkerError::Unavailable)).await,
-                Err(WorkerError::Volume)
-            ));
+            assert_eq!(
+                capture.capture(&invalid).await.unwrap_err().exit_code(),
+                expected
+            );
+            assert_eq!(
+                capture
+                    .finish_download(Err(WorkerError::Unavailable))
+                    .await
+                    .unwrap_err()
+                    .exit_code(),
+                expected
+            );
             assert!(receiver.recv().await.is_none());
         }
         let (capture, mut receiver, _) = fixture();
@@ -298,7 +298,7 @@ mod tests {
         ));
         assert!(matches!(
             capture.finish_download(Err(WorkerError::Unavailable)).await,
-            Err(WorkerError::Unavailable)
+            Err(WorkerError::Incomplete)
         ));
         assert_eq!(WorkerError::Unavailable.exit_code(), 2);
         assert_eq!(WorkerError::Volume.exit_code(), 3);
@@ -310,8 +310,12 @@ mod tests {
     #[tokio::test]
     async fn full_queue_backpressures_and_cancelled_callback_is_sticky() {
         let (capture, mut receiver, event) = fixture();
-        for _ in 0..ipc::MAX_IN_FLIGHT_EVENTS - 1 {
-            capture.capture(&event).await.unwrap();
+        for n in 0..ipc::MAX_IN_FLIGHT_EVENTS - 1 {
+            let unique = EventBuilder::new(Kind::TextNote, n.to_string())
+                .custom_created_at(Timestamp::from(150))
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            capture.capture(&unique).await.unwrap();
         }
         assert!(
             tokio::time::timeout(
@@ -325,7 +329,7 @@ mod tests {
         assert!(capture.capture(&event).await.is_err());
         assert!(
             capture
-                .finish(Some(&DownloadProof::default()))
+                .finish_download(Ok(DownloadProof::default()))
                 .await
                 .is_err()
         );
@@ -344,7 +348,10 @@ mod tests {
             remote: HashSet::from([event.id]),
             received: HashSet::from([event.id]),
         };
-        assert_eq!(capture.finish(Some(&result)).await.unwrap(), (1, expected));
+        assert_eq!(
+            capture.finish_download(Ok(result)).await.unwrap(),
+            (1, expected)
+        );
         assert!(capture.capture(&event).await.is_err());
         for fetched in [false, true] {
             let (capture, _receiver, event) = fixture();
@@ -353,12 +360,12 @@ mod tests {
             if fetched {
                 result.received.insert(event.id);
             }
-            assert!(capture.finish(Some(&result)).await.is_err());
+            assert!(capture.finish_download(Ok(result)).await.is_err());
         }
         let (capture, _receiver, _) = fixture();
         assert_eq!(
             capture
-                .finish(Some(&DownloadProof::default()))
+                .finish_download(Ok(DownloadProof::default()))
                 .await
                 .unwrap(),
             (0, ipc::initial_digest())
@@ -404,10 +411,30 @@ mod tests {
             ));
             assert!(
                 capture
-                    .finish(Some(&DownloadProof::default()))
+                    .finish_download(Ok(DownloadProof::default()))
                     .await
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_verified_event_never_consumes_novel_volume() {
+        let (capture, mut receiver, _) = fixture();
+        let event = EventBuilder::new(Kind::TextNote, "x".repeat(900_000))
+            .custom_created_at(Timestamp::from(150))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        for _ in 0..80 {
+            capture.capture(&event).await.unwrap();
+        }
+        let pending = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(capture.state.lock().await.bytes, pending.wire.len() as u64);
+        let proof = DownloadProof {
+            remote: HashSet::from([event.id]),
+            received: HashSet::from([event.id]),
+        };
+        assert_eq!(capture.finish_download(Ok(proof)).await.unwrap().0, 1);
     }
 }

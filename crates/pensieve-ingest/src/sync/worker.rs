@@ -51,7 +51,7 @@ pub enum WorkerError {
     /// identical. Preserve the gap; do not automatically split or skip it.
     #[error("worker advertised events unavailable at EOSE")]
     Unavailable,
-    /// Verified in-window candidates exceed an attempt count/byte budget.
+    /// Distinct verified in-window candidates exceed the attempt byte budget.
     /// A future authenticated parent may split, retaining all receipt obligations.
     #[error("worker attempt volume limit exceeded")]
     Volume,

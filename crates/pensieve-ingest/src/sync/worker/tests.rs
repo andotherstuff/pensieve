@@ -260,7 +260,7 @@ async fn overlapping_multiround_and_large_reply_multibatch_downloads() {
         assert_eq!(proof.remote, expected);
         client.disconnect().await;
         assert_eq!(
-            capture.finish(Some(&proof)).await.unwrap().0 as usize,
+            capture.finish_download(Ok(proof)).await.unwrap().0 as usize,
             total - overlap
         );
         assert_eq!(drain.await.unwrap(), total - overlap);
@@ -307,7 +307,12 @@ async fn expired_advertised_event_is_unavailable_not_success() {
     .unwrap();
     assert!(matches!(result, Err(WorkerError::Unavailable)));
     client.disconnect().await;
-    assert!(capture.finish(None).await.is_err());
+    assert!(
+        capture
+            .finish_download(Err(WorkerError::Unavailable))
+            .await
+            .is_err()
+    );
     assert!(receiver.recv().await.is_none());
     server.abort();
     let _ = server.await;

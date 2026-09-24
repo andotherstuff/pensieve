@@ -65,12 +65,14 @@ exit nonzero without ProtocolDone; parent retains receipts and applies retry pol
 Exit 2 specifically means EOSE arrived without all advertised IDs (`Unavailable`).
 It does not distinguish relay withholding from SDK-expired NIP-40 events; it is
 neither proof of permanent absence nor proof of a volume limit. Never split/skip/
-complete solely from exit 2. Verified local count/byte exhaustion exits 3; a verified
+complete solely from exit 2. Distinct verified local byte exhaustion exits 3; a verified
 individual event exceeding the IPC cap exits 4. Capture preserves its first local
 rejection even if the SDK suppresses Event notification and EOSE later reports
 Unavailable. Signature/window checks precede classification; a single oversized
 event is checked before aggregate budgets because splitting cannot fix it.
 Cancellation/invalid candidates remain generic failures, never inferred volume.
+Repeated verified event IDs consume no additional count/byte budget. Count overflow
+is a generic failure: the verified diff already caps the number of solicited IDs.
 All other failures exit 1. Unknown exits/signals are not volume signals either.
 These exit codes require parent attempt/process binding before use in split policy;
 they do not replace durable receipt reconciliation. Relay-advertised diff-count

@@ -73,7 +73,7 @@ Before 3b activation, persist its distinct outcome, keep the gap, bound/pace ret
 and alert on persistent failure without starving other jobs. Never split or silently
 skip IDs on this outcome. Typed proven-volume classification is required before
 enabling volume splitting; generic worker loss is insufficient. The worker now
-preserves verified local attempt count/byte exhaustion as exit 3 and a single
+preserves distinct verified local attempt byte exhaustion as exit 3 and a single
 oversized event as exit 4, ahead of the SDK's resulting missing notification.
 Only exit 3 is a potential split signal; exit 4 cannot be fixed by splitting.
 Before activation, bind exits to the authenticated attempt/process and test durable
