@@ -73,6 +73,10 @@ event is checked before aggregate budgets because splitting cannot fix it.
 Cancellation/invalid candidates remain generic failures, never inferred volume.
 Repeated verified event IDs consume no additional count/byte budget. Count overflow
 is a generic failure: the verified diff already caps the number of solicited IDs.
+SDK subscription verification is mandatory: only events matching the active fetch
+subscription and its exact requested IDs reach capture. Valid but unsolicited
+events during the diff or on unknown/mismatched subscriptions cannot consume the
+attempt budget or become a split signal.
 All other failures exit 1. Unknown exits/signals are not volume signals either.
 These exit codes require parent attempt/process binding before use in split policy;
 they do not replace durable receipt reconciliation. Relay-advertised diff-count

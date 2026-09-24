@@ -72,6 +72,7 @@ async fn relay_with_empty(
 
 #[derive(Default)]
 struct RelayStats {
+    inject_unrequested: bool,
     continuations: std::sync::atomic::AtomicUsize,
     batches: std::sync::atomic::AtomicUsize,
     max_reply: std::sync::atomic::AtomicUsize,
@@ -96,12 +97,27 @@ async fn relay_events(
         }
         storage.seal().unwrap();
         let mut engine = negentropy::Negentropy::borrowed(&storage, 1024 * 1024).unwrap();
+        let unrequested = event();
         while let Some(Ok(message)) = socket.next().await {
             if !message.is_text() {
                 continue;
             }
             let request: serde_json::Value =
                 serde_json::from_str(message.to_text().unwrap()).unwrap();
+            if stats.inject_unrequested && matches!(request[0].as_str(), Some("NEG-OPEN" | "REQ")) {
+                // Valid, in-window, but not solicited: unknown subscription during
+                // diff/fetch, and a wrong ID on the actual fetch subscription.
+                for subscription in [serde_json::json!("junk"), request[1].clone()] {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!(["EVENT", subscription, unrequested])
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
             let response = match request[0].as_str().unwrap() {
                 "NEG-OPEN" | "NEG-MSG" if !hang => {
                     if request[0] == "NEG-MSG" {
@@ -361,12 +377,21 @@ async fn explicit_empty_diff_can_complete_without_inventing_events() {
 }
 
 #[tokio::test]
-async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose() {
+async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
     for partial in [false, true] {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("ipc");
         let listener = UnixListener::bind(&socket).unwrap();
-        let (url, server) = relay(partial, false).await;
+        let (url, server) = relay_events(
+            partial,
+            false,
+            vec![event()],
+            Arc::new(RelayStats {
+                inject_unrequested: true,
+                ..Default::default()
+            }),
+        )
+        .await;
         let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
         let id = lease.job().id;
         let parent = async {
@@ -444,6 +469,7 @@ async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose
         if partial {
             assert!(matches!(outcome, Err(WorkerError::Unavailable)));
             assert_eq!(ledger.get(id).unwrap().state, JobState::Leased);
+            assert_eq!(ledger.attempt_progress(id, 1).unwrap().received, 0);
         } else {
             assert!(outcome.is_ok(), "{outcome:?}");
         }

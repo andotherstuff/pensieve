@@ -115,7 +115,11 @@ async fn attempt(
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
     let client = Client::builder()
-        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .opts(
+            ClientOptions::default()
+                .relay_limits(relay_limits())
+                .verify_subscriptions(true),
+        )
         .database(capture.clone())
         .build();
     let relay_url = assignment.relay.clone();
