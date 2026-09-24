@@ -179,6 +179,8 @@ struct CurrentSegment {
 pub struct SegmentWriter {
     #[cfg(test)]
     injected_failure: AtomicUsize,
+    #[cfg(test)]
+    pause_after_rename: Mutex<Option<[Arc<std::sync::Barrier>; 2]>>,
     /// Serialize archive mutations and latch uncertain I/O failures.
     admission_gate: Mutex<Option<String>>,
     /// Read-only health observation must never wait for archive fsyncs.
@@ -243,6 +245,8 @@ impl SegmentWriter {
         Ok(Self {
             #[cfg(test)]
             injected_failure: AtomicUsize::new(0),
+            #[cfg(test)]
+            pause_after_rename: Mutex::new(None),
             admission_gate: Mutex::new(None),
             recovery_latched: AtomicBool::new(false),
             config,
@@ -289,12 +293,45 @@ impl SegmentWriter {
         self.recovery_latched.load(Ordering::SeqCst)
     }
 
-    /// Whether this writer owns exactly the supplied archive dedupe authority.
-    /// A writer without a dedupe index cannot prove worker receipt durability.
+    /// Check that a caller holds this writer's exact durable-index authority.
     pub(crate) fn uses_dedupe(&self, dedupe: &DedupeIndex) -> bool {
         self.dedupe
             .as_ref()
             .is_some_and(|owned| std::ptr::eq(owned.as_ref(), dedupe))
+    }
+
+    /// Snapshot replay authority without waiting for archive mutation. The
+    /// exclusive cutoff includes only checkpointed seals (or startup-recovered
+    /// existing files). This is not proof that every earlier file/marker exists:
+    /// replay must still check those, failing closed on gaps/corruption.
+    pub(crate) fn inventory_source(
+        &self,
+        dedupe: &DedupeIndex,
+        archive: &Path,
+        prefix: &str,
+    ) -> Result<Option<u64>> {
+        if !self.uses_dedupe(dedupe) {
+            return Err(Error::Config(
+                "replay dedupe differs from writer authority".to_owned(),
+            ));
+        }
+        if self.recovery_required() {
+            return Err(Error::Config("archive recovery required".to_owned()));
+        }
+        let Some(failure) = self.admission_gate.try_lock() else {
+            return Ok(None);
+        };
+        if failure.is_some() {
+            return Err(Error::Config("archive recovery required".to_owned()));
+        }
+        if prefix != self.config.segment_prefix
+            || archive.canonicalize()? != self.config.output_dir.canonicalize()?
+        {
+            return Err(Error::Config(
+                "replay source differs from writer authority".to_owned(),
+            ));
+        }
+        Ok(Some(self.segment_number.load(Ordering::SeqCst)))
     }
 
     /// Find the next segment number by scanning existing files.
@@ -605,6 +642,11 @@ impl SegmentWriter {
             )));
         }
         fs::rename(&open_path, &path)?;
+        #[cfg(test)]
+        if let Some(barriers) = self.pause_after_rename.lock().take() {
+            barriers[0].wait();
+            barriers[1].wait();
+        }
         self.inject_failure(3)?;
         File::open(
             path.parent()
@@ -990,6 +1032,58 @@ pub struct SegmentStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn replay_waits_for_checkpointed_seal_without_holding_admission() {
+        use crate::sync::{SyncStateDb, inventory::InventoryReplay};
+        let dir = TempDir::new().unwrap();
+        let archive = dir.path().join("archive");
+        let dedupe = Arc::new(DedupeIndex::open(dir.path().join("dedupe")).unwrap());
+        let state = SyncStateDb::open(dir.path().join("inventory")).unwrap();
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..Default::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let event = nostr_sdk::EventBuilder::text_note("seal race")
+            .sign_with_keys(&nostr_sdk::Keys::generate())
+            .unwrap();
+        writer
+            .write_reserved(
+                pack_nostr_event(&event).unwrap(),
+                dedupe.reserve(event.id.as_bytes()).unwrap().unwrap(),
+            )
+            .unwrap();
+        let barriers = [
+            Arc::new(std::sync::Barrier::new(2)),
+            Arc::new(std::sync::Barrier::new(2)),
+        ];
+        *writer.pause_after_rename.lock() = Some(barriers.clone());
+        let sealing = writer.clone();
+        let handle = std::thread::spawn(move || sealing.seal().unwrap());
+        barriers[0].wait();
+        assert!(archive.join("segment-000000000.notepack").exists());
+        assert!(
+            InventoryReplay::begin(&state, &dedupe, &writer, &archive, "segment", 0)
+                .unwrap()
+                .is_none()
+        );
+        barriers[1].wait();
+        handle.join().unwrap();
+        let mut replay = InventoryReplay::begin(&state, &dedupe, &writer, &archive, "segment", 0)
+            .unwrap()
+            .unwrap();
+        // The reader owns no archive gate, even while it is alive and unconsumed.
+        assert!(writer.admission_gate.try_lock().is_some());
+        assert!(replay.step(2).unwrap().segment_complete);
+    }
 
     #[test]
     fn recovery_observation_does_not_wait_for_archive_lock() {

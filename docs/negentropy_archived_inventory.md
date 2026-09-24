@@ -10,8 +10,10 @@ Both examined and returned rows are capped at 250,000. TooDense returns **no usa
 partial set**; the scheduler must split the interval or block/alert at one second.
 This set describes known archive inventory, not complete relay history.
 
-`InventoryReplay::begin` binds a canonical archive directory, prefix and explicit
-rollout floor to a versioned cursor in the existing sync RocksDB. There is no
+`InventoryReplay::begin` checks its canonical archive directory, prefix and exact
+dedupe object against the supplied writer before initializing any cursor. A writer
+without its own dedupe authority cannot authorize replay. It then binds that
+source and an explicit rollout floor to a versioned cursor in the existing sync RocksDB. There is no
 default history floor. Later configuration changes fail closed. Only one replay
 reader can be active per database handle. It opens exactly the next plain/gzip
 sealed segment, never an `.open` file. Constant-memory directory discovery reports
@@ -25,13 +27,20 @@ completed segment. Gzip decoding checks all members and the stream trailer. Deco
 object overhead is not claimed to equal the wire-byte limit. There is no hard
 wall-clock deadline on a blocking disk call.
 
-Runtime integration must distinguish a seal still in progress from corruption:
-the final filename is visible before the writer finishes marking IDs Archived.
-A missing marker leaves the cursor unchanged; it is not permission to skip the
-segment. Before enabling replay, bind its directory/prefix to the actual writer
-and add a retryable seal-in-progress outcome. Persistent missing markers after
-sealing completes must remain an actionable fault, not an infinite silent retry.
-Cursor identity changes also require an explicit operator repair path before
+Replay takes a short `try_lock` snapshot of the writer's admission gate and
+exclusive next-segment cutoff. A busy writer returns `None` without opening source
+files, scanning the archive, or initializing/advancing the cursor; the caller retries
+later. This includes the interval after rename but before durable Archived markers
+and checkpoint removal. A successful snapshot only permits segments below its
+cutoff. The gate is released before replay opens/decodes any segment; replay never
+holds up live archive admission while streaming. Startup obtains the cutoff from
+existing segment names only after recovery preflight rejects checkpoints/open files.
+That cutoff is readiness, not integrity proof: missing earlier files, invalid data
+and missing Archived markers still fail closed and preserve the cursor. It never
+forgives a persistent missing marker as a transient seal race. As with the writer,
+this assumes no second archive writer or external mutation bypasses its gate.
+
+Cursor identity changes still require an explicit operator repair path before
 activation; do not delete the inventory database to fix a mistyped floor/path.
 
 Valid partial batches may enter inventory before segment completion. They are
@@ -51,5 +60,6 @@ second archive, historical rebuild or production database migration occurs here.
 Tests cover bounded export/overflow, unverified legacy IDs, inclusive boundaries,
 partial replay/reopen, synchronized completion/reopen, concurrent reader rejection,
 changed-floor refusal, missing predecessor, gzip input, malformed/oversized/truncated
-frames and missing archive markers. These are local-storage tests, not Linux worker
+frames, source/dedupe mismatch, the deterministic rename-before-marker race, and
+missing archive markers after a completed seal. These are local-storage tests, not Linux worker
 isolation or power-loss certification.

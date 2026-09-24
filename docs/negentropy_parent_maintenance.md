@@ -28,11 +28,11 @@ errors. A received event without ProtocolDone remains an unresolved gap even aft
 its receipt is archived and compacted. Maintenance never promotes such failures to
 success. Stale attempts cannot trigger retry_durability. Dropping a response does not
 undo a committed command; callers must reread durable state after cancellation.
-In particular, a serve timeout can race with an owner that already committed
-ProtocolDone or a failure report. A timeout alone is not a retry classification:
+In particular, external cancellation can race with an owner that already committed
+ProtocolDone or a failure report. A lost result alone is not a retry classification:
 read the job/attempt/report first, then choose the state-appropriate recovery.
-The corrected session awaits the owner on its own timeout to preserve terminal
-results, but external future cancellation remains ambiguous. Archive recovery
+The session awaits its owner, which alone enforces the absolute deadline and
+preserves terminal results; external future cancellation remains ambiguous. Archive recovery
 and invalid request errors now have distinct types and must not become relay blame.
 
 The owner remains monopolized by one session for up to nine minutes plus any
