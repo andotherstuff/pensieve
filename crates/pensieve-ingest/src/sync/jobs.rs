@@ -12,8 +12,15 @@ use nostr_sdk::Keys;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
+use super::failure::FailureDiagnostic;
+
 const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
+const MAX_FAILURE_JSON: usize = 32 * 1024;
+const FAILURE_SCHEMA: &str = "CREATE TABLE failure_reports (
+    job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
+    report TEXT NOT NULL CHECK(length(report)<=32768), PRIMARY KEY(job,attempt)
+);";
 /// Maximum receipt rows examined in one archive reconciliation transaction.
 pub const MAX_RECEIPT_BATCH: u32 = 256;
 /// Bound unsealed finished uploads before pausing new leases.
@@ -231,10 +238,17 @@ impl JobLedger {
                     );
                     INSERT INTO receipt_totals VALUES(1,0);")?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-                    tx.pragma_update(None, "user_version", 3)?;
+                    tx.execute_batch(FAILURE_SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 4)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 3) => {}
+                (APPLICATION_ID, 3) => {
+                    check_budget(&tx, path, limits, 0)?;
+                    tx.execute_batch(FAILURE_SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 4)?;
+                    check_budget(&tx, path, limits, 0)?;
+                }
+                (APPLICATION_ID, 4) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -427,6 +441,62 @@ impl JobLedger {
         attempt_progress(&self.db, job, attempt)
     }
 
+    /// Persist a terminal worker diagnostic without discarding any receipts or
+    /// completing the job. The parent must separately choose a retry/backoff policy.
+    pub fn record_failure_report(
+        &mut self,
+        lease: &Lease,
+        sequence: u64,
+        report: &FailureDiagnostic,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if !report.validate() {
+            return Err(LedgerError::Invalid("invalid failure diagnostic"));
+        }
+        let json = serde_json::to_string(report)
+            .map_err(|_| LedgerError::Invalid("invalid failure diagnostic"))?;
+        if json.len() > MAX_FAILURE_JSON {
+            return Err(LedgerError::Invalid("failure diagnostic too large"));
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_lease(&tx, lease, now)?;
+        let progress = attempt_progress(&tx, lease.job.id, lease.job.attempt)?;
+        if progress.protocol_done || has_failure(&tx, lease.job.id, lease.job.attempt)? {
+            return Err(LedgerError::Invalid("protocol already ended"));
+        }
+        if sequence != progress.received + 1 {
+            return Err(LedgerError::Invalid("failure sequence mismatch"));
+        }
+        check_budget(&tx, &self.path, self.limits, 0)?;
+        tx.execute(
+            "INSERT INTO failure_reports VALUES(?1,?2,?3)",
+            params![lease.job.id, lease.job.attempt, json],
+        )?;
+        commit(tx, &self.path, self.limits)
+    }
+
+    /// Read retained diagnostic history, including failed attempts after retries.
+    pub fn failure_report(
+        &self,
+        job: i64,
+        attempt: i64,
+    ) -> Result<Option<FailureDiagnostic>, LedgerError> {
+        let json: Option<String> = self.db.query_row(
+            "SELECT CASE WHEN length(report)<=32768 THEN report ELSE NULL END FROM failure_reports WHERE job=?1 AND attempt=?2",
+            params![job, attempt], |r| r.get(0)).optional()?;
+        json.map(|json| {
+            let report: FailureDiagnostic = serde_json::from_str(&json)
+                .map_err(|_| LedgerError::Invalid("invalid stored failure diagnostic"))?;
+            if !report.validate() {
+                return Err(LedgerError::Invalid("invalid stored failure diagnostic"));
+            }
+            Ok(report)
+        })
+        .transpose()
+    }
+
     pub(super) fn verify_active(&mut self, lease: &Lease, now: i64) -> Result<(), LedgerError> {
         verify_lease(&self.db, lease, now)
     }
@@ -449,7 +519,7 @@ impl JobLedger {
             return Err(LedgerError::Invalid("invalid receipt metadata"));
         }
         let progress = attempt_progress(&tx, lease.job.id, lease.job.attempt)?;
-        if progress.protocol_done {
+        if progress.protocol_done || has_failure(&tx, lease.job.id, lease.job.attempt)? {
             return Err(LedgerError::Invalid("protocol already ended"));
         }
         if received.sequence != progress.received + 1
@@ -510,7 +580,7 @@ impl JobLedger {
         {
             return Err(LedgerError::Invalid("protocol receipt summary mismatch"));
         }
-        if progress.protocol_done {
+        if progress.protocol_done || has_failure(&tx, lease.job.id, lease.job.attempt)? {
             return Err(LedgerError::Invalid("protocol already ended"));
         }
         tx.execute(
@@ -753,6 +823,14 @@ fn read_job(db: &Connection, id: i64) -> Result<Job, LedgerError> {
     })?)
 }
 
+fn has_failure(db: &Connection, job: i64, attempt: i64) -> Result<bool, LedgerError> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM failure_reports WHERE job=?1 AND attempt=?2)",
+        params![job, attempt],
+        |r| r.get(0),
+    )?)
+}
+
 fn file_bytes(path: &Path) -> Result<u64, LedgerError> {
     let mut total = 0u64;
     for suffix in ["", "-wal", "-shm"] {
@@ -807,6 +885,134 @@ mod tests {
     use super::*;
 
     const RELAY: &str = "wss://relay.example.com";
+
+    fn diagnostic() -> FailureDiagnostic {
+        FailureDiagnostic {
+            kind: super::super::failure::FailureKind::Unavailable,
+            missing_count: 2,
+            sample: vec![[1; 32], [2; 32]],
+        }
+    }
+
+    #[test]
+    fn failure_reports_are_terminal_preserved_and_lease_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let first = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&first, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(first.job.id, 1).unwrap();
+        assert!(
+            db.record_failure_report(&first, 1, &diagnostic(), 12)
+                .is_err()
+        );
+        assert!(db.failure_report(first.job.id, 1).unwrap().is_none());
+        db.record_failure_report(&first, 2, &diagnostic(), 12)
+            .unwrap();
+        assert!(
+            db.record_failure_report(&first, 2, &diagnostic(), 13)
+                .is_err()
+        );
+        assert!(db.register_received(&first, &receipt(2), 13).is_err());
+        assert!(
+            db.record_protocol_done(&first, 2, 1, prior.digest, 13)
+                .is_err()
+        );
+        assert_eq!(db.attempt_progress(first.job.id, 1).unwrap(), prior);
+        assert_eq!(db.get(first.job.id).unwrap().state, JobState::Leased);
+        db.expire(71, 60).unwrap();
+        let second = db.lease_next(131, 60).unwrap().unwrap();
+        assert!(matches!(
+            db.record_failure_report(&first, 2, &diagnostic(), 132),
+            Err(LedgerError::StaleLease)
+        ));
+        db.register_received(&second, &receipt(1), 132).unwrap();
+        let path = db.path.clone();
+        drop(db);
+        let db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        assert_eq!(
+            db.failure_report(first.job.id, 1).unwrap(),
+            Some(diagnostic())
+        );
+        assert!(db.failure_report(first.job.id, 2).unwrap().is_none());
+        assert_eq!(db.attempt_progress(first.job.id, 1).unwrap(), prior);
+        assert_eq!(db.attempt_progress(first.job.id, 2).unwrap().received, 1);
+    }
+
+    #[test]
+    fn failure_report_budget_rejection_preserves_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&lease, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(lease.job.id, 1).unwrap();
+        db.limits.max_bytes = file_bytes(&db.path).unwrap();
+        assert!(matches!(
+            db.record_failure_report(&lease, 2, &diagnostic(), 12),
+            Err(LedgerError::Budget)
+        ));
+        assert!(db.failure_report(lease.job.id, 1).unwrap().is_none());
+        assert_eq!(db.attempt_progress(lease.job.id, 1).unwrap(), prior);
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v3_migration_preserves_unfinished_jobs_and_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        let job = db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&lease, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(job.id, 1).unwrap();
+        db.db
+            .execute_batch("DROP TABLE failure_reports; PRAGMA user_version=3;")
+            .unwrap();
+        let path = db.path.clone();
+        drop(db);
+        let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        assert_eq!(
+            db.db
+                .pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(db.get(job.id).unwrap().state, JobState::Leased);
+        assert_eq!(db.attempt_progress(job.id, 1).unwrap(), prior);
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        db.record_failure_report(&lease, 2, &diagnostic(), 12)
+            .unwrap();
+        assert_eq!(db.failure_report(job.id, 1).unwrap(), Some(diagnostic()));
+    }
+
+    #[test]
+    fn failure_report_insert_error_rolls_back_without_losing_obligations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ledger(&dir);
+        db.enqueue("s", RELAY, 0, 9).unwrap();
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.register_received(&lease, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(lease.job.id, 1).unwrap();
+        db.db.execute_batch("CREATE TRIGGER reject_failure BEFORE INSERT ON failure_reports BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(matches!(
+            db.record_failure_report(&lease, 2, &diagnostic(), 12),
+            Err(LedgerError::Database(_))
+        ));
+        assert!(db.failure_report(lease.job.id, 1).unwrap().is_none());
+        assert_eq!(db.attempt_progress(lease.job.id, 1).unwrap(), prior);
+        assert_eq!(db.get(lease.job.id).unwrap().state, JobState::Leased);
+        db.register_received(&lease, &receipt(2), 13).unwrap();
+    }
 
     fn ledger(dir: &tempfile::TempDir) -> JobLedger {
         JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap()
@@ -1136,7 +1342,7 @@ mod tests {
         db.lease_next(10, 60).unwrap().unwrap();
         // Recreate the exact v1 schema shape: it has neither receipt table.
         db.db
-            .execute_batch("DROP TABLE receipts; DROP TABLE attempts; DROP TABLE receipt_totals; PRAGMA user_version=1;")
+            .execute_batch("DROP TABLE receipts; DROP TABLE attempts; DROP TABLE receipt_totals; DROP TABLE failure_reports; PRAGMA user_version=1;")
             .unwrap();
         let path = db.path.clone();
         drop(db);

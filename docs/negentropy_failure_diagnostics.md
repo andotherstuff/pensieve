@@ -1,0 +1,36 @@
+# Isolated worker: durable failure diagnostics
+
+This inactive slice preserves bounded failure information before scheduler policy
+is introduced. It launches no workers and changes no production configuration.
+
+After a reconciliation failure, the worker drains its already-captured candidates
+through the normal admission ACK path, then sends one terminal `AttemptReport`
+instead of `ProtocolDone`. A broken IPC connection, cancellation or deadline can
+prevent the report from arriving; received obligations still remain in the ledger.
+Neither a report nor an ACK proves archive durability or completes a job.
+
+The report has a fixed failure class, an outstanding-ID count, and at most 128
+sorted unique IDs. It includes no relay-provided free-form error text. On the
+first failed fetch batch, the outstanding count/sample can include later IDs not
+yet requested. It is not proof of permanent absence, not a complete missing-ID
+list, and not permission to skip or expire events. Retries retain the whole gap.
+
+The parent checks the active lease, exact next upload sequence, diagnostic bounds,
+and ledger budget before recording the report in the same transactional authority
+as event receipts. A report is terminal for that attempt, including after reconnect
+or reopen: additional receipts and protocol completion are rejected. Retry policy
+is deliberately separate; this slice does not split windows or mark failures done.
+Worker Volume hints require supervised process binding and verified byte-budget
+semantics before any future split policy can use them.
+
+Ledger schema 4 adds `failure_reports`, keyed by job and attempt. The migration
+from schema 3 preserves all jobs and receipts, and older binaries reject schema 4.
+Diagnostic history survives retries and reopen; no retention deletion is added.
+The existing total ledger budget bounds growth and rejects new writes when full.
+The new wire variant fails closed on an older parent, so a future deployment must
+install matching parent/worker binaries before activation. This is not an online
+mixed-version rollout protocol.
+
+Tests cover report validation, migration, stale leases, repeated/wrong-sequence
+reports, transactional failure, budget refusal, receipt preservation, retry/reopen,
+and a partially fetched relay batch that reports failure without false completion.

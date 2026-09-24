@@ -95,6 +95,12 @@ pub enum Failure {
     Resource,
     /// Explicit cancellation.
     Cancelled,
+    /// Advertised IDs remain outstanding; never an automatic split signal.
+    Unavailable,
+    /// Worker reports verified local attempt-volume exhaustion.
+    Volume,
+    /// A single event cannot fit the frame cap; splitting cannot fix it.
+    EventSize,
 }
 
 /// Worker-to-parent upload messages after the future inventory exchange.
@@ -111,6 +117,11 @@ pub enum Message {
     },
     /// Incomplete attempt. Never interpreted as successful empty output.
     AttemptFailed { header: Header, reason: Failure },
+    /// Bounded diagnostic accounting, not archival proof or a retry decision.
+    AttemptReport {
+        header: Header,
+        report: super::failure::FailureDiagnostic,
+    },
 }
 
 impl Message {
@@ -118,7 +129,8 @@ impl Message {
         match self {
             Self::Event { header, .. }
             | Self::ProtocolDone { header, .. }
-            | Self::AttemptFailed { header, .. } => header,
+            | Self::AttemptFailed { header, .. }
+            | Self::AttemptReport { header, .. } => header,
         }
     }
 }
@@ -380,6 +392,21 @@ impl UploadSession {
                 ledger.verify_active(&self.lease, now)?;
                 Ok(UploadAction::Failed(reason))
             }
+            Message::AttemptReport { header, report } => {
+                if !self.outstanding.is_empty() {
+                    return Err(ProtocolError::State);
+                }
+                ledger.record_failure_report(&self.lease, header.sequence, &report, now)?;
+                use super::failure::FailureKind;
+                let reason = match report.kind {
+                    FailureKind::Relay => Failure::Relay,
+                    FailureKind::Volume => Failure::Volume,
+                    FailureKind::EventSize => Failure::EventSize,
+                    FailureKind::Unavailable => Failure::Unavailable,
+                    FailureKind::Cancelled => Failure::Cancelled,
+                };
+                Ok(UploadAction::Failed(reason))
+            }
         }
     }
 
@@ -525,6 +552,53 @@ mod tests {
             UploadAction::Event(e) => e,
             _ => panic!("expected event"),
         }
+    }
+
+    #[test]
+    fn diagnostic_failure_is_terminal_durable_and_never_completion() {
+        use super::super::failure::{FailureDiagnostic, FailureKind};
+        let (dir, mut db, lease, mut session) = setup();
+        let registered = registered(
+            session
+                .receive(&mut db, frame(&wire(&lease, 1, event("one", 100))), 11)
+                .unwrap(),
+        );
+        session.accepted(&mut db, registered, 12).unwrap();
+        let report = FailureDiagnostic {
+            kind: FailureKind::Unavailable,
+            missing_count: 3,
+            sample: vec![[1; 32], [2; 32]],
+        };
+        let failed = Frame::encode(&Message::AttemptReport {
+            header: Header::for_lease(&lease, 2),
+            report: report.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            session.receive(&mut db, frame(&failed), 13).unwrap(),
+            UploadAction::Failed(Failure::Unavailable)
+        ));
+        assert!(session.receive(&mut db, frame(&failed), 14).is_err());
+        let mut reconnect = UploadSession::new(lease.clone());
+        assert!(
+            reconnect
+                .receive(&mut db, done(&lease, 1, 0, initial_digest()), 15)
+                .is_err()
+        );
+        db.retry(&lease, 16, 60, RetryReason::RelayFailure).unwrap();
+        drop(db);
+        let db = JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
+        assert_eq!(
+            db.failure_report(lease.job().id, lease.job().attempt)
+                .unwrap(),
+            Some(report)
+        );
+        let progress = db
+            .attempt_progress(lease.job().id, lease.job().attempt)
+            .unwrap();
+        assert_eq!(progress.received, 1);
+        assert!(!progress.protocol_done);
+        assert_eq!(db.get(lease.job().id).unwrap().state, JobState::RetryWait);
     }
 
     #[test]

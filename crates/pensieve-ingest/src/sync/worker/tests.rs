@@ -305,7 +305,7 @@ async fn expired_advertised_event_is_unavailable_not_success() {
     )
     .await
     .unwrap();
-    assert!(matches!(result, Err(WorkerError::Unavailable)));
+    assert!(matches!(result, Err(WorkerError::Outstanding(_))));
     client.disconnect().await;
     assert!(
         capture
@@ -421,6 +421,15 @@ async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose
                         );
                         break;
                     }
+                    UploadAction::Failed(ipc::Failure::Unavailable) if partial => {
+                        let report = ledger
+                            .failure_report(id, lease.job().attempt)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(report.missing_count, 1);
+                        assert_eq!(report.sample.len(), 1);
+                        break;
+                    }
                     _ => panic!("unexpected failure frame"),
                 }
             }
@@ -442,7 +451,7 @@ async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose
         server.abort();
         let _ = server.await;
         if partial {
-            assert!(matches!(outcome, Err(WorkerError::Unavailable)));
+            assert!(matches!(outcome, Err(WorkerError::Outstanding(_))));
             assert_eq!(ledger.get(id).unwrap().state, JobState::Leased);
         } else {
             assert!(outcome.is_ok(), "{outcome:?}");
