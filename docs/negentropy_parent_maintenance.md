@@ -6,18 +6,19 @@ policy or a scheduler. There is no listener, process launch, main wiring or depl
 Single-attempt progress and bounded failure-report read commands use the same
 owner, so an uncertain result can be investigated without reopening the ledger.
 
-One maintenance turn selects at most 32 jobs using the primary-key keyset and
+One maintenance turn selects at most 32 unresolved jobs using a partial-index keyset and
 checks at most 256 receipts **total**, not 256 per job. The cursor is persisted in
 the receipt_totals singleton. All unresolved non-live states are visited, including
 retry_wait, split and blocked receipt holders, and awaiting jobs with zero receipts.
-Completed and currently leased jobs are skipped. Long completed/empty history can
-take several turns, but no turn scans an unbounded history or materializes it.
-End of the keyspace resets the cursor; a caller must continue after zero changes.
+Completed, queued and currently leased jobs are excluded by the index and query;
+they consume no recovery turns or per-job writes. A known end of the selected
+keyspace resets the cursor in the same turn; callers continue after zero changes.
 Existing per-job completion propagation retains its separate 63-level split-tree
 bound; those ancestor checks do not count as newly selected jobs or receipt reads.
 
-Each successfully handled job advances the cursor. Reconciliation and cursor update
-are separate durable commits: a crash between them safely repeats work rather than
+Each successfully handled job advances the local cursor, persisted once at turn
+end or on error. Reconciliation and cursor update are separate durable commits:
+a crash between them safely repeats at most one bounded turn rather than
 skipping a receipt. An error does not advance past the failed job; earlier successful
 reconciliation remains committed. Within each job the existing receipt keyset cursor
 prevents one missing old event from starving later receipts. Across jobs the new
@@ -40,16 +41,15 @@ uninterruptible disk operation. Maintenance runs **between exchanges**, not in
 parallel with an upload. Scheduling that alternates recovery turns with admissions
 and guarantees freshness remains a future slice.
 
-Future scheduling must budget recovery cadence against retained history: 100,000
-jobs require about 3,126 maximum-sized turns for a full scan and wrap, even if most
-jobs are complete. One turn per nine-minute session would not provide timely gap
-recovery. Drain sufficient bounded turns between admissions; an indexed unresolved
-candidate scan is a possible later optimization, not part of this library slice.
-The explicit `now` arguments are caller timestamps, not execution-time clock reads.
-A command queued behind an externally cancelled session or slow disk operation can
-use a stale timestamp and shorten its effective retry delay. Before activation, the
-scheduler must arrange execution-time deadline calculation rather than treating a
-queued caller timestamp as a guaranteed minimum backoff from command completion.
+Future scheduling must budget recovery cadence against unresolved work, not completed
+history. Drain sufficient bounded recovery turns between admissions.
+Lease, expiry, same-window retry and durability retry sample wall time on the owner
+immediately before calling the ledger, rather than accepting a caller timestamp
+that can become stale in the bounded queue. The synchronous ledger still accepts
+explicit timestamps for deterministic state-machine testing. Session deadlines are
+unchanged. Execution-time sampling is not transaction-completion timing: a disk
+operation may block after sampling, and wall-clock adjustments can change observed
+eligibility. It does not guarantee a minimum delay from commit or response time.
 
 This changes the unshipped prototype ledger to schema 5 (schema 4 failure reports
 plus the recovery cursor). Older prototype versions fail closed without mutation;

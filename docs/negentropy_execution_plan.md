@@ -41,9 +41,10 @@ the original proposal is not evidence that any runtime or production gate passed
 | 2c, #50 | Bounded sealed-segment inventory replay/export | Merged; no runtime replay enabled |
 | 3a, #51 | One-job worker executable and parent wire exchange | Merged; CI and both independent reviews passed; no production parent endpoint |
 | 3b prerequisite, #52 | Distinct worker volume/event-size outcomes and request-scoped capture | Merged; no scheduler activation |
-| 3b diagnostics, #53 | Fenced terminal failure reports and durable diagnostics | Under review; matching worker/parent protocol required |
+| 3b prerequisite, #57 | Explicit inventory cursor rewind | Review/CI gate; no operator CLI or activation |
+| 3b diagnostics, #53 | Fenced terminal failure reports and durable diagnostics | Merged; CI and independent reviews passed; matching worker/parent protocol required |
 | 3b session, #54 | Authenticated one-attempt parent session and bounded owner executor | Under review; no listener or process launch |
-| 3b inventory, #55 | Source-bound inventory, seal-race handling and guarded repair | Merged; no replay activation |
+| 3b inventory, #55 | Source-bound inventory and seal-race handling | Merged; no replay activation |
 | 3b maintenance, #56 | Same-owner recovery commands and persisted bounded receipt fairness | Under review on #54; exact-head CI and independent review required; no scheduler policy |
 | 3b | Parent scheduler, authenticated listener and inventory activation | Next after prerequisite reviews; paced retry, maintenance cadence and process binding gates |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |

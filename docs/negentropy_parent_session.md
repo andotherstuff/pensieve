@@ -29,6 +29,11 @@ does not mean archive durability. A valid ProtocolDone produces the explicit
 The single `AttemptFailed` message persists its bounded diagnostic and terminal
 attempt fence in ledger schema 5 before returning `SessionOutcome::Failed(FailureKind)`.
 Failure reports are returned without automatic retry, split or completion.
+Archive recovery latched before or during shared admission returns
+`RecoveryRequired` without an ACK; its received receipt remains durable. Nested
+upload transport/ledger/archive failures retain their `Io`/`Ledger`/`Archive`
+classification rather than being wrapped as worker protocol violations. Queued
+deadline expiry returns `TimedOut`, distinct from dropped-session cancellation.
 
 The maximum exchange deadline is nine minutes, including queue wait, inventory
 and all socket traffic; the lease wall-clock expiry is checked independently.
