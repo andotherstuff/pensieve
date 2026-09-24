@@ -28,6 +28,9 @@ pub const MAX_RECOVERY_JOBS: u32 = 32;
 /// Bound unsealed finished uploads before pausing new leases.
 const MAX_AWAITING_DURABILITY: u32 = 2;
 
+mod planner;
+pub use planner::PlanningProgress;
+
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
 pub enum LedgerError {
@@ -244,10 +247,11 @@ impl JobLedger {
                     INSERT INTO receipt_totals VALUES(1,0,0);")?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                     tx.execute_batch(FAILURE_SCHEMA)?;
-                    tx.pragma_update(None, "user_version", 5)?;
+                    tx.execute_batch(planner::SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 6)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 5) => {}
+                (APPLICATION_ID, 6) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -275,6 +279,9 @@ impl JobLedger {
         since: i64,
         until: i64,
     ) -> Result<Job, LedgerError> {
+        if sweep.starts_with("rolling-v1:") {
+            return Err(LedgerError::Invalid("reserved planner sweep namespace"));
+        }
         if sweep.is_empty() || sweep.len() > 128 || relay.len() > 2048 || since < 0 || until < since
         {
             return Err(LedgerError::Invalid("invalid window or identity"));
@@ -285,20 +292,11 @@ impl JobLedger {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(id) = tx.query_row("SELECT id FROM jobs WHERE sweep=?1 AND relay=?2 AND since=?3 AND until=?4 AND parent IS NULL", params![sweep,relay,since,until], |r| r.get::<_,i64>(0)).optional()? {
-            return read_job(&tx,id);
+        let (job, inserted) =
+            enqueue_window(&tx, &self.path, self.limits, sweep, &relay, since, until)?;
+        if inserted {
+            commit(tx, &self.path, self.limits)?;
         }
-        let overlaps: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE sweep=?1 AND relay=?2 AND parent IS NULL AND since<=?4 AND until>=?3)",params![sweep,relay,since,until],|r|r.get(0))?;
-        if overlaps {
-            return Err(LedgerError::Invalid("overlapping root window"));
-        }
-        check_budget(&tx, &self.path, self.limits, 1)?;
-        tx.execute(
-            "INSERT INTO jobs(sweep,relay,since,until,state) VALUES(?1,?2,?3,?4,'queued')",
-            params![sweep, relay, since, until],
-        )?;
-        let job = read_job(&tx, tx.last_insert_rowid())?;
-        commit(tx, &self.path, self.limits)?;
         Ok(job)
     }
 
@@ -779,6 +777,31 @@ impl JobLedger {
         tx.commit()?;
         Ok(())
     }
+}
+
+// Shared by explicit enqueue and the planner's atomic cursor transaction.
+fn enqueue_window(
+    tx: &rusqlite::Transaction<'_>,
+    path: &Path,
+    limits: LedgerLimits,
+    sweep: &str,
+    relay: &str,
+    since: i64,
+    until: i64,
+) -> Result<(Job, bool), LedgerError> {
+    if let Some(id) = tx.query_row("SELECT id FROM jobs WHERE sweep=?1 AND relay=?2 AND since=?3 AND until=?4 AND parent IS NULL", params![sweep,relay,since,until], |r| r.get::<_,i64>(0)).optional()? {
+        return Ok((read_job(tx,id)?, false));
+    }
+    let overlaps: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE sweep=?1 AND relay=?2 AND parent IS NULL AND since<=?4 AND until>=?3)",params![sweep,relay,since,until],|r|r.get(0))?;
+    if overlaps {
+        return Err(LedgerError::Invalid("overlapping root window"));
+    }
+    check_budget(tx, path, limits, 1)?;
+    tx.execute(
+        "INSERT INTO jobs(sweep,relay,since,until,state) VALUES(?1,?2,?3,?4,'queued')",
+        params![sweep, relay, since, until],
+    )?;
+    Ok((read_job(tx, tx.last_insert_rowid())?, true))
 }
 
 /// Result of one bounded reconciliation call; checked rows can still be missing.
