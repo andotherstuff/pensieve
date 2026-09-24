@@ -15,6 +15,8 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use self::capture::Capture;
+#[cfg(test)]
+pub(super) use self::transport::inventory;
 pub use self::transport::{Assignment, Hello, ParentMessage, read_message, write_message};
 pub use self::transport::{INVENTORY_CHUNK_ITEMS, hash_item, inventory_hasher};
 use super::failure::{FailureDiagnostic, FailureKind};
