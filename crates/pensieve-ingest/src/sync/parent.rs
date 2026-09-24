@@ -216,11 +216,9 @@ impl ParentExecutor {
                             receipts,
                             reply,
                         } => {
-                            let _ = reply.send(
-                                ledger
-                                    .maintain_archived(&dedupe, &writer, jobs, receipts)
-                                    .map_err(Into::into),
-                            );
+                            let _ = reply.send(archive_maintenance(&writer, || {
+                                ledger.maintain_archived(&dedupe, &writer, jobs, receipts)
+                            }));
                         }
                         Command::Lease { now, ttl, reply } => {
                             let _ = reply.send(ledger.lease_next(now, ttl).map_err(Into::into));
@@ -377,7 +375,6 @@ impl ParentExecutor {
         )
         .await
     }
-
     /// Read one bounded job record without exposing its lease capability.
     pub async fn job(&mut self, id: i64) -> Result<Job, ParentError> {
         let (reply, response) = oneshot::channel();
@@ -419,7 +416,6 @@ impl ParentExecutor {
         )
         .await
     }
-
     /// Authenticate before exporting a lease, then perform exactly one exchange.
     ///
     /// `timeout` includes queue wait, inventory and all socket traffic, capped at
@@ -680,6 +676,25 @@ fn exchange(
             UploadAction::Failed(reason) => return Ok(SessionOutcome::Failed(reason)),
         }
     }
+}
+
+// Keep the archive pause distinct from invalid limits/authority and storage
+// errors, including when concurrent live admission latches during this turn.
+fn archive_maintenance<F>(
+    writer: &SegmentWriter,
+    operation: F,
+) -> Result<MaintenanceProgress, ParentError>
+where
+    F: FnOnce() -> Result<MaintenanceProgress, LedgerError>,
+{
+    if writer.recovery_required() {
+        return Err(ParentError::RecoveryRequired);
+    }
+    let result = operation();
+    if writer.recovery_required() {
+        return Err(ParentError::RecoveryRequired);
+    }
+    result.map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1404,6 +1419,84 @@ mod tests {
         );
         let ledger = h.executor.shutdown().await.unwrap();
         assert_eq!(ledger.get(h.job).unwrap().state, JobState::RetryWait);
+    }
+
+    #[tokio::test]
+    async fn maintenance_recovery_latch_is_typed_and_preserves_receipts() {
+        for latch_during_turn in [false, true] {
+            let mut h = Harness::new();
+            let lease = h.lease().await;
+            let mut ledger = h.executor.shutdown().await.unwrap();
+            ledger
+                .register_received(
+                    &lease,
+                    &ipc::ReceiptRecord {
+                        sequence: 1,
+                        event_id: [1; 32],
+                        created_at: 105,
+                        frame_bytes: 500,
+                        frame_digest: [2; 32],
+                    },
+                    now(),
+                )
+                .unwrap();
+            ledger
+                .retry(&lease, now(), 60, RetryReason::WorkerLost)
+                .unwrap();
+            let prior = ledger.attempt_progress(h.job, 1).unwrap();
+            let latch = || {
+                std::fs::create_dir(
+                    h._root
+                        .path()
+                        .join("archive/segment-000000000.notepack.open"),
+                )
+                .unwrap();
+                let event = EventBuilder::text_note("live archive fault")
+                    .custom_created_at(Timestamp::from(105))
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap();
+                assert!(
+                    h.writer
+                        .write_reserved(
+                            crate::pack_nostr_event(&event).unwrap(),
+                            h.dedupe.reserve(event.id.as_bytes()).unwrap().unwrap(),
+                        )
+                        .is_err()
+                );
+                assert!(h.writer.recovery_required());
+            };
+            if latch_during_turn {
+                // Deterministically latch after the owner's precheck, without
+                // timing a live-writer race or adding production test hooks.
+                let result = archive_maintenance(&h.writer, || {
+                    latch();
+                    ledger.maintain_archived(&h.dedupe, &h.writer, 32, 256)
+                });
+                assert!(matches!(result, Err(ParentError::RecoveryRequired)));
+            } else {
+                latch();
+                let mut executor = ParentExecutor::new(
+                    ledger,
+                    h.inventory.clone(),
+                    h.dedupe.clone(),
+                    h.writer.clone(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    executor.maintain_archived(32, 256).await,
+                    Err(ParentError::RecoveryRequired)
+                ));
+                ledger = executor.shutdown().await.unwrap();
+            }
+            assert_eq!(ledger.attempt_progress(h.job, 1).unwrap(), prior);
+            assert_eq!(ledger.get(h.job).unwrap().state, JobState::RetryWait);
+            drop(ledger);
+            let ledger =
+                JobLedger::open(&h._root.path().join("jobs.sqlite"), LedgerLimits::default())
+                    .unwrap();
+            assert_eq!(ledger.attempt_progress(h.job, 1).unwrap(), prior);
+            assert_eq!(ledger.get(h.job).unwrap().state, JobState::RetryWait);
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,92 @@ struct Cursor {
     next: u64,
 }
 
+/// Bounded, opaque observation used to fence an explicit cursor rewind.
+/// It grants no authority to change the archive namespace or skip segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCursorSnapshot {
+    bytes: Vec<u8>,
+    cursor: Cursor,
+}
+
+impl ReplayCursorSnapshot {
+    /// Inspect existing metadata without initializing or changing it. A snapshot
+    /// may become stale immediately; rewind compares the exact stored bytes.
+    pub fn inspect(state: &SyncStateDb) -> Result<Option<Self>> {
+        let Some(bytes) = state.replay_cursor()? else {
+            return Ok(None);
+        };
+        let cursor = decode_cursor(&bytes)?;
+        Ok(Some(Self { bytes, cursor }))
+    }
+
+    /// Explicit rollout floor currently recorded.
+    pub fn floor(&self) -> u64 {
+        self.cursor.floor
+    }
+
+    /// Next segment to replay, not a claim of remote coverage.
+    pub fn next_segment(&self) -> u64 {
+        self.cursor.next
+    }
+}
+
+/// Rewind within the existing writer namespace, preserving every inventory ID.
+/// This changes only metadata. Replay still checks archive authority and readiness
+/// before reading events. Missing, stale or forward requests fail closed.
+/// The replay ownership lock excludes active readers throughout comparison/write.
+/// A lower target also lowers the floor. Callers must subsequently use that floor
+/// when beginning replay. Missing files/markers remain hard replay errors; this
+/// does not repair archive data or prove coverage. No CLI/runtime activation.
+pub fn rewind_inventory_cursor(
+    state: &SyncStateDb,
+    expected: &ReplayCursorSnapshot,
+    target: u64,
+) -> Result<()> {
+    let _ownership = state
+        .replay_lock
+        .try_lock()
+        .ok_or_else(|| Error::Config("inventory replay already active".to_owned()))?;
+    if state.replay_cursor()?.as_deref() != Some(expected.bytes.as_slice()) {
+        return Err(Error::Validation("stale replay cursor snapshot".to_owned()));
+    }
+    if target > expected.cursor.next {
+        return Err(Error::Config(
+            "inventory cursor cannot skip forward".to_owned(),
+        ));
+    }
+    let mut cursor = expected.cursor.clone();
+    cursor.next = target;
+    cursor.floor = cursor.floor.min(target);
+    if cursor != expected.cursor {
+        save_cursor(state, &cursor)?;
+    }
+    Ok(())
+}
+
+fn valid_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 64
+        && prefix
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn decode_cursor(bytes: &[u8]) -> Result<Cursor> {
+    let cursor: Cursor =
+        serde_json::from_slice(bytes).map_err(|e| Error::Validation(e.to_string()))?;
+    if cursor.version != 1
+        || !cursor.archive.is_absolute()
+        || cursor.next < cursor.floor
+        || !valid_prefix(&cursor.prefix)
+    {
+        return Err(Error::Validation(
+            "invalid replay cursor; preserve existing state".to_owned(),
+        ));
+    }
+    Ok(cursor)
+}
+
 /// One bounded replay step, not proof of remote relay coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayProgress {
@@ -74,13 +160,7 @@ impl<'a> InventoryReplay<'a> {
             .replay_lock
             .try_lock()
             .ok_or_else(|| Error::Config("inventory replay already active".to_owned()))?;
-        if writer.recovery_required()
-            || prefix.is_empty()
-            || prefix.len() > 64
-            || !prefix
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        {
+        if writer.recovery_required() || !valid_prefix(prefix) {
             return Err(Error::Config(
                 "invalid replay configuration or archive recovery required".to_owned(),
             ));
@@ -95,14 +175,8 @@ impl<'a> InventoryReplay<'a> {
         };
         let cursor = match state.replay_cursor()? {
             Some(bytes) => {
-                let cursor: Cursor =
-                    serde_json::from_slice(&bytes).map_err(|e| Error::Validation(e.to_string()))?;
-                if cursor.version != 1
-                    || cursor.archive != archive
-                    || cursor.prefix != prefix
-                    || cursor.floor != floor
-                    || cursor.next < floor
-                {
+                let cursor = decode_cursor(&bytes)?;
+                if cursor.archive != archive || cursor.prefix != prefix || cursor.floor != floor {
                     return Err(Error::Config(
                         "replay cursor identity differs; preserve existing state".to_owned(),
                     ));
@@ -110,6 +184,11 @@ impl<'a> InventoryReplay<'a> {
                 cursor
             }
             None => {
+                if floor > ready_before {
+                    return Err(Error::Config(
+                        "initial replay floor exceeds ready archive".to_owned(),
+                    ));
+                }
                 save_cursor(state, &expected)?;
                 expected
             }
@@ -209,8 +288,7 @@ impl<'a> InventoryReplay<'a> {
                 .state
                 .replay_cursor()?
                 .ok_or_else(|| Error::Validation("missing replay cursor".to_owned()))?;
-            let current: Cursor =
-                serde_json::from_slice(&current).map_err(|e| Error::Validation(e.to_string()))?;
+            let current = decode_cursor(&current)?;
             if current != self.cursor {
                 return Err(Error::Validation("stale replay session".to_owned()));
             }
@@ -318,6 +396,146 @@ mod tests {
 
         fn cursor(&self) -> Cursor {
             serde_json::from_slice(&self.state.replay_cursor().unwrap().unwrap()).unwrap()
+        }
+    }
+
+    #[test]
+    fn rewind_preserves_inventory_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids;
+        {
+            let h = Harness::new(dir.path());
+            ids = h.seal(2);
+            h.begin().unwrap().unwrap().step(3).unwrap();
+            let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
+            assert_eq!(snapshot.next_segment(), 1);
+            rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
+            assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
+            assert_eq!(h.state.get_items_since(0).unwrap().len(), ids.len());
+        }
+        let h = Harness::new(dir.path());
+        assert_eq!(h.cursor().next, 0);
+        assert_eq!(h.begin().unwrap().unwrap().step(3).unwrap().frames, 2);
+        assert_eq!(h.state.get_items_since(0).unwrap().len(), ids.len());
+    }
+
+    #[test]
+    fn initial_floor_is_bounded_and_earlier_rollout_requires_explicit_rewind() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        h.seal(1);
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 99)
+                .is_err()
+        );
+        assert!(ReplayCursorSnapshot::inspect(&h.state).unwrap().is_none());
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 1)
+                .unwrap()
+                .is_none()
+        );
+        let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
+        assert_eq!(snapshot.floor(), 1);
+        assert!(h.begin().is_err());
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
+        assert_eq!(h.cursor().floor, 0);
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 1)
+                .is_err()
+        );
+        assert!(
+            h.begin()
+                .unwrap()
+                .unwrap()
+                .step(2)
+                .unwrap()
+                .segment_complete
+        );
+    }
+
+    #[test]
+    fn rewind_rejects_active_reader_forward_wrong_source_and_stale_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        h.seal(2);
+        let mut replay = h.begin().unwrap().unwrap();
+        let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
+        replay.step(1).unwrap();
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
+        drop(replay);
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 1).is_err());
+        let other = tempfile::tempdir().unwrap();
+        let wrong = Harness::new(other.path());
+        assert!(
+            InventoryReplay::begin(&h.state, &wrong.dedupe, &h.writer, &h.archive, "segment", 0)
+                .is_err()
+        );
+        assert!(
+            InventoryReplay::begin(
+                &h.state,
+                &wrong.dedupe,
+                &wrong.writer,
+                &wrong.archive,
+                "segment",
+                0
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap(),
+            snapshot
+        );
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
+        assert_eq!(
+            ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap(),
+            snapshot
+        );
+        // Even a semantically identical external metadata write invalidates the observation.
+        let mut changed = snapshot.bytes.clone();
+        changed.push(b' ');
+        h.state.save_replay_cursor(&changed).unwrap();
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
+        assert_eq!(h.state.replay_cursor().unwrap().unwrap(), changed);
+        assert_eq!(h.state.get_items_since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rewound_missing_segment_still_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        h.seal(1);
+        h.begin().unwrap().unwrap().step(2).unwrap();
+        let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
+        fs::rename(
+            h.archive.join("segment-000000000.notepack"),
+            h.archive.join("held.notepack"),
+        )
+        .unwrap();
+        assert!(h.begin().is_err());
+        assert_eq!(h.cursor().next, 0);
+        assert_eq!(h.state.get_items_since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_inspection_never_replaces_invalid_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        assert!(ReplayCursorSnapshot::inspect(&h.state).unwrap().is_none());
+        for bytes in [
+            b"{".to_vec(),
+            serde_json::to_vec(&Cursor {
+                version: 2,
+                archive: h.archive.canonicalize().unwrap(),
+                prefix: "segment".to_owned(),
+                floor: 0,
+                next: 0,
+            })
+            .unwrap(),
+        ] {
+            h.state.save_replay_cursor(&bytes).unwrap();
+            assert!(ReplayCursorSnapshot::inspect(&h.state).is_err());
+            assert_eq!(h.state.replay_cursor().unwrap().unwrap(), bytes);
         }
     }
 
