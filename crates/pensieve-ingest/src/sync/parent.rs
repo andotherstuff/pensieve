@@ -78,8 +78,6 @@ enum Command {
         reply: Reply<Job>,
     },
     Session {
-        #[cfg(test)]
-        delay_terminal_until_cancelled: bool,
         socket: UnixStream,
         lease: Lease,
         until: Instant,
@@ -94,8 +92,6 @@ enum Command {
 /// the writer. This library does not bind a socket, launch processes, retry jobs,
 /// or enable replay. Exclusive mutable methods prohibit concurrent submissions.
 pub struct ParentExecutor {
-    #[cfg(test)]
-    delay_terminal_until_cancelled: bool,
     sender: Option<mpsc::Sender<Command>>,
     stopped: Option<oneshot::Receiver<JobLedger>>,
     thread: Option<JoinHandle<()>>,
@@ -130,8 +126,6 @@ impl ParentExecutor {
                             let _ = reply.send(ledger.get(id).map_err(Into::into));
                         }
                         Command::Session {
-                            #[cfg(test)]
-                            delay_terminal_until_cancelled,
                             socket,
                             lease,
                             until,
@@ -144,7 +138,7 @@ impl ParentExecutor {
                                 continue;
                             }
                             if consumed_attempt == Some(identity) {
-                                let _ = reply.send(Err(ProtocolError::State.into()));
+                                let _ = reply.send(Err(ParentError::InvalidRequest));
                                 continue;
                             }
                             if cancelled.load(Ordering::Acquire) || Instant::now() >= until {
@@ -165,12 +159,6 @@ impl ParentExecutor {
                                 &dedupe,
                                 &writer,
                             );
-                            #[cfg(test)]
-                            if delay_terminal_until_cancelled && result.is_ok() {
-                                while !cancelled.load(Ordering::Acquire) {
-                                    std::thread::sleep(Duration::from_millis(1));
-                                }
-                            }
                             let _ = reply.send(result);
                         }
                     }
@@ -178,8 +166,6 @@ impl ParentExecutor {
                 let _ = done.send(ledger);
             })?;
         Ok(Self {
-            #[cfg(test)]
-            delay_terminal_until_cancelled: false,
             sender: Some(sender),
             stopped: Some(stopped),
             thread: Some(thread),
@@ -218,7 +204,11 @@ impl ParentExecutor {
     ///
     /// `timeout` includes queue wait, inventory and all socket traffic, capped at
     /// nine minutes. The lease's wall-clock expiry also fences every operation.
-    /// Dropping this future closes its socket; it does not retry/complete the job.
+    /// The owner polls this absolute deadline every 100 ms during socket work.
+    /// Already-running disk operations cannot be preempted: the await may outlast
+    /// the deadline and return a committed ProtocolDone or Failed result.
+    /// Dropping this future closes its socket but cannot undo committed work;
+    /// reread durable state before recovery after an external cancellation.
     pub async fn serve(
         &mut self,
         socket: tokio::net::UnixStream,
@@ -236,32 +226,22 @@ impl ParentExecutor {
         let socket = socket.into_std()?;
         socket.set_nonblocking(false)?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let guard = Cancel {
+        let _guard = Cancel {
             socket: socket.try_clone()?,
             cancelled: cancelled.clone(),
         };
         let (reply, response) = oneshot::channel();
         let command = Command::Session {
-            #[cfg(test)]
-            delay_terminal_until_cancelled: self.delay_terminal_until_cancelled,
             socket,
             lease,
             until,
             cancelled,
             reply,
         };
-        let request = self.request(command, response);
-        tokio::pin!(request);
-        match tokio::time::timeout(timeout, &mut request).await {
-            Ok(result) => result,
-            Err(_) => {
-                // Cancelling socket work cannot preempt a SQLite/fsync operation.
-                // Keep the owner reply: a terminal transaction may already have
-                // committed, and must not be misclassified as worker failure.
-                guard.cancel();
-                request.await
-            }
-        }
+        // The owner enforces the deadline and preserves its committed outcome.
+        // A competing timer shutting down this socket would turn a stalled read
+        // into EOF, incorrectly attributing the deadline to a peer disconnect.
+        self.request(command, response).await
     }
 
     /// Close the queue, await the owner and return the ledger for recovery.
@@ -290,11 +270,6 @@ struct Cancel {
 }
 impl Drop for Cancel {
     fn drop(&mut self) {
-        self.cancel();
-    }
-}
-impl Cancel {
-    fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         let _ = self.socket.shutdown(Shutdown::Both);
     }
@@ -307,7 +282,7 @@ struct DeadlineSocket {
     cancelled: Arc<AtomicBool>,
 }
 impl DeadlineSocket {
-    fn check(&self) -> std::io::Result<Duration> {
+    fn check(&self) -> std::io::Result<()> {
         let wall = self.expires_at.checked_sub(now()).filter(|n| *n > 0);
         if self.cancelled.load(Ordering::Acquire) || wall.is_none() {
             return Err(std::io::Error::new(
@@ -318,7 +293,7 @@ impl DeadlineSocket {
         self.until
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
-            .map(|d| d.min(Duration::from_secs(wall.unwrap() as u64)))
+            .map(|_| ())
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "parent session deadline")
             })
@@ -604,9 +579,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_terminal_outcome_survives_session_deadline() {
+    async fn terminal_frame_is_processed_when_worker_immediately_closes() {
         let mut h = Harness::new();
-        h.executor.delay_terminal_until_cancelled = true;
         let lease = h.lease().await;
         let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
         let uid = parent.peer_cred().unwrap().uid();
@@ -625,8 +599,7 @@ mod tests {
                 .unwrap();
         };
         let (result, ()) = tokio::join!(
-            h.executor
-                .serve(parent, uid, lease, Duration::from_millis(250)),
+            h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
             client
         );
         assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
@@ -801,12 +774,13 @@ mod tests {
                 tokio::select! { result = &mut future => panic!("unexpected {result:?}"), () = tokio::time::sleep(Duration::from_millis(25)) => {} }
                 drop(future);
             } else {
-                assert!(
+                assert!(matches!(
                     h.executor
                         .serve(parent, uid, lease, Duration::from_millis(30))
-                        .await
-                        .is_err()
-                );
+                        .await,
+                    Err(ParentError::Io(error))
+                        if error.kind() == std::io::ErrorKind::TimedOut
+                ));
             }
             let ledger = tokio::time::timeout(Duration::from_secs(3), h.executor.shutdown())
                 .await
@@ -814,6 +788,22 @@ mod tests {
                 .unwrap();
             assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
         }
+    }
+
+    #[tokio::test]
+    async fn peer_eof_during_greeting_is_not_a_deadline() {
+        let mut h = Harness::new();
+        let lease = h.lease().await;
+        let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        let uid = parent.peer_cred().unwrap().uid();
+        worker.write_all(&20u32.to_be_bytes()).await.unwrap();
+        worker.shutdown().await.unwrap();
+        assert!(matches!(
+            h.executor.serve(parent, uid, lease, Duration::from_secs(5)).await,
+            Err(ParentError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        let ledger = h.executor.shutdown().await.unwrap();
+        assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
     }
 
     #[tokio::test]
@@ -845,7 +835,11 @@ mod tests {
             h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
             client
         );
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(ParentError::Protocol(ProtocolError::Io(error)))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
         let ledger = h.executor.shutdown().await.unwrap();
         assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
         assert_eq!(ledger.attempt_progress(h.job, attempt).unwrap().received, 1);
@@ -919,12 +913,12 @@ mod tests {
         assert_eq!(result.unwrap(), SessionOutcome::Failed(FailureKind::Relay));
         assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
         let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
-        assert!(
+        assert!(matches!(
             h.executor
                 .serve(parent, uid, duplicate, Duration::from_secs(1))
-                .await
-                .is_err()
-        );
+                .await,
+            Err(ParentError::InvalidRequest)
+        ));
         assert_eq!(
             worker.read_u8().await.unwrap_err().kind(),
             std::io::ErrorKind::UnexpectedEof
@@ -945,7 +939,6 @@ mod tests {
                 Instant::now()
             };
             let command = Command::Session {
-                delay_terminal_until_cancelled: false,
                 socket,
                 lease: lease.clone(),
                 until,

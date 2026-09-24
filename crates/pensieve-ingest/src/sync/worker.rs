@@ -213,21 +213,7 @@ async fn attempt(
     let (count, digest) = match outcome {
         Ok(summary) => summary,
         Err(error) => {
-            // Drain/ACK all already-captured candidates before the terminal report.
-            // On any write failure/timeout the parent still owns its existing receipts.
-            timeout_at(
-                idle,
-                write_message(
-                    &mut stream,
-                    &Message::AttemptFailed {
-                        header: assignment.header(admitted + 1),
-                        report: error.diagnostic(),
-                    },
-                ),
-            )
-            .await
-            .map_err(|_| WorkerError::Deadline)??;
-            return Err(error);
+            return Err(report_failure(&mut stream, &assignment, admitted, idle, error).await);
         }
     };
     tracing::info!(relay = %relay_url, phase = "drained", count, "isolated reconciliation");
@@ -243,6 +229,29 @@ async fn attempt(
         .map_err(ProtocolError::Io)?;
     // This is protocol completion only. Parent alone decides archive completion.
     Ok(())
+}
+
+// Already captured candidates have been drained/ACKed before this best-effort
+// terminal report. A broken parent socket must not replace the verified cause.
+async fn report_failure(
+    stream: &mut UnixStream,
+    assignment: &Assignment,
+    admitted: u64,
+    idle: Instant,
+    error: WorkerError,
+) -> WorkerError {
+    let _ = timeout_at(
+        idle,
+        write_message(
+            stream,
+            &Message::AttemptFailed {
+                header: assignment.header(admitted + 1),
+                report: error.diagnostic(),
+            },
+        ),
+    )
+    .await;
+    error
 }
 
 #[cfg(test)]

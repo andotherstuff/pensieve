@@ -36,11 +36,12 @@ Blocking socket reads/writes poll at most every 100 milliseconds and check the
 same absolute deadline, so a partial frame cannot indefinitely reset the timeout.
 Socket timeouts are configured only once, before the greeting: macOS rejects
 timeout changes after peer exit even when a terminal frame remains buffered.
-The async deadline still closes the socket immediately. Dropping/timing out the
-async session shuts down both directions and sets cancellation before another
-operation begins. When its own deadline fires, `serve` retains and awaits the owner
-reply: an already-committed ProtocolDone or terminal failure is returned instead
-of being hidden by a timeout. This can extend the await beyond the socket deadline.
+The owner alone enforces the absolute deadline; no competing async timer shuts
+down the socket and misclassifies a stalled read as peer EOF. `serve` awaits the
+owner reply: an already-committed ProtocolDone or terminal failure is returned
+instead of being hidden by a timeout. This can extend the await beyond the socket
+deadline. Dropping the async session shuts down both directions and sets
+cancellation before another operation begins.
 An externally dropped future cannot deliver a reply; its caller must re-read the
 durable job/attempt state before deciding recovery, never assume a timeout means
 the terminal transaction did not commit. An already-running disk operation cannot be aborted: it may
@@ -49,8 +50,7 @@ cannot cause a false completion. The queue stays bounded while that operation
 finishes. `shutdown` asynchronously waits for the owner and returns the ledger;
 dropping an executor closes its queue but is not a substitute for joining during
 orderly shutdown. No claim of a hard disk-I/O deadline is made.
-Without an async cancellation wakeup (for example a stalled reactor), a single
-socket syscall may outlast the remaining deadline by up to the 100ms polling
+A single socket syscall may outlast the remaining deadline by up to the 100ms polling
 quantum plus OS scheduling delay. No new database operation starts afterward.
 
 ## Remaining integration requirements
@@ -73,6 +73,7 @@ quantum plus OS scheduling delay. No new database operation starts afterward.
 Local tests cover wrong UID, bounded stalled framing, dropped futures, malformed
 greetings, stale sequence, authenticated failures, refused reconnects, ACK admission,
 EOF receipts, and protocol-vs-archive completion using a real ledger/writer/index.
-They also cover committed ProtocolDone racing the session deadline and a 300-ID
+They also distinguish stalled-greeting TimedOut from actual peer EOF, preserve a
+buffered terminal result when the worker immediately closes, and cover a 300-ID
 multi-chunk inventory decoded by the real worker parser. Local invalid requests
 and archive recovery faults have distinct error types rather than worker blame.
