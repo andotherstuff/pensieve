@@ -57,6 +57,8 @@ pub mod ipc;
 pub mod jobs;
 mod negentropy;
 mod state;
+#[cfg(unix)]
+pub mod worker;
 
 pub use negentropy::{NegentropySyncConfig, NegentropySyncer, SyncStats, seed_from_clickhouse};
 pub use state::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};

@@ -1,0 +1,385 @@
+use super::super::ipc::{self, UploadAction, UploadSession};
+use super::super::jobs::{JobLedger, JobState, LedgerLimits};
+use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use futures_util::{SinkExt, StreamExt};
+use sha2::Digest;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, UnixListener};
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn event() -> Event {
+    EventBuilder::new(Kind::TextNote, "fixture")
+        .custom_created_at(Timestamp::from(150))
+        .sign_with_keys(&Keys::generate())
+        .unwrap()
+}
+
+fn job(dir: &Path, relay: &str) -> (JobLedger, super::super::jobs::Lease) {
+    let mut ledger = JobLedger::open(&dir.join("jobs"), LedgerLimits::default()).unwrap();
+    ledger.enqueue("fixture", relay, 100, 200).unwrap();
+    let lease = ledger.lease_next(now(), 600).unwrap().unwrap();
+    (ledger, lease)
+}
+
+fn uid() -> u32 {
+    UnixStream::pair().unwrap().0.peer_cred().unwrap().uid()
+}
+
+async fn send_inventory(stream: &mut UnixStream, lease: &super::super::jobs::Lease, relay: &str) {
+    let hello: Hello = read_message(stream).await.unwrap();
+    assert_eq!(hello.version, VERSION);
+    let mut assignment = Assignment::for_lease(lease);
+    // Test-only parent fixture bypasses the production ledger's private-IP filter.
+    assignment.relay = RelayUrl::parse(relay).unwrap().to_string();
+    let header = assignment.header(1);
+    write_message(stream, &ParentMessage::Job { assignment })
+        .await
+        .unwrap();
+    write_message(
+        stream,
+        &ParentMessage::InventoryEnd {
+            header,
+            count: 0,
+            digest: inventory_hasher().finalize().into(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+// Real pinned SDK speaks NIP-77 against this localhost-only relay. In partial
+// mode the relay advertises the ID but sends EOSE without fetching its event.
+async fn relay(partial: bool, hang: bool) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let event = event();
+        let mut storage = negentropy::NegentropyStorageVector::new();
+        storage
+            .insert(150, negentropy::Id::from_byte_array(event.id.to_bytes()))
+            .unwrap();
+        storage.seal().unwrap();
+        let mut engine = negentropy::Negentropy::borrowed(&storage, 60_000).unwrap();
+        while let Some(Ok(message)) = socket.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let response = match request[0].as_str().unwrap() {
+                "NEG-OPEN" | "NEG-MSG" if !hang => {
+                    let index = if request[0] == "NEG-OPEN" { 3 } else { 2 };
+                    let query = hex::decode(request[index].as_str().unwrap()).unwrap();
+                    let reply = engine.reconcile(&query).unwrap();
+                    serde_json::json!(["NEG-MSG", request[1], hex::encode(reply)])
+                }
+                "REQ" if !hang => {
+                    if !partial {
+                        let response = serde_json::json!(["EVENT", request[1], event]);
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                response.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    serde_json::json!(["EOSE", request[1]])
+                }
+                _ => continue,
+            };
+            if socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    response.to_string().into(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose() {
+    for partial in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("ipc");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (url, server) = relay(partial, false).await;
+        let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+        let id = lease.job().id;
+        let parent = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            send_inventory(&mut stream, &lease, &url).await;
+            let dedupe = Arc::new(crate::DedupeIndex::open(dir.path().join("dedupe")).unwrap());
+            let writer = crate::SegmentWriter::new(
+                crate::SegmentConfig {
+                    output_dir: dir.path().join("archive"),
+                    compress: false,
+                    ..Default::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap();
+            let mut session = UploadSession::new(lease.clone());
+            let mut count = 0;
+            loop {
+                let wire = match transport::read_wire(&mut stream).await {
+                    Ok(wire) => wire,
+                    Err(_) if partial => break,
+                    Err(error) => panic!("{error}"),
+                };
+                let frame = Frame::read(&mut &wire[..]).unwrap();
+                match session.receive(&mut ledger, frame, now()).unwrap() {
+                    UploadAction::Event(event) => {
+                        count += 1;
+                        let ack = session
+                            .admit_and_accept(&mut ledger, event, &dedupe, &writer, now)
+                            .unwrap();
+                        write_message(&mut stream, &ParentMessage::accepted(ack))
+                            .await
+                            .unwrap();
+                    }
+                    UploadAction::ProtocolDone => {
+                        assert!(!partial);
+                        assert_eq!(count, 1);
+                        assert_eq!(ledger.get(id).unwrap().state, JobState::AwaitingDurability);
+                        assert!(
+                            !ledger
+                                .reconcile_archived(id, &dedupe, &writer, 16)
+                                .unwrap()
+                                .complete
+                        );
+                        writer.seal().unwrap();
+                        assert!(
+                            ledger
+                                .reconcile_archived(id, &dedupe, &writer, 16)
+                                .unwrap()
+                                .complete
+                        );
+                        break;
+                    }
+                    _ => panic!("unexpected failure frame"),
+                }
+            }
+        };
+        let outcome = timeout(Duration::from_secs(8), async {
+            let (result, ()) = tokio::join!(
+                run_with_limits(
+                    &socket,
+                    uid(),
+                    Duration::from_secs(6),
+                    Duration::from_secs(3)
+                ),
+                parent
+            );
+            result
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        if partial {
+            assert!(matches!(outcome, Err(WorkerError::Incomplete)));
+            assert_eq!(ledger.get(id).unwrap().state, JobState::Leased);
+        } else {
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn relay_hang_and_parent_disconnect_terminate_without_protocol_done() {
+    for disconnect in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (url, server) = relay(false, true).await;
+        let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+        let parent = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            send_inventory(&mut stream, &lease, &url).await;
+            if !disconnect {
+                assert!(transport::read_wire(&mut stream).await.is_err());
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                run_with_limits(
+                    &path,
+                    uid(),
+                    Duration::from_secs(2),
+                    Duration::from_millis(250)
+                ),
+                parent
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        if !disconnect {
+            assert!(matches!(result, Err(WorkerError::Deadline)));
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn parent_uid_is_checked_before_hello_and_stalled_input_is_bounded() {
+    for wrong_uid in [true, false] {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let parent = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if !wrong_uid {
+                let _: Hello = read_message(&mut stream).await.unwrap();
+            }
+            assert!(transport::read_wire(&mut stream).await.is_err());
+        };
+        let (result, ()) = tokio::join!(
+            run_with_limits(
+                &path,
+                uid() + u32::from(wrong_uid),
+                Duration::from_millis(150),
+                Duration::from_secs(1)
+            ),
+            parent
+        );
+        assert!(matches!(
+            result,
+            Err(WorkerError::Peer | WorkerError::Deadline)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn inventory_checks_order_digest_cap_and_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    for failure in 0..6 {
+        let assignment = Assignment::for_lease(&lease);
+        let mut wire = ipc::encode_value(&ParentMessage::Job {
+            assignment: Assignment::for_lease(&lease),
+        })
+        .unwrap();
+        let items = match failure {
+            1 => vec![([1; 32], 150), ([1; 32], 150)],
+            2 => vec![([1; 32], 99)],
+            3 => vec![([1; 32], 150); INVENTORY_CHUNK_ITEMS + 1],
+            _ => vec![([1; 32], 150)],
+        };
+        let mut hash = inventory_hasher();
+        for (id, timestamp) in &items {
+            hash_item(&mut hash, id, *timestamp);
+        }
+        wire.extend(
+            ipc::encode_value(&ParentMessage::InventoryChunk {
+                header: assignment.header(1),
+                items,
+            })
+            .unwrap(),
+        );
+        wire.extend(
+            ipc::encode_value(&ParentMessage::InventoryEnd {
+                header: assignment.header(if failure == 4 { 3 } else { 2 }),
+                count: 1,
+                digest: if failure == 5 {
+                    [0; 32]
+                } else {
+                    hash.finalize().into()
+                },
+            })
+            .unwrap(),
+        );
+        let outcome = transport::inventory(&mut &wire[..]).await;
+        assert_eq!(outcome.is_ok(), failure == 0);
+        wire.pop();
+        assert!(transport::inventory(&mut &wire[..]).await.is_err());
+    }
+    let mut oversized = &((ipc::MAX_FRAME_BYTES as u32 + 1).to_be_bytes())[..];
+    assert!(matches!(
+        read_message::<_, Hello>(&mut oversized).await,
+        Err(ProtocolError::Limit)
+    ));
+    let (mut write, mut read) = tokio::io::duplex(64);
+    write.write_all(&10u32.to_be_bytes()).await.unwrap();
+    drop(write);
+    assert!(read_message::<_, Hello>(&mut read).await.is_err());
+}
+
+#[tokio::test]
+async fn lost_or_wrong_ack_never_reports_success_and_preserves_received_obligation() {
+    for wrong_ack in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = dir.path().join("ipc");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (url, server) = relay(false, false).await;
+        let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+        let parent = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            send_inventory(&mut stream, &lease, &url).await;
+            let wire = transport::read_wire(&mut stream).await.unwrap();
+            let mut session = UploadSession::new(lease.clone());
+            assert!(matches!(
+                session
+                    .receive(&mut ledger, Frame::read(&mut &wire[..]).unwrap(), now())
+                    .unwrap(),
+                UploadAction::Event(_)
+            ));
+            if wrong_ack {
+                write_message(
+                    &mut stream,
+                    &ParentMessage::Accepted {
+                        header: Assignment::for_lease(&lease).header(2),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(transport::read_wire(&mut stream).await.is_err());
+            }
+            // No admission/ACK: the receipt must survive this socket loss.
+        };
+        let (outcome, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_with_limits(
+                    &socket,
+                    uid(),
+                    Duration::from_secs(3),
+                    Duration::from_secs(2)
+                ),
+                parent
+            )
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(outcome.is_err());
+        assert!(ledger.expire(lease.expires_at(), 60).unwrap());
+        let progress = ledger
+            .attempt_progress(lease.job().id, lease.job().attempt)
+            .unwrap();
+        assert_eq!(progress.received, 1);
+        assert_eq!(progress.archived, 0);
+        assert!(!progress.protocol_done);
+        assert_eq!(
+            ledger.get(lease.job().id).unwrap().state,
+            JobState::RetryWait
+        );
+    }
+}

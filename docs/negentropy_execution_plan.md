@@ -29,11 +29,12 @@ analytics architecture. The existing SDK remains pinned; no SDK fork is required
 | Slice | Scope | Gate / status |
 | --- | --- | --- |
 | 1a, #45 | Durable jobs, leases, retry and split | Merged; CI and review passed |
-| 1b, #46 | Bounded framed uploads, credits, received receipts | Review/CI gate; library only |
-| 2a, #48 | Shared archive admission, durable receipt reconciliation and compaction | Review/CI gate; no runtime consumer yet |
-| 2b | Independent periodic archive sealing | Current implementation; Parquet-disabled durability and joined shutdown tests |
-| 2c | Bounded sealed-segment inventory replay/export | Library implemented; review/CI gate, no runtime replay enabled |
-| 3 | Worker executable, authenticated IPC and parent scheduler | Not implemented; fake relay flood/hang/partial-fetch/cancellation tests |
+| 1b, #46 | Bounded framed uploads, credits, received receipts | Merged; CI and independent reviews passed |
+| 2a, #48 | Shared archive admission, durable receipt reconciliation and compaction | Merged; CI and independent reviews passed |
+| 2b, #49 | Independent periodic archive sealing | Merged; Parquet-disabled durability and joined shutdown tests |
+| 2c, #50 | Bounded sealed-segment inventory replay/export | Merged; no runtime replay enabled |
+| 3a | One-job worker executable and parent wire exchange | Implemented; test/review gate, no production parent endpoint |
+| 3b | Parent scheduler, authenticated listener and inventory activation | Next; persistence/fairness, bounded executor, seal-race/cursor repair gates |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |
 | 5 | Controlled production canary and soak | Not started; separate readiness decision |
 
