@@ -20,10 +20,26 @@ pub(super) struct Pending {
 struct State {
     sender: Option<mpsc::Sender<Pending>>,
     failed: bool,
+    rejection: Option<Rejection>,
     count: u64,
     bytes: u64,
     digest: [u8; 32],
     ids: HashSet<EventId>,
+}
+
+#[derive(Clone, Copy)]
+enum Rejection {
+    Volume,
+    EventSize,
+}
+
+impl Rejection {
+    fn error(self) -> WorkerError {
+        match self {
+            Self::Volume => WorkerError::Volume,
+            Self::EventSize => WorkerError::EventSize,
+        }
+    }
 }
 
 pub(super) struct Capture {
@@ -52,6 +68,7 @@ impl Capture {
                 state: Mutex::new(State {
                     sender: Some(sender),
                     failed: false,
+                    rejection: None,
                     count: 0,
                     bytes: 0,
                     digest: ipc::initial_digest(),
@@ -65,13 +82,12 @@ impl Capture {
     async fn capture(&self, event: &Event) -> Result<(), WorkerError> {
         let mut state = self.state.lock().await;
         if state.failed || state.sender.is_none() {
-            return Err(WorkerError::Incomplete);
+            return Err(state
+                .rejection
+                .map_or(WorkerError::Incomplete, Rejection::error));
         }
         state.failed = true;
-        if event.created_at.as_secs() < self.since
-            || event.created_at.as_secs() > self.until
-            || state.count >= ipc::MAX_EVENTS
-        {
+        if event.created_at.as_secs() < self.since || event.created_at.as_secs() > self.until {
             return Err(WorkerError::Incomplete);
         }
         crate::pipeline::validate_archive_event(event).map_err(|_| WorkerError::Incomplete)?;
@@ -82,9 +98,19 @@ impl Capture {
                 ..self.identity.clone()
             },
             event: Box::new(event.clone()),
+        })
+        .map_err(|error| match error {
+            ipc::ProtocolError::Limit => {
+                state.rejection = Some(Rejection::EventSize);
+                WorkerError::EventSize
+            }
+            other => WorkerError::Protocol(other),
         })?;
-        if state.bytes + wire.len() as u64 > ipc::MAX_ATTEMPT_BYTES {
-            return Err(WorkerError::Incomplete);
+        if state.count >= ipc::MAX_EVENTS
+            || state.bytes + wire.len() as u64 > ipc::MAX_ATTEMPT_BYTES
+        {
+            state.rejection = Some(Rejection::Volume);
+            return Err(WorkerError::Volume);
         }
         let credit = self
             .credit
@@ -119,6 +145,9 @@ impl Capture {
     ) -> Result<(u64, [u8; 32]), WorkerError> {
         let mut state = self.state.lock().await;
         state.sender.take();
+        if let Some(reason) = state.rejection {
+            return Err(reason.error());
+        }
         let result = result.ok_or(WorkerError::Incomplete)?;
         if state.failed
             || !result.remote.is_subset(&result.received)
@@ -127,6 +156,22 @@ impl Capture {
             return Err(WorkerError::Incomplete);
         }
         Ok((state.count, state.digest))
+    }
+
+    pub async fn finish_download(
+        &self,
+        result: Result<DownloadProof, WorkerError>,
+    ) -> Result<(u64, [u8; 32]), WorkerError> {
+        let summary = self.finish(result.as_ref().ok()).await;
+        // The SDK suppresses the notification when our callback rejects an event.
+        // Preserve the first verified local cause instead of losing it to EOSE.
+        match summary {
+            Err(error @ (WorkerError::Volume | WorkerError::EventSize)) => Err(error),
+            summary => {
+                result?;
+                summary
+            }
+        }
     }
 }
 
@@ -199,6 +244,67 @@ mod tests {
             .sign_with_keys(&Keys::generate())
             .unwrap();
         (capture, receiver, event)
+    }
+
+    #[tokio::test]
+    async fn local_rejections_survive_eose_and_keep_the_first_cause() {
+        for by_count in [false, true] {
+            let (capture, mut receiver, event) = fixture();
+            if by_count {
+                capture.state.lock().await.count = ipc::MAX_EVENTS;
+            } else {
+                capture.state.lock().await.bytes = ipc::MAX_ATTEMPT_BYTES;
+            }
+            assert!(matches!(
+                capture.capture(&event).await,
+                Err(WorkerError::Volume)
+            ));
+            let mut invalid = event;
+            invalid.content.push('x');
+            assert!(matches!(
+                capture.capture(&invalid).await,
+                Err(WorkerError::Volume)
+            ));
+            assert!(matches!(
+                capture.finish_download(Err(WorkerError::Unavailable)).await,
+                Err(WorkerError::Volume)
+            ));
+            assert!(receiver.recv().await.is_none());
+        }
+        let (capture, mut receiver, _) = fixture();
+        // An individual oversized event wins over aggregate exhaustion: splitting
+        // cannot make this event fit. No payload enters the upload queue.
+        capture.state.lock().await.bytes = ipc::MAX_ATTEMPT_BYTES;
+        let large = EventBuilder::new(Kind::TextNote, "x".repeat(ipc::MAX_FRAME_BYTES))
+            .custom_created_at(Timestamp::from(150))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(matches!(
+            capture.capture(&large).await,
+            Err(WorkerError::EventSize)
+        ));
+        assert!(matches!(
+            capture.finish_download(Err(WorkerError::Unavailable)).await,
+            Err(WorkerError::EventSize)
+        ));
+        assert!(receiver.recv().await.is_none());
+
+        let (capture, _receiver, mut invalid) = fixture();
+        capture.state.lock().await.bytes = ipc::MAX_ATTEMPT_BYTES;
+        invalid.content.push('x');
+        assert!(matches!(
+            capture.capture(&invalid).await,
+            Err(WorkerError::Incomplete)
+        ));
+        assert!(matches!(
+            capture.finish_download(Err(WorkerError::Unavailable)).await,
+            Err(WorkerError::Unavailable)
+        ));
+        assert_eq!(WorkerError::Unavailable.exit_code(), 2);
+        assert_eq!(WorkerError::Volume.exit_code(), 3);
+        assert_eq!(WorkerError::EventSize.exit_code(), 4);
+        assert_eq!(WorkerError::Incomplete.exit_code(), 1);
+        assert_eq!(WorkerError::Deadline.exit_code(), 1);
     }
 
     #[tokio::test]

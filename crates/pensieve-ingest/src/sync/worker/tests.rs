@@ -159,6 +159,49 @@ async fn relay_events(
 }
 
 #[tokio::test]
+async fn closed_diff_fails_without_waiting_for_the_idle_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        while let Some(Ok(message)) = socket.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(message.to_text().unwrap()).unwrap();
+            if request[0] == "NEG-OPEN" {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!(["CLOSED", request[1], "blocked"])
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let client = Client::default();
+    client.add_relay(&url).await.unwrap();
+    let relay = client.relay(&url).await.unwrap();
+    relay.try_connect(Duration::from_secs(2)).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(2),
+        reconcile::download(&relay, &Assignment::for_lease(&lease), vec![]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Incomplete)));
+    client.disconnect().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn overlapping_multiround_and_large_reply_multibatch_downloads() {
     use std::sync::atomic::Ordering;
     for (total, overlap) in [(2000, 1000), (2400, 0)] {

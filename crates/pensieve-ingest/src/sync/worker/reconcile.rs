@@ -84,6 +84,8 @@ pub(super) async fn download(
                 for id in need {
                     remote.insert(EventId::from_byte_array(id.to_bytes()));
                     if remote.len() > MAX_EVENTS as usize {
+                        // Relay-advertised IDs are not verified events. Do not
+                        // treat this alone as proven volume for automatic splitting.
                         return Err(WorkerError::Incomplete);
                     }
                 }
@@ -100,6 +102,9 @@ pub(super) async fn download(
             RelayNotification::Message {
                 message:
                     RelayMessage::NegErr {
+                        subscription_id, ..
+                    }
+                    | RelayMessage::Closed {
                         subscription_id, ..
                     },
             } if subscription_id.as_ref() == &id => return Err(WorkerError::Incomplete),
