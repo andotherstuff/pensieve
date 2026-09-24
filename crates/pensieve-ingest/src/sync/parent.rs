@@ -45,7 +45,7 @@ pub enum ParentError {
     /// Socket or deadline failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// Invalid or out-of-order worker traffic.
+    /// Invalid traffic or ambiguous upload state; not automatic relay blame.
     #[error(transparent)]
     Protocol(ProtocolError),
     /// Durable ledger error.
@@ -60,6 +60,9 @@ impl From<ProtocolError> for ParentError {
     fn from(error: ProtocolError) -> Self {
         match error {
             ProtocolError::Io(error) => Self::Io(error),
+            ProtocolError::Ledger(error @ LedgerError::Invalid(_)) => {
+                Self::Protocol(ProtocolError::Ledger(error))
+            }
             ProtocolError::Ledger(error) => Self::Ledger(error),
             ProtocolError::Archive(error) => Self::Archive(error),
             error => Self::Protocol(error),
@@ -913,6 +916,14 @@ mod tests {
             ParentError::Ledger(LedgerError::Budget)
         ));
         assert!(matches!(
+            ParentError::from(ProtocolError::Ledger(LedgerError::Invalid(
+                "worker summary"
+            ))),
+            ParentError::Protocol(ProtocolError::Ledger(LedgerError::Invalid(
+                "worker summary"
+            )))
+        ));
+        assert!(matches!(
             ParentError::from(ProtocolError::Archive(crate::Error::Config(
                 "local".to_owned()
             ))),
@@ -961,6 +972,49 @@ mod tests {
         let ledger = h.executor.shutdown().await.unwrap();
         assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
         assert_eq!(ledger.attempt_progress(h.job, attempt).unwrap().received, 1);
+    }
+
+    #[tokio::test]
+    async fn forged_done_summary_is_protocol_error_and_preserves_gap() {
+        for wrong_count in [false, true] {
+            let mut h = Harness::new();
+            let lease = h.lease().await;
+            let attempt = lease.job().attempt;
+            let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+            let uid = parent.peer_cred().unwrap().uid();
+            let client = async move {
+                let assignment = greeting(&mut worker).await;
+                let mut digest = ipc::initial_digest();
+                if !wrong_count {
+                    digest[0] ^= 1;
+                }
+                worker
+                    .write_all(
+                        &Frame::encode(&Message::ProtocolDone {
+                            header: assignment.header(1),
+                            count: u64::from(wrong_count),
+                            digest,
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(
+                h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
+                client
+            );
+            assert!(matches!(
+                result,
+                Err(ParentError::Protocol(ProtocolError::Ledger(
+                    LedgerError::Invalid("protocol receipt summary mismatch")
+                )))
+            ));
+            let ledger = h.executor.shutdown().await.unwrap();
+            let progress = ledger.attempt_progress(h.job, attempt).unwrap();
+            assert_eq!((progress.received, progress.protocol_done), (0, false));
+            assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
+        }
     }
 
     #[tokio::test]
