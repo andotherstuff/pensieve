@@ -156,12 +156,7 @@ impl Frame {
 
     /// Encode with a bounded writer instead of building an unbounded JSON Vec.
     pub fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
-        let mut writer = BoundedWriter(Vec::new());
-        serde_json::to_writer(&mut writer, message).map_err(|_| ProtocolError::Limit)?;
-        let mut wire = Vec::with_capacity(writer.0.len() + 4);
-        wire.extend_from_slice(&(writer.0.len() as u32).to_be_bytes());
-        wire.extend_from_slice(&writer.0);
-        Ok(wire)
+        encode_value(message)
     }
 
     fn wire_bytes(&self) -> u64 {
@@ -174,6 +169,18 @@ impl Frame {
         hash.update(&self.payload);
         hash.finalize().into()
     }
+}
+
+pub(super) fn encode_value<T>(message: &T) -> Result<Vec<u8>, ProtocolError>
+where
+    T: Serialize,
+{
+    let mut writer = BoundedWriter(Vec::new());
+    serde_json::to_writer(&mut writer, message).map_err(|_| ProtocolError::Limit)?;
+    let mut wire = Vec::with_capacity(writer.0.len() + 4);
+    wire.extend_from_slice(&(writer.0.len() as u32).to_be_bytes());
+    wire.extend_from_slice(&writer.0);
+    Ok(wire)
 }
 
 struct BoundedWriter(Vec<u8>);
@@ -237,7 +244,7 @@ impl RegisteredEvent {
 /// The future parent transport must frame this under its own sequence contract.
 #[derive(Serialize)]
 pub struct Accepted {
-    header: Header,
+    pub(super) header: Header,
 }
 
 /// Result of processing one upload message. No variant means job complete.

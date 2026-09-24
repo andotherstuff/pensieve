@@ -49,6 +49,7 @@ pensieve-parquet = { path = "../pensieve-parquet" }
 # Nostr
 notepack.workspace = true
 nostr-sdk.workspace = true
+negentropy = "=0.5.0"
 
 # Async runtime
 tokio.workspace = true
@@ -103,3 +104,6 @@ ctrlc.workspace = true
 
 # TLS (for rustls crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+tokio-tungstenite = "=0.26.2"

@@ -42,6 +42,7 @@ Pensieve is an **archive-first** Nostr indexer. It stores canonical events in a 
 |-----------|--------|
 | `pensieve-core` | ✅ Event validation, notepack encoding, metrics |
 | `pensieve-ingest` | ✅ Live relay ingestion + optional inventoried Parquet shadow sink |
+| `pensieve-negentropy-worker` | Experimental one-job isolated worker; `--socket PATH --parent-uid UID`. Not enabled by ingestion; requires the pending parent scheduler and Linux isolation gate. See [worker contract](docs/negentropy_worker.md). |
 | `pensieve-parquet` | 🚧 Accepted V1 writer, strict validator, fixtures, and notepack converter prototype |
 | `pensieve-lake` | 🚧 Resumable notepack campaign, SQLite inventory, and immutable local/S3 publication |
 | `pensieve-serve` | 🚧 Placeholder |
