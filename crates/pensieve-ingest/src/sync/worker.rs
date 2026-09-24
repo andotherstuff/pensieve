@@ -1,8 +1,9 @@
 //! One isolated worker session. No archive/database handles or parent scheduler.
 //! The executable owns process exit; systemd must provide the non-yielding/OOM
-//! backstop. Wire bounds do not bound the pinned SDK's remote reconciliation sets.
+//! backstop. Wire/ID bounds do not bound all SDK decoder/allocator memory.
 
 mod capture;
+mod reconcile;
 mod transport;
 
 use std::path::Path;
@@ -96,15 +97,7 @@ async fn attempt(
             .await
             .map_err(|_| WorkerError::Incomplete)?;
         tracing::info!(relay = %relay_url, phase = "sync", "isolated reconciliation");
-        let result = relay
-            .sync_with_items(
-                Filter::new()
-                    .since(Timestamp::from(assignment.since))
-                    .until(Timestamp::from(assignment.until)),
-                items,
-                &SyncOptions::default().direction(SyncDirection::Down),
-            )
-            .await;
+        let result = reconcile::download(&relay, &assignment, items).await;
         tracing::info!(relay = %relay_url, phase = "disconnect", "isolated reconciliation");
         client.disconnect().await;
         // Close under the callback lock, not by hoping SDK Arc destruction closes

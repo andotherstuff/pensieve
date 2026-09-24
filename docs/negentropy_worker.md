@@ -29,21 +29,28 @@ before its row-count check; it is not an allocator-byte claim.
 One relay and inclusive window (at most 900 seconds) come from the authenticated
 parent. Reject URL credentials/query/fragment to avoid logging secrets. The parent
 owns allowlisting and outbound URL policy; localhost is used only by test fixtures.
-The worker runs the pinned SDK's **single-relay** `sync_with_items`, not pool-wide
-`join_all`. It has no API for reading RocksDB inventory itself.
+The worker uses the pinned SDK's single-relay transport, but owns a small
+download-only NIP-77 loop using the same pinned negentropy 0.5.0 primitive. It does
+not call SDK `sync_with_items`: that convenience loop can report success after
+notification lag/closure without completing the diff. Our one notification reader
+turns either condition into an error; only explicit diff completion followed by
+fully fetched 128-ID batches can construct download proof. Remote missing IDs are
+capped at 50,000. There is no pool-wide `join_all`, separate support-check subscriber,
+or worker API for reading RocksDB inventory. Repeated inventory IDs are rejected
+even at different timestamps.
 
 The SDK callback validates and serializes into a capped event frame, then waits on
 bounded byte credit/queue space. There are at most 15 queued wire frames plus one
 in-flight frame, capped to 8 MiB of credited wire bytes; one callback being encoded
 can hold an additional capped frame and the SDK event representation. This is not
-a bound on the SDK's remote sets or allocator memory. Total output remains 50,000
+a bound on all SDK decoder or allocator memory. Total output remains 50,000
 frames / 64 MiB per attempt. Callbacks serialize through an async mutex; cancellation
 or failure leaves the attempt poisoned. There is no unbounded collector vector.
 
 The worker releases frame credit only after a matching Accepted echo, meaning
 parent admission ownership, not archival. After sync, disconnect is requested and
 capture is explicitly closed under its callback lock. Completion requires every
-remote missing ID to appear in both SDK received IDs and captured IDs, no callback
+remote missing ID to appear in both the worker's fetched IDs and captured IDs, no callback
 failure, and every captured frame to receive its ACK. Only then send ProtocolDone
 with exact count/digest. EOSE, empty socket output and SDK success alone do not
 qualify. Unsolicited frames, cancellation, EOF and wrong ACKs fail closed. Failures
@@ -59,7 +66,7 @@ this process; the future service supplies paced restart, not a busy reconnect lo
 
 The binary exits without waiting for SDK background-task destruction on either
 result. It owns no durable writes; OS process exit closes remaining sockets. Async
-timeouts cannot interrupt non-yielding SDK code or prevent remote-set OOM. The
+timeouts cannot interrupt non-yielding SDK code or prevent all decoder OOM. The
 separate systemd runtime/memory/CPU limits remain mandatory and untested here.
 Logs allow only the worker's fixed phase/error messages, not SDK payload diagnostics.
 
@@ -68,6 +75,8 @@ parent receipt/admission library. They cover successful durable publication only
 after seal, partial fetch despite EOSE, hanging relay, parent disconnect, stalled
 inventory, wrong parent UID, lost/wrong ACK with retained receipts, bounded queue
 backpressure/cancellation, event/byte limits, ordering and digest/truncation errors.
+Explicit regression tests reject lagged/closed notification receivers and repeated
+IDs at different timestamps; a real empty diff still completes successfully.
 They do not substitute for Linux OOM/kill/no-orphan or throughput tests.
 
 Next: parent-owned bounded executor and authenticated endpoint, fair lazy planning

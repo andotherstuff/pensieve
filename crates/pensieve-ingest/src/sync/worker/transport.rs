@@ -1,5 +1,6 @@
 //! Versioned bounded parent exchange. Socket peer authentication precedes this.
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nostr_sdk::prelude::{EventId, RelayUrl, Timestamp};
@@ -194,6 +195,7 @@ where
     assignment.validate()?;
     let mut items = Vec::new();
     let mut previous = None;
+    let mut seen_ids = HashSet::new();
     let mut hash = inventory_hasher();
     let mut sequence = 1;
     loop {
@@ -213,6 +215,7 @@ where
                     if timestamp < assignment.since
                         || timestamp > assignment.until
                         || previous.is_some_and(|p| p >= (timestamp, id))
+                        || !seen_ids.insert(id)
                     {
                         return Err(ProtocolError::State);
                     }

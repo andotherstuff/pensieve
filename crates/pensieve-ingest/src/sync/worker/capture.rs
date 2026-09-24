@@ -8,6 +8,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::super::ipc::{self, Frame, Header, Message};
+use super::reconcile::DownloadProof;
 use super::{Assignment, WorkerError};
 
 pub(super) struct Pending {
@@ -114,7 +115,7 @@ impl Capture {
 
     pub async fn finish(
         &self,
-        result: Option<&Reconciliation>,
+        result: Option<&DownloadProof>,
     ) -> Result<(u64, [u8; 32]), WorkerError> {
         let mut state = self.state.lock().await;
         state.sender.take();
@@ -164,7 +165,7 @@ impl NostrDatabase for Capture {
         &self,
         _: Filter,
     ) -> BoxedFuture<'_, Result<Vec<(EventId, Timestamp)>, DatabaseError>> {
-        // sync_with_items supplies the exact bounded inventory directly.
+        // The worker-owned diff loop supplies its exact bounded inventory directly.
         Box::pin(async {
             Err(DatabaseError::backend(std::io::Error::other(
                 "worker requires explicit inventory",
@@ -218,7 +219,7 @@ mod tests {
         assert!(capture.capture(&event).await.is_err());
         assert!(
             capture
-                .finish(Some(&Reconciliation::default()))
+                .finish(Some(&DownloadProof::default()))
                 .await
                 .is_err()
         );
@@ -233,16 +234,15 @@ mod tests {
             ipc::initial_digest(),
             ipc::encoded_frame_digest(&pending.wire),
         );
-        let result = Reconciliation {
+        let result = DownloadProof {
             remote: HashSet::from([event.id]),
             received: HashSet::from([event.id]),
-            ..Default::default()
         };
         assert_eq!(capture.finish(Some(&result)).await.unwrap(), (1, expected));
         assert!(capture.capture(&event).await.is_err());
         for fetched in [false, true] {
             let (capture, _receiver, event) = fixture();
-            let mut result = Reconciliation::default();
+            let mut result = DownloadProof::default();
             result.remote.insert(event.id);
             if fetched {
                 result.received.insert(event.id);
@@ -252,7 +252,7 @@ mod tests {
         let (capture, _receiver, _) = fixture();
         assert_eq!(
             capture
-                .finish(Some(&Reconciliation::default()))
+                .finish(Some(&DownloadProof::default()))
                 .await
                 .unwrap(),
             (0, ipc::initial_digest())
@@ -298,7 +298,7 @@ mod tests {
             ));
             assert!(
                 capture
-                    .finish(Some(&Reconciliation::default()))
+                    .finish(Some(&DownloadProof::default()))
                     .await
                     .is_err()
             );

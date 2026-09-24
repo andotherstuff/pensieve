@@ -58,6 +58,14 @@ async fn send_inventory(stream: &mut UnixStream, lease: &super::super::jobs::Lea
 // Real pinned SDK speaks NIP-77 against this localhost-only relay. In partial
 // mode the relay advertises the ID but sends EOSE without fetching its event.
 async fn relay(partial: bool, hang: bool) -> (String, tokio::task::JoinHandle<()>) {
+    relay_with_empty(partial, hang, false).await
+}
+
+async fn relay_with_empty(
+    partial: bool,
+    hang: bool,
+    empty: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
@@ -65,9 +73,11 @@ async fn relay(partial: bool, hang: bool) -> (String, tokio::task::JoinHandle<()
         let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
         let event = event();
         let mut storage = negentropy::NegentropyStorageVector::new();
-        storage
-            .insert(150, negentropy::Id::from_byte_array(event.id.to_bytes()))
-            .unwrap();
+        if !empty {
+            storage
+                .insert(150, negentropy::Id::from_byte_array(event.id.to_bytes()))
+                .unwrap();
+        }
         storage.seal().unwrap();
         let mut engine = negentropy::Negentropy::borrowed(&storage, 60_000).unwrap();
         while let Some(Ok(message)) = socket.next().await {
@@ -109,6 +119,48 @@ async fn relay(partial: bool, hang: bool) -> (String, tokio::task::JoinHandle<()
         }
     });
     (url, task)
+}
+
+#[tokio::test]
+async fn explicit_empty_diff_can_complete_without_inventing_events() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (url, server) = relay_with_empty(false, false, true).await;
+    let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        let wire = transport::read_wire(&mut stream).await.unwrap();
+        let mut session = UploadSession::new(lease.clone());
+        assert!(matches!(
+            session
+                .receive(&mut ledger, Frame::read(&mut &wire[..]).unwrap(), now())
+                .unwrap(),
+            UploadAction::ProtocolDone
+        ));
+        let progress = ledger
+            .attempt_progress(lease.job().id, lease.job().attempt)
+            .unwrap();
+        assert!(progress.protocol_done);
+        assert_eq!(progress.received, 0);
+    };
+    let (outcome, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            run_with_limits(
+                &socket,
+                uid(),
+                Duration::from_secs(3),
+                Duration::from_secs(2)
+            ),
+            parent
+        )
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+    assert!(outcome.is_ok(), "{outcome:?}");
 }
 
 #[tokio::test]
@@ -271,7 +323,7 @@ async fn parent_uid_is_checked_before_hello_and_stalled_input_is_bounded() {
 async fn inventory_checks_order_digest_cap_and_truncation() {
     let dir = tempfile::tempdir().unwrap();
     let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
-    for failure in 0..6 {
+    for failure in 0..7 {
         let assignment = Assignment::for_lease(&lease);
         let mut wire = ipc::encode_value(&ParentMessage::Job {
             assignment: Assignment::for_lease(&lease),
@@ -281,6 +333,7 @@ async fn inventory_checks_order_digest_cap_and_truncation() {
             1 => vec![([1; 32], 150), ([1; 32], 150)],
             2 => vec![([1; 32], 99)],
             3 => vec![([1; 32], 150); INVENTORY_CHUNK_ITEMS + 1],
+            6 => vec![([1; 32], 150), ([1; 32], 151)],
             _ => vec![([1; 32], 150)],
         };
         let mut hash = inventory_hasher();

@@ -49,6 +49,7 @@ pensieve-parquet = { path = "../pensieve-parquet" }
 # Nostr
 notepack.workspace = true
 nostr-sdk.workspace = true
+negentropy = "=0.5.0"
 
 # Async runtime
 tokio.workspace = true
@@ -106,4 +107,3 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tokio-tungstenite = "=0.26.2"
-negentropy = "=0.5.0"
