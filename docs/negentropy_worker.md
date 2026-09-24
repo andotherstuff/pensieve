@@ -39,6 +39,12 @@ capped at 50,000. There is no pool-wide `join_all`, separate support-check subsc
 or worker API for reading RocksDB inventory. Repeated inventory IDs are rejected
 even at different timestamps.
 
+The worker disables SDK tag-count filters to match archive validation while
+retaining a 5 MiB relay JSON message cap. Its own 60 KB outgoing negentropy target
+does not constrain relay replies: incoming hex replies may use the message cap.
+IPC frames still have the independent 1 MiB cap. These are wire bounds, not total
+allocator memory guarantees.
+
 The SDK callback validates and serializes into a capped event frame, then waits on
 bounded byte credit/queue space. There are at most 15 queued wire frames plus one
 in-flight frame, capped to 8 MiB of credited wire bytes; one callback being encoded
@@ -55,6 +61,17 @@ failure, and every captured frame to receive its ACK. Only then send ProtocolDon
 with exact count/digest. EOSE, empty socket output and SDK success alone do not
 qualify. Unsolicited frames, cancellation, EOF and wrong ACKs fail closed. Failures
 exit nonzero without ProtocolDone; parent retains receipts and applies retry policy.
+
+Exit 2 specifically means EOSE arrived without all advertised IDs (`Unavailable`).
+It does not distinguish relay withholding, SDK-expired NIP-40 events or an event
+rejected by the IPC cap; it is neither proof of permanent absence nor proof of a
+volume limit. Other failures exit 1. Never split/skip/complete solely from exit 2.
+The worker cannot override the pinned SDK's unconditional expiry filtering. Before
+3b runtime activation, the scheduler must retain these gaps, use paced bounded
+retries/backoff and surface persistent failures for operator action while continuing
+healthy jobs. Explicit size failures must be distinguished from unknown loss before
+enabling volume splitting. No automatic expiry exception or skipped-ID success is
+authorized here. A window containing an undeliverable event can remain unfinished.
 
 ## Deadlines and limitations
 
@@ -77,6 +94,9 @@ inventory, wrong parent UID, lost/wrong ACK with retained receipts, bounded queu
 backpressure/cancellation, event/byte limits, ordering and digest/truncation errors.
 Explicit regression tests reject lagged/closed notification receivers and repeated
 IDs at different timestamps; a real empty diff still completes successfully.
+The relay fixture also exercises overlapping inventory with multiple diff rounds,
+multiple 128-ID fetch batches, replies above 120,000 hex characters, a 2,001-tag
+event and an advertised expired event that remains unavailable rather than complete.
 They do not substitute for Linux OOM/kill/no-orphan or throughput tests.
 
 Next: parent-owned bounded executor and authenticated endpoint, fair lazy planning

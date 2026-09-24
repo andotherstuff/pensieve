@@ -66,20 +66,36 @@ async fn relay_with_empty(
     hang: bool,
     empty: bool,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    let events = if empty { Vec::new() } else { vec![event()] };
+    relay_events(partial, hang, events, Arc::new(RelayStats::default())).await
+}
+
+#[derive(Default)]
+struct RelayStats {
+    continuations: std::sync::atomic::AtomicUsize,
+    batches: std::sync::atomic::AtomicUsize,
+    max_reply: std::sync::atomic::AtomicUsize,
+}
+
+async fn relay_events(
+    partial: bool,
+    hang: bool,
+    events: Vec<Event>,
+    stats: Arc<RelayStats>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-        let event = event();
         let mut storage = negentropy::NegentropyStorageVector::new();
-        if !empty {
+        for event in &events {
             storage
                 .insert(150, negentropy::Id::from_byte_array(event.id.to_bytes()))
                 .unwrap();
         }
         storage.seal().unwrap();
-        let mut engine = negentropy::Negentropy::borrowed(&storage, 60_000).unwrap();
+        let mut engine = negentropy::Negentropy::borrowed(&storage, 1024 * 1024).unwrap();
         while let Some(Ok(message)) = socket.next().await {
             if !message.is_text() {
                 continue;
@@ -88,20 +104,41 @@ async fn relay_with_empty(
                 serde_json::from_str(message.to_text().unwrap()).unwrap();
             let response = match request[0].as_str().unwrap() {
                 "NEG-OPEN" | "NEG-MSG" if !hang => {
+                    if request[0] == "NEG-MSG" {
+                        stats
+                            .continuations
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let index = if request[0] == "NEG-OPEN" { 3 } else { 2 };
                     let query = hex::decode(request[index].as_str().unwrap()).unwrap();
                     let reply = engine.reconcile(&query).unwrap();
+                    stats
+                        .max_reply
+                        .fetch_max(reply.len() * 2, std::sync::atomic::Ordering::Relaxed);
                     serde_json::json!(["NEG-MSG", request[1], hex::encode(reply)])
                 }
                 "REQ" if !hang => {
+                    stats
+                        .batches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if !partial {
-                        let response = serde_json::json!(["EVENT", request[1], event]);
-                        socket
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                response.to_string().into(),
-                            ))
-                            .await
-                            .unwrap();
+                        for event in &events {
+                            if !request[2]["ids"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|id| id.as_str() == Some(&event.id.to_hex()))
+                            {
+                                continue;
+                            }
+                            let response = serde_json::json!(["EVENT", request[1], event]);
+                            socket
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    response.to_string().into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
                     }
                     serde_json::json!(["EOSE", request[1]])
                 }
@@ -119,6 +156,118 @@ async fn relay_with_empty(
         }
     });
     (url, task)
+}
+
+#[tokio::test]
+async fn overlapping_multiround_and_large_reply_multibatch_downloads() {
+    use std::sync::atomic::Ordering;
+    for (total, overlap) in [(2000, 1000), (2400, 0)] {
+        let keys = Keys::generate();
+        let events: Vec<_> = (0..total)
+            .map(|i| {
+                let tags = if i == total - 1 {
+                    (0..2001)
+                        .map(|n| Tag::parse(["t".to_owned(), n.to_string()]).unwrap())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                EventBuilder::new(Kind::TextNote, i.to_string())
+                    .tags(tags)
+                    .custom_created_at(Timestamp::from(150))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+            })
+            .collect();
+        let expected: std::collections::HashSet<_> =
+            events[overlap..].iter().map(|e| e.id).collect();
+        let items = events[..overlap]
+            .iter()
+            .map(|e| (e.id, e.created_at))
+            .collect();
+        let stats = Arc::new(RelayStats::default());
+        let (url, server) = relay_events(false, false, events, stats.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+        let assignment = Assignment::for_lease(&lease);
+        let (capture, mut receiver) = Capture::new(&assignment);
+        let capture = Arc::new(capture);
+        let client = Client::builder()
+            .opts(ClientOptions::default().relay_limits(relay_limits()))
+            .database(capture.clone())
+            .build();
+        client.add_relay(&url).await.unwrap();
+        let relay = client.relay(&url).await.unwrap();
+        relay.try_connect(Duration::from_secs(2)).await.unwrap();
+        let drain = tokio::spawn(async move {
+            let mut count = 0;
+            while let Some(frame) = receiver.recv().await {
+                count += 1;
+                drop(frame);
+            }
+            count
+        });
+        let proof = timeout(
+            Duration::from_secs(30),
+            reconcile::download(&relay, &assignment, items),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(proof.remote, expected);
+        client.disconnect().await;
+        assert_eq!(
+            capture.finish(Some(&proof)).await.unwrap().0 as usize,
+            total - overlap
+        );
+        assert_eq!(drain.await.unwrap(), total - overlap);
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            stats.batches.load(Ordering::Relaxed),
+            (total - overlap).div_ceil(128)
+        );
+        if overlap > 0 {
+            assert!(stats.continuations.load(Ordering::Relaxed) > 0);
+        } else {
+            assert!(stats.max_reply.load(Ordering::Relaxed) > 120_000);
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_advertised_event_is_unavailable_not_success() {
+    let expired = EventBuilder::new(Kind::TextNote, "expired")
+        .tags([Tag::expiration(Timestamp::from(151))])
+        .custom_created_at(Timestamp::from(150))
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let (url, server) =
+        relay_events(false, false, vec![expired], Arc::new(RelayStats::default())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let assignment = Assignment::for_lease(&lease);
+    let (capture, mut receiver) = Capture::new(&assignment);
+    let capture = Arc::new(capture);
+    let client = Client::builder()
+        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .database(capture.clone())
+        .build();
+    client.add_relay(&url).await.unwrap();
+    let relay = client.relay(&url).await.unwrap();
+    relay.try_connect(Duration::from_secs(2)).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(3),
+        reconcile::download(&relay, &assignment, vec![]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Unavailable)));
+    client.disconnect().await;
+    assert!(capture.finish(None).await.is_err());
+    assert!(receiver.recv().await.is_none());
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
@@ -245,7 +394,7 @@ async fn real_sdk_upload_waits_for_archive_admission_and_cannot_complete_on_eose
         server.abort();
         let _ = server.await;
         if partial {
-            assert!(matches!(outcome, Err(WorkerError::Incomplete)));
+            assert!(matches!(outcome, Err(WorkerError::Unavailable)));
             assert_eq!(ledger.get(id).unwrap().state, JobState::Leased);
         } else {
             assert!(outcome.is_ok(), "{outcome:?}");

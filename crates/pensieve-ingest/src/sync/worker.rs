@@ -21,6 +21,15 @@ use super::ipc::{Frame, Message, ProtocolError, VERSION};
 
 const WALL_TIME: Duration = Duration::from_secs(9 * 60);
 const IDLE_TIME: Duration = Duration::from_secs(2 * 60);
+const RELAY_MESSAGE_BYTES: u32 = 5 * 1024 * 1024;
+
+fn relay_limits() -> RelayLimits {
+    // Archive admission validates signatures/IDs, not arbitrary tag counts.
+    // Restore a finite wire cap; IPC/output limits remain independently enforced.
+    let mut limits = RelayLimits::disable();
+    limits.messages.max_size = Some(RELAY_MESSAGE_BYTES);
+    limits
+}
 
 /// Sanitized worker errors; never include wire payloads, tokens or remote errors.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +46,11 @@ pub enum WorkerError {
     /// SDK error or some advertised missing IDs were not captured and fetched.
     #[error("worker relay reconciliation incomplete")]
     Incomplete,
+    /// EOSE arrived with advertised IDs missing. This does not prove a volume
+    /// limit or permanent absence: SDK policy drops and relay withholding look
+    /// identical. Preserve the gap; do not automatically split or skip it.
+    #[error("worker advertised events unavailable at EOSE")]
+    Unavailable,
 }
 
 /// Connect to one authenticated parent and execute at most one assignment.
@@ -80,7 +94,10 @@ async fn attempt(
 ) -> Result<(), WorkerError> {
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
-    let client = Client::builder().database(capture.clone()).build();
+    let client = Client::builder()
+        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .database(capture.clone())
+        .build();
     let relay_url = assignment.relay.clone();
     let sdk = async {
         client
@@ -102,7 +119,9 @@ async fn attempt(
         client.disconnect().await;
         // Close under the callback lock, not by hoping SDK Arc destruction closes
         // its sender. Every callback accepted before this cut is already queued.
-        capture.finish(result.as_ref().ok()).await
+        let summary = capture.finish(result.as_ref().ok()).await;
+        result?;
+        summary
     };
     tokio::pin!(sdk);
     let mut result = None;

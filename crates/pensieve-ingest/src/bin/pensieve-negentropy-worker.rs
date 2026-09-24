@@ -37,6 +37,13 @@ fn main() {
         Ok(()) => 0,
         Err(error) => {
             tracing::error!(error = %error, "isolated worker failed; parent retains job");
+            #[cfg(unix)]
+            if matches!(
+                error,
+                pensieve_ingest::sync::worker::WorkerError::Unavailable
+            ) {
+                std::process::exit(2);
+            }
             1
         }
     };

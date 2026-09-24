@@ -70,7 +70,9 @@ pub(super) async fn download(
                         message,
                     },
             } if subscription_id.as_ref() == &id => {
-                if message.len() > NEG_FRAME * 2 {
+                // Our outbound frame target does not constrain the responder.
+                // Accept larger bounded replies from strfry/khatru as well.
+                if message.len() > super::RELAY_MESSAGE_BYTES as usize {
                     return Err(WorkerError::Incomplete);
                 }
                 let bytes = hex::decode(message.as_ref()).map_err(|_| WorkerError::Incomplete)?;
@@ -144,7 +146,7 @@ pub(super) async fn download(
                     message: RelayMessage::EndOfStoredEvents(subscription_id),
                 } if subscription_id.as_ref() == &fetch => {
                     if !batch.iter().all(|id| received.contains(id)) {
-                        return Err(WorkerError::Incomplete);
+                        return Err(WorkerError::Unavailable);
                     }
                     relay
                         .unsubscribe(&fetch)

@@ -66,6 +66,13 @@ IDs, 1 MiB frames, 16 events / 8 MiB credit, 50,000 frames / 64 MiB per attempt,
 bounded receipt recovery. Never delete unfinished work to make quotas pass. Attempt
 summaries also need a measured retention policy before indefinite operation.
 
+Worker exit 2 means advertised IDs were unavailable at EOSE, not a proven volume
+failure. SDK expiry filtering, frame limits and relay withholding can cause this.
+Before 3b activation, persist its distinct outcome, keep the gap, bound/pace retries
+and alert on persistent failure without starving other jobs. Never split or silently
+skip IDs on this outcome. Typed proven-volume classification is required before
+enabling volume splitting; generic worker loss is insufficient.
+
 Systemd, not the ingester, owns the separate worker's process lifetime and sibling
 cgroup: proposed 1 CPU, MemoryHigh 1 GiB, MemoryMax 2 GiB, no swap/core dumps,
 64 tasks, 10-minute runtime and 5-second kill grace. Application deadlines are
