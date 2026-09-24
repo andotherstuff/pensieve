@@ -38,7 +38,7 @@ digest) remains `Protocol(Ledger(Invalid))`, not a local storage failure. Queued
 deadline expiry returns `TimedOut`, distinct from dropped-session cancellation.
 
 `Protocol(State)` is still ambiguous: an unretained live-ingestion dedupe claim
-or cancellation during admission can produce it without invalid worker traffic.
+or lease expiry during admission can produce it without invalid worker traffic.
 Future scheduling must retain and conservatively retry that gap, not automatically
 blame/quarantine the relay or infer proven volume from the outer Protocol variant.
 

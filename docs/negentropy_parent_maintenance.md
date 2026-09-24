@@ -6,7 +6,8 @@ policy or a scheduler. There is no listener, process launch, main wiring or depl
 Single-attempt progress and bounded failure-report read commands use the same
 owner, so an uncertain result can be investigated without reopening the ledger.
 
-One maintenance turn selects at most 32 unresolved jobs using a partial-index keyset and
+One maintenance turn selects at most 32 unresolved jobs using an explicitly selected
+partial-index keyset (`INDEXED BY unresolved_jobs`; bundled SQLite query-plan regression) and
 checks at most 256 receipts **total**, not 256 per job. The cursor is persisted in
 the receipt_totals singleton. All unresolved non-live states are visited, including
 retry_wait, split and blocked receipt holders, and awaiting jobs with zero receipts.
@@ -35,6 +36,10 @@ read the job/attempt/report first, then choose the state-appropriate recovery.
 The session awaits its owner, which alone enforces the absolute deadline and
 preserves terminal results; external future cancellation remains ambiguous. Archive recovery
 and invalid request errors now have distinct types and must not become relay blame.
+The maintenance owner checks the writer recovery latch before and after the turn
+and returns `RecoveryRequired`, including a latch raised by concurrent live admission.
+Earlier committed per-job recovery remains committed; a recovery error does not
+mean the entire turn rolled back. Durable state must be reread before retry decisions.
 
 The owner remains monopolized by one session for up to nine minutes plus any
 uninterruptible disk operation. Maintenance runs **between exchanges**, not in

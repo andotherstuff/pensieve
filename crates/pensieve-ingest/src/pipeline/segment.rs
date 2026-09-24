@@ -1035,7 +1035,10 @@ mod tests {
 
     #[test]
     fn replay_waits_for_checkpointed_seal_without_holding_admission() {
-        use crate::sync::{SyncStateDb, inventory::InventoryReplay};
+        use crate::sync::{
+            SyncStateDb,
+            inventory::{InventoryReplay, ReplayCursorSnapshot},
+        };
         let dir = TempDir::new().unwrap();
         let archive = dir.path().join("archive");
         let dedupe = Arc::new(DedupeIndex::open(dir.path().join("dedupe")).unwrap());
@@ -1075,6 +1078,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(ReplayCursorSnapshot::inspect(&state).unwrap().is_none());
         barriers[1].wait();
         handle.join().unwrap();
         let mut replay = InventoryReplay::begin(&state, &dedupe, &writer, &archive, "segment", 0)

@@ -41,11 +41,11 @@ the original proposal is not evidence that any runtime or production gate passed
 | 2c, #50 | Bounded sealed-segment inventory replay/export | Merged; no runtime replay enabled |
 | 3a, #51 | One-job worker executable and parent wire exchange | Merged; CI and both independent reviews passed; no production parent endpoint |
 | 3b prerequisite, #52 | Distinct worker volume/event-size outcomes and request-scoped capture | Merged; no scheduler activation |
-| 3b prerequisite, #57 | Explicit inventory cursor rewind | Review/CI gate; no operator CLI or activation |
+| 3b prerequisite, #57 | Explicit inventory cursor rewind | Merged; no operator CLI or activation |
 | 3b diagnostics, #53 | Fenced terminal failure reports and durable diagnostics | Merged; CI and independent reviews passed; matching worker/parent protocol required |
-| 3b session, #54 | Authenticated one-attempt parent session and bounded owner executor | Under review; no listener or process launch |
+| 3b session, #54 | Authenticated one-attempt parent session and bounded owner executor | Merged; no listener or process launch |
 | 3b inventory, #55 | Source-bound inventory and seal-race handling | Merged; no replay activation |
-| 3b maintenance, #56 | Same-owner recovery commands and persisted bounded receipt fairness | Under review on #54; exact-head CI and independent review required; no scheduler policy |
+| 3b maintenance, #56 | Same-owner recovery commands and persisted bounded receipt fairness | Under review; exact-head CI and independent review required; no scheduler policy |
 | 3b | Parent scheduler, authenticated listener and inventory activation | Next after prerequisite reviews; paced retry, maintenance cadence and process binding gates |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |
 | 5 | Controlled production canary and soak | Not started; separate readiness decision |
@@ -64,6 +64,19 @@ explicit rollout floor rather than silently rebuilding all history. Verify legac
 entries against durable archive markers before advertising them. Export complete
 capped intervals; never truncate and call them complete. Do not prune inventory or
 source segments required by unresolved jobs/replay.
+
+The inactive inventory library now supports explicit same-source rewind with an
+opaque, bounded `ReplayCursorSnapshot`. It compares exact observed metadata while
+holding replay ownership and only lowers `next` (and `floor` when needed). Archive
+authority/readiness remain enforced by replay, not metadata rewind. It never removes verified inventory,
+retargets a namespace, replaces invalid metadata, skips forward or forgives missing
+files/markers. An active reader or stale observation
+fails closed. After lowering the floor, callers must use that recorded floor for
+subsequent replay; changed configuration is never silently accepted. Initial floors
+beyond the writer's ready boundary are rejected without initializing metadata.
+This is not a repair CLI or runtime activation. A wrongly bound
+archive namespace still requires a separate design/operator decision; `next ==
+floor` is not proof that no partial inventory exists.
 
 Keep database work off async reactors, using bounded queues/executors. Begin with
 one worker, at most two awaiting-durability jobs, 15-minute inclusive windows and
