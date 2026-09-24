@@ -220,6 +220,8 @@ impl JobLedger {
                         CREATE UNIQUE INDEX one_active_lease ON jobs(state) WHERE state='leased';
                         CREATE INDEX due_jobs ON jobs(state,next_eligible,id);
                         CREATE INDEX child_jobs ON jobs(parent);
+                        CREATE INDEX unresolved_jobs ON jobs(id)
+                            WHERE state IN ('awaiting_durability','retry_wait','blocked','split');
                     CREATE TABLE attempts (
                         job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
                         received INTEGER NOT NULL, bytes INTEGER NOT NULL, digest BLOB NOT NULL,
@@ -683,9 +685,9 @@ impl JobLedger {
     /// One fair, persisted keyset turn over at most 32 jobs and 256 total receipts.
     ///
     /// Visits all non-live unresolved states, including split/blocked/retry jobs,
-    /// and zero-receipt awaiting jobs. Completed/empty history costs at most the
-    /// job budget per call; callers must continue even when no receipt changed.
-    /// Each successfully handled job advances the durable cursor. Errors leave
+    /// and zero-receipt awaiting jobs. A partial index excludes queued, complete
+    /// and leased history. Persist the cursor once per turn, including on error.
+    /// Each successfully handled job advances the local cursor. Errors leave
     /// that job due; prior successful reconciliation remains valid. A crash
     /// between reconciliation and cursor persistence only repeats safe work.
     /// Recovery bypasses admission ceilings but never actual storage errors.
@@ -715,38 +717,43 @@ impl JobLedger {
         let jobs = {
             let mut query = self
                 .db
-                .prepare("SELECT id,state FROM jobs WHERE id>?1 ORDER BY id LIMIT ?2")?;
+                .prepare("SELECT id FROM jobs WHERE id>?1 AND state IN ('awaiting_durability','retry_wait','blocked','split') ORDER BY id LIMIT ?2")?;
             query
-                .query_map(params![after, max_jobs], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })?
+                .query_map(params![after, max_jobs], |r| r.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut progress = MaintenanceProgress::default();
-        if jobs.is_empty() {
-            self.db
-                .execute("UPDATE receipt_totals SET scan_job=0 WHERE singleton=1", [])?;
-            progress.wrapped = true;
-            return Ok(progress);
-        }
-        for (id, state) in jobs {
-            if progress.checked == max_receipts {
-                break;
-            }
-            if state != "leased" && state != "complete" {
+        let end_known = jobs.len() < max_jobs as usize;
+        let selected = jobs.len();
+        let mut last = after;
+        let result = (|| -> Result<(), LedgerError> {
+            for id in jobs {
+                if progress.checked == max_receipts {
+                    break;
+                }
                 let outcome =
                     self.reconcile_archived(id, dedupe, writer, max_receipts - progress.checked)?;
                 progress.checked += outcome.checked;
                 progress.satisfied += outcome.satisfied;
                 progress.completed += u32::from(outcome.complete);
+                last = id;
+                progress.jobs += 1;
             }
-            // Separate commits deliberately favor harmless replay over skipping.
+            Ok(())
+        })();
+        if result.is_ok() && end_known && progress.jobs as usize == selected {
+            last = 0;
+            progress.wrapped = true;
+        }
+        // One cursor commit per turn: errors retain the failed job for retry.
+        // A crash before this write repeats at most one bounded turn safely.
+        if last != after {
             self.db.execute(
                 "UPDATE receipt_totals SET scan_job=?1 WHERE singleton=1",
-                [id],
+                [last],
             )?;
-            progress.jobs += 1;
         }
+        result?;
         Ok(progress)
     }
 
@@ -1268,27 +1275,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (dedupe, writer) = archive(&dir);
         let mut db = ledger(&dir);
-        for n in 0..40 {
+        for n in 0..80 {
             db.enqueue(&format!("{n}"), RELAY, 0, 9).unwrap();
         }
+        // Synthetic terminal history must not consume scan turns or writes.
+        db.db
+            .execute("UPDATE jobs SET state='complete' WHERE id>40", [])
+            .unwrap();
+        let writes = db.db.total_changes();
         assert_eq!(
             db.maintain_archived(&dedupe, &writer, 32, 256)
                 .unwrap()
                 .jobs,
-            32
+            0
         );
         assert_eq!(
             db.maintain_archived(&dedupe, &writer, 32, 256)
                 .unwrap()
                 .jobs,
-            8
+            0
         );
         assert!(
             db.maintain_archived(&dedupe, &writer, 32, 256)
                 .unwrap()
                 .wrapped
         );
-        for _ in 0..2 {
+        assert_eq!(db.db.total_changes(), writes);
+        for _ in 0..3 {
             let lease = db.lease_next(10, 60).unwrap().unwrap();
             for n in 1..=200 {
                 db.register_received(&lease, &receipt(n), 11).unwrap();
@@ -1304,7 +1317,63 @@ mod tests {
             .query_row("SELECT scan_job FROM receipt_totals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cursor, 2);
-        assert_eq!(db.get(3).unwrap().state, JobState::Queued);
+        assert_eq!(db.get(3).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
+    fn maintenance_persists_success_before_error_and_wraps_in_the_last_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dedupe, writer) = archive(&dir);
+        let mut db = ledger(&dir);
+        for n in 0..3 {
+            let job = db.enqueue(&format!("{n}"), RELAY, 0, 9).unwrap();
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            let mut item = receipt(1);
+            item.event_id = [job.id as u8; 32];
+            db.register_received(&lease, &item, 11).unwrap();
+            db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();
+            dedupe.mark_archived([&item.event_id].into_iter()).unwrap();
+        }
+        db.db.execute_batch("CREATE TABLE cursor_writes(value INTEGER);
+            CREATE TRIGGER count_cursor AFTER UPDATE OF scan_job ON receipt_totals BEGIN INSERT INTO cursor_writes VALUES(NEW.scan_job); END;
+            CREATE TRIGGER fail_second BEFORE UPDATE ON attempts WHEN NEW.job=2 BEGIN SELECT RAISE(ABORT,'second job fault'); END;").unwrap();
+        assert!(db.maintain_archived(&dedupe, &writer, 32, 256).is_err());
+        assert_eq!(
+            db.db
+                .query_row("SELECT scan_job FROM receipt_totals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.attempt_progress(1, 1).unwrap().archived, 1);
+        assert_eq!(db.attempt_progress(2, 1).unwrap().archived, 0);
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM cursor_writes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        db.db.execute_batch("DROP TRIGGER fail_second;").unwrap();
+        let progress = db.maintain_archived(&dedupe, &writer, 32, 256).unwrap();
+        assert_eq!(
+            (progress.jobs, progress.satisfied, progress.wrapped),
+            (2, 2, true)
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT scan_job FROM receipt_totals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM cursor_writes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
