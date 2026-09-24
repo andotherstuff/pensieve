@@ -47,13 +47,24 @@ pub enum ParentError {
     Io(#[from] std::io::Error),
     /// Invalid or out-of-order worker traffic.
     #[error(transparent)]
-    Protocol(#[from] ProtocolError),
+    Protocol(ProtocolError),
     /// Durable ledger error.
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     /// Archive inventory error.
     #[error(transparent)]
     Archive(#[from] crate::Error),
+}
+
+impl From<ProtocolError> for ParentError {
+    fn from(error: ProtocolError) -> Self {
+        match error {
+            ProtocolError::Io(error) => Self::Io(error),
+            ProtocolError::Ledger(error) => Self::Ledger(error),
+            ProtocolError::Archive(error) => Self::Archive(error),
+            error => Self::Protocol(error),
+        }
+    }
 }
 
 /// Transport result, deliberately not named job completion.
@@ -141,10 +152,17 @@ impl ParentExecutor {
                                 let _ = reply.send(Err(ParentError::InvalidRequest));
                                 continue;
                             }
-                            if cancelled.load(Ordering::Acquire) || Instant::now() >= until {
+                            if cancelled.load(Ordering::Acquire) {
                                 let _ = reply.send(Err(ParentError::Io(std::io::Error::new(
                                     std::io::ErrorKind::ConnectionAborted,
-                                    "queued parent session cancelled or expired",
+                                    "queued parent session cancelled",
+                                ))));
+                                continue;
+                            }
+                            if Instant::now() >= until {
+                                let _ = reply.send(Err(ParentError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "queued parent session deadline",
                                 ))));
                                 continue;
                             }
@@ -446,7 +464,14 @@ fn exchange(
         match upload.receive(ledger, frame, now())? {
             UploadAction::Event(event) => {
                 socket.check()?;
-                let accepted = upload.admit_and_accept(ledger, event, dedupe, writer, now)?;
+                let admission = upload.admit_and_accept(ledger, event, dedupe, writer, now);
+                // Live ingestion can latch the shared writer after inventory,
+                // or this admission itself can latch an uncertain write fault.
+                // The received obligation remains; neither case blames the peer.
+                if writer.recovery_required() {
+                    return Err(ParentError::RecoveryRequired);
+                }
+                let accepted = admission?;
                 socket.send(&ParentMessage::accepted(accepted))?;
             }
             UploadAction::ProtocolDone => return Ok(SessionOutcome::ProtocolDone),
@@ -807,6 +832,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_recovery_latch_is_local_and_preserves_unacked_receipt() {
+        for latch_before_admission in [false, true] {
+            let mut h = Harness::new();
+            let lease = h.lease().await;
+            let attempt = lease.job().attempt;
+            let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+            let uid = parent.peer_cred().unwrap().uid();
+            let path = h
+                ._root
+                .path()
+                .join("archive/segment-000000000.notepack.open");
+            let writer = h.writer.clone();
+            let dedupe = h.dedupe.clone();
+            let client = async move {
+                let assignment = greeting(&mut worker).await;
+                // Local temporary-path fault, after inventory completed. In one
+                // case a live-writer call latches first; in the other the upload
+                // admission itself encounters the fault.
+                std::fs::create_dir(path).unwrap();
+                if latch_before_admission {
+                    let live = EventBuilder::text_note("live writer fault")
+                        .custom_created_at(Timestamp::from(105))
+                        .sign_with_keys(&Keys::generate())
+                        .unwrap();
+                    assert!(
+                        writer
+                            .write_reserved(
+                                crate::pack_nostr_event(&live).unwrap(),
+                                dedupe.reserve(live.id.as_bytes()).unwrap().unwrap()
+                            )
+                            .is_err()
+                    );
+                    assert!(writer.recovery_required());
+                }
+                let event = EventBuilder::text_note("received but not admitted")
+                    .custom_created_at(Timestamp::from(105))
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap();
+                worker
+                    .write_all(
+                        &Frame::encode(&Message::Event {
+                            header: assignment.header(1),
+                            event: Box::new(event),
+                        })
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // No Accepted frame may escape on either recovery path.
+                assert_eq!(
+                    worker.read_u8().await.unwrap_err().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+            };
+            let (result, ()) = tokio::join!(
+                h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
+                client
+            );
+            assert!(matches!(result, Err(ParentError::RecoveryRequired)));
+            assert!(h.writer.recovery_required());
+            let ledger = h.executor.shutdown().await.unwrap();
+            let progress = ledger.attempt_progress(h.job, attempt).unwrap();
+            assert_eq!(
+                (progress.received, progress.archived, progress.protocol_done),
+                (1, 0, false)
+            );
+            assert_eq!(ledger.get(h.job).unwrap().state, JobState::Leased);
+        }
+    }
+
+    #[test]
+    fn nested_local_upload_faults_do_not_become_worker_protocol_errors() {
+        assert!(matches!(
+            ParentError::from(ProtocolError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            ParentError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(matches!(
+            ParentError::from(ProtocolError::Ledger(LedgerError::Budget)),
+            ParentError::Ledger(LedgerError::Budget)
+        ));
+        assert!(matches!(
+            ParentError::from(ProtocolError::Archive(crate::Error::Config(
+                "local".to_owned()
+            ))),
+            ParentError::Archive(crate::Error::Config(_))
+        ));
+        assert!(matches!(
+            ParentError::from(ProtocolError::Malformed),
+            ParentError::Protocol(ProtocolError::Malformed)
+        ));
+    }
+
+    #[tokio::test]
     async fn eof_after_ack_keeps_receipt_for_retry() {
         let mut h = Harness::new();
         let lease = h.lease().await;
@@ -837,7 +955,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ParentError::Protocol(ProtocolError::Io(error)))
+            Err(ParentError::Io(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
         let ledger = h.executor.shutdown().await.unwrap();
@@ -945,7 +1063,14 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(cancelled)),
                 reply,
             };
-            assert!(h.executor.request(command, response).await.is_err());
+            assert!(matches!(
+                h.executor.request(command, response).await,
+                Err(ParentError::Io(error)) if error.kind() == if cancelled {
+                    std::io::ErrorKind::ConnectionAborted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            ));
             let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
             let uid = parent.peer_cred().unwrap().uid();
             let client = async move {
