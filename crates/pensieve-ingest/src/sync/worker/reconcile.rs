@@ -151,7 +151,17 @@ pub(super) async fn download(
                     message: RelayMessage::EndOfStoredEvents(subscription_id),
                 } if subscription_id.as_ref() == &fetch => {
                     if !batch.iter().all(|id| received.contains(id)) {
-                        return Err(WorkerError::Unavailable);
+                        let remaining: Vec<_> =
+                            ids.iter().filter(|id| !received.contains(id)).collect();
+                        return Err(WorkerError::Unavailable(super::FailureDiagnostic {
+                            kind: super::FailureKind::Unavailable,
+                            missing_count: remaining.len() as u64,
+                            sample: remaining
+                                .into_iter()
+                                .take(crate::sync::failure::MAX_FAILURE_SAMPLE)
+                                .map(|id| id.to_bytes())
+                                .collect(),
+                        }));
                     }
                     relay
                         .unsubscribe(&fetch)
