@@ -63,9 +63,25 @@ qualify. Unsolicited frames, cancellation, EOF and wrong ACKs fail closed. Failu
 exit nonzero without ProtocolDone; parent retains receipts and applies retry policy.
 
 Exit 2 specifically means EOSE arrived without all advertised IDs (`Unavailable`).
-It does not distinguish relay withholding, SDK-expired NIP-40 events or an event
-rejected by the IPC cap; it is neither proof of permanent absence nor proof of a
-volume limit. Other failures exit 1. Never split/skip/complete solely from exit 2.
+It does not distinguish relay withholding from SDK-expired NIP-40 events; it is
+neither proof of permanent absence nor proof of a volume limit. Never split/skip/
+complete solely from exit 2. Distinct verified local byte exhaustion exits 3; a verified
+individual event exceeding the IPC cap exits 4. Capture preserves its first local
+rejection even if the SDK suppresses Event notification and EOSE later reports
+Unavailable. Signature/window checks precede classification; a single oversized
+event is checked before aggregate budgets because splitting cannot fix it.
+Cancellation/invalid candidates remain generic failures, never inferred volume.
+Repeated verified event IDs consume no additional count/byte budget. Count overflow
+is a generic failure: the verified diff already caps the number of solicited IDs.
+SDK subscription verification is mandatory: only events matching the active fetch
+subscription and its exact requested IDs reach capture. Valid but unsolicited
+events during the diff or on unknown/mismatched subscriptions cannot consume the
+attempt budget or become a split signal.
+All other failures exit 1. Unknown exits/signals are not volume signals either.
+These exit codes require parent attempt/process binding before use in split policy;
+they do not replace durable receipt reconciliation. Relay-advertised diff-count
+overflow is not verified event volume and still fails generically. A matching
+CLOSED during the diff now fails immediately instead of waiting for idle expiry.
 The worker cannot override the pinned SDK's unconditional expiry filtering. Before
 3b runtime activation, the scheduler must retain these gaps, use paced bounded
 retries/backoff and surface persistent failures for operator action while continuing
@@ -97,6 +113,9 @@ IDs at different timestamps; a real empty diff still completes successfully.
 The relay fixture also exercises overlapping inventory with multiple diff rounds,
 multiple 128-ID fetch batches, replies above 120,000 hex characters, a 2,001-tag
 event and an advertised expired event that remains unavailable rather than complete.
+Additional regressions cover first-cause preservation through missing notifications,
+attempt budgets versus individual event limits, invalid events never becoming volume
+signals, stable exit codes, and prompt failure on a CLOSED diff.
 They do not substitute for Linux OOM/kill/no-orphan or throughput tests.
 
 Next: parent-owned bounded executor and authenticated endpoint, fair lazy planning

@@ -33,7 +33,8 @@ analytics architecture. The existing SDK remains pinned; no SDK fork is required
 | 2a, #48 | Shared archive admission, durable receipt reconciliation and compaction | Merged; CI and independent reviews passed |
 | 2b, #49 | Independent periodic archive sealing | Merged; Parquet-disabled durability and joined shutdown tests |
 | 2c, #50 | Bounded sealed-segment inventory replay/export | Merged; no runtime replay enabled |
-| 3a | One-job worker executable and parent wire exchange | Implemented; test/review gate, no production parent endpoint |
+| 3a, #51 | One-job worker executable and parent wire exchange | Merged; CI and both independent reviews passed; no production parent endpoint |
+| 3b prerequisite | Distinct worker volume/event-size outcomes | Implemented; test/review gate, no scheduler activation |
 | 3b | Parent scheduler, authenticated listener and inventory activation | Next; persistence/fairness, bounded executor, seal-race/cursor repair gates |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |
 | 5 | Controlled production canary and soak | Not started; separate readiness decision |
@@ -67,11 +68,19 @@ bounded receipt recovery. Never delete unfinished work to make quotas pass. Atte
 summaries also need a measured retention policy before indefinite operation.
 
 Worker exit 2 means advertised IDs were unavailable at EOSE, not a proven volume
-failure. SDK expiry filtering, frame limits and relay withholding can cause this.
+failure. SDK expiry filtering and relay withholding can cause this.
 Before 3b activation, persist its distinct outcome, keep the gap, bound/pace retries
 and alert on persistent failure without starving other jobs. Never split or silently
 skip IDs on this outcome. Typed proven-volume classification is required before
-enabling volume splitting; generic worker loss is insufficient.
+enabling volume splitting; generic worker loss is insufficient. The worker now
+preserves distinct verified local attempt byte exhaustion as exit 3 and a single
+oversized event as exit 4, ahead of the SDK's resulting missing notification.
+Only exit 3 is a potential split signal; exit 4 cannot be fixed by splitting.
+Before activation, bind exits to the authenticated attempt/process and test durable
+retry/split accounting. Relay-advertised diff-count overflow still exits 1 because
+those IDs have not been validated as in-window events. Bounded missing-ID diagnostics
+and their durable parent accounting remain required; neither diagnostics nor an
+operator exception may silently mark an unresolved gap recovered.
 
 Systemd, not the ingester, owns the separate worker's process lifetime and sibling
 cgroup: proposed 1 CPU, MemoryHigh 1 GiB, MemoryMax 2 GiB, no swap/core dumps,

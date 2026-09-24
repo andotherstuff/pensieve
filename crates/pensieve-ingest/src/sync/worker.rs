@@ -51,6 +51,26 @@ pub enum WorkerError {
     /// identical. Preserve the gap; do not automatically split or skip it.
     #[error("worker advertised events unavailable at EOSE")]
     Unavailable,
+    /// Distinct verified in-window candidates exceed the attempt byte budget.
+    /// A future authenticated parent may split, retaining all receipt obligations.
+    #[error("worker attempt volume limit exceeded")]
+    Volume,
+    /// One verified event exceeds the IPC frame cap; splitting cannot fix it.
+    #[error("worker individual event frame limit exceeded")]
+    EventSize,
+}
+
+impl WorkerError {
+    /// Dedicated-process exit classification, never an archive completion proof.
+    /// Unknown exits/signals must not be interpreted as a volume limit.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Unavailable => 2,
+            Self::Volume => 3,
+            Self::EventSize => 4,
+            _ => 1,
+        }
+    }
 }
 
 /// Connect to one authenticated parent and execute at most one assignment.
@@ -95,7 +115,11 @@ async fn attempt(
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
     let client = Client::builder()
-        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .opts(
+            ClientOptions::default()
+                .relay_limits(relay_limits())
+                .verify_subscriptions(true),
+        )
         .database(capture.clone())
         .build();
     let relay_url = assignment.relay.clone();
@@ -119,9 +143,7 @@ async fn attempt(
         client.disconnect().await;
         // Close under the callback lock, not by hoping SDK Arc destruction closes
         // its sender. Every callback accepted before this cut is already queued.
-        let summary = capture.finish(result.as_ref().ok()).await;
-        result?;
-        summary
+        capture.finish_download(result).await
     };
     tokio::pin!(sdk);
     let mut result = None;
