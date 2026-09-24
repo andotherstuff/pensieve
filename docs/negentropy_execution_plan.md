@@ -34,8 +34,12 @@ analytics architecture. The existing SDK remains pinned; no SDK fork is required
 | 2b, #49 | Independent periodic archive sealing | Merged; Parquet-disabled durability and joined shutdown tests |
 | 2c, #50 | Bounded sealed-segment inventory replay/export | Merged; no runtime replay enabled |
 | 3a, #51 | One-job worker executable and parent wire exchange | Merged; CI and both independent reviews passed; no production parent endpoint |
-| 3b prerequisite | Distinct worker volume/event-size outcomes | Implemented; test/review gate, no scheduler activation |
-| 3b | Parent scheduler, authenticated listener and inventory activation | Next; persistence/fairness, bounded executor, seal-race/cursor repair gates |
+| 3b prerequisite, #52 | Distinct worker volume/event-size outcomes and request-scoped capture | Merged; no scheduler activation |
+| 3b diagnostics, #53 | Fenced terminal failure reports and durable diagnostics | Under review; matching worker/parent protocol required |
+| 3b session, #54 | Authenticated one-attempt parent session and bounded owner executor | Under review; no listener or process launch |
+| 3b inventory, #55 | Source-bound inventory, seal-race handling and guarded repair | Under review; no replay activation |
+| 3b maintenance | Same-owner recovery commands and persisted bounded receipt fairness | Implemented on #54; precommit, exact-head CI and independent review required; no scheduler policy |
+| 3b | Parent scheduler, authenticated listener and inventory activation | Next after prerequisite reviews; paced retry, maintenance cadence and process binding gates |
 | 4 | Linux isolation, metrics and operations | Not implemented; synthetic worker OOM/hang/kill and real alert-delivery gate |
 | 5 | Controlled production canary and soak | Not started; separate readiness decision |
 

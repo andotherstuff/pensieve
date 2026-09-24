@@ -17,9 +17,11 @@ use sha2::Digest;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use super::failure::FailureKind;
+use super::failure::{FailureDiagnostic, FailureKind};
 use super::ipc::{self, Frame, ProtocolError, UploadAction, UploadSession};
-use super::jobs::{Job, JobLedger, Lease, LedgerError};
+use super::jobs::{
+    AttemptProgress, Job, JobLedger, Lease, LedgerError, MaintenanceProgress, RetryReason,
+};
 use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};
 use crate::{DedupeIndex, SegmentWriter};
@@ -68,6 +70,40 @@ pub enum SessionOutcome {
 type Reply<T> = oneshot::Sender<Result<T, ParentError>>;
 
 enum Command {
+    FailureReport {
+        job: i64,
+        attempt: i64,
+        reply: Reply<Option<FailureDiagnostic>>,
+    },
+    AttemptProgress {
+        job: i64,
+        attempt: i64,
+        reply: Reply<AttemptProgress>,
+    },
+    Expire {
+        now: i64,
+        delay: u32,
+        reply: Reply<bool>,
+    },
+    Retry {
+        lease: Lease,
+        now: i64,
+        delay: u32,
+        reason: RetryReason,
+        reply: Reply<()>,
+    },
+    RetryDurability {
+        job: i64,
+        attempt: i64,
+        now: i64,
+        delay: u32,
+        reply: Reply<()>,
+    },
+    Maintain {
+        jobs: u32,
+        receipts: u32,
+        reply: Reply<MaintenanceProgress>,
+    },
     Lease {
         now: i64,
         ttl: u32,
@@ -91,8 +127,8 @@ enum Command {
 /// A single owned database executor with a capacity-one command queue.
 ///
 /// Construct after startup archive recovery, with the *same* dedupe index used by
-/// the writer. This library does not bind a socket, launch processes, retry jobs,
-/// or enable replay. Exclusive mutable methods prohibit concurrent submissions.
+/// the writer. This library does not bind a socket, launch processes, choose retry
+/// policy, or enable replay. Exclusive mutable methods prohibit concurrent submissions.
 pub struct ParentExecutor {
     #[cfg(test)]
     delay_terminal_until_cancelled: bool,
@@ -123,6 +159,59 @@ impl ParentExecutor {
                 let mut consumed_attempt = None;
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
+                        Command::FailureReport {
+                            job,
+                            attempt,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(ledger.failure_report(job, attempt).map_err(Into::into));
+                        }
+                        Command::AttemptProgress {
+                            job,
+                            attempt,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(ledger.attempt_progress(job, attempt).map_err(Into::into));
+                        }
+                        Command::Expire { now, delay, reply } => {
+                            let _ = reply.send(ledger.expire(now, delay).map_err(Into::into));
+                        }
+                        Command::Retry {
+                            lease,
+                            now,
+                            delay,
+                            reason,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(ledger.retry(&lease, now, delay, reason).map_err(Into::into));
+                        }
+                        Command::RetryDurability {
+                            job,
+                            attempt,
+                            now,
+                            delay,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                ledger
+                                    .retry_durability(job, attempt, now, delay)
+                                    .map_err(Into::into),
+                            );
+                        }
+                        Command::Maintain {
+                            jobs,
+                            receipts,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                ledger
+                                    .maintain_archived(&dedupe, &writer, jobs, receipts)
+                                    .map_err(Into::into),
+                            );
+                        }
                         Command::Lease { now, ttl, reply } => {
                             let _ = reply.send(ledger.lease_next(now, ttl).map_err(Into::into));
                         }
@@ -208,10 +297,120 @@ impl ParentExecutor {
             .await
     }
 
+    /// Recover one expired lease without inferring completion or volume failure.
+    pub async fn expire(&mut self, now: i64, delay: u32) -> Result<bool, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::Expire { now, delay, reply }, response)
+            .await
+    }
+
+    /// Release an active attempt into durable same-window backoff.
+    /// Cancellation of the response does not undo a committed release.
+    pub async fn retry(
+        &mut self,
+        lease: Lease,
+        now: i64,
+        delay: u32,
+        reason: RetryReason,
+    ) -> Result<(), ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(
+            Command::Retry {
+                lease,
+                now,
+                delay,
+                reason,
+                reply,
+            },
+            response,
+        )
+        .await
+    }
+
+    /// Explicitly retry a finished but not durable attempt, retaining receipts.
+    pub async fn retry_durability(
+        &mut self,
+        job: i64,
+        attempt: i64,
+        now: i64,
+        delay: u32,
+    ) -> Result<(), ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(
+            Command::RetryDurability {
+                job,
+                attempt,
+                now,
+                delay,
+                reply,
+            },
+            response,
+        )
+        .await
+    }
+
+    /// Run one bounded persisted recovery turn between socket exchanges.
+    ///
+    /// The owner is monopolized by a session for up to nine minutes (plus
+    /// uninterruptible disk time); this does not run concurrently with a session.
+    /// Canceling the response leaves completed recovery transactions committed.
+    pub async fn maintain_archived(
+        &mut self,
+        jobs: u32,
+        receipts: u32,
+    ) -> Result<MaintenanceProgress, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(
+            Command::Maintain {
+                jobs,
+                receipts,
+                reply,
+            },
+            response,
+        )
+        .await
+    }
+
     /// Read one bounded job record without exposing its lease capability.
     pub async fn job(&mut self, id: i64) -> Result<Job, ParentError> {
         let (reply, response) = oneshot::channel();
         self.request(Command::Job { id, reply }, response).await
+    }
+
+    /// Read one bounded persisted failure report after an uncertain result.
+    pub async fn failure_report(
+        &mut self,
+        job: i64,
+        attempt: i64,
+    ) -> Result<Option<FailureDiagnostic>, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(
+            Command::FailureReport {
+                job,
+                attempt,
+                reply,
+            },
+            response,
+        )
+        .await
+    }
+
+    /// Read one fixed-size attempt summary using the same ledger owner.
+    pub async fn attempt_progress(
+        &mut self,
+        job: i64,
+        attempt: i64,
+    ) -> Result<AttemptProgress, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(
+            Command::AttemptProgress {
+                job,
+                attempt,
+                reply,
+            },
+            response,
+        )
+        .await
     }
 
     /// Authenticate before exporting a lease, then perform exactly one exchange.
@@ -902,9 +1101,9 @@ mod tests {
                     &Frame::encode(&Message::AttemptFailed {
                         header: assignment.header(1),
                         report: super::super::failure::FailureDiagnostic {
-                            kind: FailureKind::Relay,
+                            kind: FailureKind::Volume,
                             missing_count: 0,
-                            sample: Vec::new(),
+                            sample: vec![],
                         },
                     })
                     .unwrap(),
@@ -916,7 +1115,23 @@ mod tests {
             h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
             client
         );
-        assert_eq!(result.unwrap(), SessionOutcome::Failed(FailureKind::Relay));
+        assert_eq!(result.unwrap(), SessionOutcome::Failed(FailureKind::Volume));
+        assert_eq!(
+            h.executor
+                .failure_report(h.job, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            FailureKind::Volume
+        );
+        assert!(
+            !h.executor
+                .attempt_progress(h.job, 1)
+                .await
+                .unwrap()
+                .protocol_done
+        );
         assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
         let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
         assert!(
@@ -976,5 +1191,191 @@ mod tests {
             assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
             h.executor.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn maintenance_commands_release_preserve_and_fence_attempts() {
+        let mut h = Harness::new();
+        let lease = h.lease().await;
+        let old = lease.clone();
+        let due = now();
+        h.executor
+            .retry(lease, due, 60, RetryReason::Cancelled)
+            .await
+            .unwrap();
+        assert!(
+            h.executor
+                .retry(old, due, 60, RetryReason::Cancelled)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().state,
+            JobState::RetryWait
+        );
+        let lease = h.executor.lease_next(due + 60, 1).await.unwrap().unwrap();
+        assert!(h.executor.expire(lease.expires_at(), 60).await.unwrap());
+        assert!(!h.executor.expire(lease.expires_at(), 60).await.unwrap());
+        assert!(
+            h.executor
+                .retry_durability(h.job, 1, due + 61, 60)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            h.executor
+                .maintain_archived(32, 256)
+                .await
+                .unwrap()
+                .completed,
+            0
+        );
+        let ledger = h.executor.shutdown().await.unwrap();
+        assert_eq!(ledger.get(h.job).unwrap().state, JobState::RetryWait);
+    }
+
+    #[tokio::test]
+    async fn dropped_maintenance_response_does_not_undo_committed_release() {
+        let mut h = Harness::new();
+        let lease = h.lease().await;
+        let (reply, response) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Retry {
+                lease,
+                now: now(),
+                delay: 60,
+                reason: RetryReason::Cancelled,
+                reply,
+            })
+            .await
+            .unwrap();
+        drop(response);
+        // FIFO job read is a barrier after the canceled response's command.
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().state,
+            JobState::RetryWait
+        );
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durability_retry_is_attempt_fenced_and_maintenance_does_not_restore_success() {
+        let mut h = Harness::new();
+        let lease = h.lease().await;
+        let attempt = lease.job().attempt;
+        let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        let uid = parent.peer_cred().unwrap().uid();
+        let client = async move {
+            let assignment = greeting(&mut worker).await;
+            worker
+                .write_all(
+                    &Frame::encode(&Message::ProtocolDone {
+                        header: assignment.header(1),
+                        count: 0,
+                        digest: ipc::initial_digest(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
+            client
+        );
+        assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
+        assert!(
+            h.executor
+                .retry_durability(h.job, attempt + 1, now(), 60)
+                .await
+                .is_err()
+        );
+        h.executor
+            .retry_durability(h.job, attempt, now(), 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            h.executor
+                .maintain_archived(32, 256)
+                .await
+                .unwrap()
+                .completed,
+            0
+        );
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().state,
+            JobState::RetryWait
+        );
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_terminal_response_requires_reading_durable_job_state() {
+        let mut h = Harness::new();
+        let lease = h.lease().await;
+        let old = lease.clone();
+        let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        let socket = parent.into_std().unwrap();
+        socket.set_nonblocking(false).unwrap();
+        let (reply, response) = oneshot::channel();
+        // Models a lost result after the owner has permission to execute: the
+        // caller cannot infer whether ProtocolDone committed from absent reply.
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Session {
+                delay_terminal_until_cancelled: false,
+                socket,
+                lease,
+                until: Instant::now() + Duration::from_secs(5),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                reply,
+            })
+            .await
+            .unwrap();
+        drop(response);
+        let client = async move {
+            let assignment = greeting(&mut worker).await;
+            worker
+                .write_all(
+                    &Frame::encode(&Message::ProtocolDone {
+                        header: assignment.header(1),
+                        count: 0,
+                        digest: ipc::initial_digest(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        };
+        let (job, ()) = tokio::join!(h.executor.job(h.job), client);
+        assert_eq!(job.unwrap().state, JobState::AwaitingDurability);
+        assert!(
+            h.executor
+                .attempt_progress(h.job, 1)
+                .await
+                .unwrap()
+                .protocol_done
+        );
+        assert!(h.executor.failure_report(h.job, 1).await.unwrap().is_none());
+        assert!(
+            h.executor
+                .retry(old, now(), 60, RetryReason::WorkerLost)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            h.executor
+                .maintain_archived(32, 256)
+                .await
+                .unwrap()
+                .completed,
+            1
+        );
+        h.executor.shutdown().await.unwrap();
     }
 }

@@ -27,7 +27,7 @@ archive admission. Only its typed admission result produces an ACK. ACK still
 does not mean archive durability. A valid ProtocolDone produces the explicit
 `SessionOutcome::ProtocolDone`, leaving the ledger awaiting archive reconciliation.
 The single `AttemptFailed` message persists its bounded diagnostic and terminal
-attempt fence in ledger schema 4 before returning `SessionOutcome::Failed(FailureKind)`.
+attempt fence in ledger schema 5 before returning `SessionOutcome::Failed(FailureKind)`.
 Failure reports are returned without automatic retry, split or completion.
 
 The maximum exchange deadline is nine minutes, including queue wait, inventory
@@ -61,9 +61,10 @@ quantum plus OS scheduling delay. No new database operation starts afterward.
   restart. The in-memory one-session fence is not a persistent restart fence.
 - Apply fair, paced retry policy to persisted failure classifications/diagnostics.
   The library does not automatically split even a Volume report.
-- Keep bounded receipt reconciliation running while admissions are paused. It is
-  available after executor shutdown today; the future long-lived scheduler must
-  add bounded recovery commands/turns instead of opening another ledger.
+- Schedule the bounded [maintenance commands](negentropy_parent_maintenance.md)
+  between exchanges while admissions are paused. They use the same owner/ledger;
+  they do not run concurrently with an upload, which can occupy the owner for
+  nine minutes plus non-preemptible disk time.
 - Bind replay source identity to the writer, distinguish sealing-in-progress from
   corruption, and implement non-destructive guarded cursor repair before replay
   activation. Disable the old sync/seed/prune loop in the new mode.
