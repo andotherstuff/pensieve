@@ -289,6 +289,14 @@ impl SegmentWriter {
         self.recovery_latched.load(Ordering::SeqCst)
     }
 
+    /// Whether this writer owns exactly the supplied archive dedupe authority.
+    /// A writer without a dedupe index cannot prove worker receipt durability.
+    pub(crate) fn uses_dedupe(&self, dedupe: &DedupeIndex) -> bool {
+        self.dedupe
+            .as_ref()
+            .is_some_and(|owned| std::ptr::eq(owned.as_ref(), dedupe))
+    }
+
     /// Find the next segment number by scanning existing files.
     fn find_next_segment_number(config: &SegmentConfig) -> Result<u64> {
         let mut max_num = None;

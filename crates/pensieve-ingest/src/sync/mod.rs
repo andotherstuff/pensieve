@@ -56,6 +56,8 @@ pub mod inventory;
 pub mod ipc;
 pub mod jobs;
 mod negentropy;
+#[cfg(unix)]
+pub mod parent;
 mod state;
 #[cfg(unix)]
 pub mod worker;
