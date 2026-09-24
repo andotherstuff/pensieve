@@ -18,17 +18,23 @@ Each relay freezes a sweep at `floor(now / 900) * 900` (exclusive upper bound) a
 starts at `max(0, upper - 14 days)`. Windows have inclusive endpoints, normally
 `[since, since + 899]`. There are no boundary gaps/overlaps within a sweep. A
 completed sweep can be revisited under a new globally monotonic `rolling-v1:N`
-identity only when the upper boundary advances. The namespace is reserved from
-manual enqueue. A backward clock cannot start an older sweep; it does not prevent
-resuming already-frozen work. Sequence exhaustion is an error, never reuse.
+identity when the nonzero upper boundary changes, including after a backward
+clock correction. The namespace is reserved from manual enqueue. Corrections
+never abandon unfinished frozen planning or its jobs; after that cursor finishes,
+a distinct sequence permits returning to corrected time without waiting for a
+mistaken future timestamp. Sequence exhaustion is an error, never reuse.
 
 One transaction enqueues at most 32 roots and persists each relay cursor plus the
-global sequence/round-robin position. Planning pauses at 32 queued root jobs for
-currently enabled relay identities. Existing manually queued roots for enabled
-relays count too; split children do not. Disabled relay backlog is preserved but
-does not prevent planning for replacement relays. This cap bounds active planning,
-not outstanding obligations: disabled, failed
-jobs and split lineage remain durable. Errors, including a failure after job
+global sequence/round-robin position. Each relay pauses at 32 unresolved root jobs
+across queued, leased, awaiting-durability, retry, blocked and split states. A
+forced partial index and at-most-32-row probe keep quota checks bounded. A full
+relay is skipped so healthy relays continue; failures do not reopen quota. Existing
+manual roots count too; split children do not. With 32 enabled relays the planner
+can retain at most 1,024 unresolved roots across those identities (manual enqueue
+is independently bounded by the ledger ceilings). Disabled backlog is preserved
+but cannot block replacement relays. Split descendants and disabled obligations
+remain under lifetime ledger budgets; this is not a total-obligation cap.
+Errors, including a failure after job
 insertion but before cursor update, roll back the entire turn. No repeated full
 14-day materialization occurs in a single turn. Round-robin planning is persisted;
 fair leasing between fresh jobs and old gaps remains a separate slice.

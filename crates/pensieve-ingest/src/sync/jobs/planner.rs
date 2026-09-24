@@ -8,7 +8,8 @@ use super::{JobLedger, LedgerError, check_budget, commit, enqueue_window};
 
 const MAX_ACTIVE: usize = 32;
 const MAX_RETAINED: i64 = 128;
-const MAX_QUEUED_ROOTS: u32 = 32;
+const MAX_ROOTS_PER_RELAY: u32 = 32;
+const MAX_TURN: u32 = 32;
 const WINDOW: i64 = 900;
 const HORIZON: i64 = 14 * 24 * 60 * 60;
 
@@ -26,7 +27,7 @@ CREATE TABLE planner_relays (
  upper INTEGER NOT NULL DEFAULT 0 CHECK(upper>=0),
  next INTEGER NOT NULL DEFAULT 0 CHECK(next>=0 AND next<=upper)
 );
-CREATE INDEX queued_roots ON jobs(id) WHERE state='queued' AND parent IS NULL;
+CREATE INDEX planner_unresolved_roots ON jobs(relay,id) WHERE state!='complete' AND parent IS NULL;
 ";
 
 /// Outcome of one atomic planning turn, not completed relay coverage.
@@ -34,7 +35,7 @@ CREATE INDEX queued_roots ON jobs(id) WHERE state='queued' AND parent IS NULL;
 pub struct PlanningProgress {
     /// Root windows enqueued in this turn (at most 32).
     pub enqueued: u32,
-    /// The enabled-relay queued-root ceiling prevents further planning.
+    /// At least one enabled relay has reached its unresolved-root ceiling.
     pub backpressured: bool,
 }
 
@@ -97,8 +98,8 @@ impl JobLedger {
     /// Plan at most 32 windows, lazily, against a caller-supplied Unix time.
     /// Future owner wiring must obtain time at execution, not queue submission.
     /// Sweep upper bounds freeze at the latest completed 15-minute boundary.
-    /// A backward clock resumes frozen work but cannot create an older sweep.
-    /// Root-job backpressure counts currently enabled relay identities only;
+    /// A changed clock boundary starts a new sweep only after frozen work is planned.
+    /// Each relay has its own unresolved-root ceiling, including retry/split states;
     /// disabled obligations remain under lifetime ledger budgets. Failures roll back this
     /// entire turn, including sweep sequence and round-robin/cursor progress.
     pub fn plan_rolling(
@@ -106,25 +107,17 @@ impl JobLedger {
         now: i64,
         max_jobs: u32,
     ) -> Result<PlanningProgress, LedgerError> {
-        if now < 0 || max_jobs == 0 || max_jobs > MAX_QUEUED_ROOTS {
+        if now < 0 || max_jobs == 0 || max_jobs > MAX_TURN {
             return Err(LedgerError::Invalid("invalid planner bounds"));
         }
         let boundary = now / WINDOW * WINDOW;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let queued: u32 = tx.query_row(
-            "SELECT count(*) FROM jobs WHERE state='queued' AND parent IS NULL AND relay IN (SELECT relay FROM planner_relays WHERE enabled=1)",
-            [],
-            |r| r.get(0),
-        )?;
         let mut progress = PlanningProgress {
             enqueued: 0,
-            backpressured: queued >= MAX_QUEUED_ROOTS,
+            backpressured: false,
         };
-        if progress.backpressured {
-            return Ok(progress);
-        }
         let (mut sequence, mut after): (i64, i64) = tx.query_row(
             "SELECT sequence,after_relay FROM planner_state WHERE singleton=1",
             [],
@@ -154,10 +147,21 @@ impl JobLedger {
         relays.rotate_left(start);
         let mut idle = 0;
         let mut index = 0;
-        let limit = max_jobs.min(MAX_QUEUED_ROOTS - queued);
-        while progress.enqueued < limit && idle < relays.len() {
+        while progress.enqueued < max_jobs && idle < relays.len() {
             let (id, relay, sweep_sequence, upper, next) = &mut relays[index];
-            if *next == *upper && boundary > *upper {
+            // Indexed and bounded even with a large manually enqueued backlog.
+            let unresolved: u32 = tx.query_row(
+                "SELECT count(*) FROM (SELECT id FROM jobs INDEXED BY planner_unresolved_roots WHERE relay=?1 AND state!='complete' AND parent IS NULL LIMIT ?2)",
+                params![relay.as_str(), MAX_ROOTS_PER_RELAY],
+                |r| r.get(0),
+            )?;
+            if unresolved >= MAX_ROOTS_PER_RELAY {
+                progress.backpressured = true;
+                idle += 1;
+                index = (index + 1) % relays.len();
+                continue;
+            }
+            if *next == *upper && boundary != *upper && boundary > 0 {
                 sequence = sequence
                     .checked_add(1)
                     .ok_or(LedgerError::Invalid("planner sequence exhausted"))?;
@@ -183,6 +187,7 @@ impl JobLedger {
                 )?;
                 after = *id;
                 progress.enqueued += 1;
+                progress.backpressured |= unresolved + 1 >= MAX_ROOTS_PER_RELAY;
                 idle = 0;
             } else {
                 idle += 1;
@@ -196,7 +201,6 @@ impl JobLedger {
             )?;
             commit(tx, &self.path, self.limits)?;
         }
-        progress.backpressured = queued + progress.enqueued >= MAX_QUEUED_ROOTS;
         Ok(progress)
     }
 }
@@ -304,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_boundaries_are_revisited_only_after_upper_advances() {
+    fn completed_boundaries_are_revisited_only_after_upper_changes() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = open(&dir);
         db.configure_planner(&["wss://a.example"]).unwrap();
@@ -321,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_ceiling_preserves_cursor_and_old_gaps() {
+    fn unresolved_ceiling_preserves_cursor_and_old_gaps() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = open(&dir);
         db.configure_planner(&["wss://a.example"]).unwrap();
@@ -337,12 +341,88 @@ mod tests {
         assert_eq!((state(&db), cursors(&db), windows(&db)), before);
         let lease = db.lease_next(10, 60).unwrap().unwrap();
         db.retry(&lease, 11, 60, RetryReason::WorkerLost).unwrap();
-        assert_eq!(db.plan_rolling(HORIZON * 2, 32).unwrap().enqueued, 1);
+        assert_eq!(db.plan_rolling(HORIZON * 2, 32).unwrap().enqueued, 0);
         assert_eq!(
             db.get(lease.job().id).unwrap().state,
             crate::sync::jobs::JobState::RetryWait
         );
         assert_eq!(cursors(&db)[0].3, HORIZON);
+    }
+
+    #[test]
+    fn corrected_clock_starts_distinct_sweep_after_frozen_work_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.configure_planner(&["wss://a.example"]).unwrap();
+        assert_eq!(db.plan_rolling(3600, 1).unwrap().enqueued, 1);
+        // Correction does not abandon the already-frozen sweep.
+        assert_eq!(db.plan_rolling(1800, 3).unwrap().enqueued, 3);
+        let frozen = windows(&db);
+        assert_eq!(frozen.len(), 4);
+        assert!(frozen.iter().all(|r| r.0 == frozen[0].0));
+        assert_eq!(frozen.last().unwrap().3, 3599);
+        db.db
+            .execute("UPDATE jobs SET state='complete'", [])
+            .unwrap();
+        drop(db);
+        let mut db = open(&dir);
+        assert_eq!(db.plan_rolling(1800, 2).unwrap().enqueued, 2);
+        let rows = windows(&db);
+        assert_eq!(&rows[..4], frozen.as_slice());
+        assert_ne!(rows[4].0, frozen[0].0);
+        assert_eq!(rows[4].0, rows[5].0);
+        assert_eq!((rows[4].2, rows[5].3), (0, 1799));
+        assert_eq!(db.plan_rolling(1800, 32).unwrap().enqueued, 0);
+    }
+
+    #[test]
+    fn full_failed_relay_does_not_starve_healthy_relay_or_grow_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.configure_planner(&["wss://a.example"]).unwrap();
+        db.plan_rolling(HORIZON, 32).unwrap();
+        let before = windows(&db);
+        // All unresolved states consume the same root quota; none forgives gaps.
+        for (i, state) in [
+            "queued",
+            "leased",
+            "awaiting_durability",
+            "retry_wait",
+            "blocked",
+            "split",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.db
+                .execute(
+                    "UPDATE jobs SET state=?1,token=CASE WHEN ?1='leased' THEN zeroblob(32) ELSE NULL END,expires_at=CASE WHEN ?1='leased' THEN 100 ELSE NULL END WHERE id=?2",
+                    params![state, i as i64 + 1],
+                )
+                .unwrap();
+        }
+        db.configure_planner(&["wss://a.example", "wss://b.example"])
+            .unwrap();
+        let progress = db.plan_rolling(HORIZON, 32).unwrap();
+        assert_eq!(progress.enqueued, 32);
+        assert!(progress.backpressured);
+        assert_eq!(&windows(&db)[..32], before.as_slice());
+        assert!(windows(&db)[32..].iter().all(|r| r.1 == "wss://b.example"));
+        let cursors_before = cursors(&db);
+        for _ in 0..3 {
+            assert_eq!(db.plan_rolling(HORIZON * 2, 32).unwrap().enqueued, 0);
+        }
+        assert_eq!(windows(&db).len(), 64);
+        assert_eq!(cursors(&db), cursors_before);
+        // Only actual completion restores capacity for this relay.
+        db.db
+            .execute(
+                "UPDATE jobs SET state='complete',token=NULL,expires_at=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.plan_rolling(HORIZON, 32).unwrap().enqueued, 1);
+        assert_eq!(windows(&db).last().unwrap().1, "wss://a.example");
     }
 
     #[test]

@@ -40,8 +40,13 @@ and missing Archived markers still fail closed and preserve the cursor. It never
 forgives a persistent missing marker as a transient seal race. As with the writer,
 this assumes no second archive writer or external mutation bypasses its gate.
 
-Cursor identity changes still require an explicit operator repair path before
-activation; do not delete the inventory database to fix a mistyped floor/path.
+The inactive `ReplayCursorSnapshot`/`rewind_inventory_cursor` library permits an
+explicit metadata-only rewind within the existing namespace, preserving inventory.
+It excludes active readers and checks exact observed bytes. Lowering the rollout
+floor also requires explicitly adjusting the caller's configured floor; mismatches
+still fail closed. Initialization beyond the ready archive boundary is rejected.
+Namespace/path repair and an operator CLI remain unimplemented; do not delete the
+inventory database to change identity. Replay retains all archive-authority checks.
 
 Valid partial batches may enter inventory before segment completion. They are
 safe, incomplete inventory, not coverage. On EOF the inventory WAL is synchronized

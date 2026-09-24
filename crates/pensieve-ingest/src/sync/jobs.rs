@@ -17,6 +17,7 @@ use super::failure::FailureDiagnostic;
 const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
 const MAX_FAILURE_JSON: usize = 32 * 1024;
+const MAINTENANCE_JOBS: &str = "SELECT id FROM jobs INDEXED BY unresolved_jobs WHERE id>?1 AND state IN ('awaiting_durability','retry_wait','blocked','split') ORDER BY id LIMIT ?2";
 const FAILURE_SCHEMA: &str = "CREATE TABLE failure_reports (
     job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
     report TEXT NOT NULL CHECK(length(report)<=32768), PRIMARY KEY(job,attempt)
@@ -713,9 +714,7 @@ impl JobLedger {
             |r| r.get(0),
         )?;
         let jobs = {
-            let mut query = self
-                .db
-                .prepare("SELECT id FROM jobs WHERE id>?1 AND state IN ('awaiting_durability','retry_wait','blocked','split') ORDER BY id LIMIT ?2")?;
+            let mut query = self.db.prepare(MAINTENANCE_JOBS)?;
             query
                 .query_map(params![after, max_jobs], |r| r.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -818,7 +817,7 @@ pub struct ReceiptReconciliation {
 /// Bounded maintenance accounting; zero changes is not a stop condition.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceProgress {
-    /// Job rows handled this turn, including skipped live/completed rows.
+    /// Unresolved job rows reconciled this turn.
     pub jobs: u32,
     /// Total receipt rows checked across every visited job.
     pub checked: u32,
@@ -1291,6 +1290,29 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn maintenance_query_uses_partial_index_without_sorting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ledger(&dir);
+        let plan = db
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {MAINTENANCE_JOBS}"))
+            .unwrap()
+            .query_map(params![0, MAX_RECOVERY_JOBS], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH jobs USING INDEX unresolved_jobs (id>?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 
     #[test]
