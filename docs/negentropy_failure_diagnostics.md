@@ -23,9 +23,10 @@ is deliberately separate; this slice does not split windows or mark failures don
 Worker Volume hints require supervised process binding and verified byte-budget
 semantics before any future split policy can use them.
 
-Ledger schema 4 adds `failure_reports`, keyed by job and attempt. This is an
+Ledger schema 5 retains `failure_reports`, keyed by job and attempt, alongside the
+bounded maintenance cursor added after the schema-4 diagnostic slice. This is an
 undeployed prototype: earlier schema versions are rejected without mutation, not
-migrated automatically. Existing schema-4 ledgers open even when over the admission
+migrated automatically. Existing schema-5 ledgers open even when over the admission
 ceiling so lease expiry, retry and receipt recovery remain available.
 Diagnostic history survives retries and reopen; no retention deletion is added.
 The existing total ledger budget bounds growth and rejects new writes when full.

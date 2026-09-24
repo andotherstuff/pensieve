@@ -17,12 +17,15 @@ use super::failure::FailureDiagnostic;
 const APPLICATION_ID: i64 = 0x504e4a31;
 const WRITE_RESERVE: u64 = 64 * 1024;
 const MAX_FAILURE_JSON: usize = 32 * 1024;
+const MAINTENANCE_JOBS: &str = "SELECT id FROM jobs INDEXED BY unresolved_jobs WHERE id>?1 AND state IN ('awaiting_durability','retry_wait','blocked','split') ORDER BY id LIMIT ?2";
 const FAILURE_SCHEMA: &str = "CREATE TABLE failure_reports (
     job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
     report TEXT NOT NULL CHECK(length(report)<=32768), PRIMARY KEY(job,attempt)
 );";
 /// Maximum receipt rows examined in one archive reconciliation transaction.
 pub const MAX_RECEIPT_BATCH: u32 = 256;
+/// Maximum job rows examined by one fair archive-maintenance turn.
+pub const MAX_RECOVERY_JOBS: u32 = 32;
 /// Bound unsealed finished uploads before pausing new leases.
 const MAX_AWAITING_DURABILITY: u32 = 2;
 
@@ -218,6 +221,8 @@ impl JobLedger {
                         CREATE UNIQUE INDEX one_active_lease ON jobs(state) WHERE state='leased';
                         CREATE INDEX due_jobs ON jobs(state,next_eligible,id);
                         CREATE INDEX child_jobs ON jobs(parent);
+                        CREATE INDEX unresolved_jobs ON jobs(id)
+                            WHERE state IN ('awaiting_durability','retry_wait','blocked','split');
                     CREATE TABLE attempts (
                         job INTEGER NOT NULL REFERENCES jobs(id), attempt INTEGER NOT NULL,
                         received INTEGER NOT NULL, bytes INTEGER NOT NULL, digest BLOB NOT NULL,
@@ -234,15 +239,16 @@ impl JobLedger {
                     );
                     CREATE TABLE receipt_totals (
                         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                        retained INTEGER NOT NULL CHECK(retained>=0)
+                        retained INTEGER NOT NULL CHECK(retained>=0),
+                        scan_job INTEGER NOT NULL DEFAULT 0 CHECK(scan_job>=0)
                     );
-                    INSERT INTO receipt_totals VALUES(1,0);")?;
+                    INSERT INTO receipt_totals VALUES(1,0,0);")?;
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                     tx.execute_batch(FAILURE_SCHEMA)?;
-                    tx.pragma_update(None, "user_version", 4)?;
+                    tx.pragma_update(None, "user_version", 5)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 4) => {}
+                (APPLICATION_ID, 5) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -677,6 +683,79 @@ impl JobLedger {
         })
     }
 
+    /// One fair, persisted keyset turn over at most 32 jobs and 256 total receipts.
+    ///
+    /// Visits all non-live unresolved states, including split/blocked/retry jobs,
+    /// and zero-receipt awaiting jobs. A partial index excludes queued, complete
+    /// and leased history. Persist the cursor once per turn, including on error.
+    /// Each successfully handled job advances the local cursor. Errors leave
+    /// that job due; prior successful reconciliation remains valid. A crash
+    /// between reconciliation and cursor persistence only repeats safe work.
+    /// Recovery bypasses admission ceilings but never actual storage errors.
+    pub fn maintain_archived(
+        &mut self,
+        dedupe: &crate::DedupeIndex,
+        writer: &crate::SegmentWriter,
+        max_jobs: u32,
+        max_receipts: u32,
+    ) -> Result<MaintenanceProgress, LedgerError> {
+        if max_jobs == 0
+            || max_jobs > MAX_RECOVERY_JOBS
+            || max_receipts == 0
+            || max_receipts > MAX_RECEIPT_BATCH
+            || writer.recovery_required()
+            || !writer.uses_dedupe(dedupe)
+        {
+            return Err(LedgerError::Invalid(
+                "invalid maintenance bounds or archive authority",
+            ));
+        }
+        let after: i64 = self.db.query_row(
+            "SELECT scan_job FROM receipt_totals WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let jobs = {
+            let mut query = self.db.prepare(MAINTENANCE_JOBS)?;
+            query
+                .query_map(params![after, max_jobs], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut progress = MaintenanceProgress::default();
+        let end_known = jobs.len() < max_jobs as usize;
+        let selected = jobs.len();
+        let mut last = after;
+        let result = (|| -> Result<(), LedgerError> {
+            for id in jobs {
+                if progress.checked == max_receipts {
+                    break;
+                }
+                let outcome =
+                    self.reconcile_archived(id, dedupe, writer, max_receipts - progress.checked)?;
+                progress.checked += outcome.checked;
+                progress.satisfied += outcome.satisfied;
+                progress.completed += u32::from(outcome.complete);
+                last = id;
+                progress.jobs += 1;
+            }
+            Ok(())
+        })();
+        if result.is_ok() && end_known && progress.jobs as usize == selected {
+            last = 0;
+            progress.wrapped = true;
+        }
+        // One cursor commit per turn: errors retain the failed job for retry.
+        // A crash before this write repeats at most one bounded turn safely.
+        if last != after {
+            self.db.execute(
+                "UPDATE receipt_totals SET scan_job=?1 WHERE singleton=1",
+                [last],
+            )?;
+        }
+        result?;
+        Ok(progress)
+    }
+
     /// Explicit parent recovery when a finished upload cannot reach durability.
     /// Preserves every receipt and retries the same interval with a new capability.
     /// The attempt number fences stale recovery decisions. Not a worker message.
@@ -710,6 +789,21 @@ pub struct ReceiptReconciliation {
     pub satisfied: u32,
     /// This job is durably complete, not merely protocol-complete.
     pub complete: bool,
+}
+
+/// Bounded maintenance accounting; zero changes is not a stop condition.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceProgress {
+    /// Unresolved job rows reconciled this turn.
+    pub jobs: u32,
+    /// Total receipt rows checked across every visited job.
+    pub checked: u32,
+    /// Archive-confirmed receipts compacted this turn.
+    pub satisfied: u32,
+    /// Selected jobs newly observed complete after reconciliation.
+    pub completed: u32,
+    /// End of the keyspace reached; next turn starts at its beginning.
+    pub wrapped: bool,
 }
 
 fn complete_if_durable(tx: &Transaction<'_>, mut job: i64) -> Result<(), LedgerError> {
@@ -957,12 +1051,13 @@ mod tests {
     }
 
     #[test]
-    fn undeployed_v3_is_rejected_without_mutating_jobs_and_receipts() {
+    fn old_prototype_schema_is_rejected_without_changing_obligations() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = ledger(&dir);
         let job = db.enqueue("s", RELAY, 0, 9).unwrap();
         let lease = db.lease_next(10, 60).unwrap().unwrap();
         db.register_received(&lease, &receipt(1), 11).unwrap();
+        let prior = db.attempt_progress(job.id, 1).unwrap();
         db.db
             .execute_batch("DROP TABLE failure_reports; PRAGMA user_version=3;")
             .unwrap();
@@ -972,14 +1067,14 @@ mod tests {
             JobLedger::open(&path, LedgerLimits::default()),
             Err(LedgerError::Invalid(_))
         ));
-        let raw = Connection::open(&path).unwrap();
+        let raw = Connection::open(path).unwrap();
         assert_eq!(
             raw.pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
                 .unwrap(),
             3
         );
         assert_eq!(read_job(&raw, job.id).unwrap().state, JobState::Leased);
-        assert_eq!(attempt_progress(&raw, job.id, 1).unwrap().received, 1);
+        assert_eq!(attempt_progress(&raw, job.id, 1).unwrap(), prior);
         assert_eq!(
             raw.query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
                 .unwrap(),
@@ -1047,6 +1142,260 @@ mod tests {
 
     fn ledger(dir: &tempfile::TempDir) -> JobLedger {
         JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap()
+    }
+
+    fn archive(
+        dir: &tempfile::TempDir,
+    ) -> (std::sync::Arc<crate::DedupeIndex>, crate::SegmentWriter) {
+        let dedupe =
+            std::sync::Arc::new(crate::DedupeIndex::open(dir.path().join("dedupe")).unwrap());
+        let writer = crate::SegmentWriter::new(
+            crate::SegmentConfig {
+                output_dir: dir.path().join("archive"),
+                ..crate::SegmentConfig::default()
+            },
+            None,
+            Some(dedupe.clone()),
+        )
+        .unwrap();
+        (dedupe, writer)
+    }
+
+    #[test]
+    fn maintenance_cursor_survives_reopen_and_missing_first_receipt_does_not_starve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dedupe, writer) = archive(&dir);
+        let mut db = ledger(&dir);
+        let a = db.enqueue("a", RELAY, 0, 9).unwrap();
+        let b = db.enqueue("b", RELAY, 0, 9).unwrap();
+        let c = db.enqueue("c", RELAY, 0, 9).unwrap();
+        for id in [a.id, b.id] {
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            assert_eq!(lease.job.id, id);
+            let mut item = receipt(1);
+            item.event_id = [id as u8; 32];
+            db.register_received(&lease, &item, 11).unwrap();
+            db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();
+        }
+        let lease = db.lease_next(10, 60).unwrap().unwrap();
+        db.record_protocol_done(&lease, 1, 0, super::super::ipc::initial_digest(), 11)
+            .unwrap();
+        dedupe
+            .mark_archived([&[b.id as u8; 32]].into_iter())
+            .unwrap();
+        let progress = db.maintain_archived(&dedupe, &writer, 1, 1).unwrap();
+        assert_eq!(
+            (progress.jobs, progress.checked, progress.satisfied),
+            (1, 1, 0)
+        );
+        drop(db);
+        let mut db = ledger(&dir);
+        db.limits.max_bytes = 1; // Admission paused; maintenance must continue.
+        assert!(matches!(
+            db.enqueue("budget", RELAY, 0, 9),
+            Err(LedgerError::Budget)
+        ));
+        let progress = db.maintain_archived(&dedupe, &writer, 1, 1).unwrap();
+        assert_eq!(
+            (progress.jobs, progress.checked, progress.satisfied),
+            (1, 1, 1)
+        );
+        assert_eq!(db.get(b.id).unwrap().state, JobState::RetryWait);
+        let progress = db.maintain_archived(&dedupe, &writer, 1, 1).unwrap();
+        assert_eq!((progress.checked, progress.completed), (0, 1));
+        assert_eq!(db.get(c.id).unwrap().state, JobState::Complete);
+        assert!(
+            db.maintain_archived(&dedupe, &writer, 1, 1)
+                .unwrap()
+                .wrapped
+        );
+        assert_eq!(
+            db.maintain_archived(&dedupe, &writer, 1, 1).unwrap().jobs,
+            1
+        );
+        assert_eq!(db.get(a.id).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
+    fn failure_report_survives_split_maintenance_and_reopen_without_completing_gaps() {
+        for until in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let (dedupe, writer) = archive(&dir);
+            let mut db = ledger(&dir);
+            let job = db.enqueue("s", RELAY, 1, until).unwrap();
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            db.register_received(&lease, &receipt(1), 11).unwrap();
+            let report = FailureDiagnostic {
+                kind: super::super::failure::FailureKind::Volume,
+                missing_count: 0,
+                sample: Vec::new(),
+            };
+            db.record_failure_report(&lease, 2, &report, 12).unwrap();
+            db.split(&lease, 12).unwrap();
+            assert_eq!(db.failure_report(job.id, 1).unwrap(), Some(report.clone()));
+            dedupe.mark_archived([&[1; 32]].into_iter()).unwrap();
+            let progress = db.maintain_archived(&dedupe, &writer, 32, 256).unwrap();
+            assert_eq!(progress.satisfied, 1);
+            assert_eq!(progress.completed, 0);
+            drop(db);
+            let mut db = ledger(&dir);
+            assert_eq!(db.failure_report(job.id, 1).unwrap(), Some(report));
+            let attempt = db.attempt_progress(job.id, 1).unwrap();
+            assert_eq!((attempt.received, attempt.archived), (1, 1));
+            assert!(!attempt.protocol_done);
+            let remaining: i64 = db
+                .db
+                .query_row("SELECT count(*) FROM receipts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(remaining, 0);
+            // Repeated maintenance after reopen cannot turn a compacted failed
+            // attempt into success; split children have not recovered their gaps.
+            for _ in 0..2 {
+                assert_eq!(
+                    db.maintain_archived(&dedupe, &writer, 32, 256)
+                        .unwrap()
+                        .completed,
+                    0
+                );
+            }
+            assert_eq!(
+                db.get(job.id).unwrap().state,
+                if until == 1 {
+                    JobState::Blocked
+                } else {
+                    JobState::Split
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_query_uses_partial_index_without_sorting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ledger(&dir);
+        let plan = db
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {MAINTENANCE_JOBS}"))
+            .unwrap()
+            .query_map(params![0, MAX_RECOVERY_JOBS], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH jobs USING INDEX unresolved_jobs (id>?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn maintenance_limits_empty_history_and_total_receipts_and_keeps_error_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dedupe, writer) = archive(&dir);
+        let mut db = ledger(&dir);
+        for n in 0..80 {
+            db.enqueue(&format!("{n}"), RELAY, 0, 9).unwrap();
+        }
+        // Synthetic terminal history must not consume scan turns or writes.
+        db.db
+            .execute("UPDATE jobs SET state='complete' WHERE id>40", [])
+            .unwrap();
+        let writes = db.db.total_changes();
+        assert_eq!(
+            db.maintain_archived(&dedupe, &writer, 32, 256)
+                .unwrap()
+                .jobs,
+            0
+        );
+        assert_eq!(
+            db.maintain_archived(&dedupe, &writer, 32, 256)
+                .unwrap()
+                .jobs,
+            0
+        );
+        assert!(
+            db.maintain_archived(&dedupe, &writer, 32, 256)
+                .unwrap()
+                .wrapped
+        );
+        assert_eq!(db.db.total_changes(), writes);
+        for _ in 0..3 {
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            for n in 1..=200 {
+                db.register_received(&lease, &receipt(n), 11).unwrap();
+            }
+            db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();
+        }
+        let progress = db.maintain_archived(&dedupe, &writer, 32, 256).unwrap();
+        assert_eq!((progress.jobs, progress.checked), (2, 256));
+        db.db.execute_batch("CREATE TRIGGER reject_cursor BEFORE UPDATE OF scan_job ON receipt_totals BEGIN SELECT RAISE(ABORT,'cursor fault'); END;").unwrap();
+        assert!(db.maintain_archived(&dedupe, &writer, 1, 1).is_err());
+        let cursor: i64 = db
+            .db
+            .query_row("SELECT scan_job FROM receipt_totals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(db.get(3).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
+    fn maintenance_persists_success_before_error_and_wraps_in_the_last_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dedupe, writer) = archive(&dir);
+        let mut db = ledger(&dir);
+        for n in 0..3 {
+            let job = db.enqueue(&format!("{n}"), RELAY, 0, 9).unwrap();
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            let mut item = receipt(1);
+            item.event_id = [job.id as u8; 32];
+            db.register_received(&lease, &item, 11).unwrap();
+            db.retry(&lease, 12, 60, RetryReason::WorkerLost).unwrap();
+            dedupe.mark_archived([&item.event_id].into_iter()).unwrap();
+        }
+        db.db.execute_batch("CREATE TABLE cursor_writes(value INTEGER);
+            CREATE TRIGGER count_cursor AFTER UPDATE OF scan_job ON receipt_totals BEGIN INSERT INTO cursor_writes VALUES(NEW.scan_job); END;
+            CREATE TRIGGER fail_second BEFORE UPDATE ON attempts WHEN NEW.job=2 BEGIN SELECT RAISE(ABORT,'second job fault'); END;").unwrap();
+        assert!(db.maintain_archived(&dedupe, &writer, 32, 256).is_err());
+        assert_eq!(
+            db.db
+                .query_row("SELECT scan_job FROM receipt_totals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.attempt_progress(1, 1).unwrap().archived, 1);
+        assert_eq!(db.attempt_progress(2, 1).unwrap().archived, 0);
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM cursor_writes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        db.db.execute_batch("DROP TRIGGER fail_second;").unwrap();
+        let progress = db.maintain_archived(&dedupe, &writer, 32, 256).unwrap();
+        assert_eq!(
+            (progress.jobs, progress.satisfied, progress.wrapped),
+            (2, 2, true)
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT scan_job FROM receipt_totals", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT count(*) FROM cursor_writes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

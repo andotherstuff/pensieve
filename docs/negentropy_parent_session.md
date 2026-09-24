@@ -27,7 +27,7 @@ archive admission. Only its typed admission result produces an ACK. ACK still
 does not mean archive durability. A valid ProtocolDone produces the explicit
 `SessionOutcome::ProtocolDone`, leaving the ledger awaiting archive reconciliation.
 The single `AttemptFailed` message persists its bounded diagnostic and terminal
-attempt fence in ledger schema 4 before returning `SessionOutcome::Failed(FailureKind)`.
+attempt fence in ledger schema 5 before returning `SessionOutcome::Failed(FailureKind)`.
 Failure reports are returned without automatic retry, split or completion.
 Archive recovery latched before or during shared admission returns
 `RecoveryRequired` without an ACK; its received receipt remains durable. Nested
@@ -38,7 +38,7 @@ digest) remains `Protocol(Ledger(Invalid))`, not a local storage failure. Queued
 deadline expiry returns `TimedOut`, distinct from dropped-session cancellation.
 
 `Protocol(State)` is still ambiguous: an unretained live-ingestion dedupe claim
-or cancellation during admission can produce it without invalid worker traffic.
+or lease expiry during admission can produce it without invalid worker traffic.
 Future scheduling must retain and conservatively retry that gap, not automatically
 blame/quarantine the relay or infer proven volume from the outer Protocol variant.
 
@@ -73,9 +73,10 @@ quantum plus OS scheduling delay. No new database operation starts afterward.
   restart. The in-memory one-session fence is not a persistent restart fence.
 - Apply fair, paced retry policy to persisted failure classifications/diagnostics.
   The library does not automatically split even a Volume report.
-- Keep bounded receipt reconciliation running while admissions are paused. It is
-  available after executor shutdown today; the future long-lived scheduler must
-  add bounded recovery commands/turns instead of opening another ledger.
+- Schedule the bounded [maintenance commands](negentropy_parent_maintenance.md)
+  between exchanges while admissions are paused. They use the same owner/ledger;
+  they do not run concurrently with an upload, which can occupy the owner for
+  nine minutes plus non-preemptible disk time.
 - Bind replay source identity to the writer, distinguish sealing-in-progress from
   corruption, and implement non-destructive guarded cursor repair before replay
   activation. Disable the old sync/seed/prune loop in the new mode.
