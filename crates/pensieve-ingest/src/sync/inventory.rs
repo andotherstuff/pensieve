@@ -44,22 +44,7 @@ impl ReplayCursorSnapshot {
         let Some(bytes) = state.replay_cursor()? else {
             return Ok(None);
         };
-        let cursor: Cursor =
-            serde_json::from_slice(&bytes).map_err(|e| Error::Validation(e.to_string()))?;
-        if cursor.version != 1
-            || !cursor.archive.is_absolute()
-            || cursor.next < cursor.floor
-            || cursor.prefix.is_empty()
-            || cursor.prefix.len() > 64
-            || !cursor
-                .prefix
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        {
-            return Err(Error::Validation(
-                "invalid replay cursor; preserve existing state".to_owned(),
-            ));
-        }
+        let cursor = decode_cursor(&bytes)?;
         Ok(Some(Self { bytes, cursor }))
     }
 
@@ -75,20 +60,17 @@ impl ReplayCursorSnapshot {
 }
 
 /// Rewind within the existing writer namespace, preserving every inventory ID.
-/// Returns false when the writer is busy (no change), true after a durable rewind
-/// or an identical no-op. Missing, invalid, stale or forward requests fail closed.
-/// The replay ownership lock excludes active readers throughout comparison/write;
-/// the archive admission lock is held only for the writer's readiness snapshot.
+/// This changes only metadata. Replay still checks archive authority and readiness
+/// before reading events. Missing, stale or forward requests fail closed.
+/// The replay ownership lock excludes active readers throughout comparison/write.
 /// A lower target also lowers the floor. Callers must subsequently use that floor
 /// when beginning replay. Missing files/markers remain hard replay errors; this
 /// does not repair archive data or prove coverage. No CLI/runtime activation.
 pub fn rewind_inventory_cursor(
     state: &SyncStateDb,
-    dedupe: &DedupeIndex,
-    writer: &SegmentWriter,
     expected: &ReplayCursorSnapshot,
     target: u64,
-) -> Result<bool> {
+) -> Result<()> {
     let _ownership = state
         .replay_lock
         .try_lock()
@@ -101,23 +83,36 @@ pub fn rewind_inventory_cursor(
             "inventory cursor cannot skip forward".to_owned(),
         ));
     }
-    let Some(ready_before) =
-        writer.inventory_source(dedupe, &expected.cursor.archive, &expected.cursor.prefix)?
-    else {
-        return Ok(false);
-    };
-    if target > ready_before || writer.recovery_required() {
-        return Err(Error::Config(
-            "rewind target beyond ready archive or recovery required".to_owned(),
-        ));
-    }
     let mut cursor = expected.cursor.clone();
     cursor.next = target;
     cursor.floor = cursor.floor.min(target);
     if cursor != expected.cursor {
         save_cursor(state, &cursor)?;
     }
-    Ok(true)
+    Ok(())
+}
+
+fn valid_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 64
+        && prefix
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn decode_cursor(bytes: &[u8]) -> Result<Cursor> {
+    let cursor: Cursor =
+        serde_json::from_slice(bytes).map_err(|e| Error::Validation(e.to_string()))?;
+    if cursor.version != 1
+        || !cursor.archive.is_absolute()
+        || cursor.next < cursor.floor
+        || !valid_prefix(&cursor.prefix)
+    {
+        return Err(Error::Validation(
+            "invalid replay cursor; preserve existing state".to_owned(),
+        ));
+    }
+    Ok(cursor)
 }
 
 /// One bounded replay step, not proof of remote relay coverage.
@@ -165,13 +160,7 @@ impl<'a> InventoryReplay<'a> {
             .replay_lock
             .try_lock()
             .ok_or_else(|| Error::Config("inventory replay already active".to_owned()))?;
-        if writer.recovery_required()
-            || prefix.is_empty()
-            || prefix.len() > 64
-            || !prefix
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-        {
+        if writer.recovery_required() || !valid_prefix(prefix) {
             return Err(Error::Config(
                 "invalid replay configuration or archive recovery required".to_owned(),
             ));
@@ -186,14 +175,8 @@ impl<'a> InventoryReplay<'a> {
         };
         let cursor = match state.replay_cursor()? {
             Some(bytes) => {
-                let cursor: Cursor =
-                    serde_json::from_slice(&bytes).map_err(|e| Error::Validation(e.to_string()))?;
-                if cursor.version != 1
-                    || cursor.archive != archive
-                    || cursor.prefix != prefix
-                    || cursor.floor != floor
-                    || cursor.next < floor
-                {
+                let cursor = decode_cursor(&bytes)?;
+                if cursor.archive != archive || cursor.prefix != prefix || cursor.floor != floor {
                     return Err(Error::Config(
                         "replay cursor identity differs; preserve existing state".to_owned(),
                     ));
@@ -201,6 +184,11 @@ impl<'a> InventoryReplay<'a> {
                 cursor
             }
             None => {
+                if floor > ready_before {
+                    return Err(Error::Config(
+                        "initial replay floor exceeds ready archive".to_owned(),
+                    ));
+                }
                 save_cursor(state, &expected)?;
                 expected
             }
@@ -300,8 +288,7 @@ impl<'a> InventoryReplay<'a> {
                 .state
                 .replay_cursor()?
                 .ok_or_else(|| Error::Validation("missing replay cursor".to_owned()))?;
-            let current: Cursor =
-                serde_json::from_slice(&current).map_err(|e| Error::Validation(e.to_string()))?;
+            let current = decode_cursor(&current)?;
             if current != self.cursor {
                 return Err(Error::Validation("stale replay session".to_owned()));
             }
@@ -422,8 +409,8 @@ mod tests {
             h.begin().unwrap().unwrap().step(3).unwrap();
             let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
             assert_eq!(snapshot.next_segment(), 1);
-            assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).unwrap());
-            assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).is_err());
+            rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
+            assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
             assert_eq!(h.state.get_items_since(0).unwrap().len(), ids.len());
         }
         let h = Harness::new(dir.path());
@@ -433,24 +420,29 @@ mod tests {
     }
 
     #[test]
-    fn rewind_repairs_high_floor_without_skipping_or_removing_inventory() {
+    fn initial_floor_is_bounded_and_earlier_rollout_requires_explicit_rewind() {
         let dir = tempfile::tempdir().unwrap();
         let h = Harness::new(dir.path());
         h.seal(1);
         assert!(
             InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 99)
+                .is_err()
+        );
+        assert!(ReplayCursorSnapshot::inspect(&h.state).unwrap().is_none());
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 1)
                 .unwrap()
                 .is_none()
         );
         let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
-        assert_eq!(snapshot.floor(), 99);
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 98).is_err());
-        assert_eq!(
-            ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap(),
-            snapshot
-        );
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).unwrap());
+        assert_eq!(snapshot.floor(), 1);
+        assert!(h.begin().is_err());
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
         assert_eq!(h.cursor().floor, 0);
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 1)
+                .is_err()
+        );
         assert!(
             h.begin()
                 .unwrap()
@@ -469,20 +461,31 @@ mod tests {
         let mut replay = h.begin().unwrap().unwrap();
         let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
         replay.step(1).unwrap();
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).is_err());
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
         drop(replay);
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 1).is_err());
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 1).is_err());
         let other = tempfile::tempdir().unwrap();
         let wrong = Harness::new(other.path());
-        assert!(rewind_inventory_cursor(&h.state, &wrong.dedupe, &h.writer, &snapshot, 0).is_err());
         assert!(
-            rewind_inventory_cursor(&h.state, &wrong.dedupe, &wrong.writer, &snapshot, 0).is_err()
+            InventoryReplay::begin(&h.state, &wrong.dedupe, &h.writer, &h.archive, "segment", 0)
+                .is_err()
+        );
+        assert!(
+            InventoryReplay::begin(
+                &h.state,
+                &wrong.dedupe,
+                &wrong.writer,
+                &wrong.archive,
+                "segment",
+                0
+            )
+            .is_err()
         );
         assert_eq!(
             ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap(),
             snapshot
         );
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).unwrap());
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
         assert_eq!(
             ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap(),
             snapshot
@@ -491,7 +494,7 @@ mod tests {
         let mut changed = snapshot.bytes.clone();
         changed.push(b' ');
         h.state.save_replay_cursor(&changed).unwrap();
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).is_err());
+        assert!(rewind_inventory_cursor(&h.state, &snapshot, 0).is_err());
         assert_eq!(h.state.replay_cursor().unwrap().unwrap(), changed);
         assert_eq!(h.state.get_items_since(0).unwrap().len(), 1);
     }
@@ -503,7 +506,7 @@ mod tests {
         h.seal(1);
         h.begin().unwrap().unwrap().step(2).unwrap();
         let snapshot = ReplayCursorSnapshot::inspect(&h.state).unwrap().unwrap();
-        assert!(rewind_inventory_cursor(&h.state, &h.dedupe, &h.writer, &snapshot, 0).unwrap());
+        rewind_inventory_cursor(&h.state, &snapshot, 0).unwrap();
         fs::rename(
             h.archive.join("segment-000000000.notepack"),
             h.archive.join("held.notepack"),

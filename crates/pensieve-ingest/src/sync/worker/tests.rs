@@ -56,7 +56,7 @@ async fn send_inventory(stream: &mut UnixStream, lease: &super::super::jobs::Lea
 }
 
 // Real pinned SDK speaks NIP-77 against this localhost-only relay. In partial
-// mode the relay advertises the ID but sends EOSE without fetching its event.
+// mode the relay advertises every ID but withholds the last event before EOSE.
 async fn relay(partial: bool, hang: bool) -> (String, tokio::task::JoinHandle<()>) {
     relay_with_empty(partial, hang, false).await
 }
@@ -137,24 +137,25 @@ async fn relay_events(
                     stats
                         .batches
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !partial {
-                        for event in &events {
-                            if !request[2]["ids"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .any(|id| id.as_str() == Some(&event.id.to_hex()))
-                            {
-                                continue;
-                            }
-                            let response = serde_json::json!(["EVENT", request[1], event]);
-                            socket
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    response.to_string().into(),
-                                ))
-                                .await
-                                .unwrap();
+                    for event in events
+                        .iter()
+                        .take(events.len().saturating_sub(usize::from(partial)))
+                    {
+                        if !request[2]["ids"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|id| id.as_str() == Some(&event.id.to_hex()))
+                        {
+                            continue;
                         }
+                        let response = serde_json::json!(["EVENT", request[1], event]);
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                response.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
                     }
                     serde_json::json!(["EOSE", request[1]])
                 }
@@ -321,11 +322,17 @@ async fn expired_advertised_event_is_unavailable_not_success() {
     )
     .await
     .unwrap();
-    assert!(matches!(result, Err(WorkerError::Unavailable)));
+    assert!(matches!(result, Err(WorkerError::Unavailable(_))));
     client.disconnect().await;
     assert!(
         capture
-            .finish_download(Err(WorkerError::Unavailable))
+            .finish_download(Err(WorkerError::Unavailable(
+                crate::sync::failure::FailureDiagnostic {
+                    kind: crate::sync::failure::FailureKind::Unavailable,
+                    missing_count: 0,
+                    sample: Vec::new()
+                }
+            )))
             .await
             .is_err()
     );
@@ -378,14 +385,18 @@ async fn explicit_empty_diff_can_complete_without_inventing_events() {
 
 #[tokio::test]
 async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
-    for partial in [false, true] {
+    for (partial, delivered) in [(false, 1), (true, 0), (true, 1)] {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("ipc");
         let listener = UnixListener::bind(&socket).unwrap();
+        let events: Vec<_> = (0..delivered + usize::from(partial))
+            .map(|_| event())
+            .collect();
+        let withheld = events.last().unwrap().id.to_bytes();
         let (url, server) = relay_events(
             partial,
             false,
-            vec![event()],
+            events,
             Arc::new(RelayStats {
                 inject_unrequested: true,
                 ..Default::default()
@@ -411,11 +422,7 @@ async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
             let mut session = UploadSession::new(lease.clone());
             let mut count = 0;
             loop {
-                let wire = match transport::read_wire(&mut stream).await {
-                    Ok(wire) => wire,
-                    Err(_) if partial => break,
-                    Err(error) => panic!("{error}"),
-                };
+                let wire = transport::read_wire(&mut stream).await.unwrap();
                 let frame = Frame::read(&mut &wire[..]).unwrap();
                 match session.receive(&mut ledger, frame, now()).unwrap() {
                     UploadAction::Event(event) => {
@@ -429,7 +436,7 @@ async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
                     }
                     UploadAction::ProtocolDone => {
                         assert!(!partial);
-                        assert_eq!(count, 1);
+                        assert_eq!(count, delivered);
                         assert_eq!(ledger.get(id).unwrap().state, JobState::AwaitingDurability);
                         assert!(
                             !ledger
@@ -444,6 +451,16 @@ async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
                                 .unwrap()
                                 .complete
                         );
+                        break;
+                    }
+                    UploadAction::Failed(FailureKind::Unavailable) if partial => {
+                        let report = ledger
+                            .failure_report(id, lease.job().attempt)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(report.missing_count, 1);
+                        assert_eq!(report.sample, vec![withheld]);
+                        assert_eq!(count, delivered);
                         break;
                     }
                     _ => panic!("unexpected failure frame"),
@@ -467,12 +484,48 @@ async fn real_sdk_rejects_unsolicited_events_and_requires_archive_admission() {
         server.abort();
         let _ = server.await;
         if partial {
-            assert!(matches!(outcome, Err(WorkerError::Unavailable)));
+            assert!(matches!(outcome, Err(WorkerError::Unavailable(_))));
             assert_eq!(ledger.get(id).unwrap().state, JobState::Leased);
-            assert_eq!(ledger.attempt_progress(id, 1).unwrap().received, 0);
+            assert_eq!(
+                ledger.attempt_progress(id, 1).unwrap().received,
+                delivered as u64
+            );
+            let report = ledger.failure_report(id, 1).unwrap().unwrap();
+            assert_eq!(report.kind, FailureKind::Unavailable);
+            assert_eq!(report.missing_count, 1);
+            assert_eq!(report.sample, vec![withheld]);
         } else {
             assert!(outcome.is_ok(), "{outcome:?}");
         }
+    }
+}
+
+#[tokio::test]
+async fn failed_diagnostic_delivery_preserves_the_original_exit_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let assignment = Assignment::for_lease(&lease);
+    for expected in [2, 3, 4] {
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let error = match expected {
+            2 => WorkerError::Unavailable(crate::sync::failure::FailureDiagnostic {
+                kind: FailureKind::Unavailable,
+                missing_count: 1,
+                sample: vec![[1; 32]],
+            }),
+            3 => WorkerError::Volume,
+            _ => WorkerError::EventSize,
+        };
+        let error = report_failure(
+            &mut stream,
+            &assignment,
+            0,
+            Instant::now() + Duration::from_secs(1),
+            error,
+        )
+        .await;
+        assert_eq!(error.exit_code(), expected);
     }
 }
 

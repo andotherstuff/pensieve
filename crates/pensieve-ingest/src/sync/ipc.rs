@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::failure::{FailureDiagnostic, FailureKind};
 use super::jobs::{JobLedger, Lease, LedgerError};
 
 /// Upload protocol version; inventory/handshake integration is not implemented.
@@ -85,18 +86,6 @@ impl Header {
     }
 }
 
-/// Bounded failure classes, never arbitrary remote error strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Failure {
-    /// Connection/protocol failure, requiring same-window retry policy.
-    Relay,
-    /// Worker reports resource exhaustion; classification still needs validation.
-    Resource,
-    /// Explicit cancellation.
-    Cancelled,
-}
-
 /// Worker-to-parent upload messages after the future inventory exchange.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -109,8 +98,11 @@ pub enum Message {
         count: u64,
         digest: [u8; 32],
     },
-    /// Incomplete attempt. Never interpreted as successful empty output.
-    AttemptFailed { header: Header, reason: Failure },
+    /// Bounded diagnostic accounting, not archival proof or a retry decision.
+    AttemptFailed {
+        header: Header,
+        report: FailureDiagnostic,
+    },
 }
 
 impl Message {
@@ -254,7 +246,7 @@ pub enum UploadAction {
     /// Persisted matching worker summary, still awaiting archive integration.
     ProtocolDone,
     /// Caller applies explicit retry policy; receipts are retained.
-    Failed(Failure),
+    Failed(FailureKind),
 }
 
 /// One non-resumable attempt upload. After error, drop it and apply retry policy.
@@ -376,9 +368,12 @@ impl UploadSession {
                 ledger.record_protocol_done(&self.lease, header.sequence, count, digest, now)?;
                 Ok(UploadAction::ProtocolDone)
             }
-            Message::AttemptFailed { reason, .. } => {
-                ledger.verify_active(&self.lease, now)?;
-                Ok(UploadAction::Failed(reason))
+            Message::AttemptFailed { header, report } => {
+                if !self.outstanding.is_empty() {
+                    return Err(ProtocolError::State);
+                }
+                ledger.record_failure_report(&self.lease, header.sequence, &report, now)?;
+                Ok(UploadAction::Failed(report.kind))
             }
         }
     }
@@ -525,6 +520,88 @@ mod tests {
             UploadAction::Event(e) => e,
             _ => panic!("expected event"),
         }
+    }
+
+    #[test]
+    fn zero_receipt_failure_fences_empty_success_after_reopen() {
+        let (dir, mut db, lease, mut session) = setup();
+        let report = FailureDiagnostic {
+            kind: FailureKind::Relay,
+            missing_count: 0,
+            sample: vec![],
+        };
+        let failed = Frame::encode(&Message::AttemptFailed {
+            header: Header::for_lease(&lease, 1),
+            report: report.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            session.receive(&mut db, frame(&failed), 11).unwrap(),
+            UploadAction::Failed(FailureKind::Relay)
+        ));
+        drop(db);
+        let mut db =
+            JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
+        let mut fresh = UploadSession::new(lease.clone());
+        assert!(
+            fresh
+                .receive(&mut db, done(&lease, 1, 0, initial_digest()), 12)
+                .is_err()
+        );
+        assert_eq!(db.failure_report(lease.job().id, 1).unwrap(), Some(report));
+        assert!(
+            !db.attempt_progress(lease.job().id, 1)
+                .unwrap()
+                .protocol_done
+        );
+        assert_eq!(db.get(lease.job().id).unwrap().state, JobState::Leased);
+    }
+
+    #[test]
+    fn diagnostic_failure_is_terminal_durable_and_never_completion() {
+        use super::super::failure::{FailureDiagnostic, FailureKind};
+        let (dir, mut db, lease, mut session) = setup();
+        let registered = registered(
+            session
+                .receive(&mut db, frame(&wire(&lease, 1, event("one", 100))), 11)
+                .unwrap(),
+        );
+        session.accepted(&mut db, registered, 12).unwrap();
+        let report = FailureDiagnostic {
+            kind: FailureKind::Unavailable,
+            missing_count: 3,
+            sample: vec![[1; 32], [2; 32]],
+        };
+        let failed = Frame::encode(&Message::AttemptFailed {
+            header: Header::for_lease(&lease, 2),
+            report: report.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            session.receive(&mut db, frame(&failed), 13).unwrap(),
+            UploadAction::Failed(FailureKind::Unavailable)
+        ));
+        assert!(session.receive(&mut db, frame(&failed), 14).is_err());
+        let mut reconnect = UploadSession::new(lease.clone());
+        assert!(
+            reconnect
+                .receive(&mut db, done(&lease, 1, 0, initial_digest()), 15)
+                .is_err()
+        );
+        db.retry(&lease, 16, 60, RetryReason::RelayFailure).unwrap();
+        drop(db);
+        let db = JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
+        assert_eq!(
+            db.failure_report(lease.job().id, lease.job().attempt)
+                .unwrap(),
+            Some(report)
+        );
+        let progress = db
+            .attempt_progress(lease.job().id, lease.job().attempt)
+            .unwrap();
+        assert_eq!(progress.received, 1);
+        assert!(!progress.protocol_done);
+        assert_eq!(db.get(lease.job().id).unwrap().state, JobState::RetryWait);
     }
 
     #[test]
@@ -864,22 +941,27 @@ mod tests {
     fn failure_and_eof_keep_receipts_and_never_claim_success() {
         for eof in [false, true] {
             let (_dir, mut db, lease, mut session) = setup();
-            let _received = session
+            let received = session
                 .receive(&mut db, frame(&wire(&lease, 1, event("one", 100))), 11)
                 .unwrap();
             if eof {
                 assert!(session.read_receive(&mut db, &mut &b""[..], || 12).is_err());
             } else {
+                session.accepted(&mut db, registered(received), 12).unwrap();
                 let failed = frame(
                     &Frame::encode(&Message::AttemptFailed {
                         header: Header::for_lease(&lease, 2),
-                        reason: Failure::Relay,
+                        report: FailureDiagnostic {
+                            kind: FailureKind::Relay,
+                            missing_count: 0,
+                            sample: Vec::new(),
+                        },
                     })
                     .unwrap(),
                 );
                 assert!(matches!(
                     session.receive(&mut db, failed, 12).unwrap(),
-                    UploadAction::Failed(Failure::Relay)
+                    UploadAction::Failed(FailureKind::Relay)
                 ));
             }
             let progress = db.attempt_progress(lease.job().id, 1).unwrap();

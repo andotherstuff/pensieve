@@ -1037,7 +1037,7 @@ mod tests {
     fn replay_waits_for_checkpointed_seal_without_holding_admission() {
         use crate::sync::{
             SyncStateDb,
-            inventory::{InventoryReplay, ReplayCursorSnapshot, rewind_inventory_cursor},
+            inventory::{InventoryReplay, ReplayCursorSnapshot},
         };
         let dir = TempDir::new().unwrap();
         let archive = dir.path().join("archive");
@@ -1087,21 +1087,6 @@ mod tests {
         // The reader owns no archive gate, even while it is alive and unconsumed.
         assert!(writer.admission_gate.try_lock().is_some());
         assert!(replay.step(2).unwrap().segment_complete);
-        drop(replay);
-        let snapshot = ReplayCursorSnapshot::inspect(&state).unwrap().unwrap();
-        let gate = writer.admission_gate.lock();
-        assert!(!rewind_inventory_cursor(&state, &dedupe, &writer, &snapshot, 0).unwrap());
-        assert_eq!(
-            ReplayCursorSnapshot::inspect(&state).unwrap().unwrap(),
-            snapshot
-        );
-        drop(gate);
-        writer.recovery_latched.store(true, Ordering::SeqCst);
-        assert!(rewind_inventory_cursor(&state, &dedupe, &writer, &snapshot, 0).is_err());
-        assert_eq!(
-            ReplayCursorSnapshot::inspect(&state).unwrap().unwrap(),
-            snapshot
-        );
     }
 
     #[test]

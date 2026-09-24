@@ -56,12 +56,14 @@ source segments required by unresolved jobs/replay.
 
 The inactive inventory library now supports explicit same-source rewind with an
 opaque, bounded `ReplayCursorSnapshot`. It compares exact observed metadata while
-holding replay ownership, checks the exact writer/dedupe and seal readiness, and
-only lowers `next` (and `floor` when needed). It never removes verified inventory,
+holding replay ownership and only lowers `next` (and `floor` when needed). Archive
+authority/readiness remain enforced by replay, not metadata rewind. It never removes verified inventory,
 retargets a namespace, replaces invalid metadata, skips forward or forgives missing
-files/markers. A busy writer makes no change; an active reader or stale observation
+files/markers. An active reader or stale observation
 fails closed. After lowering the floor, callers must use that recorded floor for
-subsequent replay. This is not a repair CLI or runtime activation. A wrongly bound
+subsequent replay; changed configuration is never silently accepted. Initial floors
+beyond the writer's ready boundary are rejected without initializing metadata.
+This is not a repair CLI or runtime activation. A wrongly bound
 archive namespace still requires a separate design/operator decision; `next ==
 floor` is not proof that no partial inventory exists.
 
