@@ -53,7 +53,9 @@ impl<'a> InventoryReplay<'a> {
     /// Open exactly the next sealed segment. Initialize only with an explicit
     /// operator-chosen floor; later archive/prefix/floor changes fail closed.
     ///
-    /// None means the next segment has not sealed yet. A higher sealed segment
+    /// None means the writer is mutating the archive or the next segment has not
+    /// checkpointed its seal yet. Busy writers cause no cursor/file access.
+    /// Archive, prefix and dedupe must match this exact writer. A higher sealed segment
     /// with a missing predecessor is an error, never an instruction to skip it.
     /// Run after archive startup recovery, on a bounded blocking executor. Do not
     /// run the legacy inventory pruner while replay or retained jobs need history.
@@ -65,6 +67,9 @@ impl<'a> InventoryReplay<'a> {
         prefix: &str,
         floor: u64,
     ) -> Result<Option<Self>> {
+        let Some(ready_before) = writer.inventory_source(dedupe, archive, prefix)? else {
+            return Ok(None);
+        };
         let ownership = state
             .replay_lock
             .try_lock()
@@ -111,6 +116,9 @@ impl<'a> InventoryReplay<'a> {
         };
         let plain = archive.join(format!("{prefix}-{:09}.notepack", cursor.next));
         let gzip = archive.join(format!("{prefix}-{:09}.notepack.gz", cursor.next));
+        if cursor.next >= ready_before {
+            return Ok(None);
+        }
         let reader: Box<dyn Read + Send> = match File::open(&plain) {
             Ok(file) => Box::new(BufReader::new(file)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => match File::open(&gzip) {
@@ -130,7 +138,10 @@ impl<'a> InventoryReplay<'a> {
                             )));
                         }
                     }
-                    return Ok(None);
+                    return Err(Error::Validation(format!(
+                        "missing checkpointed replay segment {}",
+                        cursor.next
+                    )));
                 }
                 Err(error) => return Err(error.into()),
             },
@@ -395,6 +406,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = Harness::new(dir.path());
         fs::write(h.archive.join("segment-000000001.notepack"), []).unwrap();
+        drop(h);
+        let h = Harness::new(dir.path());
         assert!(h.begin().is_err());
         let original = h.state.replay_cursor().unwrap();
         assert!(
@@ -417,6 +430,8 @@ mod tests {
             let h = Harness::new(dir.path());
             let file = h.archive.join("segment-000000000.notepack");
             fs::write(&file, &bytes).unwrap();
+            drop(h);
+            let h = Harness::new(dir.path());
             let mut replay = h.begin().unwrap().unwrap();
             assert!(replay.step(1).is_err());
             assert!(replay.step(1).is_err());
@@ -473,12 +488,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = Harness::new(dir.path());
         h.seal(1);
-        let empty = DedupeIndex::open(dir.path().join("empty-index")).unwrap();
-        let mut replay =
-            InventoryReplay::begin(&h.state, &empty, &h.writer, &h.archive, "segment", 0)
-                .unwrap()
-                .unwrap();
+        let event = EventBuilder::text_note("unarchived replacement")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let packed = pack_nostr_event(&event).unwrap();
+        let mut bytes = (packed.data.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&packed.data);
+        let file = h.archive.join("segment-000000000.notepack");
+        fs::write(&file, &bytes).unwrap();
+        let mut replay = h.begin().unwrap().unwrap();
         assert!(replay.step(2).is_err());
         assert_eq!(h.cursor().next, 0);
+        assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mismatched_source_or_dedupe_never_initializes_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        h.seal(1);
+        let empty = DedupeIndex::open(dir.path().join("empty-index")).unwrap();
+        assert!(
+            InventoryReplay::begin(&h.state, &empty, &h.writer, &h.archive, "segment", 0).is_err()
+        );
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, dir.path(), "segment", 0)
+                .is_err()
+        );
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "other", 0).is_err()
+        );
+        assert!(h.state.replay_cursor().unwrap().is_none());
+        let without_dedupe = SegmentWriter::new(
+            SegmentConfig {
+                output_dir: h.archive.clone(),
+                compress: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            InventoryReplay::begin(
+                &h.state,
+                &h.dedupe,
+                &without_dedupe,
+                &h.archive,
+                "segment",
+                0
+            )
+            .is_err()
+        );
+        assert!(h.state.replay_cursor().unwrap().is_none());
+        assert!(h.begin().unwrap().is_some());
     }
 }
