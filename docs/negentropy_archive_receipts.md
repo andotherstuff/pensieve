@@ -62,7 +62,7 @@ performed; freed SQLite pages can be reused. Job and attempt summaries are retai
 and therefore are **not** unbounded-lifetime storage: the byte/job ceilings still
 pause admissions and require future measured retention policy or operator action.
 
-The undeployed prototype schema is version 3. Versions 1 and 2 fail closed without
+The undeployed prototype schema is version 4. Earlier versions fail closed without
 mutation; there is intentionally no speculative migration for unshipped databases.
 Never point this prototype at production state or delete incompatible state.
 

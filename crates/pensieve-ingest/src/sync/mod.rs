@@ -52,6 +52,7 @@
 //! }).await?;
 //! ```
 
+pub mod failure;
 pub mod inventory;
 pub mod ipc;
 pub mod jobs;

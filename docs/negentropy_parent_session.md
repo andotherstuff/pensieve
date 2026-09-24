@@ -26,6 +26,8 @@ The existing upload session persists each received obligation before shared
 archive admission. Only its typed admission result produces an ACK. ACK still
 does not mean archive durability. A valid ProtocolDone produces the explicit
 `SessionOutcome::ProtocolDone`, leaving the ledger awaiting archive reconciliation.
+The single `AttemptFailed` message persists its bounded diagnostic and terminal
+attempt fence in ledger schema 4 before returning `SessionOutcome::Failed(FailureKind)`.
 Failure reports are returned without automatic retry, split or completion.
 
 The maximum exchange deadline is nine minutes, including queue wait, inventory
@@ -36,7 +38,12 @@ Socket timeouts are configured only once, before the greeting: macOS rejects
 timeout changes after peer exit even when a terminal frame remains buffered.
 The async deadline still closes the socket immediately. Dropping/timing out the
 async session shuts down both directions and sets cancellation before another
-operation begins. An already-running disk operation cannot be aborted: it may
+operation begins. When its own deadline fires, `serve` retains and awaits the owner
+reply: an already-committed ProtocolDone or terminal failure is returned instead
+of being hidden by a timeout. This can extend the await beyond the socket deadline.
+An externally dropped future cannot deliver a reply; its caller must re-read the
+durable job/attempt state before deciding recovery, never assume a timeout means
+the terminal transaction did not commit. An already-running disk operation cannot be aborted: it may
 finish registration/admission after cancellation, but its receipt remains and
 cannot cause a false completion. The queue stays bounded while that operation
 finishes. `shutdown` asynchronously waits for the owner and returns the ledger;
@@ -52,7 +59,7 @@ quantum plus OS scheduling delay. No new database operation starts afterward.
   supervised process as well as its UID before interpreting process exit codes.
 - Recover/expire an old active lease before creating a replacement executor after
   restart. The in-memory one-session fence is not a persistent restart fence.
-- Persist failure classifications/diagnostics and apply fair, paced retry policy.
+- Apply fair, paced retry policy to persisted failure classifications/diagnostics.
   The library does not automatically split even a Volume report.
 - Keep bounded receipt reconciliation running while admissions are paused. It is
   available after executor shutdown today; the future long-lived scheduler must
@@ -66,3 +73,6 @@ quantum plus OS scheduling delay. No new database operation starts afterward.
 Local tests cover wrong UID, bounded stalled framing, dropped futures, malformed
 greetings, stale sequence, authenticated failures, refused reconnects, ACK admission,
 EOF receipts, and protocol-vs-archive completion using a real ledger/writer/index.
+They also cover committed ProtocolDone racing the session deadline and a 300-ID
+multi-chunk inventory decoded by the real worker parser. Local invalid requests
+and archive recovery faults have distinct error types rather than worker blame.

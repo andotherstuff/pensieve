@@ -182,7 +182,7 @@ pub fn hash_item(hash: &mut sha2::Sha256, id: &[u8; 32], timestamp: u64) {
     hash.update(id);
 }
 
-pub(super) async fn inventory<R>(
+pub(in crate::sync) async fn inventory<R>(
     reader: &mut R,
 ) -> Result<(Assignment, Vec<(EventId, Timestamp)>), ProtocolError>
 where

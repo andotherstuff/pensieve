@@ -17,7 +17,8 @@ use sha2::Digest;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use super::ipc::{self, Failure, Frame, ProtocolError, UploadAction, UploadSession};
+use super::failure::FailureKind;
+use super::ipc::{self, Frame, ProtocolError, UploadAction, UploadSession};
 use super::jobs::{Job, JobLedger, Lease, LedgerError};
 use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};
@@ -35,6 +36,12 @@ pub enum ParentError {
     /// Complete inventory exceeded the cap. No partial set was sent.
     #[error("inventory window too dense")]
     TooDense,
+    /// Parent policy supplied invalid session parameters.
+    #[error("invalid parent session request")]
+    InvalidRequest,
+    /// Local archive uncertainty blocks admission until operator recovery.
+    #[error("archive recovery required")]
+    RecoveryRequired,
     /// Socket or deadline failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -55,7 +62,7 @@ pub enum SessionOutcome {
     /// Valid summary persisted; archive reconciliation is still required.
     ProtocolDone,
     /// Authenticated failure report; caller owns durable retry/split policy.
-    Failed(Failure),
+    Failed(FailureKind),
 }
 
 type Reply<T> = oneshot::Sender<Result<T, ParentError>>;
@@ -71,6 +78,8 @@ enum Command {
         reply: Reply<Job>,
     },
     Session {
+        #[cfg(test)]
+        delay_terminal_until_cancelled: bool,
         socket: UnixStream,
         lease: Lease,
         until: Instant,
@@ -85,6 +94,8 @@ enum Command {
 /// the writer. This library does not bind a socket, launch processes, retry jobs,
 /// or enable replay. Exclusive mutable methods prohibit concurrent submissions.
 pub struct ParentExecutor {
+    #[cfg(test)]
+    delay_terminal_until_cancelled: bool,
     sender: Option<mpsc::Sender<Command>>,
     stopped: Option<oneshot::Receiver<JobLedger>>,
     thread: Option<JoinHandle<()>>,
@@ -119,6 +130,8 @@ impl ParentExecutor {
                             let _ = reply.send(ledger.get(id).map_err(Into::into));
                         }
                         Command::Session {
+                            #[cfg(test)]
+                            delay_terminal_until_cancelled,
                             socket,
                             lease,
                             until,
@@ -146,12 +159,18 @@ impl ParentExecutor {
                                 socket,
                                 lease,
                                 until,
-                                cancelled,
+                                cancelled.clone(),
                                 &mut ledger,
                                 &inventory,
                                 &dedupe,
                                 &writer,
                             );
+                            #[cfg(test)]
+                            if delay_terminal_until_cancelled && result.is_ok() {
+                                while !cancelled.load(Ordering::Acquire) {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
                             let _ = reply.send(result);
                         }
                     }
@@ -159,6 +178,8 @@ impl ParentExecutor {
                 let _ = done.send(ledger);
             })?;
         Ok(Self {
+            #[cfg(test)]
+            delay_terminal_until_cancelled: false,
             sender: Some(sender),
             stopped: Some(stopped),
             thread: Some(thread),
@@ -209,32 +230,38 @@ impl ParentExecutor {
             return Err(ParentError::Peer);
         }
         if timeout.is_zero() || timeout > Duration::from_secs(540) {
-            return Err(ParentError::Protocol(ProtocolError::State));
+            return Err(ParentError::InvalidRequest);
         }
         let until = Instant::now() + timeout;
         let socket = socket.into_std()?;
         socket.set_nonblocking(false)?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let _guard = Cancel {
+        let guard = Cancel {
             socket: socket.try_clone()?,
             cancelled: cancelled.clone(),
         };
         let (reply, response) = oneshot::channel();
         let command = Command::Session {
+            #[cfg(test)]
+            delay_terminal_until_cancelled: self.delay_terminal_until_cancelled,
             socket,
             lease,
             until,
             cancelled,
             reply,
         };
-        tokio::time::timeout(timeout, self.request(command, response))
-            .await
-            .map_err(|_| {
-                ParentError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "parent session deadline",
-                ))
-            })?
+        let request = self.request(command, response);
+        tokio::pin!(request);
+        match tokio::time::timeout(timeout, &mut request).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Cancelling socket work cannot preempt a SQLite/fsync operation.
+                // Keep the owner reply: a terminal transaction may already have
+                // committed, and must not be misclassified as worker failure.
+                guard.cancel();
+                request.await
+            }
+        }
     }
 
     /// Close the queue, await the owner and return the ledger for recovery.
@@ -263,6 +290,11 @@ struct Cancel {
 }
 impl Drop for Cancel {
     fn drop(&mut self) {
+        self.cancel();
+    }
+}
+impl Cancel {
+    fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         let _ = self.socket.shutdown(Shutdown::Both);
     }
@@ -373,10 +405,10 @@ fn exchange(
         || lease.job().until < lease.job().since
         || lease.job().until - lease.job().since >= 900
     {
-        return Err(ParentError::Protocol(ProtocolError::State));
+        return Err(ParentError::InvalidRequest);
     }
     if writer.recovery_required() {
-        return Err(ParentError::Protocol(ProtocolError::State));
+        return Err(ParentError::RecoveryRequired);
     }
     let mut length = [0; 4];
     socket.read_exact(&mut length)?;
@@ -391,6 +423,11 @@ fn exchange(
     if hello.version != ipc::VERSION {
         return Err(ParentError::Protocol(ProtocolError::State));
     }
+    socket.check()?;
+    ledger.verify_active(&lease, now())?;
+    if writer.recovery_required() {
+        return Err(ParentError::RecoveryRequired);
+    }
     let items = match inventory.archived_window(
         lease.job().since as u64,
         lease.job().until as u64,
@@ -403,7 +440,7 @@ fn exchange(
     socket.check()?;
     ledger.verify_active(&lease, now())?;
     if writer.recovery_required() {
-        return Err(ParentError::Protocol(ProtocolError::State));
+        return Err(ParentError::RecoveryRequired);
     }
     let assignment = Assignment::for_lease(&lease);
     socket.send(&ParentMessage::Job {
@@ -457,6 +494,7 @@ mod tests {
         executor: ParentExecutor,
         writer: Arc<SegmentWriter>,
         dedupe: Arc<DedupeIndex>,
+        inventory: Arc<SyncStateDb>,
         job: i64,
     }
     impl Harness {
@@ -483,12 +521,13 @@ mod tests {
                 .unwrap()
                 .id;
             let executor =
-                ParentExecutor::new(ledger, state, dedupe.clone(), writer.clone()).unwrap();
+                ParentExecutor::new(ledger, state.clone(), dedupe.clone(), writer.clone()).unwrap();
             Self {
                 _root: root,
                 executor,
                 writer,
                 dedupe,
+                inventory: state,
                 job,
             }
         }
@@ -562,6 +601,104 @@ mod tests {
             panic!("empty complete inventory expected")
         };
         assignment
+    }
+
+    #[tokio::test]
+    async fn committed_terminal_outcome_survives_session_deadline() {
+        let mut h = Harness::new();
+        h.executor.delay_terminal_until_cancelled = true;
+        let lease = h.lease().await;
+        let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        let uid = parent.peer_cred().unwrap().uid();
+        let client = async move {
+            let assignment = greeting(&mut worker).await;
+            worker
+                .write_all(
+                    &Frame::encode(&Message::ProtocolDone {
+                        header: assignment.header(1),
+                        count: 0,
+                        digest: ipc::initial_digest(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            h.executor
+                .serve(parent, uid, lease, Duration::from_millis(250)),
+            client
+        );
+        assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().state,
+            JobState::AwaitingDurability
+        );
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonempty_multichunk_inventory_passes_real_worker_parser() {
+        let mut h = Harness::new();
+        let mut expected = Vec::new();
+        for n in 0..300 {
+            let event = EventBuilder::text_note(format!("inventory {n}"))
+                .custom_created_at(Timestamp::from(105))
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            h.writer
+                .write_reserved(
+                    crate::pack_nostr_event(&event).unwrap(),
+                    h.dedupe.reserve(event.id.as_bytes()).unwrap().unwrap(),
+                )
+                .unwrap();
+            expected.push((event.id.to_bytes(), 105));
+        }
+        h.writer.seal().unwrap();
+        h.inventory
+            .record_batch(expected.iter().map(|(id, timestamp)| (id, *timestamp)))
+            .unwrap();
+        expected.sort();
+        let lease = h.lease().await;
+        let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
+        let uid = parent.peer_cred().unwrap().uid();
+        let client = async move {
+            transport::write_message(
+                &mut worker,
+                &Hello {
+                    version: ipc::VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            // This is the production worker parser, including chunk sequence,
+            // ordering, uniqueness, count and final digest checks.
+            let (assignment, inventory) = transport::inventory(&mut worker).await.unwrap();
+            assert_eq!(
+                inventory
+                    .iter()
+                    .map(|(id, stamp)| (id.to_bytes(), stamp.as_secs()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            worker
+                .write_all(
+                    &Frame::encode(&Message::ProtocolDone {
+                        header: assignment.header(1),
+                        count: 0,
+                        digest: ipc::initial_digest(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
+            client
+        );
+        assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
+        h.executor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -764,7 +901,11 @@ mod tests {
                 .write_all(
                     &Frame::encode(&Message::AttemptFailed {
                         header: assignment.header(1),
-                        reason: Failure::Resource,
+                        report: super::super::failure::FailureDiagnostic {
+                            kind: FailureKind::Relay,
+                            missing_count: 0,
+                            sample: Vec::new(),
+                        },
                     })
                     .unwrap(),
                 )
@@ -775,7 +916,7 @@ mod tests {
             h.executor.serve(parent, uid, lease, Duration::from_secs(5)),
             client
         );
-        assert_eq!(result.unwrap(), SessionOutcome::Failed(Failure::Resource));
+        assert_eq!(result.unwrap(), SessionOutcome::Failed(FailureKind::Relay));
         assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
         let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
         assert!(
@@ -804,6 +945,7 @@ mod tests {
                 Instant::now()
             };
             let command = Command::Session {
+                delay_terminal_until_cancelled: false,
                 socket,
                 lease: lease.clone(),
                 until,

@@ -15,8 +15,11 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use self::capture::Capture;
+#[cfg(test)]
+pub(super) use self::transport::inventory;
 pub use self::transport::{Assignment, Hello, ParentMessage, read_message, write_message};
 pub use self::transport::{INVENTORY_CHUNK_ITEMS, hash_item, inventory_hasher};
+use super::failure::{FailureDiagnostic, FailureKind};
 use super::ipc::{Frame, Message, ProtocolError, VERSION};
 
 const WALL_TIME: Duration = Duration::from_secs(9 * 60);
@@ -50,7 +53,7 @@ pub enum WorkerError {
     /// limit or permanent absence: SDK policy drops and relay withholding look
     /// identical. Preserve the gap; do not automatically split or skip it.
     #[error("worker advertised events unavailable at EOSE")]
-    Unavailable,
+    Unavailable(FailureDiagnostic),
     /// Distinct verified in-window candidates exceed the attempt byte budget.
     /// A future authenticated parent may split, retaining all receipt obligations.
     #[error("worker attempt volume limit exceeded")]
@@ -65,10 +68,24 @@ impl WorkerError {
     /// Unknown exits/signals must not be interpreted as a volume limit.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Unavailable => 2,
+            Self::Unavailable(_) => 2,
             Self::Volume => 3,
             Self::EventSize => 4,
             _ => 1,
+        }
+    }
+
+    fn diagnostic(&self) -> FailureDiagnostic {
+        let kind = match self {
+            Self::Unavailable(report) => return report.clone(),
+            Self::Volume => FailureKind::Volume,
+            Self::EventSize => FailureKind::EventSize,
+            _ => FailureKind::Relay,
+        };
+        FailureDiagnostic {
+            kind,
+            missing_count: 0,
+            sample: Vec::new(),
         }
     }
 }
@@ -115,26 +132,33 @@ async fn attempt(
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
     let client = Client::builder()
-        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .opts(
+            ClientOptions::default()
+                .relay_limits(relay_limits())
+                .verify_subscriptions(true),
+        )
         .database(capture.clone())
         .build();
     let relay_url = assignment.relay.clone();
     let sdk = async {
-        client
-            .add_relay(&relay_url)
-            .await
-            .map_err(|_| WorkerError::Incomplete)?;
-        let relay = client
-            .relay(&relay_url)
-            .await
-            .map_err(|_| WorkerError::Incomplete)?;
-        tracing::info!(relay = %relay_url, phase = "connect", "isolated reconciliation");
-        relay
-            .try_connect(Duration::from_secs(20))
-            .await
-            .map_err(|_| WorkerError::Incomplete)?;
-        tracing::info!(relay = %relay_url, phase = "sync", "isolated reconciliation");
-        let result = reconcile::download(&relay, &assignment, items).await;
+        let result = async {
+            client
+                .add_relay(&relay_url)
+                .await
+                .map_err(|_| WorkerError::Incomplete)?;
+            let relay = client
+                .relay(&relay_url)
+                .await
+                .map_err(|_| WorkerError::Incomplete)?;
+            tracing::info!(relay = %relay_url, phase = "connect", "isolated reconciliation");
+            relay
+                .try_connect(Duration::from_secs(20))
+                .await
+                .map_err(|_| WorkerError::Incomplete)?;
+            tracing::info!(relay = %relay_url, phase = "sync", "isolated reconciliation");
+            reconcile::download(&relay, &assignment, items).await
+        }
+        .await;
         tracing::info!(relay = %relay_url, phase = "disconnect", "isolated reconciliation");
         client.disconnect().await;
         // Close under the callback lock, not by hoping SDK Arc destruction closes
@@ -143,11 +167,12 @@ async fn attempt(
     };
     tokio::pin!(sdk);
     let mut result = None;
+    let mut admitted = 0;
     let mut idle = Instant::now() + idle_time;
     loop {
         tokio::select! {
             value = &mut sdk, if result.is_none() => {
-                result = Some(value?);
+                result = Some(value);
             }
             _ = tokio::time::sleep_until(idle) => return Err(WorkerError::Deadline),
             ready = stream.readable() => {
@@ -174,15 +199,36 @@ async fn attempt(
                 // Credit is held until a matching parent admission ACK. Arbitrary
                 // SDK progress and socket chatter do not refresh this deadline.
                 drop(event);
+                admitted += 1;
                 idle = Instant::now() + idle_time;
             }
         }
     }
-    let (count, digest) = match result {
+    let outcome = match result {
         Some(summary) => summary,
         None => timeout_at(idle, &mut sdk)
             .await
-            .map_err(|_| WorkerError::Deadline)??,
+            .map_err(|_| WorkerError::Deadline)?,
+    };
+    let (count, digest) = match outcome {
+        Ok(summary) => summary,
+        Err(error) => {
+            // Drain/ACK all already-captured candidates before the terminal report.
+            // On any write failure/timeout the parent still owns its existing receipts.
+            timeout_at(
+                idle,
+                write_message(
+                    &mut stream,
+                    &Message::AttemptFailed {
+                        header: assignment.header(admitted + 1),
+                        report: error.diagnostic(),
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| WorkerError::Deadline)??;
+            return Err(error);
+        }
     };
     tracing::info!(relay = %relay_url, phase = "drained", count, "isolated reconciliation");
     let wire = Frame::encode(&Message::ProtocolDone {
