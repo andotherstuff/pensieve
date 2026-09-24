@@ -153,12 +153,12 @@ pub(super) async fn download(
                     if !batch.iter().all(|id| received.contains(id)) {
                         let remaining: Vec<_> =
                             ids.iter().filter(|id| !received.contains(id)).collect();
-                        return Err(WorkerError::Outstanding(super::FailureDiagnostic {
+                        return Err(WorkerError::Unavailable(super::FailureDiagnostic {
                             kind: super::FailureKind::Unavailable,
                             missing_count: remaining.len() as u64,
                             sample: remaining
                                 .into_iter()
-                                .take(128)
+                                .take(crate::sync::failure::MAX_FAILURE_SAMPLE)
                                 .map(|id| id.to_bytes())
                                 .collect(),
                         }));

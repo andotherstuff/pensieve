@@ -4,7 +4,7 @@ This inactive slice preserves bounded failure information before scheduler polic
 is introduced. It launches no workers and changes no production configuration.
 
 After a reconciliation failure, the worker drains its already-captured candidates
-through the normal admission ACK path, then sends one terminal `AttemptReport`
+through the normal admission ACK path, then sends one terminal `AttemptFailed`
 instead of `ProtocolDone`. A broken IPC connection, cancellation or deadline can
 prevent the report from arriving; received obligations still remain in the ledger.
 Neither a report nor an ACK proves archive durability or completes a job.
@@ -23,14 +23,21 @@ is deliberately separate; this slice does not split windows or mark failures don
 Worker Volume hints require supervised process binding and verified byte-budget
 semantics before any future split policy can use them.
 
-Ledger schema 4 adds `failure_reports`, keyed by job and attempt. The migration
-from schema 3 preserves all jobs and receipts, and older binaries reject schema 4.
+Ledger schema 4 adds `failure_reports`, keyed by job and attempt. This is an
+undeployed prototype: earlier schema versions are rejected without mutation, not
+migrated automatically. Existing schema-4 ledgers open even when over the admission
+ceiling so lease expiry, retry and receipt recovery remain available.
 Diagnostic history survives retries and reopen; no retention deletion is added.
 The existing total ledger budget bounds growth and rejects new writes when full.
 The new wire variant fails closed on an older parent, so a future deployment must
 install matching parent/worker binaries before activation. This is not an online
 mixed-version rollout protocol.
 
-Tests cover report validation, migration, stale leases, repeated/wrong-sequence
+There is one terminal failure message, `AttemptFailed`, and every accepted failure
+persists the same attempt fence. There is no legacy unfenced failure path.
+
+Tests cover report validation, old-schema rejection, stale leases, repeated/wrong-sequence
 reports, transactional failure, budget refusal, receipt preservation, retry/reopen,
 and a partially fetched relay batch that reports failure without false completion.
+An explicit zero-receipt failure/reopen regression rejects a fresh session's empty
+ProtocolDone, proving the failure fence independently of prior receipt counts.

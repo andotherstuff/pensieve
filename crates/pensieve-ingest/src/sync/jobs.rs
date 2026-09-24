@@ -242,12 +242,6 @@ impl JobLedger {
                     tx.pragma_update(None, "user_version", 4)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 3) => {
-                    check_budget(&tx, path, limits, 0)?;
-                    tx.execute_batch(FAILURE_SCHEMA)?;
-                    tx.pragma_update(None, "user_version", 4)?;
-                    check_budget(&tx, path, limits, 0)?;
-                }
                 (APPLICATION_ID, 4) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
@@ -963,36 +957,73 @@ mod tests {
     }
 
     #[test]
-    fn v3_migration_preserves_unfinished_jobs_and_receipts() {
+    fn undeployed_v3_is_rejected_without_mutating_jobs_and_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = ledger(&dir);
         let job = db.enqueue("s", RELAY, 0, 9).unwrap();
         let lease = db.lease_next(10, 60).unwrap().unwrap();
         db.register_received(&lease, &receipt(1), 11).unwrap();
-        let prior = db.attempt_progress(job.id, 1).unwrap();
         db.db
             .execute_batch("DROP TABLE failure_reports; PRAGMA user_version=3;")
             .unwrap();
         let path = db.path.clone();
         drop(db);
-        let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        assert!(matches!(
+            JobLedger::open(&path, LedgerLimits::default()),
+            Err(LedgerError::Invalid(_))
+        ));
+        let raw = Connection::open(&path).unwrap();
         assert_eq!(
-            db.db
-                .pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
+            raw.pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
                 .unwrap(),
-            4
+            3
         );
-        assert_eq!(db.get(job.id).unwrap().state, JobState::Leased);
-        assert_eq!(db.attempt_progress(job.id, 1).unwrap(), prior);
+        assert_eq!(read_job(&raw, job.id).unwrap().state, JobState::Leased);
+        assert_eq!(attempt_progress(&raw, job.id, 1).unwrap().received, 1);
         assert_eq!(
-            db.db
-                .query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
+            raw.query_row("SELECT count(*) FROM receipts", [], |r| r.get::<_, u64>(0))
                 .unwrap(),
             1
         );
-        db.record_failure_report(&lease, 2, &diagnostic(), 12)
+        assert_eq!(
+            raw.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='failure_reports'",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn current_schema_over_admission_ceiling_still_opens_and_recovers() {
+        for expire in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = ledger(&dir);
+            db.enqueue("first", RELAY, 0, 9).unwrap();
+            db.enqueue("second", RELAY, 10, 19).unwrap();
+            let lease = db.lease_next(10, 60).unwrap().unwrap();
+            db.register_received(&lease, &receipt(1), 11).unwrap();
+            let path = db.path.clone();
+            drop(db);
+            let mut db = JobLedger::open(
+                &path,
+                LedgerLimits {
+                    max_jobs: 1,
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        assert_eq!(db.failure_report(job.id, 1).unwrap(), Some(diagnostic()));
+            if expire {
+                assert!(db.expire(71, 60).unwrap());
+            } else {
+                db.retry(&lease, 12, 60, RetryReason::RelayFailure).unwrap();
+            }
+            assert_eq!(db.get(lease.job.id).unwrap().state, JobState::RetryWait);
+            assert_eq!(db.attempt_progress(lease.job.id, 1).unwrap().received, 1);
+            assert!(matches!(db.lease_next(132, 60), Err(LedgerError::Budget)));
+        }
     }
 
     #[test]

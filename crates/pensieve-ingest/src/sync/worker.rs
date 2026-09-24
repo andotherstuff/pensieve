@@ -51,10 +51,7 @@ pub enum WorkerError {
     /// limit or permanent absence: SDK policy drops and relay withholding look
     /// identical. Preserve the gap; do not automatically split or skip it.
     #[error("worker advertised events unavailable at EOSE")]
-    Unavailable,
-    /// Bounded outstanding-ID diagnostic at EOSE, never logged as payload.
-    #[error("worker advertised events remain outstanding at EOSE")]
-    Outstanding(FailureDiagnostic),
+    Unavailable(FailureDiagnostic),
     /// Distinct verified in-window candidates exceed the attempt byte budget.
     /// A future authenticated parent may split, retaining all receipt obligations.
     #[error("worker attempt volume limit exceeded")]
@@ -69,7 +66,7 @@ impl WorkerError {
     /// Unknown exits/signals must not be interpreted as a volume limit.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Unavailable | Self::Outstanding(_) => 2,
+            Self::Unavailable(_) => 2,
             Self::Volume => 3,
             Self::EventSize => 4,
             _ => 1,
@@ -78,8 +75,7 @@ impl WorkerError {
 
     fn diagnostic(&self) -> FailureDiagnostic {
         let kind = match self {
-            Self::Outstanding(report) => return report.clone(),
-            Self::Unavailable => FailureKind::Unavailable,
+            Self::Unavailable(report) => return report.clone(),
             Self::Volume => FailureKind::Volume,
             Self::EventSize => FailureKind::EventSize,
             _ => FailureKind::Relay,
@@ -134,7 +130,11 @@ async fn attempt(
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
     let client = Client::builder()
-        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .opts(
+            ClientOptions::default()
+                .relay_limits(relay_limits())
+                .verify_subscriptions(true),
+        )
         .database(capture.clone())
         .build();
     let relay_url = assignment.relay.clone();
@@ -217,7 +217,7 @@ async fn attempt(
                 idle,
                 write_message(
                     &mut stream,
-                    &Message::AttemptReport {
+                    &Message::AttemptFailed {
                         header: assignment.header(admitted + 1),
                         report: error.diagnostic(),
                     },

@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum diagnostic event IDs retained per attempt.
 pub const MAX_FAILURE_SAMPLE: usize = 128;
-/// Maximum missing count reported by the bounded worker.
-pub const MAX_FAILURE_MISSING: u64 = 50_000;
 
 /// Stable failure classes with no free-form relay-controlled text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -40,7 +38,7 @@ impl FailureDiagnostic {
     /// Check semantic bounds after bounded frame decoding and before persistence.
     pub fn validate(&self) -> bool {
         self.sample.len() <= MAX_FAILURE_SAMPLE
-            && self.missing_count <= MAX_FAILURE_MISSING
+            && self.missing_count <= super::ipc::MAX_EVENTS
             && self.missing_count >= self.sample.len() as u64
             && self.sample.windows(2).all(|ids| ids[0] < ids[1])
             && (self.kind == FailureKind::Unavailable
@@ -67,7 +65,7 @@ mod tests {
         report.sample = vec![[1; 32]];
         report.missing_count = 0;
         assert!(!report.validate());
-        report.missing_count = MAX_FAILURE_MISSING + 1;
+        report.missing_count = super::super::ipc::MAX_EVENTS + 1;
         assert!(!report.validate());
         report.missing_count = 1;
         report.kind = FailureKind::Relay;

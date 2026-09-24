@@ -263,7 +263,13 @@ mod tests {
             );
             assert_eq!(
                 capture
-                    .finish_download(Err(WorkerError::Unavailable))
+                    .finish_download(Err(WorkerError::Unavailable(
+                        crate::sync::failure::FailureDiagnostic {
+                            kind: crate::sync::failure::FailureKind::Unavailable,
+                            missing_count: 0,
+                            sample: Vec::new()
+                        }
+                    )))
                     .await
                     .unwrap_err()
                     .exit_code(),
@@ -284,7 +290,15 @@ mod tests {
             Err(WorkerError::EventSize)
         ));
         assert!(matches!(
-            capture.finish_download(Err(WorkerError::Unavailable)).await,
+            capture
+                .finish_download(Err(WorkerError::Unavailable(
+                    crate::sync::failure::FailureDiagnostic {
+                        kind: crate::sync::failure::FailureKind::Unavailable,
+                        missing_count: 0,
+                        sample: Vec::new()
+                    }
+                )))
+                .await,
             Err(WorkerError::EventSize)
         ));
         assert!(receiver.recv().await.is_none());
@@ -297,10 +311,26 @@ mod tests {
             Err(WorkerError::Incomplete)
         ));
         assert!(matches!(
-            capture.finish_download(Err(WorkerError::Unavailable)).await,
+            capture
+                .finish_download(Err(WorkerError::Unavailable(
+                    crate::sync::failure::FailureDiagnostic {
+                        kind: crate::sync::failure::FailureKind::Unavailable,
+                        missing_count: 0,
+                        sample: Vec::new()
+                    }
+                )))
+                .await,
             Err(WorkerError::Incomplete)
         ));
-        assert_eq!(WorkerError::Unavailable.exit_code(), 2);
+        assert_eq!(
+            WorkerError::Unavailable(crate::sync::failure::FailureDiagnostic {
+                kind: crate::sync::failure::FailureKind::Unavailable,
+                missing_count: 0,
+                sample: Vec::new()
+            })
+            .exit_code(),
+            2
+        );
         assert_eq!(WorkerError::Volume.exit_code(), 3);
         assert_eq!(WorkerError::EventSize.exit_code(), 4);
         assert_eq!(WorkerError::Incomplete.exit_code(), 1);
