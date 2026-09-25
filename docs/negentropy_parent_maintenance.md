@@ -48,11 +48,13 @@ and guarantees freshness remains a future slice.
 
 Future scheduling must budget recovery cadence against unresolved work, not completed
 history. Drain sufficient bounded recovery turns between admissions.
-The explicit `now` arguments are caller timestamps, not execution-time clock reads.
-A command queued behind an externally cancelled session or slow disk operation can
-use a stale timestamp and shorten its effective retry delay. Before activation, the
-scheduler must arrange execution-time deadline calculation rather than treating a
-queued caller timestamp as a guaranteed minimum backoff from command completion.
+Lease, expiry, same-window retry and durability retry sample wall time on the owner
+immediately before calling the ledger, rather than accepting a caller timestamp
+that can become stale in the bounded queue. The synchronous ledger still accepts
+explicit timestamps for deterministic state-machine testing. Session deadlines are
+unchanged. Execution-time sampling is not transaction-completion timing: a disk
+operation may block after sampling, and wall-clock adjustments can change observed
+eligibility. It does not guarantee a minimum delay from commit or response time.
 
 This changes the unshipped prototype ledger to schema 5 (schema 4 failure reports
 plus the recovery cursor). Older prototype versions fail closed without mutation;

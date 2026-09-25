@@ -95,13 +95,11 @@ enum Command {
         reply: Reply<AttemptProgress>,
     },
     Expire {
-        now: i64,
         delay: u32,
         reply: Reply<bool>,
     },
     Retry {
         lease: Lease,
-        now: i64,
         delay: u32,
         reason: RetryReason,
         reply: Reply<()>,
@@ -109,7 +107,6 @@ enum Command {
     RetryDurability {
         job: i64,
         attempt: i64,
-        now: i64,
         delay: u32,
         reply: Reply<()>,
     },
@@ -119,7 +116,6 @@ enum Command {
         reply: Reply<MaintenanceProgress>,
     },
     Lease {
-        now: i64,
         ttl: u32,
         reply: Reply<Option<Lease>>,
     },
@@ -141,6 +137,9 @@ enum Command {
 /// Construct after startup archive recovery, with the *same* dedupe index used by
 /// the writer. This library does not bind a socket, launch processes, choose retry
 /// policy, or enable replay. Exclusive mutable methods prohibit concurrent submissions.
+/// Lease and retry times are sampled on the owner immediately before the ledger
+/// operation, not at submission. This is wall-clock execution time, not commit
+/// time: clock adjustments and uninterruptible disk latency remain possible.
 pub struct ParentExecutor {
     sender: Option<mpsc::Sender<Command>>,
     stopped: Option<oneshot::Receiver<JobLedger>>,
@@ -155,6 +154,19 @@ impl ParentExecutor {
         dedupe: Arc<DedupeIndex>,
         writer: Arc<SegmentWriter>,
     ) -> Result<Self, ParentError> {
+        Self::with_clock(ledger, inventory, dedupe, writer, now)
+    }
+
+    fn with_clock<F>(
+        ledger: JobLedger,
+        inventory: Arc<SyncStateDb>,
+        dedupe: Arc<DedupeIndex>,
+        writer: Arc<SegmentWriter>,
+        clock: F,
+    ) -> Result<Self, ParentError>
+    where
+        F: Fn() -> i64 + Send + 'static,
+    {
         if !writer.uses_dedupe(&dedupe) {
             return Err(ParentError::Archive(crate::Error::Config(
                 "parent dedupe differs from writer authority".to_owned(),
@@ -185,29 +197,30 @@ impl ParentExecutor {
                             let _ = reply
                                 .send(ledger.attempt_progress(job, attempt).map_err(Into::into));
                         }
-                        Command::Expire { now, delay, reply } => {
-                            let _ = reply.send(ledger.expire(now, delay).map_err(Into::into));
+                        Command::Expire { delay, reply } => {
+                            let _ = reply.send(ledger.expire(clock(), delay).map_err(Into::into));
                         }
                         Command::Retry {
                             lease,
-                            now,
                             delay,
                             reason,
                             reply,
                         } => {
-                            let _ = reply
-                                .send(ledger.retry(&lease, now, delay, reason).map_err(Into::into));
+                            let _ = reply.send(
+                                ledger
+                                    .retry(&lease, clock(), delay, reason)
+                                    .map_err(Into::into),
+                            );
                         }
                         Command::RetryDurability {
                             job,
                             attempt,
-                            now,
                             delay,
                             reply,
                         } => {
                             let _ = reply.send(
                                 ledger
-                                    .retry_durability(job, attempt, now, delay)
+                                    .retry_durability(job, attempt, clock(), delay)
                                     .map_err(Into::into),
                             );
                         }
@@ -220,8 +233,8 @@ impl ParentExecutor {
                                 ledger.maintain_archived(&dedupe, &writer, jobs, receipts)
                             }));
                         }
-                        Command::Lease { now, ttl, reply } => {
-                            let _ = reply.send(ledger.lease_next(now, ttl).map_err(Into::into));
+                        Command::Lease { ttl, reply } => {
+                            let _ = reply.send(ledger.lease_next(clock(), ttl).map_err(Into::into));
                         }
                         Command::Job { id, reply } => {
                             let _ = reply.send(ledger.get(id).map_err(Into::into));
@@ -296,16 +309,15 @@ impl ParentExecutor {
 
     /// Acquire one lease using existing oldest-eligible policy, not a scheduler.
     /// Cancellation may leave a committed lease; its expiry preserves recovery.
-    pub async fn lease_next(&mut self, now: i64, ttl: u32) -> Result<Option<Lease>, ParentError> {
+    pub async fn lease_next(&mut self, ttl: u32) -> Result<Option<Lease>, ParentError> {
         let (reply, response) = oneshot::channel();
-        self.request(Command::Lease { now, ttl, reply }, response)
-            .await
+        self.request(Command::Lease { ttl, reply }, response).await
     }
 
     /// Recover one expired lease without inferring completion or volume failure.
-    pub async fn expire(&mut self, now: i64, delay: u32) -> Result<bool, ParentError> {
+    pub async fn expire(&mut self, delay: u32) -> Result<bool, ParentError> {
         let (reply, response) = oneshot::channel();
-        self.request(Command::Expire { now, delay, reply }, response)
+        self.request(Command::Expire { delay, reply }, response)
             .await
     }
 
@@ -314,7 +326,6 @@ impl ParentExecutor {
     pub async fn retry(
         &mut self,
         lease: Lease,
-        now: i64,
         delay: u32,
         reason: RetryReason,
     ) -> Result<(), ParentError> {
@@ -322,7 +333,6 @@ impl ParentExecutor {
         self.request(
             Command::Retry {
                 lease,
-                now,
                 delay,
                 reason,
                 reply,
@@ -337,7 +347,6 @@ impl ParentExecutor {
         &mut self,
         job: i64,
         attempt: i64,
-        now: i64,
         delay: u32,
     ) -> Result<(), ParentError> {
         let (reply, response) = oneshot::channel();
@@ -345,7 +354,6 @@ impl ParentExecutor {
             Command::RetryDurability {
                 job,
                 attempt,
-                now,
                 delay,
                 reply,
             },
@@ -704,6 +712,7 @@ mod tests {
     use super::*;
     use crate::SegmentConfig;
     use nostr_sdk::{EventBuilder, Keys, Timestamp};
+    use std::sync::atomic::AtomicI64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct Harness {
@@ -716,6 +725,12 @@ mod tests {
     }
     impl Harness {
         fn new() -> Self {
+            Self::with_clock(now)
+        }
+        fn with_clock<F>(clock: F) -> Self
+        where
+            F: Fn() -> i64 + Send + 'static,
+        {
             let root = tempfile::tempdir().unwrap();
             let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
             let writer = Arc::new(
@@ -737,8 +752,14 @@ mod tests {
                 .enqueue("sweep", "wss://relay.example.com", 100, 110)
                 .unwrap()
                 .id;
-            let executor =
-                ParentExecutor::new(ledger, state.clone(), dedupe.clone(), writer.clone()).unwrap();
+            let executor = ParentExecutor::with_clock(
+                ledger,
+                state.clone(),
+                dedupe.clone(),
+                writer.clone(),
+                clock,
+            )
+            .unwrap();
             Self {
                 _root: root,
                 executor,
@@ -749,7 +770,7 @@ mod tests {
             }
         }
         async fn lease(&mut self) -> Lease {
-            self.executor.lease_next(now(), 60).await.unwrap().unwrap()
+            self.executor.lease_next(60).await.unwrap().unwrap()
         }
     }
 
@@ -1381,18 +1402,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_lease_uses_owner_execution_time_and_dropped_retry_reply_keeps_backoff() {
+        let clock = Arc::new(AtomicI64::new(1000));
+        let owner_clock = clock.clone();
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first = AtomicBool::new(true);
+        let mut h = Harness::with_clock(move || {
+            if first.swap(false, Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            owner_clock.load(Ordering::Acquire)
+        });
+        // Hold an earlier owner command, then queue the lease without a timestamp.
+        let (reply, expired) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Expire { delay: 60, reply })
+            .await
+            .unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (reply, response) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Lease { ttl: 60, reply })
+            .await
+            .unwrap();
+        clock.store(2000, Ordering::Release);
+        release.send(()).unwrap();
+        assert!(!expired.await.unwrap().unwrap());
+        let lease = response.await.unwrap().unwrap().unwrap();
+        assert_eq!(lease.expires_at(), 2060);
+        assert_eq!(h.executor.job(h.job).await.unwrap().attempt, 1);
+        // A lost release reply cannot roll back the owner's execution-time backoff.
+        clock.store(2010, Ordering::Release);
+        let (reply, response) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Retry {
+                lease,
+                delay: 60,
+                reason: RetryReason::Cancelled,
+                reply,
+            })
+            .await
+            .unwrap();
+        drop(response);
+        let job = h.executor.job(h.job).await.unwrap();
+        assert_eq!(job.state, JobState::RetryWait);
+        assert_eq!(job.next_eligible, 2070);
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_retry_rejects_a_lease_that_expired_while_waiting() {
+        let clock = Arc::new(AtomicI64::new(1000));
+        let owner_clock = clock.clone();
+        let block = Arc::new(AtomicBool::new(false));
+        let owner_block = block.clone();
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut h = Harness::with_clock(move || {
+            if owner_block.swap(false, Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            owner_clock.load(Ordering::Acquire)
+        });
+        let lease = h.lease().await;
+        block.store(true, Ordering::Release);
+        let (reply, first) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Lease { ttl: 60, reply })
+            .await
+            .unwrap();
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (reply, response) = oneshot::channel();
+        h.executor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Command::Retry {
+                lease,
+                delay: 60,
+                reason: RetryReason::Cancelled,
+                reply,
+            })
+            .await
+            .unwrap();
+        clock.store(1060, Ordering::Release);
+        release.send(()).unwrap();
+        assert!(first.await.unwrap().unwrap().is_none());
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ParentError::Ledger(LedgerError::StaleLease))
+        ));
+        assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
+        assert!(h.executor.expire(60).await.unwrap());
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_clock_rejects_expired_retry_and_invalid_time_without_mutation() {
+        let clock = Arc::new(AtomicI64::new(1000));
+        let owner_clock = clock.clone();
+        let mut h = Harness::with_clock(move || owner_clock.load(Ordering::Acquire));
+        for time in [-1, i64::MAX] {
+            clock.store(time, Ordering::Release);
+            assert!(matches!(
+                h.executor.lease_next(60).await,
+                Err(ParentError::Ledger(LedgerError::Invalid(_)))
+            ));
+            assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Queued);
+        }
+        clock.store(1000, Ordering::Release);
+        assert!(matches!(
+            h.executor.lease_next(0).await,
+            Err(ParentError::Ledger(LedgerError::Invalid(_)))
+        ));
+        let lease = h.lease().await;
+        clock.store(1060, Ordering::Release);
+        assert!(matches!(
+            h.executor.retry(lease, 60, RetryReason::Cancelled).await,
+            Err(ParentError::Ledger(LedgerError::StaleLease))
+        ));
+        assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
+        for time in [-1, i64::MAX] {
+            clock.store(time, Ordering::Release);
+            assert!(matches!(
+                h.executor.expire(60).await,
+                Err(ParentError::Ledger(LedgerError::Invalid(_)))
+            ));
+            assert_eq!(h.executor.job(h.job).await.unwrap().state, JobState::Leased);
+        }
+        clock.store(1060, Ordering::Release);
+        assert!(h.executor.expire(60).await.unwrap());
+        assert_eq!(h.executor.job(h.job).await.unwrap().next_eligible, 1120);
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn maintenance_commands_release_preserve_and_fence_attempts() {
-        let mut h = Harness::new();
+        let clock = Arc::new(AtomicI64::new(1000));
+        let owner_clock = clock.clone();
+        let mut h = Harness::with_clock(move || owner_clock.load(Ordering::Acquire));
         let lease = h.lease().await;
         let old = lease.clone();
-        let due = now();
         h.executor
-            .retry(lease, due, 60, RetryReason::Cancelled)
+            .retry(lease, 60, RetryReason::Cancelled)
             .await
             .unwrap();
         assert!(
             h.executor
-                .retry(old, due, 60, RetryReason::Cancelled)
+                .retry(old, 60, RetryReason::Cancelled)
                 .await
                 .is_err()
         );
@@ -1400,15 +1572,13 @@ mod tests {
             h.executor.job(h.job).await.unwrap().state,
             JobState::RetryWait
         );
-        let lease = h.executor.lease_next(due + 60, 1).await.unwrap().unwrap();
-        assert!(h.executor.expire(lease.expires_at(), 60).await.unwrap());
-        assert!(!h.executor.expire(lease.expires_at(), 60).await.unwrap());
-        assert!(
-            h.executor
-                .retry_durability(h.job, 1, due + 61, 60)
-                .await
-                .is_err()
-        );
+        clock.store(1060, Ordering::Release);
+        let lease = h.executor.lease_next(1).await.unwrap().unwrap();
+        assert!(!h.executor.expire(60).await.unwrap());
+        clock.store(lease.expires_at(), Ordering::Release);
+        assert!(h.executor.expire(60).await.unwrap());
+        assert!(!h.executor.expire(60).await.unwrap());
+        assert!(h.executor.retry_durability(h.job, 1, 60).await.is_err());
         assert_eq!(
             h.executor
                 .maintain_archived(32, 256)
@@ -1510,7 +1680,6 @@ mod tests {
             .unwrap()
             .send(Command::Retry {
                 lease,
-                now: now(),
                 delay: 60,
                 reason: RetryReason::Cancelled,
                 reply,
@@ -1528,7 +1697,10 @@ mod tests {
 
     #[tokio::test]
     async fn durability_retry_is_attempt_fenced_and_maintenance_does_not_restore_success() {
-        let mut h = Harness::new();
+        let start = now();
+        let clock = Arc::new(AtomicI64::new(start));
+        let owner_clock = clock.clone();
+        let mut h = Harness::with_clock(move || owner_clock.load(Ordering::Acquire));
         let lease = h.lease().await;
         let attempt = lease.job().attempt;
         let (parent, mut worker) = tokio::net::UnixStream::pair().unwrap();
@@ -1552,16 +1724,21 @@ mod tests {
             client
         );
         assert_eq!(result.unwrap(), SessionOutcome::ProtocolDone);
+        clock.store(start + 600, Ordering::Release);
         assert!(
             h.executor
-                .retry_durability(h.job, attempt + 1, now(), 60)
+                .retry_durability(h.job, attempt + 1, 60)
                 .await
                 .is_err()
         );
         h.executor
-            .retry_durability(h.job, attempt, now(), 60)
+            .retry_durability(h.job, attempt, 60)
             .await
             .unwrap();
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().next_eligible,
+            start + 660
+        );
         assert_eq!(
             h.executor
                 .maintain_archived(32, 256)
@@ -1628,7 +1805,7 @@ mod tests {
         assert!(h.executor.failure_report(h.job, 1).await.unwrap().is_none());
         assert!(
             h.executor
-                .retry(old, now(), 60, RetryReason::WorkerLost)
+                .retry(old, 60, RetryReason::WorkerLost)
                 .await
                 .is_err()
         );
