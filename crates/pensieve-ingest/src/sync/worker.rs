@@ -24,6 +24,7 @@ use super::ipc::{Frame, Message, ProtocolError, VERSION};
 
 const WALL_TIME: Duration = Duration::from_secs(9 * 60);
 const IDLE_TIME: Duration = Duration::from_secs(2 * 60);
+const SETUP_TIME: Duration = Duration::from_secs(20);
 const RELAY_MESSAGE_BYTES: u32 = 5 * 1024 * 1024;
 
 fn relay_limits() -> RelayLimits {
@@ -43,7 +44,7 @@ pub enum WorkerError {
     /// Wrong Unix peer, rejected before any Hello or capability exchange.
     #[error("worker parent peer UID mismatch")]
     Peer,
-    /// Entire lifecycle or useful-progress budget expired.
+    /// IPC setup/framing, assigned lifecycle or useful-progress budget expired.
     #[error("worker lifecycle or idle deadline exceeded")]
     Deadline,
     /// SDK error or some advertised missing IDs were not captured and fetched.
@@ -92,7 +93,8 @@ impl WorkerError {
 
 /// Connect to one authenticated parent and execute at most one assignment.
 /// Caller must exit this dedicated process on return, including failure. The
-/// outer deadline covers connect, inventory, SDK connect/sync/disconnect and drain.
+/// job deadlines start upon assignment, not during idle waiting. Dropping this
+/// future cancels idle waiting and closes its socket; no SDK exists before Job.
 pub async fn run(socket: &Path, parent_uid: u32) -> Result<(), WorkerError> {
     run_with_limits(socket, parent_uid, WALL_TIME, IDLE_TIME).await
 }
@@ -103,7 +105,7 @@ async fn run_with_limits(
     wall: Duration,
     idle: Duration,
 ) -> Result<(), WorkerError> {
-    timeout(wall, async {
+    let mut stream = timeout(SETUP_TIME, async {
         let mut stream = UnixStream::connect(socket)
             .await
             .map_err(ProtocolError::Io)?;
@@ -111,16 +113,40 @@ async fn run_with_limits(
             return Err(WorkerError::Peer);
         }
         write_message(&mut stream, &Hello { version: VERSION }).await?;
-        let (assignment, items) = timeout(idle, transport::inventory(&mut stream))
-            .await
-            .map_err(|_| WorkerError::Deadline)??;
-        let remaining = assignment.remaining()?;
-        timeout(remaining, attempt(stream, assignment, items, idle))
-            .await
-            .map_err(|_| WorkerError::Deadline)?
+        Ok::<_, WorkerError>(stream)
+    })
+    .await
+    .map_err(|_| WorkerError::Deadline)??;
+    let assignment = wait_assignment(&mut stream, SETUP_TIME).await?;
+    let started = Instant::now();
+    let until = started + wall.min(assignment.remaining()?);
+    let progress_until = started + idle;
+    timeout_at(until, async {
+        let items = timeout_at(
+            progress_until,
+            transport::assigned_inventory(&mut stream, &assignment),
+        )
+        .await
+        .map_err(|_| WorkerError::Deadline)??;
+        attempt(stream, assignment, items, idle, progress_until).await
     })
     .await
     .map_err(|_| WorkerError::Deadline)?
+}
+
+// Idle before the first byte is intentionally unbounded. Once framing starts,
+// bound the entire frame; drip-fed bytes cannot reset this separate setup timer.
+async fn wait_assignment(
+    stream: &mut UnixStream,
+    frame_time: Duration,
+) -> Result<Assignment, WorkerError> {
+    use tokio::io::AsyncReadExt;
+    let first = [stream.read_u8().await.map_err(ProtocolError::Io)?];
+    let mut reader = first.as_slice().chain(stream);
+    timeout(frame_time, transport::assignment(&mut reader))
+        .await
+        .map_err(|_| WorkerError::Deadline)?
+        .map_err(Into::into)
 }
 
 async fn attempt(
@@ -128,7 +154,11 @@ async fn attempt(
     assignment: Assignment,
     items: Vec<(EventId, Timestamp)>,
     idle_time: Duration,
+    mut idle: Instant,
 ) -> Result<(), WorkerError> {
+    if Instant::now() >= idle {
+        return Err(WorkerError::Deadline);
+    }
     let (capture, mut events) = Capture::new(&assignment);
     let capture = Arc::new(capture);
     let client = Client::builder()
@@ -168,7 +198,6 @@ async fn attempt(
     tokio::pin!(sdk);
     let mut result = None;
     let mut admitted = 0;
-    let mut idle = Instant::now() + idle_time;
     loop {
         tokio::select! {
             value = &mut sdk, if result.is_none() => {

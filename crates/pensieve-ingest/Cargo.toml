@@ -107,3 +107,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tokio-tungstenite = "=0.26.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.30.1", features = ["socket", "poll", "time", "user", "fs"] }

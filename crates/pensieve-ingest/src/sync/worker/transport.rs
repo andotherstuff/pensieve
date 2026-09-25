@@ -182,17 +182,42 @@ pub fn hash_item(hash: &mut sha2::Sha256, id: &[u8; 32], timestamp: u64) {
     hash.update(id);
 }
 
+#[cfg(test)]
 pub(in crate::sync) async fn inventory<R>(
     reader: &mut R,
 ) -> Result<(Assignment, Vec<(EventId, Timestamp)>), ProtocolError>
 where
     R: AsyncRead + Unpin,
 {
-    use sha2::Digest;
-    let ParentMessage::Job { assignment } = read_message(reader).await? else {
-        return Err(ProtocolError::State);
-    };
+    let assignment = assignment(reader).await?;
+    let items = assigned_inventory(reader, &assignment).await?;
+    Ok((assignment, items))
+}
+
+/// Read and validate the first assignment without allocating inventory state.
+pub(super) async fn assignment<R>(reader: &mut R) -> Result<Assignment, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    // Do not deserialize an unsolicited inventory array before assignment.
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+    enum FirstMessage {
+        Job { assignment: Assignment },
+    }
+    let FirstMessage::Job { assignment } = read_message(reader).await?;
     assignment.validate()?;
+    Ok(assignment)
+}
+
+pub(super) async fn assigned_inventory<R>(
+    reader: &mut R,
+    assignment: &Assignment,
+) -> Result<Vec<(EventId, Timestamp)>, ProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    use sha2::Digest;
     let mut items = Vec::new();
     let mut previous = None;
     let mut seen_ids = HashSet::new();
@@ -236,7 +261,7 @@ where
                 {
                     return Err(ProtocolError::State);
                 }
-                return Ok((assignment, items));
+                return Ok(items);
             }
             _ => return Err(ProtocolError::State),
         }

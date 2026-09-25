@@ -3074,6 +3074,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3222,6 +3231,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3642,6 +3652,7 @@ dependencies = [
  "hex",
  "metrics",
  "negentropy",
+ "nix",
  "nostr-sdk",
  "notepack",
  "num_cpus",
