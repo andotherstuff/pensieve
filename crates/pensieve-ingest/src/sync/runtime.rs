@@ -268,8 +268,12 @@ fn data_has_headroom(ledger: &Path) -> Result<bool, RuntimeError> {
         .ok_or(RuntimeError::Config("ledger has no parent"))?;
     let stats = nix::sys::statvfs::statvfs(directory)
         .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
-    let available = u64::from(stats.blocks_available()).saturating_mul(stats.fragment_size());
+    let available = available_bytes(stats.blocks_available(), stats.fragment_size());
     Ok(available >= DATA_RESERVE_BYTES)
+}
+
+fn available_bytes<B: Into<u64>>(blocks: B, fragment_size: u64) -> u64 {
+    blocks.into().saturating_mul(fragment_size)
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
