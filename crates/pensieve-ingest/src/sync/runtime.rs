@@ -58,6 +58,9 @@ pub enum RuntimeError {
     /// Local socket or filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// An existing socket path may belong to a live owner and is never removed.
+    #[error("isolated socket path already exists; inspect before operator recovery: {}", .0.display())]
+    SocketOccupied(PathBuf),
     /// Durable ledger failure; no obligation is discarded.
     #[error(transparent)]
     Ledger(#[from] LedgerError),
@@ -104,8 +107,12 @@ impl IsolatedRuntime {
         let inventory = Arc::new(SyncStateDb::open(&config.inventory)?);
         let mut parent = ParentExecutor::new(ledger, inventory, dedupe, writer.clone())?;
         parent.configure(config.relays.clone()).await?;
-        // Refuse an existing path; never unlink an unknown listener or replace a
-        // socket belonging to another process.
+        // Refuse an existing path, including a stale socket after SIGKILL.
+        // An operator must prove ownership before recovery; never unlink an
+        // unknown active listener just to make startup succeed.
+        if fs::symlink_metadata(&config.socket).is_ok() {
+            return Err(RuntimeError::SocketOccupied(config.socket.clone()));
+        }
         let listener = UnixListener::bind(&config.socket)?;
         fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
         let inode = fs::symlink_metadata(&config.socket)?.ino();
@@ -114,6 +121,7 @@ impl IsolatedRuntime {
             let result = drive(&config, listener, parent, writer, stopping).await;
             gauge!("negentropy_isolated_ready").set(0.0);
             if let Err(ref error) = result {
+                gauge!("negentropy_isolated_unhealthy").set(1.0);
                 tracing::error!(error = %error, "isolated reconciliation paused; durable gaps retained");
             }
             // Remove only the socket created here; a replacement is not ours.
@@ -176,9 +184,12 @@ async fn drive(
                 }
                 gauge!("negentropy_isolated_ledger_space_pause").set(0.0);
                 // Replay one sealed source segment before serving an assignment.
-                parent.replay_next(
-                    config.archive.clone(), config.segment_prefix.clone(), config.replay_floor,
-                ).await?;
+                tokio::select! {
+                    _ = &mut stopping => break Ok(()),
+                    result = parent.replay_next(
+                        config.archive.clone(), config.segment_prefix.clone(), config.replay_floor,
+                    ) => { result?; }
+                }
                 let planned = parent.plan(32).await?;
                 gauge!("negentropy_isolated_planner_backpressured").set(f64::from(planned.backpressured));
                 if let Some((socket, candidate)) = peer.take() {
@@ -284,6 +295,43 @@ mod tests {
     use crate::sync::jobs::JobState;
     use crate::sync::worker::{Hello, ParentMessage, read_message, write_message};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn occupied_socket_is_preserved_and_reconciliation_stays_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("worker.sock");
+        let active = UnixListener::bind(&socket).unwrap();
+        let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+        let archive = root.path().join("archive");
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..SegmentConfig::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let config = RuntimeConfig {
+            socket: socket.clone(),
+            worker_uid: 501,
+            ledger: root.path().join("jobs.sqlite"),
+            inventory: root.path().join("inventory"),
+            archive,
+            segment_prefix: "segment".to_owned(),
+            replay_floor: 0,
+            relays: vec!["wss://a.example".to_owned()],
+        };
+        assert!(matches!(
+            IsolatedRuntime::start(config, dedupe, writer).await,
+            Err(RuntimeError::SocketOccupied(path)) if path == socket
+        ));
+        let _peer = UnixStream::connect(&socket).await.unwrap();
+        let (_accepted, _) = active.accept().await.unwrap();
+    }
 
     #[tokio::test]
     async fn opt_in_listener_reaches_durable_zero_event_completion() {

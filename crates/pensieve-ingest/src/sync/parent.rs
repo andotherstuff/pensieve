@@ -99,6 +99,7 @@ enum Command {
         archive: PathBuf,
         prefix: String,
         floor: u64,
+        cancelled: Arc<AtomicBool>,
         reply: Reply<bool>,
     },
     Split {
@@ -194,16 +195,22 @@ impl ParentExecutor {
         floor: u64,
     ) -> Result<bool, ParentError> {
         let (reply, response) = oneshot::channel();
-        self.request(
-            Command::Replay {
-                archive,
-                prefix,
-                floor,
-                reply,
-            },
-            response,
-        )
-        .await
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = ReplayCancel(Arc::clone(&cancelled));
+        let result = self
+            .request(
+                Command::Replay {
+                    archive,
+                    prefix,
+                    floor,
+                    cancelled,
+                    reply,
+                },
+                response,
+            )
+            .await;
+        drop(cancel_on_drop);
+        result
     }
 
     /// Split only a classified local-density or verified-volume failure.
@@ -261,7 +268,7 @@ impl ParentExecutor {
                         Command::Plan { max_jobs, reply } => {
                             let _ = reply.send(ledger.plan_rolling(clock(), max_jobs).map_err(Into::into));
                         }
-                        Command::Replay { archive, prefix, floor, reply } => {
+                        Command::Replay { archive, prefix, floor, cancelled, reply } => {
                             let result = (|| {
                                 if writer.recovery_required() {
                                     return Err(ParentError::RecoveryRequired);
@@ -271,9 +278,22 @@ impl ParentExecutor {
                                 )? else {
                                     return Ok(false);
                                 };
+                                let mut batches = 0;
                                 loop {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        return Ok(false);
+                                    }
                                     if replay.step(MAX_REPLAY_BATCH)?.segment_complete {
                                         break;
+                                    }
+                                    batches += 1;
+                                    if batches == 16 {
+                                        // Replay can take many batches. Keep old receipts
+                                        // moving while this owner command holds the queue.
+                                        archive_maintenance(&writer, || {
+                                            ledger.maintain_archived(&dedupe, &writer, 32, 256)
+                                        })?;
+                                        batches = 0;
                                     }
                                 }
                                 Ok(true)
@@ -636,6 +656,13 @@ struct Cancel {
     socket: UnixStream,
     cancelled: Arc<AtomicBool>,
 }
+
+struct ReplayCancel(Arc<AtomicBool>);
+impl Drop for ReplayCancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 impl Drop for Cancel {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -858,6 +885,16 @@ mod tests {
     use nostr_sdk::{EventBuilder, Keys, Timestamp};
     use std::sync::atomic::AtomicI64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn dropped_replay_request_signals_owner_without_discarding_cursor() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let _request = ReplayCancel(Arc::clone(&cancelled));
+            assert!(!cancelled.load(Ordering::Acquire));
+        }
+        assert!(cancelled.load(Ordering::Acquire));
+    }
 
     struct Harness {
         _root: tempfile::TempDir,

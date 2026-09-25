@@ -98,13 +98,14 @@ pub(super) async fn snapshot(until: Instant) -> Result<super::Snapshot, BindingE
             "SubState",
             "InvocationID",
             "ActiveEnterTimestampMonotonic",
+            "ControlGroup",
         ],
         until,
     )
     .await?;
     let service = call(
         "org.freedesktop.systemd1.Service",
-        &["Type", "MainPID", "ControlGroup", "RuntimeMaxUSec"],
+        &["Type", "MainPID", "RuntimeMaxUSec"],
         until,
     )
     .await?;
@@ -152,5 +153,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    // Run only on a disposable systemd test host with the real static unit
+    // already active. This reads the actual manager interfaces, so a fixture
+    // cannot conceal a property/interface mismatch.
+    #[tokio::test]
+    #[ignore = "requires marked disposable systemd host and active worker unit"]
+    async fn live_systemd_property_contract() {
+        assert!(std::path::Path::new("/etc/pensieve-isolation-test-host").exists());
+        let snapshot = snapshot(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_ne!(snapshot.invocation, [0; 16]);
+        assert_ne!(snapshot.pid, 0);
+        assert_eq!(snapshot.runtime_us, 600_000_000);
     }
 }

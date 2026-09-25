@@ -481,8 +481,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let isolated_config = isolated_config(&args)?;
-
     tracing::info!("Pensieve live ingestion daemon starting...");
 
     let archive_ready = Arc::new(AtomicBool::new(false));
@@ -498,6 +496,11 @@ async fn main() -> Result<()> {
         gauge!("ingestion_running").set(0.0);
         tracing::info!(port = args.metrics_port, "metrics server listening");
     }
+    if args.isolated_negentropy {
+        gauge!("negentropy_isolated_ready").set(0.0);
+        gauge!("negentropy_isolated_unhealthy").set(0.0);
+    }
+    let isolated_config = continue_live_after_isolated_failure(isolated_config(&args)).flatten();
 
     // Set up graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -530,10 +533,10 @@ async fn main() -> Result<()> {
         .transpose()
         .context("Failed to start archive seal timer")?;
     let isolated_runtime = match isolated_config {
-        Some(config) => Some(
+        Some(config) => continue_live_after_isolated_failure(
             IsolatedRuntime::start(config, Arc::clone(&dedupe), Arc::clone(&segment_writer))
                 .await
-                .context("Failed to start isolated reconciliation")?,
+                .context("Failed to start isolated reconciliation"),
         ),
         None => None,
     };
@@ -1310,125 +1313,160 @@ async fn main() -> Result<()> {
         let _ = handle.await;
     }
 
-    if let Some(runtime) = isolated_runtime {
+    let isolated_shutdown_error = if let Some(runtime) = isolated_runtime {
         runtime
             .shutdown()
             .await
-            .context("Failed to stop isolated reconciliation cleanly")?;
+            .context("Failed to stop isolated reconciliation cleanly")
+            .err()
+    } else {
+        None
+    };
+    if let Some(ref error) = isolated_shutdown_error {
+        tracing::error!(error = %compact_error(error), "isolated reconciliation stopped unhealthy; continuing archive shutdown");
     }
 
-    // Flush negentropy sync state
-    if let Some(ref syncer) = negentropy_syncer {
-        if let Err(e) = syncer.sync_state().flush() {
-            tracing::warn!(error = %compact_error(&e), "failed to flush negentropy sync state");
-        } else {
-            tracing::info!(
-                approximate_items = syncer.sync_state().approximate_count().unwrap_or(0),
-                "negentropy sync state flushed"
-            );
+    finish_archive_shutdown(isolated_shutdown_error, async {
+        // Flush negentropy sync state
+        if let Some(ref syncer) = negentropy_syncer {
+            if let Err(e) = syncer.sync_state().flush() {
+                tracing::warn!(error = %compact_error(&e), "failed to flush negentropy sync state");
+            } else {
+                tracing::info!(
+                    approximate_items = syncer.sync_state().approximate_count().unwrap_or(0),
+                    "negentropy sync state flushed"
+                );
+            }
         }
-    }
 
-    if let Some(timer) = archive_seal_timer {
-        tokio::task::spawn_blocking(move || timer.shutdown())
-            .await
-            .context("archive seal timer join task failed")?
-            .map_err(|_| anyhow::anyhow!("archive seal timer panicked"))?;
-    }
+        if let Some(timer) = archive_seal_timer {
+            tokio::task::spawn_blocking(move || timer.shutdown())
+                .await
+                .context("archive seal timer join task failed")?
+                .map_err(|_| anyhow::anyhow!("archive seal timer panicked"))?;
+        }
 
-    // Seal final segment. Its events are marked archived inside seal() now (the
-    // writer holds a dedupe reference), so we don't mark them again here.
-    if segment_writer.recovery_required() {
-        wait_for_archive_recovery(
-            &shutdown_requested,
-            "archive writer fault; preserve open files and marker",
-        )
-        .await;
-        return Ok(());
-    }
-    let final_seal = match segment_writer.seal() {
-        Ok(sealed) => sealed,
-        Err(error) => {
-            wait_for_archive_recovery(&shutdown_requested, &error.to_string()).await;
+        // Seal final segment. Its events are marked archived inside seal() now (the
+        // writer holds a dedupe reference), so we don't mark them again here.
+        if segment_writer.recovery_required() {
+            wait_for_archive_recovery(
+                &shutdown_requested,
+                "archive writer fault; preserve open files and marker",
+            )
+            .await;
             return Ok(());
         }
-    };
-    if let Some(sealed) = final_seal {
+        let final_seal = match segment_writer.seal() {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                wait_for_archive_recovery(&shutdown_requested, &error.to_string()).await;
+                return Ok(());
+            }
+        };
+        if let Some(sealed) = final_seal {
+            tracing::info!(
+                segment_number = sealed.segment_number,
+                event_count = sealed.event_count,
+                "sealed final segment"
+            );
+        }
+        segment_writer.wait_for_compression()?;
+
+        // Flush dedupe
+        dedupe.flush()?;
+
+        // Flush relay manager stats
+        if let Err(e) = relay_manager.flush() {
+            tracing::warn!(error = %compact_error(&e), "failed to flush relay stats");
+        }
+
+        // Save final checkpoint
+        let final_checkpoint = max_created_at.load(Ordering::Relaxed);
+        if final_checkpoint > 0 {
+            match relay_manager.update_last_archived_timestamp(final_checkpoint) {
+                Ok(()) => tracing::info!(checkpoint = final_checkpoint, "saved final checkpoint"),
+                Err(e) => {
+                    tracing::warn!(error = %compact_error(&e), "failed to save final checkpoint")
+                }
+            }
+        }
+
+        // Dropping the writer closes downstream channels after any background
+        // compression threads finish sending their final notifications.
+        drop(segment_writer);
+
+        // Wait for ClickHouse indexer if running
+        if let Some(handle) = indexer_handle {
+            tracing::info!("Waiting for ClickHouse indexer to finish...");
+            if let Err(e) = handle.join() {
+                tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
+            }
+        }
+        if let Some(handle) = parquet_shadow_handle {
+            tracing::info!("Waiting for Parquet shadow worker to finish...");
+            if let Err(error) = handle.join() {
+                tracing::warn!(panic = ?error, "Parquet shadow worker thread panicked");
+            }
+        }
+
+        // Mark as stopped
+        gauge!("ingestion_running").set(0.0);
+
+        // Get final relay manager stats
+        let relay_stats = relay_manager.get_aggregate_stats().ok();
+
+        // Get final counts from atomics
+        let final_received = events_received.load(Ordering::Relaxed);
+        let final_processed = events_processed.load(Ordering::Relaxed);
+        let final_deduplicated = events_deduplicated.load(Ordering::Relaxed);
+
+        // Print summary
         tracing::info!(
-            segment_number = sealed.segment_number,
-            event_count = sealed.event_count,
-            "sealed final segment"
+            events_received = final_received,
+            events_processed = final_processed,
+            events_deduplicated = final_deduplicated,
+            relays_connected = stats.source_metadata.relays_connected.unwrap_or(0),
+            relays_discovered = stats.source_metadata.relays_discovered.unwrap_or(0),
+            "shutdown complete"
         );
-    }
-    segment_writer.wait_for_compression()?;
+        if let Some(rs) = relay_stats {
+            tracing::info!(
+                total_relays = rs.total_relays,
+                active_relays = rs.active_relays,
+                blocked_relays = rs.blocked_relays,
+                seed_relays = rs.seed_relays,
+                discovered_relays = rs.discovered_relays,
+                avg_quality_score = rs.avg_score,
+                "relay manager summary"
+            );
+        }
 
-    // Flush dedupe
-    dedupe.flush()?;
+        Ok(())
+    })
+    .await
+}
 
-    // Flush relay manager stats
-    if let Err(e) = relay_manager.flush() {
-        tracing::warn!(error = %compact_error(&e), "failed to flush relay stats");
-    }
-
-    // Save final checkpoint
-    let final_checkpoint = max_created_at.load(Ordering::Relaxed);
-    if final_checkpoint > 0 {
-        match relay_manager.update_last_archived_timestamp(final_checkpoint) {
-            Ok(()) => tracing::info!(checkpoint = final_checkpoint, "saved final checkpoint"),
-            Err(e) => tracing::warn!(error = %compact_error(&e), "failed to save final checkpoint"),
+fn continue_live_after_isolated_failure<T>(result: Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            gauge!("negentropy_isolated_ready").set(0.0);
+            gauge!("negentropy_isolated_unhealthy").set(1.0);
+            counter!("negentropy_isolated_start_failures_total").increment(1);
+            tracing::error!(error = %compact_error(&error), "isolated reconciliation unavailable; live ingestion remains enabled");
+            None
         }
     }
+}
 
-    // Dropping the writer closes downstream channels after any background
-    // compression threads finish sending their final notifications.
-    drop(segment_writer);
-
-    // Wait for ClickHouse indexer if running
-    if let Some(handle) = indexer_handle {
-        tracing::info!("Waiting for ClickHouse indexer to finish...");
-        if let Err(e) = handle.join() {
-            tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
-        }
+async fn finish_archive_shutdown(
+    isolated_error: Option<anyhow::Error>,
+    cleanup: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    cleanup.await?;
+    if let Some(error) = isolated_error {
+        return Err(error);
     }
-    if let Some(handle) = parquet_shadow_handle {
-        tracing::info!("Waiting for Parquet shadow worker to finish...");
-        if let Err(error) = handle.join() {
-            tracing::warn!(panic = ?error, "Parquet shadow worker thread panicked");
-        }
-    }
-
-    // Mark as stopped
-    gauge!("ingestion_running").set(0.0);
-
-    // Get final relay manager stats
-    let relay_stats = relay_manager.get_aggregate_stats().ok();
-
-    // Get final counts from atomics
-    let final_received = events_received.load(Ordering::Relaxed);
-    let final_processed = events_processed.load(Ordering::Relaxed);
-    let final_deduplicated = events_deduplicated.load(Ordering::Relaxed);
-
-    // Print summary
-    tracing::info!(
-        events_received = final_received,
-        events_processed = final_processed,
-        events_deduplicated = final_deduplicated,
-        relays_connected = stats.source_metadata.relays_connected.unwrap_or(0),
-        relays_discovered = stats.source_metadata.relays_discovered.unwrap_or(0),
-        "shutdown complete"
-    );
-    if let Some(rs) = relay_stats {
-        tracing::info!(
-            total_relays = rs.total_relays,
-            active_relays = rs.active_relays,
-            blocked_relays = rs.blocked_relays,
-            seed_relays = rs.seed_relays,
-            discovered_relays = rs.discovered_relays,
-            avg_quality_score = rs.avg_score,
-            "relay manager summary"
-        );
-    }
-
     Ok(())
 }
 
@@ -1729,6 +1767,57 @@ mod tests {
         assert!(
             Args::try_parse_from(["pensieve-ingest", "--negentropy", "--isolated-negentropy",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn isolated_config_fault_does_not_disable_live_path() {
+        let root = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from(vec![
+            "pensieve-ingest".to_owned(),
+            "--isolated-negentropy".to_owned(),
+            "--isolated-negentropy-relays-file".to_owned(),
+            root.path().join("missing-relays.txt").display().to_string(),
+            "--isolated-negentropy-worker-uid".to_owned(),
+            "501".to_owned(),
+            "--isolated-negentropy-replay-floor".to_owned(),
+            "0".to_owned(),
+        ])
+        .unwrap();
+        let runtime = continue_live_after_isolated_failure(isolated_config(&args)).flatten();
+        let live_started = true; // The live startup path follows the optional result.
+        assert!(runtime.is_none());
+        assert!(live_started);
+    }
+
+    #[tokio::test]
+    async fn isolated_shutdown_fault_is_reported_after_archive_durability() {
+        let mut stages = Vec::new();
+        let result = finish_archive_shutdown(
+            Some(anyhow::anyhow!("injected isolated shutdown failure")),
+            async {
+                stages.push("seal timer joined");
+                stages.push("final segment sealed");
+                stages.push("dedupe flushed");
+                stages.push("checkpoint saved");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            stages,
+            [
+                "seal timer joined",
+                "final segment sealed",
+                "dedupe flushed",
+                "checkpoint saved"
+            ]
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("isolated shutdown")
         );
     }
 

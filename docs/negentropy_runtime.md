@@ -51,6 +51,14 @@ Archive recovery or local ledger faults pause the isolated runtime and leave
 receipts/jobs intact. `negentropy_isolated_ready`,
 `negentropy_isolated_recovery_required`, planner backpressure and binding
 rejection metrics expose its state separately from live-ingestion health.
+An isolated startup fault (including invalid allowlist, unavailable ledger or
+occupied socket) marks `negentropy_isolated_unhealthy=1` and leaves live ingestion
+running, without activating the legacy loop. An existing socket is never removed
+automatically: the operator must establish that no active owner exists before
+recovering a stale path. Isolated shutdown errors are reported only after the
+archive seal timer, final seal, dedupe flush and checkpoint cleanup have run.
+Replay checks cancellation between bounded decoder batches and services receipt
+maintenance during a long sealed segment.
 
 This is a development milestone, not a rollout approval. The Linux cgroup
 OOM/hang/kill proof, alert delivery, exact canary allowlist, throughput/freshness
@@ -59,3 +67,6 @@ recovery, and a 24-hour soak remain operator gates. Repeated sweeps eventually
 reach the lifetime job ceiling; a measured terminal-summary retention design
 must precede indefinite operation. Existing older prototype ledgers are rejected
 without migration or deletion and require an explicit recovery decision.
+On a marked disposable systemd 257 host with the static worker unit already
+active, `ops/tests/negentropy-binding-properties.sh` exercises the real fixed
+bus query read-only; macOS fixture tests do not constitute that proof.

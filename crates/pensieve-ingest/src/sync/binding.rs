@@ -139,13 +139,13 @@ fn properties(bytes: &[u8], signatures: &[&str]) -> Result<Vec<Value>, BindingEr
 
 #[cfg(any(target_os = "linux", test))]
 fn parse(unit: &[u8], service: &[u8]) -> Result<Snapshot, BindingError> {
-    let unit = properties(unit, &["s", "s", "s", "ay", "t"])?;
-    let service = properties(service, &["s", "u", "s", "t"])?;
+    let unit = properties(unit, &["s", "s", "s", "ay", "t", "s"])?;
+    let service = properties(service, &["s", "u", "t"])?;
     if unit[0].as_str() != Some(UNIT)
         || unit[1].as_str() != Some("active")
         || unit[2].as_str() != Some("running")
         || service[0].as_str() != Some("simple")
-        || service[2].as_str() != Some(WORKER_CGROUP)
+        || unit[5].as_str() != Some(WORKER_CGROUP)
     {
         return Err(BindingError::Identity);
     }
@@ -167,7 +167,7 @@ fn parse(unit: &[u8], service: &[u8]) -> Result<Snapshot, BindingError> {
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(BindingError::Identity)?,
         active_us: unit[4].as_u64().ok_or(BindingError::Identity)?,
-        runtime_us: service[3].as_u64().ok_or(BindingError::Identity)?,
+        runtime_us: service[2].as_u64().ok_or(BindingError::Identity)?,
     };
     if snapshot.invocation == [0; 16]
         || snapshot.pid == 0
@@ -205,11 +205,10 @@ mod tests {
 
     fn outputs() -> (Vec<u8>, Vec<u8>) {
         let unit = format!(
-            "{{\"type\":\"s\",\"data\":\"{UNIT}\"}}\n{{\"type\":\"s\",\"data\":\"active\"}}\n{{\"type\":\"s\",\"data\":\"running\"}}\n{{\"type\":\"ay\",\"data\":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}\n{{\"type\":\"t\",\"data\":1000000}}"
+            "{{\"type\":\"s\",\"data\":\"{UNIT}\"}}\n{{\"type\":\"s\",\"data\":\"active\"}}\n{{\"type\":\"s\",\"data\":\"running\"}}\n{{\"type\":\"ay\",\"data\":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}\n{{\"type\":\"t\",\"data\":1000000}}\n{{\"type\":\"s\",\"data\":\"{WORKER_CGROUP}\"}}"
         );
-        let service = format!(
-            "{{\"type\":\"s\",\"data\":\"simple\"}}\n{{\"type\":\"u\",\"data\":123}}\n{{\"type\":\"s\",\"data\":\"{WORKER_CGROUP}\"}}\n{{\"type\":\"t\",\"data\":600000000}}"
-        );
+        let service = "{\"type\":\"s\",\"data\":\"simple\"}\n{\"type\":\"u\",\"data\":123}\n{\"type\":\"t\",\"data\":600000000}"
+            .to_owned();
         (unit.into_bytes(), service.into_bytes())
     }
 
