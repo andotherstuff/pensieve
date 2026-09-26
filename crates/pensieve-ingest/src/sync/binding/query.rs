@@ -12,6 +12,14 @@ use super::{BindingError, OUTPUT_LIMIT};
 const BUSCTL: &str = "/usr/bin/busctl";
 const DESTINATION: &str = "org.freedesktop.systemd1";
 const OBJECT: &str = "/org/freedesktop/systemd1/unit/pensieve_2dnegentropy_2dworker_2eservice";
+const UNIT_PROPERTIES: &[&str] = &[
+    "Id",
+    "ActiveState",
+    "SubState",
+    "InvocationID",
+    "ActiveEnterTimestampMonotonic",
+];
+const SERVICE_PROPERTIES: &[&str] = &["Type", "MainPID", "ControlGroup", "RuntimeMaxUSec"];
 
 // Dropping a query, including caller cancellation, kills and asynchronously
 // reaps its child. No successful output is accepted before the child exits 0.
@@ -90,22 +98,10 @@ async fn capture(process: Child, until: Instant) -> Result<Vec<u8>, BindingError
 
 /// Read the two fixed interfaces before the shared absolute deadline.
 pub(super) async fn snapshot(until: Instant) -> Result<super::Snapshot, BindingError> {
-    let unit = call(
-        "org.freedesktop.systemd1.Unit",
-        &[
-            "Id",
-            "ActiveState",
-            "SubState",
-            "InvocationID",
-            "ActiveEnterTimestampMonotonic",
-            "ControlGroup",
-        ],
-        until,
-    )
-    .await?;
+    let unit = call("org.freedesktop.systemd1.Unit", UNIT_PROPERTIES, until).await?;
     let service = call(
         "org.freedesktop.systemd1.Service",
-        &["Type", "MainPID", "RuntimeMaxUSec"],
+        SERVICE_PROPERTIES,
         until,
     )
     .await?;
@@ -117,6 +113,12 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn control_group_is_queried_on_service_interface() {
+        assert!(!UNIT_PROPERTIES.contains(&"ControlGroup"));
+        assert_eq!(SERVICE_PROPERTIES[2], "ControlGroup");
+    }
 
     #[tokio::test]
     async fn output_limit_kills_unbounded_child() {
@@ -162,6 +164,18 @@ mod tests {
     #[ignore = "requires marked disposable systemd host and active worker unit"]
     async fn live_systemd_property_contract() {
         assert!(std::path::Path::new("/etc/pensieve-isolation-test-host").exists());
+        let until = Instant::now() + Duration::from_secs(2);
+        let service_cgroup = call("org.freedesktop.systemd1.Service", &["ControlGroup"], until)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::properties(&service_cgroup, &["s"]).unwrap()[0].as_str(),
+            Some(super::super::WORKER_CGROUP)
+        );
+        assert!(matches!(
+            call("org.freedesktop.systemd1.Unit", &["ControlGroup"], until,).await,
+            Err(BindingError::Identity)
+        ));
         let snapshot = snapshot(Instant::now() + Duration::from_secs(2))
             .await
             .unwrap();
