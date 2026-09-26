@@ -1,0 +1,52 @@
+# Static, deliberately not enabled by this repository. Install the binary at
+# /usr/local/libexec and provision the dedicated pensieve-negentropy UID plus
+# pensieve-ipc group before operator-controlled Linux validation. The non-secret
+# environment file contains only PENSIEVE_PARENT_UID (numeric).
+[Unit]
+Description=Pensieve isolated NIP-77 reconciliation worker
+Documentation=https://github.com/andotherstuff/pensieve
+After=network-online.target pensieve-ingest.service
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=pensieve-negentropy
+Group=pensieve-negentropy
+SupplementaryGroups=pensieve-ipc
+EnvironmentFile=/etc/pensieve/negentropy-worker.env
+ExecStart=/usr/local/libexec/pensieve-negentropy-worker --socket /run/pensieve/negentropy.sock --parent-uid ${PENSIEVE_PARENT_UID}
+Restart=always
+RestartSec=5s
+RuntimeMaxSec=10min
+TimeoutStopSec=5s
+KillMode=control-group
+OOMPolicy=kill
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=64
+LimitCORE=0
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=/data /archive /etc/pensieve
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pensieve-negentropy-worker
+
+# No [Install] section: rollout requires a separate, explicit operator gate.

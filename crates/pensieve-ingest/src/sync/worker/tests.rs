@@ -567,30 +567,129 @@ async fn relay_hang_and_parent_disconnect_terminate_without_protocol_done() {
 }
 
 #[tokio::test]
-async fn parent_uid_is_checked_before_hello_and_stalled_input_is_bounded() {
-    for wrong_uid in [true, false] {
+async fn parent_uid_is_checked_before_hello() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let path = dir.path().join("ipc");
+    let listener = UnixListener::bind(&path).unwrap();
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(transport::read_wire(&mut stream).await.is_err());
+    };
+    let (result, ()) = tokio::join!(
+        run_with_limits(
+            &path,
+            uid() + 1,
+            Duration::from_millis(150),
+            Duration::from_secs(1)
+        ),
+        parent
+    );
+    assert!(matches!(result, Err(WorkerError::Peer)));
+}
+
+#[tokio::test]
+async fn idle_wait_outlives_job_budgets_and_cancellation_closes_socket() {
+    for partial in [false, true] {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let path = dir.path().join("ipc");
         let listener = UnixListener::bind(&path).unwrap();
-        let parent = async {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            if !wrong_uid {
-                let _: Hello = read_message(&mut stream).await.unwrap();
-            }
-            assert!(transport::read_wire(&mut stream).await.is_err());
-        };
-        let (result, ()) = tokio::join!(
+        let mut worker = tokio::spawn(async move {
             run_with_limits(
                 &path,
-                uid() + u32::from(wrong_uid),
-                Duration::from_millis(150),
-                Duration::from_secs(1)
-            ),
-            parent
+                uid(),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: Hello = read_message(&mut stream).await.unwrap();
+        if partial {
+            stream.write_all(&[0]).await.unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(40), &mut worker)
+                .await
+                .is_err()
         );
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        // Dropping the idle future owns socket cleanup, not an orphan task.
+        assert!(
+            timeout(Duration::from_secs(1), transport::read_wire(&mut stream))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn partial_assignment_is_bounded_but_absent_assignment_is_idle() {
+    let (mut worker, mut parent) = UnixStream::pair().unwrap();
+    parent.write_all(&[0]).await.unwrap();
+    assert!(matches!(
+        wait_assignment(&mut worker, Duration::from_millis(20)).await,
+        Err(WorkerError::Deadline)
+    ));
+}
+
+#[tokio::test]
+async fn delayed_assignment_starts_inventory_deadlines_only_when_assigned() {
+    for wall_shorter in [false, true] {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+        let short = Duration::from_millis(30);
+        let long = Duration::from_secs(1);
+        let (wall, idle) = if wall_shorter {
+            (short, long)
+        } else {
+            (long, short)
+        };
+        let mut worker =
+            tokio::spawn(async move { run_with_limits(&path, uid(), wall, idle).await });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: Hello = read_message(&mut stream).await.unwrap();
+        // More than the shorter job budget passes before a lease is offered.
+        assert!(timeout(short * 2, &mut worker).await.is_err());
+        let assigned = Instant::now();
+        write_message(
+            &mut stream,
+            &ParentMessage::Job {
+                assignment: Assignment::for_lease(&lease),
+            },
+        )
+        .await
+        .unwrap();
+        // No inventory end: neither SDK nor a completion is allowed to start.
         assert!(matches!(
-            result,
-            Err(WorkerError::Peer | WorkerError::Deadline)
+            timeout(long * 2, worker).await.unwrap().unwrap(),
+            Err(WorkerError::Deadline)
+        ));
+        assert!(assigned.elapsed() >= short);
+        assert!(transport::read_wire(&mut stream).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn idle_eof_and_expired_assignment_fail_closed() {
+    for expired in [false, true] {
+        let (mut worker, mut parent) = UnixStream::pair().unwrap();
+        if expired {
+            let dir = tempfile::tempdir().unwrap();
+            let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+            let mut assignment = Assignment::for_lease(&lease);
+            assignment.expires_at = 0;
+            write_message(&mut parent, &ParentMessage::Job { assignment })
+                .await
+                .unwrap();
+        }
+        drop(parent);
+        assert!(matches!(
+            wait_assignment(&mut worker, Duration::from_secs(1)).await,
+            Err(WorkerError::Protocol(_))
         ));
     }
 }

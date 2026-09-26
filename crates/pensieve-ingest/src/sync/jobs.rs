@@ -30,6 +30,7 @@ pub const MAX_RECOVERY_JOBS: u32 = 32;
 const MAX_AWAITING_DURABILITY: u32 = 2;
 
 mod planner;
+mod selector;
 pub use planner::PlanningProgress;
 
 /// A rejected operation leaves the prior durable obligation intact.
@@ -249,10 +250,11 @@ impl JobLedger {
                     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                     tx.execute_batch(FAILURE_SCHEMA)?;
                     tx.execute_batch(planner::SCHEMA)?;
-                    tx.pragma_update(None, "user_version", 6)?;
+                    tx.execute_batch(selector::SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 7)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 6) => {}
+                (APPLICATION_ID, 7) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             tx.commit()?;
@@ -399,31 +401,23 @@ impl JobLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_lease(&tx, lease, now)?;
         let parent = read_job(&tx, lease.job.id)?;
-        let dense = parent.since == parent.until;
-        check_budget(&tx, &self.path, self.limits, if dense { 0 } else { 2 })?;
-        tx.execute(
-            "UPDATE jobs SET state=?2,token=NULL,expires_at=NULL,reason=?3 WHERE id=?1",
-            params![
-                parent.id,
-                if dense { "blocked" } else { "split" },
-                if dense {
-                    "dense_timestamp"
-                } else {
-                    "resource_split"
-                }
-            ],
-        )?;
-        let outcome = if dense {
-            SplitOutcome::Blocked
-        } else {
-            let midpoint = parent.since + (parent.until - parent.since) / 2;
-            let mut children = Vec::with_capacity(2);
-            for (since, until) in [(parent.since, midpoint), (midpoint + 1, parent.until)] {
-                tx.execute("INSERT INTO jobs(sweep,relay,since,until,parent,state) VALUES(?1,?2,?3,?4,?5,'queued')",params![parent.sweep,parent.relay,since,until,parent.id])?;
-                children.push(read_job(&tx, tx.last_insert_rowid())?);
-            }
-            SplitOutcome::Children(Box::new([children.remove(0), children.remove(0)]))
-        };
+        let outcome = split_window(&tx, &self.path, self.limits, &parent)?;
+        commit(tx, &self.path, self.limits)?;
+        Ok(outcome)
+    }
+
+    /// Split an unleased locally dense candidate without spending an attempt.
+    /// The caller must be the sole ledger owner and must have just checked the
+    /// candidate's complete archived-inventory cap.
+    pub(super) fn split_unleased(&mut self, id: i64) -> Result<SplitOutcome, LedgerError> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parent = read_job(&tx, id)?;
+        if !matches!(parent.state, JobState::Queued | JobState::RetryWait) {
+            return Err(LedgerError::Invalid("candidate no longer unleased"));
+        }
+        let outcome = split_window(&tx, &self.path, self.limits, &parent)?;
         commit(tx, &self.path, self.limits)?;
         Ok(outcome)
     }
@@ -776,6 +770,44 @@ impl JobLedger {
         tx.commit()?;
         Ok(())
     }
+}
+
+fn split_window(
+    tx: &Transaction<'_>,
+    path: &Path,
+    limits: LedgerLimits,
+    parent: &Job,
+) -> Result<SplitOutcome, LedgerError> {
+    let dense = parent.since == parent.until;
+    check_budget(tx, path, limits, if dense { 0 } else { 2 })?;
+    tx.execute(
+        "UPDATE jobs SET state=?2,token=NULL,expires_at=NULL,reason=?3 WHERE id=?1",
+        params![
+            parent.id,
+            if dense { "blocked" } else { "split" },
+            if dense {
+                "dense_timestamp"
+            } else {
+                "resource_split"
+            }
+        ],
+    )?;
+    if dense {
+        return Ok(SplitOutcome::Blocked);
+    }
+    let midpoint = parent.since + (parent.until - parent.since) / 2;
+    let mut children = Vec::with_capacity(2);
+    for (since, until) in [(parent.since, midpoint), (midpoint + 1, parent.until)] {
+        tx.execute(
+            "INSERT INTO jobs(sweep,relay,since,until,parent,state) VALUES(?1,?2,?3,?4,?5,'queued')",
+            params![parent.sweep, parent.relay, since, until, parent.id],
+        )?;
+        children.push(read_job(tx, tx.last_insert_rowid())?);
+    }
+    Ok(SplitOutcome::Children(Box::new([
+        children.remove(0),
+        children.remove(0),
+    ])))
 }
 
 // Shared by explicit enqueue and the planner's atomic cursor transaction.

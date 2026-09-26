@@ -52,6 +52,8 @@
 //! }).await?;
 //! ```
 
+#[cfg(unix)]
+pub mod binding;
 pub mod failure;
 pub mod inventory;
 pub mod ipc;
@@ -59,6 +61,8 @@ pub mod jobs;
 mod negentropy;
 #[cfg(unix)]
 pub mod parent;
+#[cfg(unix)]
+pub mod runtime;
 mod state;
 #[cfg(unix)]
 pub mod worker;

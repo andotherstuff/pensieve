@@ -91,11 +91,34 @@ authorized here. A window containing an undeliverable event can remain unfinishe
 
 ## Deadlines and limitations
 
-A nine-minute deadline wraps Unix connect, assignment, relay connect/sync,
-disconnect and output drain. Lease expiry may shorten it. Inventory has a two-minute
-exchange limit; during relay work two minutes without an admitted-event ACK ends
-the worker. Arbitrary SDK chatter does not reset progress. Socket absence fails
-this process; the future service supplies paced restart, not a busy reconnect loop.
+Unix connect, peer authentication and Hello have a separate 20-second setup limit.
+After Hello the worker waits idle until the first assignment byte, with no job
+deadline, inventory collection, capture queue or SDK client. A started assignment
+frame has its own 20-second total framing limit; individual bytes never reset it.
+Only a validated Job is accepted, with the existing identity and lease checks.
+Unsolicited inventory cannot allocate the inventory collection before Job.
+
+Upon validated Job receipt, a nine-minute monotonic deadline covers inventory,
+relay connect/sync, disconnect and output drain; lease expiry may shorten it.
+The two-minute useful-progress deadline also starts at Job and is carried through
+inventory into relay work, not restarted when inventory finishes. Only a matching
+admitted-event ACK refreshes that progress deadline; inventory chunks and arbitrary
+SDK chatter do not. Socket absence fails this process; the future service supplies
+paced restart, not a busy reconnect loop.
+
+Before assignment, parent EOF or dropping/aborting the worker future closes the
+idle socket without ProtocolDone or any SDK task. There is no pre-lease Cancel
+identity: an idle parent cancels by closing the socket. After assignment, existing
+Cancel/EOF/error handling stays fail-closed and parent-owned obligations remain.
+Dropping after SDK creation still requires dedicated-process exit, not an in-process
+task-abort claim that all SDK background tasks have joined.
+
+This worker-only change does not alter the approved static systemd service.
+RuntimeMaxSec still counts process time, including idle time. Before offering a
+lease, the future authenticated process-binding gate must verify at least 540
+seconds plus safety margin remain under that backstop. An aged idle worker gets
+no lease and is recycled by systemd. No listener or lifetime-management mechanism
+is activated here.
 
 The binary exits without waiting for SDK background-task destruction on either
 result. It owns no durable writes; OS process exit closes remaining sockets. Async
@@ -106,7 +129,8 @@ Logs allow only the worker's fixed phase/error messages, not SDK payload diagnos
 Tests use a localhost NIP-77 relay and the real pinned SDK, plus the existing
 parent receipt/admission library. They cover successful durable publication only
 after seal, partial fetch despite EOSE, hanging relay, parent disconnect, stalled
-inventory, wrong parent UID, lost/wrong ACK with retained receipts, bounded queue
+inventory, delayed assignment, idle cancellation/EOF, partial assignment framing,
+expired assignment, wrong parent UID, lost/wrong ACK with retained receipts, bounded queue
 backpressure/cancellation, event/byte limits, ordering and digest/truncation errors.
 Explicit regression tests reject lagged/closed notification receivers and repeated
 IDs at different timestamps; a real empty diff still completes successfully.

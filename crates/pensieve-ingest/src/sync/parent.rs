@@ -8,6 +8,7 @@
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -18,9 +19,11 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use super::failure::{FailureDiagnostic, FailureKind};
+use super::inventory::{InventoryReplay, MAX_REPLAY_BATCH};
 use super::ipc::{self, Frame, ProtocolError, UploadAction, UploadSession};
 use super::jobs::{
-    AttemptProgress, Job, JobLedger, Lease, LedgerError, MaintenanceProgress, RetryReason,
+    AttemptProgress, Job, JobLedger, Lease, LedgerError, MaintenanceProgress, PlanningProgress,
+    RetryReason, SplitOutcome,
 };
 use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};
@@ -84,6 +87,25 @@ pub enum SessionOutcome {
 type Reply<T> = oneshot::Sender<Result<T, ParentError>>;
 
 enum Command {
+    Configure {
+        relays: Vec<String>,
+        reply: Reply<()>,
+    },
+    Plan {
+        max_jobs: u32,
+        reply: Reply<PlanningProgress>,
+    },
+    Replay {
+        archive: PathBuf,
+        prefix: String,
+        floor: u64,
+        cancelled: Arc<AtomicBool>,
+        reply: Reply<bool>,
+    },
+    Split {
+        lease: Lease,
+        reply: Reply<SplitOutcome>,
+    },
     FailureReport {
         job: i64,
         attempt: i64,
@@ -119,6 +141,10 @@ enum Command {
         ttl: u32,
         reply: Reply<Option<Lease>>,
     },
+    LeaseFair {
+        ttl: u32,
+        reply: Reply<Option<Lease>>,
+    },
     Job {
         id: i64,
         reply: Reply<Job>,
@@ -147,6 +173,60 @@ pub struct ParentExecutor {
 }
 
 impl ParentExecutor {
+    /// Replace the explicit isolated-worker relay allowlist on the owner.
+    pub async fn configure(&mut self, relays: Vec<String>) -> Result<(), ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::Configure { relays, reply }, response)
+            .await
+    }
+
+    /// Persist one bounded rolling-planning turn using execution-time wall clock.
+    pub async fn plan(&mut self, max_jobs: u32) -> Result<PlanningProgress, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::Plan { max_jobs, reply }, response)
+            .await
+    }
+
+    /// Replay one sealed source segment in bounded decoder batches.
+    pub async fn replay_next(
+        &mut self,
+        archive: PathBuf,
+        prefix: String,
+        floor: u64,
+    ) -> Result<bool, ParentError> {
+        let (reply, response) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = ReplayCancel(Arc::clone(&cancelled));
+        let result = self
+            .request(
+                Command::Replay {
+                    archive,
+                    prefix,
+                    floor,
+                    cancelled,
+                    reply,
+                },
+                response,
+            )
+            .await;
+        drop(cancel_on_drop);
+        result
+    }
+
+    /// Split only a classified local-density or verified-volume failure.
+    pub async fn split(&mut self, lease: Lease) -> Result<SplitOutcome, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::Split { lease, reply }, response)
+            .await
+    }
+
+    /// Acquire a fair lease among explicitly enabled planner relays.
+    pub async fn lease_next_fair(&mut self, ttl: u32) -> Result<Option<Lease>, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::LeaseFair { ttl, reply }, response)
+            .await
+    }
+
     /// Move the sole ledger connection to a dedicated blocking owner thread.
     pub fn new(
         ledger: JobLedger,
@@ -181,6 +261,48 @@ impl ParentExecutor {
                 let mut consumed_attempt = None;
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
+                        Command::Configure { relays, reply } => {
+                            let refs = relays.iter().map(String::as_str).collect::<Vec<_>>();
+                            let _ = reply.send(ledger.configure_planner(&refs).map_err(Into::into));
+                        }
+                        Command::Plan { max_jobs, reply } => {
+                            let _ = reply.send(ledger.plan_rolling(clock(), max_jobs).map_err(Into::into));
+                        }
+                        Command::Replay { archive, prefix, floor, cancelled, reply } => {
+                            let result = (|| {
+                                if writer.recovery_required() {
+                                    return Err(ParentError::RecoveryRequired);
+                                }
+                                let Some(mut replay) = InventoryReplay::begin(
+                                    &inventory, &dedupe, &writer, &archive, &prefix, floor,
+                                )? else {
+                                    return Ok(false);
+                                };
+                                let mut batches = 0;
+                                loop {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        return Ok(false);
+                                    }
+                                    if replay.step(MAX_REPLAY_BATCH)?.segment_complete {
+                                        break;
+                                    }
+                                    batches += 1;
+                                    if batches == 16 {
+                                        // Replay can take many batches. Keep old receipts
+                                        // moving while this owner command holds the queue.
+                                        archive_maintenance(&writer, || {
+                                            ledger.maintain_archived(&dedupe, &writer, 32, 256)
+                                        })?;
+                                        batches = 0;
+                                    }
+                                }
+                                Ok(true)
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        Command::Split { lease, reply } => {
+                            let _ = reply.send(ledger.split(&lease, clock()).map_err(Into::into));
+                        }
                         Command::FailureReport {
                             job,
                             attempt,
@@ -235,6 +357,48 @@ impl ParentExecutor {
                         }
                         Command::Lease { ttl, reply } => {
                             let _ = reply.send(ledger.lease_next(clock(), ttl).map_err(Into::into));
+                        }
+                        Command::LeaseFair { ttl, reply } => {
+                            let result = (|| {
+                                if writer.recovery_required() {
+                                    return Err(ParentError::RecoveryRequired);
+                                }
+                                // Split local density before consuming a worker attempt.
+                                // A concurrent append after preflight can still make the
+                                // eventual session TooDense; that remains unresolved work.
+                                for _ in 0..16 {
+                                    let now = clock();
+                                    let Some(candidate) = ledger.fair_candidate(now)? else {
+                                        return Ok(None);
+                                    };
+                                    match inventory.archived_window(
+                                        candidate.since as u64,
+                                        candidate.until as u64,
+                                        MAX_WINDOW_ITEMS,
+                                        &dedupe,
+                                    )? {
+                                        ArchivedWindow::Complete(_) => {
+                                            if writer.recovery_required() {
+                                                return Err(ParentError::RecoveryRequired);
+                                            }
+                                            let lease = ledger.lease_next_fair(clock(), ttl)?;
+                                            if lease.as_ref().is_some_and(|lease| lease.job().id != candidate.id) {
+                                                return Err(ParentError::InvalidRequest);
+                                            }
+                                            return Ok(lease);
+                                        }
+                                        ArchivedWindow::TooDense => {
+                                            let result = ledger.split_unleased(candidate.id)?;
+                                            if result == SplitOutcome::Blocked {
+                                                metrics::counter!("negentropy_dense_timestamp_blocked_total").increment(1);
+                                                tracing::error!(job = candidate.id, relay = %candidate.relay, timestamp = candidate.since, "isolated inventory too dense at one second");
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None)
+                            })();
+                            let _ = reply.send(result);
                         }
                         Command::Job { id, reply } => {
                             let _ = reply.send(ledger.get(id).map_err(Into::into));
@@ -492,6 +656,13 @@ struct Cancel {
     socket: UnixStream,
     cancelled: Arc<AtomicBool>,
 }
+
+struct ReplayCancel(Arc<AtomicBool>);
+impl Drop for ReplayCancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 impl Drop for Cancel {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -714,6 +885,16 @@ mod tests {
     use nostr_sdk::{EventBuilder, Keys, Timestamp};
     use std::sync::atomic::AtomicI64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn dropped_replay_request_signals_owner_without_discarding_cursor() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let _request = ReplayCancel(Arc::clone(&cancelled));
+            assert!(!cancelled.load(Ordering::Acquire));
+        }
+        assert!(cancelled.load(Ordering::Acquire));
+    }
 
     struct Harness {
         _root: tempfile::TempDir,

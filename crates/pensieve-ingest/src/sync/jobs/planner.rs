@@ -10,6 +10,9 @@ const MAX_ACTIVE: usize = 32;
 const MAX_RETAINED: i64 = 128;
 const MAX_ROOTS_PER_RELAY: u32 = 32;
 const MAX_TURN: u32 = 32;
+// Keep admission room for at least one full 15-minute split tree while roots
+// remain unresolved. This is a planning stop, not permission to delete history.
+const SPLIT_JOB_RESERVE: u32 = 2048;
 const WINDOW: i64 = 900;
 const HORIZON: i64 = 14 * 24 * 60 * 60;
 
@@ -114,9 +117,20 @@ impl JobLedger {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retained: u32 = tx.query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))?;
+        let reserve = SPLIT_JOB_RESERVE.min(self.limits.max_jobs / 10);
+        let planned_limit = self.limits.max_jobs.saturating_sub(reserve);
+        if retained >= planned_limit {
+            return Ok(PlanningProgress {
+                enqueued: 0,
+                backpressured: true,
+            });
+        }
+        let capacity_backpressured = max_jobs > planned_limit - retained;
+        let max_jobs = max_jobs.min(planned_limit - retained);
         let mut progress = PlanningProgress {
             enqueued: 0,
-            backpressured: false,
+            backpressured: capacity_backpressured,
         };
         let (mut sequence, mut after): (i64, i64) = tx.query_row(
             "SELECT sequence,after_relay FROM planner_state WHERE singleton=1",
@@ -479,20 +493,44 @@ mod tests {
         assert!(windows(&db).is_empty());
         assert_eq!((state(&db), cursors(&db)), before);
         db.db.execute_batch("DROP TRIGGER fail_cursor;").unwrap();
-        db.limits.max_jobs = 1;
-        assert!(matches!(
-            db.plan_rolling(HORIZON, 2),
-            Err(LedgerError::Budget)
-        ));
-        assert!(windows(&db).is_empty());
-        assert_eq!((state(&db), cursors(&db)), before);
-        db.limits.max_jobs = 100_000;
         db.limits.max_bytes = 1;
         assert!(matches!(
             db.plan_rolling(HORIZON, 1),
             Err(LedgerError::Budget)
         ));
         assert_eq!((state(&db), cursors(&db)), before);
+        db.limits.max_bytes = LedgerLimits::default().max_bytes;
+        db.limits.max_jobs = 1;
+        let progress = db.plan_rolling(HORIZON, 2).unwrap();
+        assert_eq!(progress.enqueued, 1);
+        assert!(progress.backpressured);
+        assert_eq!(db.plan_rolling(HORIZON, 2).unwrap().enqueued, 0);
+        assert_eq!(windows(&db).len(), 1);
+    }
+
+    #[test]
+    fn planning_stops_before_split_recovery_exhausts_job_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        db.configure_planner(&["wss://a.example"]).unwrap();
+        db.limits.max_jobs = 20;
+        for n in 0..18 {
+            db.enqueue(
+                &format!("manual-{n}"),
+                "wss://a.example",
+                n * 10,
+                n * 10 + 9,
+            )
+            .unwrap();
+        }
+        let progress = db.plan_rolling(HORIZON, 32).unwrap();
+        assert_eq!(progress.enqueued, 0);
+        assert!(progress.backpressured);
+        let lease = db.lease_next(HORIZON, 60).unwrap().unwrap();
+        assert!(matches!(
+            db.split(&lease, HORIZON + 1),
+            Ok(super::super::SplitOutcome::Children(_))
+        ));
     }
 
     #[test]

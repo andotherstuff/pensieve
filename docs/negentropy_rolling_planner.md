@@ -1,9 +1,9 @@
-# Rolling planner (inactive library)
+# Rolling planner and opt-in runtime
 
-`JobLedger::configure_planner` and `plan_rolling` add persisted lazy planning, not
-a scheduler, lease selection policy, parent API, listener or process launcher.
-The approved static systemd worker/idle-wait design is unchanged. No production
-configuration, inventory replay or historical exploration is activated.
+`JobLedger::configure_planner` and `plan_rolling` provide persisted lazy planning.
+The isolated runtime now calls them only behind the explicit, default-off
+`--isolated-negentropy` mode described in [the runtime contract](negentropy_runtime.md).
+There is still no process launcher or production activation in this change.
 
 An explicit allowlist contains at most 32 entries; normalized duplicates collapse.
 Empty disables planning. Removal disables only future planning for that relay;
@@ -37,7 +37,7 @@ remain under lifetime ledger budgets; this is not a total-obligation cap.
 Errors, including a failure after job
 insertion but before cursor update, roll back the entire turn. No repeated full
 14-day materialization occurs in a single turn. Round-robin planning is persisted;
-fair leasing between fresh jobs and old gaps remains a separate slice.
+opt-in fair leasing is described in [the selector contract](negentropy_fair_leases.md).
 
 The supplied timestamp must eventually come from the owner at command execution,
 not before an async queue wait. The 15-minute boundary is a minimum engineering
@@ -45,14 +45,17 @@ cadence, not a claim that sweeping every interval of every relay every 15 minute
 is sustainable. No runtime timer is implemented here. Canary throughput, freshness
 and backlog acceptance remain rollout gates.
 
-The default ledger has a **100,000 lifetime retained-job ceiling**, including
+The runtime reserves 2,048 default slots for split recovery before planning
+additional roots; smaller test ceilings reserve at most one tenth. The default
+ledger has a **100,000 lifetime retained-job ceiling**, including
 completed jobs and split parents, and a 1 GiB admission budget. Repeated sweeps
 will eventually stop at those ceilings. This slice does not promise indefinite
 operation or invent a retention/deletion policy. Preservation of unresolved gaps
 takes precedence over throughput; a measured terminal-summary/retention design
 must precede indefinite operation.
 
-This is fresh unshipped schema 6, adding planner metadata to schema 5. Older ledger
+The planner introduced schema 6; the opt-in fair selector now uses fresh unshipped
+schema 7, adding lease-rotation metadata and due-head indexes. Older ledger
 versions are rejected without mutation, not migrated or discarded. Preserve any
 older ledger containing real work and stop for an explicit recovery decision.
 
