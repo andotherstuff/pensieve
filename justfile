@@ -10,8 +10,12 @@ default:
 # ============================================================================
 
 # Run all precommit checks (fmt, clippy, test)
-precommit: fmt clippy test
+precommit: fmt clippy test ops-test
     @echo "✓ All precommit checks passed"
+
+# Read-only operational tooling regressions (standard-library Python only).
+ops-test:
+    python3 -B -m unittest discover -s ops/tests -p 'test_*.py'
 
 # Check code compiles without building
 check:
