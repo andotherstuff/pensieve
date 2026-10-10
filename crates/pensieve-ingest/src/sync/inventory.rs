@@ -178,8 +178,12 @@ impl<'a> InventoryReplay<'a> {
                 let cursor = decode_cursor(&bytes)?;
                 if cursor.archive != archive || cursor.prefix != prefix || cursor.floor != floor {
                     return Err(Error::Config(format!(
-                        "replay cursor identity differs; preserve existing state (stored floor={}, next={}, configured floor={floor})",
-                        cursor.floor, cursor.next,
+                        "replay cursor identity differs; preserve existing state (stored archive={}, prefix={}, floor={}, next={}; configured archive={}, prefix={prefix}, floor={floor})",
+                        cursor.archive.display(),
+                        cursor.prefix,
+                        cursor.floor,
+                        cursor.next,
+                        expected.archive.display(),
                     )));
                 }
                 cursor
