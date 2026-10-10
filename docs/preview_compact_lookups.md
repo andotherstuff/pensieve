@@ -141,10 +141,9 @@ Production (checked 2026-10-10) inserts **synchronously**:
 - about 70 sealed-segment inserts per hour;
 - `system.asynchronous_insert_log` is empty.
 
-The `async_insert` profile settings in `ops/production/clickhouse/config.xml`
-are not in effect: ClickHouse reads profiles from the users configuration,
-not from a server `config.d` file. A failing view would therefore fail the
-INSERT. The ingester would see the error, retry the segment and then queue it
+Async inserts are not configured: the `default` user runs with stock
+settings (see `ops/production/clickhouse/users.xml`). A failing view would
+therefore fail the INSERT. The ingester would see the error, retry the segment and then queue it
 for reindexing. Rows are not lost silently, but ingest into ClickHouse stalls
 until the view is fixed or dropped. If async inserts with
 `wait_for_async_insert=0` are ever enabled, a failing view would instead drop
