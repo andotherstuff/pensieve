@@ -197,8 +197,8 @@ impl JobLedger {
         )
     }
 
-    /// Open with the live admission policy. A changed policy fails closed without
-    /// mutating prior completion claims or exclusions; operator migration is required.
+    /// Open with the live admission policy. Additions preserve all earlier proof;
+    /// removals fail closed and require an explicit recovery plan.
     pub fn open_with_policy(
         path: &Path,
         limits: LedgerLimits,
@@ -289,6 +289,7 @@ impl JobLedger {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "wal_autocheckpoint", 16)?;
+        policy::report(&db, limits.max_bytes)?;
         Ok(Self {
             db,
             path: path.canonicalize()?,

@@ -411,9 +411,6 @@ impl UploadSession {
         let admission_time = clock();
         self.check_ack(ledger, &event, admission_time)?;
         self.closed = true;
-        if writer.recovery_required() {
-            return Err(ProtocolError::State);
-        }
         if ledger.exclude_by_policy(
             &self.lease,
             event.header.sequence,
@@ -425,6 +422,9 @@ impl UploadSession {
             let mut accepted = self.accepted(ledger, event, clock())?;
             accepted.outcome = AdmissionOutcome::PolicyExcluded;
             return Ok(accepted);
+        }
+        if writer.recovery_required() {
+            return Err(ProtocolError::State);
         }
         match dedupe.reserve_unarchived(event.event.id.as_bytes())? {
             Some(claim) => {

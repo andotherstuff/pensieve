@@ -33,6 +33,11 @@ impl AdmissionPolicy {
     pub fn blocks(&self, event: &nostr_sdk::Event) -> bool {
         is_blocked(event, &self.recipients)
     }
+
+    /// Canonical keys for durable policy compatibility checks.
+    pub(crate) fn recipients(&self) -> &[String] {
+        &self.recipients
+    }
 }
 
 /// Parse a configured hex or npub key once, rejecting invalid configuration.
