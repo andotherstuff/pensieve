@@ -274,7 +274,11 @@ impl ParentExecutor {
                         Command::Lifecycle { reply } => {
                             let result = (|| {
                                 let now = clock();
-                                ledger.retain_completed(now)?;
+                                let retention = ledger.retain_completed(now)?;
+                                metrics::counter!("negentropy_retention_removed_jobs_total")
+                                    .increment(u64::from(retention.removed_jobs));
+                                metrics::counter!("negentropy_retention_skipped_roots_total")
+                                    .increment(u64::from(retention.retained_candidate));
                                 ledger.progress_observation(now)
                             })();
                             let _ = reply.send(result.map_err(Into::into));

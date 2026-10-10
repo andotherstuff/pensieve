@@ -62,7 +62,9 @@ Legacy completed rows have unknown completion times/policy identity and remain
 ineligible for automatic cleanup. New successful detail is kept at least 24 hours.
 Each maintenance turn considers at most one root and 2,048 tree nodes, 4,096
 detail rows and 8 MiB of estimated detail. Whole trees pinned by proof, oversized
-trees, current planner sweeps, and sweeps with unresolved jobs are skipped.
+trees and active planners' current sweeps are skipped. An unresolved sibling root
+does not pin completed trees; its gap and split lineage remain detailed. Disabled
+planners do not pin history, and re-enabling resumes their persisted next window.
 Compaction uses exact 15-minute coverage bits per relay/day/policy, together with
 frame/attempt/failure accounting. Repeated sweeps do not imply novel events.
 Summaries expire 90 days after their last compaction and are capped at 16,384 rows;
@@ -82,16 +84,14 @@ Validate the versioned migration with backup and rollback tests before enabling
 retention. Maintain the original replay floor (29808 on this deployment), policy
 fingerprint, planner cursor, fair selector state and every unresolved obligation.
 
-Compact only fully completed, closed rolling sweeps whose whole split trees are
+Compact only completed rolling roots whose whole split trees are
 complete, have no remaining receipts, and have no exclusion-proof references.
 Skip pinned trees; never evict their proof merely to free job slots. Preserve
 compact per-relay/day coverage and received/archived/excluded/attempt/failure
 accounting separately; call these frame counts, not unique new-event counts.
-Record the exact intervals and schema/policy identity so a summary cannot imply
-broader coverage. Define a bounded lifetime for detailed successful histories and
-bounded summary storage; merely moving all rows to an ever-growing table is not
-retention. Initial detailed retention duration and summary limits must be reviewed
-alongside measured growth, not invented from this three-job trial.
+The bitmap records exact intervals and policy identity, not broader coverage.
+Measure detailed-row growth against the retention defaults above; the three-job
+trial did not establish sustained capacity.
 
 Each compaction transaction must have explicit row/byte bounds, commit the summary
 and deletion together, and preserve counters and foreign keys. No automatic
@@ -114,6 +114,11 @@ one hour fails. Blocked jobs or still-unresolved jobs with three attempts fail
 even if another job completes. Persisted creation/completion times survive
 restart. An owner failure remains latched for that runtime; new process startup
 must still satisfy the durable ledger checks rather than refreshing a grace clock.
+Observations are refreshed after replay and planning, before a nine-minute worker
+session; replay time is not charged against that session's observation freshness.
+Retention exports `negentropy_retention_removed_jobs_total`,
+`negentropy_retention_skipped_roots_total`, and `negentropy_retained_jobs`. A skipped
+root may simply be too recent, not necessarily proof-pinned or unhealthy.
 
 Install `ops/scripts/negentropy-kuma.py` as
 `/usr/local/libexec/pensieve-negentropy-kuma.py` and the matching service/timer only
@@ -126,11 +131,12 @@ live archive admission to synthesize an alert. Never put the push URL in argv,
 logs, Git, or evidence. When intentionally disabling reconciliation, pause its
 monitor; the explicit disabled response is not HTTP success. Keep Archive Admission
 monitor 45 and API monitor 10 unchanged.
+On this deployment, monitor 45 is an outbound **push** monitor (verified from Kuma),
+not a direct HTTP probe; only monitor 10 is HTTP. The push path intentionally keeps
+the private health endpoint unexposed rather than adding network access for Kuma.
 
-- Add durable completion time and last-success/failure observations. Alert on
-  stalled work, persistent missing-ID failures and ledger/admission backpressure.
-  Archive-admission Kuma is already tested, but its HTTP 200 does **not** prove
-  reconciliation is advancing. Test the reconciliation alert separately.
+- Verify the new progress alert separately: archive-admission HTTP 200 does
+  **not** prove reconciliation is advancing. Test both failure and recovery delivery.
 - Measure a single-relay rolling run against the approved 14-day horizon before
   expanding the relay set. There are 1,344 root windows per full sweep per relay;
   the planner can revisit the horizon after a changed boundary. Three small
@@ -140,7 +146,7 @@ monitor 45 and API monitor 10 unchanged.
   Parquet catch-up before the necessary controlled ingester restart.
 - Premium Primal only initially, no catalog expansion. Preserve worker resource
   limits, recipient block and archive reserves. A finite monitored pilot is not
-  permission for indefinite unattended operation before retention is implemented.
+  proof of indefinite unattended capacity, even with bounded retention implemented.
 - Enable the static worker only after reviewed code, green exact-head CI, verified
   binaries, alert delivery and the above gates. Stopping the worker must leave
   live ingestion and all unresolved gaps intact.

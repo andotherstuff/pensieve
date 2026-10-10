@@ -1,6 +1,6 @@
 //! Bounded retention of successful rolling work; never deletion of obligations.
 //!
-//! A complete split tree is the smallest deletion unit. Unfinished sweeps and
+//! A complete split tree is the smallest deletion unit. Unfinished trees and
 //! exclusion-proof owners are deliberately pinned, even under admission pressure.
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -27,7 +27,6 @@ CREATE TABLE lifecycle (
 INSERT INTO lifecycle(singleton,high_job,activated_at) SELECT 1,coalesce(max(id),0),unixepoch() FROM jobs;
 CREATE INDEX retention_roots ON jobs(id) WHERE parent IS NULL AND state='complete';
 CREATE INDEX pending_recorded ON jobs(recorded_at) WHERE state!='complete';
-CREATE INDEX sweep_states ON jobs(sweep,state);
 CREATE INDEX exclusion_owner ON policy_exclusions(first_job);
 CREATE TABLE completed_coverage (
  relay TEXT NOT NULL, day INTEGER NOT NULL, policy_identity BLOB NOT NULL,
@@ -94,13 +93,14 @@ impl JobLedger {
         }
         let persistent_failure = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked'
-             OR (state!='complete' AND state!='split' AND attempt>=3))",
+             OR (state IN ('queued','leased','awaiting_durability','retry_wait') AND attempt>=3))",
             [],
             |r| r.get(0),
         )?;
         let retained: u32 = self
             .db
             .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))?;
+        metrics::gauge!("negentropy_retained_jobs").set(f64::from(retained));
         let reserve = 2048.min(self.limits.max_jobs / 10);
         let capacity_exhausted = match super::check_budget(&self.db, &self.path, self.limits, 0) {
             Ok(()) => retained >= self.limits.max_jobs.saturating_sub(reserve),
@@ -161,11 +161,14 @@ impl JobLedger {
 
 #[cfg(test)]
 pub(super) fn strip_for_legacy_fixture(db: &rusqlite::Connection) {
-    db.execute_batch("DROP TRIGGER job_recorded; DROP TRIGGER job_completed;
+    db.execute_batch(
+        "DROP TRIGGER job_recorded; DROP TRIGGER job_completed;
         DROP TABLE lifecycle; DROP TABLE completed_coverage;
-        DROP INDEX retention_roots; DROP INDEX pending_recorded; DROP INDEX sweep_states; DROP INDEX exclusion_owner;
+        DROP INDEX retention_roots; DROP INDEX pending_recorded; DROP INDEX exclusion_owner;
         ALTER TABLE jobs DROP COLUMN completed_at; ALTER TABLE jobs DROP COLUMN recorded_at;
-        ALTER TABLE jobs DROP COLUMN policy_identity; PRAGMA user_version=8;").unwrap();
+        ALTER TABLE jobs DROP COLUMN policy_identity; PRAGMA user_version=8;",
+    )
+    .unwrap();
 }
 
 fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, LedgerError> {
@@ -198,12 +201,12 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
     {
         return Ok(0);
     }
-    // A current planner sweep can still append roots. A closed sweep with any
-    // unresolved root/child must retain its full detailed lineage.
+    // Only active planners pin their current sweep. Disabled cursors resume at
+    // their persisted next window, not at deleted completed roots. Other roots'
+    // gaps do not pin this tree; the checks below preserve this tree's lineage.
     let open: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM planner_relays WHERE sequence=?1)
-         OR EXISTS(SELECT 1 FROM jobs WHERE sweep=?2 AND state!='complete')",
-        params![sequence, sweep],
+        "SELECT EXISTS(SELECT 1 FROM planner_relays WHERE enabled=1 AND sequence=?1)",
+        [sequence],
         |r| r.get(0),
     )?;
     if open {
@@ -362,14 +365,15 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_sweep_and_current_sweep_are_not_compacted() {
+    fn unresolved_tree_survives_while_completed_sibling_is_compacted() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = closed_sweep(&dir);
         db.db
             .execute("UPDATE jobs SET state='retry_wait' WHERE id=2", [])
             .unwrap();
-        assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 0);
-        assert!(db.get(1).is_ok());
+        assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 1);
+        assert!(db.get(1).is_err());
+        assert!(db.get(2).is_ok());
         db.db
             .execute("UPDATE jobs SET state='complete' WHERE id=3", [])
             .unwrap();
@@ -378,6 +382,26 @@ mod tests {
             .unwrap();
         assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 0);
         assert!(db.get(3).is_ok());
+    }
+
+    #[test]
+    fn disabled_relay_completion_compacts_without_recreating_windows_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = closed_sweep(&dir);
+        db.db
+            .execute("UPDATE jobs SET state='complete' WHERE id=3", [])
+            .unwrap();
+        db.db.execute("UPDATE jobs SET completed_at=1", []).unwrap();
+        db.configure_planner(&[]).unwrap();
+        for _ in 0..3 {
+            assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 1);
+        }
+        assert!(db.get(3).is_err());
+        db.configure_planner(&["wss://relay.example"]).unwrap();
+        assert_eq!(db.plan_rolling(2700, 2).unwrap().enqueued, 2);
+        // The disabled partial sweep resumes after its already-planned [0,899].
+        assert_eq!(db.get(4).unwrap().since, 900);
+        assert_eq!(db.get(5).unwrap().since, 1800);
     }
 
     #[test]
@@ -540,6 +564,10 @@ mod tests {
             (
                 "EXPLAIN QUERY PLAN SELECT 1 FROM policy_exclusions WHERE first_job=1",
                 "exclusion_owner",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked' OR (state IN ('queued','leased','awaiting_durability','retry_wait') AND attempt>=3))",
+                "due_jobs",
             ),
         ] {
             let details = db

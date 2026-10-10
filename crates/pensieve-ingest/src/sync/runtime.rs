@@ -267,6 +267,12 @@ async fn drive(
                     let planned = parent.plan(32).await?;
                     gauge!("negentropy_isolated_planner_backpressured").set(f64::from(planned.backpressured));
                 }
+                // Replay and a worker session have separate durations. Refresh
+                // owner facts after replay so their sum cannot age a healthy
+                // observation past the watchdog before the session returns.
+                let mut observation = parent.lifecycle().await?;
+                observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                pensieve_core::reconciliation_health::reconciliation_health().observe(observation);
                 if let Some((socket, candidate)) = peer.take() {
                     // Revalidate the same pidfd, invocation and remaining service
                     // lifetime immediately before exporting a lease capability.
