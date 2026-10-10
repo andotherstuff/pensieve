@@ -1301,3 +1301,98 @@ async fn validation_with_every_key_skipped_is_inconclusive() {
     assert!(!report.passed(), "{}", report.render());
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn validation_with_empty_sample_of_nonempty_source_is_inconclusive() {
+    let db = TestDb::new().await;
+    db.insert_sync(&workload(7, 1_600_000_000)).await;
+    db.apply_migration().await;
+
+    // Sampling disabled entirely is rejected.
+    let none = validate::ValidateOptions {
+        sample: 0,
+        hot: 0,
+        require_projection: false,
+        ..validate::ValidateOptions::default()
+    };
+    assert!(validate::run(&db.client, &db.name, &none).await.is_err());
+
+    // A random-only sample that selects no keys cannot pass on a non-empty
+    // source, even though the compact tables were never backfilled.
+    let empty_fraction = validate::ValidateOptions {
+        sample: 20,
+        hot: 0,
+        sample_permyriad: 0,
+        cutoff_margin: Duration::ZERO,
+        require_projection: false,
+        ..validate::ValidateOptions::default()
+    };
+    let report = validate::run(&db.client, &db.name, &empty_fraction)
+        .await
+        .unwrap();
+    for t in &report.targets {
+        assert_eq!(t.sampled, 0);
+        assert!(t.source_has_keys, "{}", report.render());
+    }
+    assert_eq!(report.inconclusive_targets().len(), 3);
+    assert!(!report.passed(), "{}", report.render());
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn session_deadline_expiring_during_merge_wait_starts_no_insert() {
+    let db = TestDb::new().await;
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    db.insert_sync(&workload(8, 1_600_000_000)).await;
+    db.apply_migration().await;
+    // One live insert gives the target a part, so a zero-part limit waits.
+    db.insert_sync(&[profile(0x9998, 0x9998, 1, "live")]).await;
+
+    let options = PlanOptions {
+        shard_by: ShardBy::CreatedAt,
+        max_rows_per_shard: 1_000,
+        id_prefix_len: 2,
+        require_projection: false,
+    };
+    let p = plan::build_plan(&db.client, &db.name, Target::Profiles, &options)
+        .await
+        .unwrap();
+    let dir = CheckpointDir::new(checkpoint_dir.path(), Target::Profiles);
+    dir.save_plan(&p, false).unwrap();
+    let rows_before = db.count("SELECT count() FROM profile_latest").await;
+
+    // A positive budget that runs out while waiting for merges (the parts
+    // wait alone would allow an hour).
+    let waiting = BackfillOptions {
+        max_runtime: Some(Duration::from_secs(2)),
+        max_target_parts: 0,
+        parts_wait_timeout: Duration::from_secs(3600),
+        ..backfill_options()
+    };
+    let started = std::time::Instant::now();
+    let report = backfill::run_backfill(&db.client, &p, &dir, &waiting)
+        .await
+        .unwrap();
+    assert_eq!(report.stopped, StopReason::MaxRuntime);
+    assert_eq!(report.shards_run, 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "wait was not bounded by the deadline"
+    );
+
+    let stopped = backfill::run_gap_pass(&db.client, &p, &dir, Duration::from_secs(3600), &waiting)
+        .await
+        .unwrap();
+    assert_eq!(stopped, StopReason::MaxRuntime);
+
+    assert!(dir.completed_shards().unwrap().is_empty());
+    assert!(!dir.gap_pass_path().exists());
+    assert_eq!(
+        db.count("SELECT count() FROM profile_latest").await,
+        rows_before,
+        "no INSERT may start after the deadline"
+    );
+    db.drop().await;
+}

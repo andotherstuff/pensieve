@@ -194,8 +194,10 @@ Connection settings also come from `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`,
 - **Merge backlog.** While the target has more than `--max-target-parts`
   active parts (default 300), the tool waits for merges. After 30 minutes it
   stops cleanly.
-- **Runtime.** `--max-runtime-mins`, `--max-shards` and `--delay-secs` bound
-  each session. Each finished shard writes a JSON checkpoint containing its
+- **Runtime.** `--max-runtime-mins` is an absolute session deadline. It also
+  bounds merge waits and is re-checked right before every INSERT, so no
+  INSERT starts after the window closes. `--max-shards` and `--delay-secs`
+  further bound each session. Each finished shard writes a JSON checkpoint containing its
   `system.query_log` entry.
 - **Progress.** Each shard logs done/total, percent, rows read and written,
   duration and ETA.
@@ -232,9 +234,10 @@ comparing `status` (bytes on disk per row) with the plan, and keep
     indexed after `now - --cutoff-margin-secs` is skipped. Freshness is
     checked again after the compact and legacy reads, so a concurrent insert
     is skipped rather than reported as a difference.
-  - A target whose sampled keys were all skipped is reported as
-    **inconclusive**. The command then exits non-zero, because nothing was
-    compared.
+  - A target is reported as **inconclusive**, and the command exits non-zero,
+    when nothing was compared but the source has keys. That covers every
+    sampled key being skipped, and sampling selecting no keys. Disabling
+    sampling (`--sample 0 --hot 0`) is rejected.
   - The compact read must equal the oracle exactly.
   - Legacy differences are classified as `legacy_tie_break`,
     `legacy_id_content_mix`, `legacy_duplicate_inflation`,

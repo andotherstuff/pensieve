@@ -22,7 +22,9 @@
 //! `max_memory_usage`, external aggregation and `max_execution_time` set by
 //! the caller's client. Before each shard the free space on the table's disk
 //! must cover the remaining estimate plus a reserve, and the target must not
-//! have too many unmerged parts. `max_runtime` and `max_shards` stop between
+//! have too many unmerged parts. `max_runtime` is an absolute session deadline:
+//! it bounds merge waits and is re-checked immediately before every INSERT, so
+//! no INSERT starts after the window closes. `max_shards` stops between
 //! shards; completed shards are checkpointed so a re-run resumes.
 
 use std::time::{Duration, Instant};
@@ -165,6 +167,7 @@ pub async fn run_backfill(
     }
 
     let started = Instant::now();
+    let deadline = session_deadline(options);
     let done: std::collections::BTreeSet<usize> = checkpoints
         .completed_shards()?
         .into_iter()
@@ -192,9 +195,7 @@ pub async fn run_backfill(
             continue;
         }
 
-        if let Some(max) = options.max_runtime
-            && started.elapsed() >= max
-        {
+        if expired(deadline) {
             return Ok(report(
                 total,
                 shards_done,
@@ -230,13 +231,17 @@ pub async fn run_backfill(
                 StopReason::DiskGuard(refusal),
             ));
         }
-        if let Some(backlog) = wait_for_merges(client, plan, options).await? {
+        if let Some(stop) = wait_for_merges(client, plan, options, deadline).await? {
+            return Ok(report(total, shards_done, shards_run, rows_written, stop));
+        }
+        // Guards may have taken a while; never start an INSERT past the deadline.
+        if expired(deadline) {
             return Ok(report(
                 total,
                 shards_done,
                 shards_run,
                 rows_written,
-                StopReason::PartsBacklog(backlog),
+                StopReason::MaxRuntime,
             ));
         }
 
@@ -299,7 +304,8 @@ pub async fn run_gap_pass(
     margin: Duration,
     options: &BackfillOptions,
 ) -> Result<StopReason> {
-    if options.max_runtime.is_some_and(|m| m.is_zero()) {
+    let deadline = session_deadline(options);
+    if expired(deadline) {
         return Ok(StopReason::MaxRuntime);
     }
     let margin = margin.as_secs() as u32;
@@ -320,11 +326,17 @@ pub async fn run_gap_pass(
         .fetch_one::<u64>()
         .await
         .with_context(|| format!("sizing {} gap-closure pass", plan.target))?;
+    if expired(deadline) {
+        return Ok(StopReason::MaxRuntime);
+    }
     if let Some(refusal) = disk_guard(client, plan, estimated_rows, options).await? {
         return Ok(StopReason::DiskGuard(refusal));
     }
-    if let Some(backlog) = wait_for_merges(client, plan, options).await? {
-        return Ok(StopReason::PartsBacklog(backlog));
+    if let Some(stop) = wait_for_merges(client, plan, options, deadline).await? {
+        return Ok(stop);
+    }
+    if expired(deadline) {
+        return Ok(StopReason::MaxRuntime);
     }
 
     // Read amplification is expected here (indexed_at is not a key column).
@@ -479,24 +491,41 @@ async fn disk_guard(
     Ok(None)
 }
 
+/// Absolute session deadline for `max_runtime`, fixed when a run starts.
+fn session_deadline(options: &BackfillOptions) -> Option<Instant> {
+    options.max_runtime.map(|max| Instant::now() + max)
+}
+
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+/// Wait while the target has too many active parts. Stops with
+/// `PartsBacklog` after `parts_wait_timeout`, or `MaxRuntime` when the
+/// session deadline passes first.
 async fn wait_for_merges(
     client: &Client,
     plan: &Plan,
     options: &BackfillOptions,
-) -> Result<Option<String>> {
-    let deadline = Instant::now() + options.parts_wait_timeout;
+    session: Option<Instant>,
+) -> Result<Option<StopReason>> {
+    let parts_deadline = Instant::now() + options.parts_wait_timeout;
     loop {
         let parts = ops::table_parts(client, &plan.database, plan.target.table()).await?;
         if parts.parts <= options.max_target_parts {
             return Ok(None);
         }
-        if Instant::now() >= deadline {
-            return Ok(Some(format!(
+        if expired(session) {
+            return Ok(Some(StopReason::MaxRuntime));
+        }
+        let now = Instant::now();
+        if now >= parts_deadline {
+            return Ok(Some(StopReason::PartsBacklog(format!(
                 "{} still has {} active parts (limit {})",
                 plan.target.table(),
                 parts.parts,
                 options.max_target_parts
-            )));
+            ))));
         }
         tracing::info!(
             table = plan.target.table(),
@@ -504,7 +533,8 @@ async fn wait_for_merges(
             limit = options.max_target_parts,
             "waiting for merges"
         );
-        tokio::time::sleep(PARTS_POLL).await;
+        let wake = session.map_or(parts_deadline, |d| d.min(parts_deadline));
+        tokio::time::sleep(PARTS_POLL.min(wake.saturating_duration_since(now))).await;
     }
 }
 

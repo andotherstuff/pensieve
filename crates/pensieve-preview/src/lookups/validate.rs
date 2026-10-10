@@ -15,13 +15,14 @@
 //!    defects (timestamp tie-breaks, id/content from different rows,
 //!    duplicate inflation, missing amount rows) or unexplained.
 //!
-//! A target whose sampled keys were all skipped is **inconclusive**, not a
-//! pass.
+//! A target with no compared keys is **inconclusive**, not a pass: either
+//! every sampled key was skipped, or sampling found no keys although the
+//! source has some.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clickhouse::Client;
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +114,8 @@ pub struct TargetReport {
     pub target: Target,
     /// Keys sampled.
     pub sampled: usize,
+    /// Whether `events_local` has any source key for this target.
+    pub source_has_keys: bool,
     /// Keys skipped because source rows were indexed after the cutoff
     /// (before or during validation).
     pub skipped_after_cutoff: usize,
@@ -129,6 +132,7 @@ impl TargetReport {
         Self {
             target,
             sampled,
+            source_has_keys: sampled > 0,
             skipped_after_cutoff: 0,
             compact: BTreeMap::new(),
             legacy: BTreeMap::new(),
@@ -165,10 +169,11 @@ impl TargetReport {
         self.compact.values().sum()
     }
 
-    /// Keys were sampled but none could be compared, so the target provides
-    /// no correctness evidence.
+    /// Nothing was compared although the source has keys, so the target
+    /// provides no correctness evidence. Only a truly empty source passes
+    /// with zero comparisons.
     pub fn inconclusive(&self) -> bool {
-        self.sampled > 0 && self.compared() == 0
+        self.compared() == 0 && (self.sampled > 0 || self.source_has_keys)
     }
 
     /// Unexplained differences on either side.
@@ -234,8 +239,9 @@ impl ValidationReport {
         let inconclusive = self.inconclusive_targets();
         if !inconclusive.is_empty() {
             out.push_str(&format!(
-                "INCONCLUSIVE (no keys compared): {inconclusive:?}; lower --cutoff-margin-secs \
-                 only if ingest is quiet, or retry later\n"
+                "INCONCLUSIVE (source has keys but none were compared): {inconclusive:?}; \
+                 widen --sample/--hot/--sample-permyriad, or retry later if keys were \
+                 skipped by the cutoff\n"
             ));
         }
         out
@@ -272,6 +278,9 @@ pub async fn run(
     database: &str,
     options: &ValidateOptions,
 ) -> Result<ValidationReport> {
+    if options.sample == 0 && options.hot == 0 {
+        bail!("validation needs --sample or --hot above 0");
+    }
     let now = ops::server_now(client).await?;
     let cutoff = now.saturating_sub(options.cutoff_margin.as_secs() as u32);
     let source = projection_client(client, options.require_projection);
@@ -286,11 +295,14 @@ pub async fn run(
 
     let mut targets = Vec::new();
     for target in &options.targets {
-        let report = match target {
+        let mut report = match target {
             Target::Profiles => validate_profiles(&ctx).await?,
             Target::Zaps => validate_zaps(&ctx).await?,
             Target::Addressable => validate_addressable(&ctx).await?,
         };
+        if report.sampled == 0 {
+            report.source_has_keys = source_has_keys(&ctx, *target).await?;
+        }
         targets.push(report);
     }
     Ok(ValidationReport {
@@ -307,6 +319,25 @@ struct Ctx<'a> {
     legacy: &'a Client,
     options: &'a ValidateOptions,
     cutoff: u32,
+}
+
+/// Whether the source has at least one key for `target` (used when sampling
+/// found none, to tell an empty source from an empty sample).
+async fn source_has_keys(ctx: &Ctx<'_>, target: Target) -> Result<bool> {
+    let db = ctx.db;
+    let filter = match target {
+        Target::Zaps => format!("kind = 9735 AND notEmpty({ZAP_TARGETS_EXPR})"),
+        other => other.kind_predicate().to_string(),
+    };
+    let found = ctx
+        .source
+        .query(&format!(
+            "SELECT count() FROM (SELECT 1 FROM {db}.events_local WHERE {filter} LIMIT 1)"
+        ))
+        .fetch_one::<u64>()
+        .await
+        .with_context(|| format!("checking {target} source keys"))?;
+    Ok(found > 0)
 }
 
 fn placeholders(n: usize) -> String {
@@ -849,6 +880,13 @@ mod tests {
 
         let empty = TargetReport::new(Target::Addressable, 0);
         assert!(!empty.inconclusive(), "an empty source is vacuously fine");
+
+        let mut empty_sample = TargetReport::new(Target::Addressable, 0);
+        empty_sample.source_has_keys = true;
+        assert!(
+            empty_sample.inconclusive(),
+            "an empty sample of a non-empty source proves nothing"
+        );
 
         let mut compared = TargetReport::new(Target::Profiles, 2);
         compared.skipped_after_cutoff = 1;
