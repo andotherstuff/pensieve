@@ -113,8 +113,10 @@ non-sensitive classifications: disabled, starting, idle, recent progress, stale
 owner, stalled durable progress, unresolved failures, capacity exhaustion, or
 runtime failure. Idle is only healthy with a fresh owner observation. Owner
 observations expire after 15 minutes; pending work without durable completion for
-one hour fails. Blocked jobs or still-unresolved jobs with three attempts fail
-even if another job completes. Persisted creation/completion times survive
+one hour fails. Blocked jobs or jobs in retry backoff after at least three failed
+attempts fail even if another job completes. An active attempt is not itself a
+failure; protocol success awaiting archive durability remains subject to the
+one-hour completion deadline and does not record durable success. Persisted creation/completion times survive
 restart. An owner failure remains latched for that runtime; new process startup
 must still satisfy the durable ledger checks rather than refreshing a grace clock.
 Observations are refreshed after replay and planning, before a nine-minute worker

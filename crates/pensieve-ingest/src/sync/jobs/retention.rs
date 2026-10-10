@@ -104,7 +104,7 @@ impl JobLedger {
         }
         let persistent_failure = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked'
-             OR (state IN ('queued','leased','awaiting_durability','retry_wait') AND attempt>=3))",
+             OR (state='retry_wait' AND attempt>=3))",
             [],
             |r| r.get(0),
         )?;
@@ -577,7 +577,7 @@ mod tests {
                 "exclusion_owner",
             ),
             (
-                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked' OR (state IN ('queued','leased','awaiting_durability','retry_wait') AND attempt>=3))",
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked' OR (state='retry_wait' AND attempt>=3))",
                 "due_jobs",
             ),
         ] {
@@ -652,6 +652,59 @@ mod tests {
             8
         );
         assert!(db.get(3).is_ok());
+    }
+
+    #[test]
+    fn third_attempt_is_not_a_failure_until_it_actually_fails() {
+        use crate::sync::{ipc::initial_digest, jobs::RetryReason};
+        use pensieve_core::reconciliation_health::ReconciliationHealth;
+
+        for succeeds in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("jobs.sqlite");
+            let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+            db.enqueue("trial", "wss://relay.example", 0, 899).unwrap();
+            let start = db.progress_observation(0).unwrap().pending_since.unwrap();
+            let health = ReconciliationHealth::default();
+            health.enable();
+            for attempt in 1..=3 {
+                let now = start + (attempt - 1) * 61;
+                let lease = db.lease_next(now, 60).unwrap().unwrap();
+                assert_eq!(lease.job.attempt, attempt);
+                health.observe(db.progress_observation(now).unwrap());
+                assert_eq!(health.status(now), (true, "progress_within_deadline"));
+                if attempt == 3 && succeeds {
+                    db.record_protocol_done(&lease, 1, 0, initial_digest(), now + 1)
+                        .unwrap();
+                } else {
+                    db.retry(&lease, now + 1, 60, RetryReason::WorkerLost)
+                        .unwrap();
+                }
+            }
+            drop(db);
+            let db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+            health.observe(db.progress_observation(start + 300).unwrap());
+            assert_eq!(
+                health.status(start + 300),
+                if succeeds {
+                    (true, "progress_within_deadline")
+                } else {
+                    (false, "unresolved_failures")
+                }
+            );
+            // Protocol success still cannot manufacture archive completion.
+            assert_eq!(
+                db.progress_observation(start + 300).unwrap().last_success,
+                None
+            );
+            if succeeds {
+                health.observe(db.progress_observation(start + 3600).unwrap());
+                assert_eq!(
+                    health.status(start + 3600),
+                    (false, "durable_progress_stalled")
+                );
+            }
+        }
     }
 
     #[test]
