@@ -471,7 +471,9 @@ $PL bench --samples 50 --out /home/pensieve/preview-lookups/bench-warm.json
 $PL bench --samples 50 --drop-caches --include-legacy --legacy-samples 3 --out /home/pensieve/preview-lookups/bench-cold.json
 ```
 
-- **`validate`** must report `unexplained differences: 0`. Legacy
+- **`validate`** must exit 0: `unexplained differences: 0` and no
+  `INCONCLUSIVE` targets. A target where every key was skipped by the cutoff
+  proves nothing, so retry later. Legacy
   `tie_break`, `id_content_mix`, `duplicate_inflation` and
   `amount_row_missing` are known legacy defects (see the design doc).
 - **`bench`** results are what decide the sub-second target. Record p95 and

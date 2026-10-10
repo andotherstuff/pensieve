@@ -174,7 +174,8 @@ Connection settings also come from `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`,
   including inserts carrying old `created_at` values for shards that are
   already done. Overlap is harmless, as described above. `--gap-pass` adds an
   optional belt-and-braces re-read of rows with `indexed_at` within
-  `--gap-margin-mins` of `T0`; it reads the whole target-kind slice.
+  `--gap-margin-mins` of `T0`; it reads the whole target-kind slice and is
+  subject to the same runtime, disk and merge-backlog guards as a shard.
 - **Projection enforcement.** Shards run with `optimize_use_projections=1`
   and `force_optimize_projection=1`. After each shard the tool also checks
   `system.query_log`:
@@ -183,7 +184,8 @@ Connection settings also come from `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`,
     (plus 1M rows of slack).
 
   This catches parts that lack the projection and would silently be scanned
-  in full. `--allow-full-scan` with `--shard-by id-prefix` is only for rebuilds
+  in full. A shard with no `query_log` entry cannot be verified, so it is not
+  checkpointed. The run stops, and re-running redoes that shard. `--allow-full-scan` with `--shard-by id-prefix` is only for rebuilds
   after the projection is gone; each shard then reads a primary-key range of
   the whole table.
 - **Disk guard.** Before each shard, the unreserved space on the table's disk
@@ -227,7 +229,12 @@ comparing `status` (bytes on disk per row) with the plan, and keep
   - Samples keys from **`events_local`**, so keys missing from the compact
     tables are detected. It uses a hashed random subset plus the hottest keys.
   - Compares each key at a consistent cutoff: any key with a source row
-    indexed after `now - --cutoff-margin-secs` is skipped.
+    indexed after `now - --cutoff-margin-secs` is skipped. Freshness is
+    checked again after the compact and legacy reads, so a concurrent insert
+    is skipped rather than reported as a difference.
+  - A target whose sampled keys were all skipped is reported as
+    **inconclusive**. The command then exits non-zero, because nothing was
+    compared.
   - The compact read must equal the oracle exactly.
   - Legacy differences are classified as `legacy_tie_break`,
     `legacy_id_content_mix`, `legacy_duplicate_inflation`,

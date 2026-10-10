@@ -880,7 +880,7 @@ async fn backfill_and_live_ingest_overlap_without_gaps_or_double_counts() {
             .await
             .unwrap();
         assert_eq!(full.shards_run, p.shards.len());
-        backfill::run_gap_pass(
+        let gap = backfill::run_gap_pass(
             &db.client,
             p,
             dir,
@@ -889,6 +889,7 @@ async fn backfill_and_live_ingest_overlap_without_gaps_or_double_counts() {
         )
         .await
         .unwrap();
+        assert_eq!(gap, StopReason::Complete);
     }
     assert_matches_oracle(&db, &all, "after repeated backfill (before merges)").await;
 
@@ -1090,6 +1091,7 @@ async fn projection_backfill_validate_and_bench_end_to_end() {
     .await
     .unwrap();
     assert_eq!(report.unexplained(), 0, "{}", report.render());
+    assert!(report.passed(), "{}", report.render());
     for t in &report.targets {
         assert!(t.sampled > 0, "{}: no keys sampled", t.target);
     }
@@ -1142,5 +1144,160 @@ async fn projection_backfill_validate_and_bench_end_to_end() {
     ] {
         assert!(lookups.contains_key(name), "bench missing {name}");
     }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn gap_pass_honours_runtime_disk_and_backlog_guards() {
+    let db = TestDb::new().await;
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    db.insert_sync(&workload(5, 1_600_000_000)).await;
+    db.apply_migration().await;
+
+    let options = PlanOptions {
+        shard_by: ShardBy::CreatedAt,
+        max_rows_per_shard: 1_000,
+        id_prefix_len: 2,
+        require_projection: false,
+    };
+    let p = plan::build_plan(&db.client, &db.name, Target::Profiles, &options)
+        .await
+        .unwrap();
+    let dir = CheckpointDir::new(checkpoint_dir.path(), Target::Profiles);
+    dir.save_plan(&p, false).unwrap();
+    let margin = Duration::from_secs(3600);
+
+    let no_runtime = BackfillOptions {
+        max_runtime: Some(Duration::ZERO),
+        ..backfill_options()
+    };
+    let stopped = backfill::run_gap_pass(&db.client, &p, &dir, margin, &no_runtime)
+        .await
+        .unwrap();
+    assert_eq!(stopped, StopReason::MaxRuntime);
+
+    let no_disk = BackfillOptions {
+        min_free_bytes: u64::MAX,
+        ..backfill_options()
+    };
+    let stopped = backfill::run_gap_pass(&db.client, &p, &dir, margin, &no_disk)
+        .await
+        .unwrap();
+    assert!(matches!(stopped, StopReason::DiskGuard(_)), "{stopped:?}");
+
+    assert_eq!(db.count("SELECT count() FROM profile_latest").await, 0);
+
+    // A live insert gives the target one part, which exceeds a zero-part limit.
+    db.insert_sync(&[profile(0x9999, 0x9999, 1, "live")]).await;
+    let backlog = BackfillOptions {
+        max_target_parts: 0,
+        parts_wait_timeout: Duration::ZERO,
+        ..backfill_options()
+    };
+    let stopped = backfill::run_gap_pass(&db.client, &p, &dir, margin, &backlog)
+        .await
+        .unwrap();
+    assert!(
+        matches!(stopped, StopReason::PartsBacklog(_)),
+        "{stopped:?}"
+    );
+
+    assert!(
+        !dir.gap_pass_path().exists(),
+        "refused passes must not checkpoint"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn validation_rechecks_keys_changed_during_reads() {
+    let db = TestDb::new().await;
+    db.apply_migration().await;
+    let author = 0x5150;
+    let target = hex(0x6001);
+    let quiet_target = hex(0x6002);
+    db.insert_sync(&[
+        profile(0x10, author, 100, "v1"),
+        profile(0x11, author + 1, 100, "quiet"),
+        receipt(0x20, &[&["bolt11", "lnbc1u1x"], &["e", &target]]),
+        receipt(0x21, &[&["bolt11", "lnbc1u1x"], &["e", &quiet_target]]),
+        event(0x30, author, 100, 30023, "", &[&["d", "slug"]]),
+        event(0x31, author, 100, 30023, "", &[&["d", "quiet"]]),
+    ])
+    .await;
+
+    // The validator's cutoff and source read happen here...
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let cutoff: u32 = db
+        .client
+        .query("SELECT toUInt32(now())")
+        .fetch_one()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // ...then new winners land before the compact reads.
+    db.insert_sync(&[
+        profile(0x12, author, 200, "v2"),
+        receipt(0x22, &[&["bolt11", "lnbc2u1x"], &["e", &target]]),
+        event(0x32, author, 200, 30023, "", &[&["d", "slug"]]),
+    ])
+    .await;
+
+    let pubkeys = [hex(author), hex(author + 1)];
+    let changed = validate::profiles_changed_after(&db.client, &db.name, &pubkeys, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![hex(author)]);
+
+    let targets = [target.clone(), quiet_target.clone()];
+    let changed = validate::zap_targets_changed_after(&db.client, &db.name, &targets, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![target]);
+
+    let coordinates = [
+        (hex(author), 30023u16, "slug".to_string()),
+        (hex(author), 30023u16, "quiet".to_string()),
+    ];
+    let changed = validate::coordinates_changed_after(&db.client, &db.name, &coordinates, cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.into_iter().collect::<Vec<_>>(),
+        vec![(hex(author), 30023u16, "slug".to_string())]
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn validation_with_every_key_skipped_is_inconclusive() {
+    let db = TestDb::new().await;
+    db.apply_migration().await;
+    // Everything was just indexed, so a 5-minute cutoff excludes every key.
+    db.insert_async(&workload(6, 1_600_000_000)).await;
+
+    let report = validate::run(
+        &db.client,
+        &db.name,
+        &validate::ValidateOptions {
+            sample: 20,
+            hot: 5,
+            sample_permyriad: 10_000,
+            require_projection: false,
+            ..validate::ValidateOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.unexplained(), 0);
+    for t in &report.targets {
+        assert!(t.sampled > 0 && t.compared() == 0, "{}", report.render());
+    }
+    assert_eq!(report.inconclusive_targets().len(), 3);
+    assert!(!report.passed(), "{}", report.render());
     db.drop().await;
 }

@@ -298,13 +298,35 @@ pub async fn run_gap_pass(
     checkpoints: &CheckpointDir,
     margin: Duration,
     options: &BackfillOptions,
-) -> Result<ShardCheckpoint> {
+) -> Result<StopReason> {
+    if options.max_runtime.is_some_and(|m| m.is_zero()) {
+        return Ok(StopReason::MaxRuntime);
+    }
     let margin = margin.as_secs() as u32;
     let range = ShardRange::IndexedAt {
         start: plan.view_created_at.saturating_sub(margin),
         end: plan.view_created_at.saturating_add(margin),
     };
     let insert_client = projection_client(client, plan.require_projection);
+
+    // The pass is guarded like any shard: size it, then check disk and merges.
+    let estimated_rows = insert_client
+        .query(&format!(
+            "SELECT count() FROM {}.events_local WHERE {} AND ({})",
+            plan.database,
+            plan.target.kind_predicate(),
+            range.predicate()
+        ))
+        .fetch_one::<u64>()
+        .await
+        .with_context(|| format!("sizing {} gap-closure pass", plan.target))?;
+    if let Some(refusal) = disk_guard(client, plan, estimated_rows, options).await? {
+        return Ok(StopReason::DiskGuard(refusal));
+    }
+    if let Some(backlog) = wait_for_merges(client, plan, options).await? {
+        return Ok(StopReason::PartsBacklog(backlog));
+    }
+
     // Read amplification is expected here (indexed_at is not a key column).
     let options = BackfillOptions {
         max_read_amplification: f64::INFINITY,
@@ -316,17 +338,18 @@ pub async fn run_gap_pass(
         plan,
         usize::MAX,
         &range,
-        0,
+        estimated_rows,
         &options,
     )
     .await?;
     checkpoints.save_gap_pass(&checkpoint)?;
     tracing::info!(
         target = %plan.target,
+        estimated_rows,
         written_rows = checkpoint.query_log.as_ref().map_or(0, |q| q.written_rows),
         "gap-closure pass complete"
     );
-    Ok(checkpoint)
+    Ok(StopReason::Complete)
 }
 
 fn report(
@@ -371,14 +394,8 @@ async fn run_shard(
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let query_log = ops::query_log_entry(log_client, &query_id, QUERY_LOG_TIMEOUT).await?;
-    if let Some(entry) = &query_log {
-        check_projection_use(plan, index, estimated_rows, entry, options)?;
-    } else {
-        tracing::warn!(
-            query_id,
-            "no system.query_log entry; projection use not verified"
-        );
-    }
+    check_projection_use(plan, index, estimated_rows, query_log.as_ref(), options)
+        .with_context(|| format!("query id {query_id}"))?;
 
     Ok(ShardCheckpoint {
         index,
@@ -390,16 +407,30 @@ async fn run_shard(
     })
 }
 
+/// Verify a shard was served by `events_by_kind`. Fails closed: when the
+/// projection is required and the shard has no `system.query_log` entry, the
+/// shard is not checkpointed (its rows are harmless and a re-run redoes it).
 fn check_projection_use(
     plan: &Plan,
     index: usize,
     estimated_rows: u64,
-    entry: &QueryLogEntry,
+    entry: Option<&QueryLogEntry>,
     options: &BackfillOptions,
 ) -> Result<()> {
     if !plan.require_projection {
+        if entry.is_none() {
+            tracing::warn!(target = %plan.target, shard = index, "no system.query_log entry for shard");
+        }
         return Ok(());
     }
+    let Some(entry) = entry else {
+        bail!(
+            "{} shard {index} has no system.query_log entry, so projection use cannot be \
+             verified; not checkpointing it. Rows it wrote are harmless. Check that \
+             query_log is enabled and flushing, then re-run to retry the shard.",
+            plan.target
+        );
+    };
     let projection = format!("{}.events_local.events_by_kind", plan.database);
     if !entry.projections.iter().any(|p| p == &projection) {
         bail!(
@@ -434,13 +465,14 @@ async fn disk_guard(
     } else {
         (remaining_rows as f64 / plan.source.source_rows as f64).min(1.0)
     };
-    let needed = (e.peak_bytes as f64 * remaining_fraction) as u64 + options.min_free_bytes;
+    let needed =
+        ((e.peak_bytes as f64 * remaining_fraction) as u64).saturating_add(options.min_free_bytes);
     if disk.unreserved_space < needed {
         return Ok(Some(format!(
             "disk {} has {} unreserved; remaining backfill needs ~{} plus {} reserve",
             disk.name,
             ops::human_bytes(disk.unreserved_space),
-            ops::human_bytes(needed - options.min_free_bytes),
+            ops::human_bytes(needed.saturating_sub(options.min_free_bytes)),
             ops::human_bytes(options.min_free_bytes)
         )));
     }
@@ -473,5 +505,65 @@ async fn wait_for_merges(
             "waiting for merges"
         );
         tokio::time::sleep(PARTS_POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lookups::plan::{DiskEstimate, PLAN_FORMAT_VERSION, ShardBy, SourceStats};
+    use crate::lookups::target::Target;
+
+    fn plan(require_projection: bool) -> Plan {
+        Plan {
+            format_version: PLAN_FORMAT_VERSION,
+            database: "db".into(),
+            target: Target::Profiles,
+            shard_by: ShardBy::CreatedAt,
+            require_projection,
+            view_created_at: 0,
+            planned_at: 0,
+            source: SourceStats::default(),
+            estimate: DiskEstimate::default(),
+            shards: Vec::new(),
+        }
+    }
+
+    fn entry(projections: &[&str], read_rows: u64) -> QueryLogEntry {
+        QueryLogEntry {
+            kind: "QueryFinish".into(),
+            read_rows,
+            projections: projections.iter().map(|p| p.to_string()).collect(),
+            ..QueryLogEntry::default()
+        }
+    }
+
+    #[test]
+    fn missing_query_log_fails_closed_when_projection_required() {
+        let options = BackfillOptions::default();
+        assert!(check_projection_use(&plan(true), 3, 100, None, &options).is_err());
+        assert!(check_projection_use(&plan(false), 3, 100, None, &options).is_ok());
+    }
+
+    #[test]
+    fn projection_and_read_amplification_checks() {
+        let options = BackfillOptions::default();
+        let used = "db.events_local.events_by_kind";
+        assert!(
+            check_projection_use(&plan(true), 0, 100, Some(&entry(&[used], 50)), &options).is_ok()
+        );
+        assert!(
+            check_projection_use(&plan(true), 0, 100, Some(&entry(&[], 50)), &options).is_err()
+        );
+        assert!(
+            check_projection_use(
+                &plan(true),
+                0,
+                100,
+                Some(&entry(&[used], 2_000_000)),
+                &options
+            )
+            .is_err()
+        );
     }
 }

@@ -6,15 +6,19 @@
 //!
 //! 1. reads every source version and computes the expected answer with the
 //!    independent Rust [`oracle`](super::oracle);
-//! 2. skips the key if any source row was indexed after the cutoff, so both
-//!    sides are compared at a consistent point in time;
+//! 2. skips the key if any source row was indexed after the cutoff — checked
+//!    both before and again after the compact and legacy reads, so a
+//!    concurrent insert cannot be misread as a difference;
 //! 3. requires the compact read (the exact function the preview uses) to
 //!    equal the oracle — any difference is **unexplained**;
 //! 4. compares the legacy read and classifies differences as known legacy
 //!    defects (timestamp tie-breaks, id/content from different rows,
 //!    duplicate inflation, missing amount rows) or unexplained.
+//!
+//! A target whose sampled keys were all skipped is **inconclusive**, not a
+//! pass.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -109,7 +113,8 @@ pub struct TargetReport {
     pub target: Target,
     /// Keys sampled.
     pub sampled: usize,
-    /// Keys skipped because source rows were indexed after the cutoff.
+    /// Keys skipped because source rows were indexed after the cutoff
+    /// (before or during validation).
     pub skipped_after_cutoff: usize,
     /// Compact-vs-source outcomes.
     pub compact: BTreeMap<Outcome, u64>,
@@ -155,6 +160,17 @@ impl TargetReport {
         }
     }
 
+    /// Keys whose compact read was compared with the source.
+    pub fn compared(&self) -> u64 {
+        self.compact.values().sum()
+    }
+
+    /// Keys were sampled but none could be compared, so the target provides
+    /// no correctness evidence.
+    pub fn inconclusive(&self) -> bool {
+        self.sampled > 0 && self.compared() == 0
+    }
+
     /// Unexplained differences on either side.
     pub fn unexplained(&self) -> u64 {
         self.compact
@@ -182,13 +198,27 @@ impl ValidationReport {
         self.targets.iter().map(TargetReport::unexplained).sum()
     }
 
+    /// Targets with sampled keys but no comparisons.
+    pub fn inconclusive_targets(&self) -> Vec<Target> {
+        self.targets
+            .iter()
+            .filter(|t| t.inconclusive())
+            .map(|t| t.target)
+            .collect()
+    }
+
+    /// No unexplained differences and every target compared at least one key.
+    pub fn passed(&self) -> bool {
+        self.unexplained() == 0 && self.inconclusive_targets().is_empty()
+    }
+
     /// Text summary.
     pub fn render(&self) -> String {
         let mut out = format!("cutoff {} (seed {})\n", self.cutoff, self.seed);
         for t in &self.targets {
             out.push_str(&format!(
-                "{}: sampled {}, skipped after cutoff {}\n  compact vs source: {:?}\n  legacy vs source:  {:?}\n",
-                t.target, t.sampled, t.skipped_after_cutoff, t.compact, t.legacy
+                "{}: sampled {}, compared {}, skipped after cutoff {}\n  compact vs source: {:?}\n  legacy vs source:  {:?}\n",
+                t.target, t.sampled, t.compared(), t.skipped_after_cutoff, t.compact, t.legacy
             ));
             for d in &t.examples {
                 out.push_str(&format!(
@@ -201,6 +231,13 @@ impl ValidationReport {
             "unexplained differences: {}\n",
             self.unexplained()
         ));
+        let inconclusive = self.inconclusive_targets();
+        if !inconclusive.is_empty() {
+            out.push_str(&format!(
+                "INCONCLUSIVE (no keys compared): {inconclusive:?}; lower --cutoff-margin-secs \
+                 only if ingest is quiet, or retry later\n"
+            ));
+        }
         out
     }
 }
@@ -335,10 +372,11 @@ async fn validate_profiles(ctx: &Ctx<'_>) -> Result<TargetReport> {
 
         let compact_rows = compact::fetch_profiles(ctx.compact, batch).await?;
         let legacy_rows = query::fetch_profiles(ctx.legacy, batch).await?;
+        let changed = profiles_changed_after(ctx.source, db, batch, ctx.cutoff).await?;
 
         for key in batch {
             let versions = by_key.get(key.as_str()).cloned().unwrap_or_default();
-            if versions.iter().any(|r| r.indexed_at > ctx.cutoff) {
+            if changed.contains(key) || versions.iter().any(|r| r.indexed_at > ctx.cutoff) {
                 report.skipped_after_cutoff += 1;
                 continue;
             }
@@ -457,9 +495,28 @@ async fn validate_zaps(ctx: &Ctx<'_>) -> Result<TargetReport> {
             }
         }
 
+        // Read compact (and some legacy) results first, then re-check source
+        // freshness so keys changed during the reads are skipped.
+        let mut reads = Vec::new();
         for key in batch {
             let receipts = by_target.get(key).cloned().unwrap_or_default();
             if receipts.iter().any(|r| r.indexed_at > ctx.cutoff) {
+                report.skipped_after_cutoff += 1;
+                continue;
+            }
+            let compact_totals = compact::fetch_zap_totals(ctx.compact, key).await?;
+            let legacy = if legacy_checked < o.legacy_sample {
+                legacy_checked += 1;
+                Some(query::fetch_zap_totals(ctx.legacy, key).await?)
+            } else {
+                None
+            };
+            reads.push((key, receipts, compact_totals, legacy));
+        }
+        let changed = zap_targets_changed_after(ctx.source, db, batch, ctx.cutoff).await?;
+
+        for (key, receipts, compact_totals, legacy) in reads {
+            if changed.contains(key) {
                 report.skipped_after_cutoff += 1;
                 continue;
             }
@@ -468,7 +525,6 @@ async fn validate_zaps(ctx: &Ctx<'_>) -> Result<TargetReport> {
                 .remove(key.as_str())
                 .unwrap_or_default();
 
-            let compact_totals = compact::fetch_zap_totals(ctx.compact, key).await?;
             let outcome = if compact_totals == expected {
                 Outcome::Match
             } else {
@@ -482,11 +538,9 @@ async fn validate_zaps(ctx: &Ctx<'_>) -> Result<TargetReport> {
                 o.max_examples,
             );
 
-            if legacy_checked >= o.legacy_sample {
+            let Some(legacy) = legacy else {
                 continue;
-            }
-            legacy_checked += 1;
-            let legacy = query::fetch_zap_totals(ctx.legacy, key).await?;
+            };
             let outcome = if legacy == expected {
                 Outcome::Match
             } else if legacy.zap_count > expected.zap_count && zap_duplicates(ctx, key).await? > 0 {
@@ -590,8 +644,11 @@ async fn validate_addressable(ctx: &Ctx<'_>) -> Result<TargetReport> {
                 .push(row);
         }
 
-        for (pubkey, kind, d) in batch {
-            let label = format!("{kind}:{pubkey}:{d}");
+        // Read compact (and some legacy) results first, then re-check source
+        // freshness so coordinates changed during the reads are skipped.
+        let mut reads = Vec::new();
+        for coordinate in batch {
+            let (pubkey, kind, d) = coordinate;
             let versions = by_key
                 .get(&(pubkey.as_str(), *kind, d.as_str()))
                 .cloned()
@@ -600,12 +657,33 @@ async fn validate_addressable(ctx: &Ctx<'_>) -> Result<TargetReport> {
                 report.skipped_after_cutoff += 1;
                 continue;
             }
-            let events: Vec<SourceEvent> = versions.iter().map(|r| r.event()).collect();
-            let expected = oracle::replaceable_winner(&events).map(|e| e.id.clone());
-
             let compact_id = compact::fetch_replaceable(ctx.compact, *kind, pubkey, d)
                 .await?
                 .map(|e| e.id);
+            let legacy_id = if legacy_checked < o.legacy_sample {
+                legacy_checked += 1;
+                Some(
+                    query::fetch_replaceable(ctx.legacy, *kind, pubkey, d)
+                        .await?
+                        .map(|e| e.id),
+                )
+            } else {
+                None
+            };
+            reads.push((coordinate, versions, compact_id, legacy_id));
+        }
+        let changed = coordinates_changed_after(ctx.source, db, batch, ctx.cutoff).await?;
+
+        for (coordinate, versions, compact_id, legacy_id) in reads {
+            if changed.contains(coordinate) {
+                report.skipped_after_cutoff += 1;
+                continue;
+            }
+            let (pubkey, kind, d) = coordinate;
+            let label = format!("{kind}:{pubkey}:{d}");
+            let events: Vec<SourceEvent> = versions.iter().map(|r| r.event()).collect();
+            let expected = oracle::replaceable_winner(&events).map(|e| e.id.clone());
+
             let outcome = if compact_id == expected {
                 Outcome::Match
             } else {
@@ -619,13 +697,9 @@ async fn validate_addressable(ctx: &Ctx<'_>) -> Result<TargetReport> {
                 o.max_examples,
             );
 
-            if legacy_checked >= o.legacy_sample {
+            let Some(legacy_id) = legacy_id else {
                 continue;
-            }
-            legacy_checked += 1;
-            let legacy_id = query::fetch_replaceable(ctx.legacy, *kind, pubkey, d)
-                .await?
-                .map(|e| e.id);
+            };
             let outcome = if legacy_id == expected {
                 Outcome::Match
             } else if oracle::tie_width(&events) > 1 {
@@ -650,6 +724,100 @@ async fn validate_addressable(ctx: &Ctx<'_>) -> Result<TargetReport> {
     Ok(report)
 }
 
+/// Pubkeys with a kind 0 row indexed after `cutoff`.
+///
+/// Validation calls this after the compact and legacy reads, so an insert
+/// that landed between the source read and those reads is skipped rather
+/// than reported as a difference.
+pub async fn profiles_changed_after(
+    source: &Client,
+    database: &str,
+    pubkeys: &[String],
+    cutoff: u32,
+) -> Result<HashSet<String>> {
+    if pubkeys.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut q = source.query(&format!(
+        "SELECT DISTINCT pubkey FROM {database}.events_local \
+         WHERE kind = 0 AND indexed_at > toDateTime({cutoff}) AND pubkey IN ({})",
+        placeholders(pubkeys.len())
+    ));
+    for pk in pubkeys {
+        q = q.bind(pk);
+    }
+    let rows = q
+        .fetch_all::<String>()
+        .await
+        .context("re-checking profile freshness")?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Zap targets with a receipt indexed after `cutoff`.
+pub async fn zap_targets_changed_after(
+    source: &Client,
+    database: &str,
+    targets: &[String],
+    cutoff: u32,
+) -> Result<HashSet<String>> {
+    if targets.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let list = placeholders(targets.len());
+    let mut q = source.query(&format!(
+        "SELECT DISTINCT target FROM ( \
+             SELECT tags FROM {database}.events_local \
+             WHERE kind = 9735 AND indexed_at > toDateTime({cutoff}) \
+             AND hasAny({ZAP_TARGETS_EXPR}, [{list}]) \
+         ) ARRAY JOIN {ZAP_TARGETS_EXPR} AS target WHERE target IN ({list})"
+    ));
+    for _ in 0..2 {
+        for target in targets {
+            q = q.bind(target);
+        }
+    }
+    let rows = q
+        .fetch_all::<String>()
+        .await
+        .context("re-checking zap freshness")?;
+    Ok(rows.into_iter().collect())
+}
+
+/// naddr coordinates with a version indexed after `cutoff`.
+pub async fn coordinates_changed_after(
+    source: &Client,
+    database: &str,
+    coordinates: &[(String, u16, String)],
+    cutoff: u32,
+) -> Result<HashSet<(String, u16, String)>> {
+    if coordinates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let pubkeys: BTreeSet<&str> = coordinates.iter().map(|(p, _, _)| p.as_str()).collect();
+    let kinds: BTreeSet<u16> = coordinates.iter().map(|(_, k, _)| *k).collect();
+    let kind_list = kinds
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut q = source.query(&format!(
+        "SELECT DISTINCT pubkey, kind, {D_TAG_EXPR} AS d FROM {database}.events_local \
+         WHERE {} AND kind IN ({kind_list}) AND indexed_at > toDateTime({cutoff}) \
+         AND pubkey IN ({})",
+        Target::Addressable.kind_predicate(),
+        placeholders(pubkeys.len())
+    ));
+    for pk in &pubkeys {
+        q = q.bind(*pk);
+    }
+    let wanted: HashSet<&(String, u16, String)> = coordinates.iter().collect();
+    let rows = q
+        .fetch_all::<(String, u16, String)>()
+        .await
+        .context("re-checking naddr freshness")?;
+    Ok(rows.into_iter().filter(|c| wanted.contains(c)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +838,39 @@ mod tests {
         assert_eq!(report.unexplained(), 2);
         // The last record's cap of 1 is already reached, so it is not kept.
         assert_eq!(report.examples.len(), 2);
+    }
+
+    #[test]
+    fn all_skipped_target_is_inconclusive() {
+        let mut skipped = TargetReport::new(Target::Zaps, 4);
+        skipped.skipped_after_cutoff = 4;
+        assert_eq!(skipped.compared(), 0);
+        assert!(skipped.inconclusive());
+
+        let empty = TargetReport::new(Target::Addressable, 0);
+        assert!(!empty.inconclusive(), "an empty source is vacuously fine");
+
+        let mut compared = TargetReport::new(Target::Profiles, 2);
+        compared.skipped_after_cutoff = 1;
+        compared.record("compact", "k", Outcome::Match, String::new, 5);
+        assert!(!compared.inconclusive());
+
+        let report = ValidationReport {
+            cutoff: 0,
+            seed: 0,
+            targets: vec![compared.clone(), skipped],
+        };
+        assert_eq!(report.unexplained(), 0);
+        assert_eq!(report.inconclusive_targets(), vec![Target::Zaps]);
+        assert!(!report.passed());
+        assert!(report.render().contains("INCONCLUSIVE"));
+
+        let ok = ValidationReport {
+            cutoff: 0,
+            seed: 0,
+            targets: vec![compared],
+        };
+        assert!(ok.passed());
     }
 
     #[test]

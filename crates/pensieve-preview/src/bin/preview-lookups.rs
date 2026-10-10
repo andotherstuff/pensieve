@@ -308,7 +308,11 @@ async fn run(args: Args) -> Result<ExitCode> {
                     break;
                 }
                 if gap_pass {
-                    backfill::run_gap_pass(
+                    let options = BackfillOptions {
+                        max_runtime: max_runtime.map(|m| m.saturating_sub(started.elapsed())),
+                        ..options
+                    };
+                    let stopped = backfill::run_gap_pass(
                         &client,
                         &plan,
                         &checkpoints,
@@ -316,6 +320,11 @@ async fn run(args: Args) -> Result<ExitCode> {
                         &options,
                     )
                     .await?;
+                    println!("{target} gap pass: {}", serde_json::to_string(&stopped)?);
+                    if stopped != StopReason::Complete {
+                        complete = false;
+                        break;
+                    }
                 }
             }
             if complete {
@@ -357,7 +366,7 @@ async fn run(args: Args) -> Result<ExitCode> {
             let report = validate::run(&client, &database, &options).await?;
             print!("{}", report.render());
             write_report(out.as_ref(), &report)?;
-            Ok(if report.unexplained() == 0 {
+            Ok(if report.passed() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
