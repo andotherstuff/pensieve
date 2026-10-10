@@ -118,15 +118,27 @@ the v1 view.
 
 ### Ingest safety
 
-The new views run inside every `events_local` flush. Production uses
-`async_insert=1, wait_for_async_insert=0`, so the ingester never sees a flush
-error. A view that throws would fail the whole flush, and the rows would be
-lost silently.
+The new views run inside every `events_local` insert, so a view that throws
+fails the whole insert.
+
+Production (checked 2026-10-10) inserts **synchronously**:
+- `async_insert = 0` for the ingest user;
+- about 70 sealed-segment inserts per hour;
+- `system.asynchronous_insert_log` is empty.
+
+The `async_insert` profile settings in `ops/production/clickhouse/config.xml`
+are not in effect: ClickHouse reads profiles from the users configuration,
+not from a server `config.d` file. A failing view would therefore fail the
+INSERT. The ingester would see the error, retry the segment and then queue it
+for reindexing. Rows are not lost silently, but ingest into ClickHouse stalls
+until the view is fixed or dropped. If async inserts with
+`wait_for_async_insert=0` are ever enabled, a failing view would instead drop
+rows silently.
 
 Precautions:
 - Every view expression is non-throwing: `OrZero` conversions, array indexing that returns defaults, and no fallible casts.
-- An integration test pushes malformed tags through production async-insert settings and asserts that every row lands and `system.asynchronous_insert_log` shows no failures.
-- Monitoring queries are in the runbook.
+- Integration tests push malformed tags through both synchronous and async (`wait_for_async_insert=0`) inserts and assert that every row lands.
+- The runbook monitors `system.query_views_log` (per-view status) and insert exceptions in `system.query_log`. It has an abort rule that drops the views.
 
 ## Behaviour differences from the legacy reads
 
@@ -293,7 +305,7 @@ production build) prove correctness and mechanics only.
 3. **Backfill impact:** runtime and impact on live ingest and queries at the
    chosen `--max-threads`/`--max-memory-gib`.
 4. **Ingest overhead:** flush latency and errors after the views are created
-   (`system.asynchronous_insert_log`, `system.query_views_log`).
+   (`system.query_views_log`, insert exceptions in `system.query_log`).
 5. **Latency:** `bench` with projections off, query cache off and
    `--drop-caches` in a quiet window. The sub-second target is met only if
    this run shows it.

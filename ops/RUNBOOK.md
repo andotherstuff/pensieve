@@ -406,7 +406,9 @@ just ch-query "SELECT name, count() parts, sum(rows) rows, formatReadableSize(su
 just ch-query "SELECT count() FROM system.parts p WHERE database = 'nostr' AND table = 'events_local' AND active AND name NOT IN (SELECT parent_name FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND name = 'events_by_kind' AND active)"
 just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks"
 just ch-query "SELECT count() FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND is_done = 0"
-just ch-query "SELECT count() FROM system.asynchronous_insert_log WHERE event_date = today()"
+# Ingest inserts: expect ~70/hour, synchronous (async_insert empty or 0), no errors:
+just ch-query "SELECT toStartOfHour(event_time) h, count() n, sum(written_rows) rows, any(Settings['async_insert']) async_setting, countIf(exception != '') errors FROM system.query_log WHERE event_time > now() - INTERVAL 3 HOUR AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart' GROUP BY h ORDER BY h"
+just ch-query "SELECT view_name, status, count() FROM system.query_views_log WHERE event_time > now() - INTERVAL 1 HOUR GROUP BY view_name, status ORDER BY view_name"
 ```
 
 Do not continue if `events_by_kind` is missing from any part or a mutation
@@ -419,17 +421,23 @@ just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
 ```
 
 This creates empty tables and three insert-triggered views on `events_local`.
-For the next 30 minutes, watch the ingest flushes and the views:
+For the next 30 minutes (about 35 ingest inserts), watch the views and the
+inserts:
 
 ```bash
-just ch-query "SELECT status, count(), any(exception) FROM system.asynchronous_insert_log WHERE event_time > now() - INTERVAL 30 MINUTE AND database = 'nostr' AND table = 'events_local' GROUP BY status"
-just ch-query "SELECT view_name, status, count(), any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name LIKE 'nostr.%' GROUP BY view_name, status"
+just ch-query "SELECT view_name, status, count(), any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name LIKE 'nostr.%' GROUP BY view_name, status ORDER BY view_name"
+just ch-query "SELECT count() n, countIf(exception != '') errors, any(exception) FROM system.query_log WHERE event_time > now() - INTERVAL 30 MINUTE AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
 journalctl -u pensieve-ingest --since "30 min ago" | grep -i clickhouse
 ```
 
-**Abort:** if any flush status is not `Ok`, or any view reports an
-exception, run the rollback SQL immediately (step 7). A failing view drops
-ingest rows silently under `wait_for_async_insert=0`.
+Each new view should show `QueryFinish` with the same count as the existing
+views.
+
+**Abort:** if any view reports an exception, or inserts into `events_local`
+start failing, run the rollback SQL immediately (step 7). Production inserts
+are synchronous, so a failing view fails the insert. The ingester then
+retries and queues the segment for reindexing, and ClickHouse ingest stalls
+until the view is dropped.
 
 ### 3. Plan and estimate disk
 

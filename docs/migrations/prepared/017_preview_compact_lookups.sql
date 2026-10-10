@@ -22,8 +22,8 @@
 --   - Follow docs/preview_compact_lookups.md and the ops/RUNBOOK.md section
 --     "Preview compact lookups" for preflight, backfill, validation and rollout.
 --   - Every expression below must be non-throwing for arbitrary tag arrays. A
---     throwing materialized view fails the whole async-insert flush, and with
---     wait_for_async_insert=0 the ingester never sees that error.
+--     throwing materialized view fails the whole events_local insert (with
+--     async inserts and wait_for_async_insert=0 it would drop rows silently).
 --
 -- Correctness model (see docs/preview_compact_lookups.md):
 --   Reads never depend on background merges. Every read collapses duplicate

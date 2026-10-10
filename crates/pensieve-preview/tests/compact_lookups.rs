@@ -736,6 +736,9 @@ async fn async_insert_flush_survives_malformed_events() {
         event(9, 3, 5, 10002, "", &[&["d", "\u{1F600}"]]),
         event(10, 3, 5, 39999, "", &[&["d", ""], &["d", "second"]]),
     ];
+    // Production inserts synchronously; also cover fire-and-forget async
+    // inserts, where a throwing view would drop rows silently.
+    db.insert_sync(&malformed).await;
     db.insert_async(&malformed).await;
     db.exec("SYSTEM FLUSH LOGS").await;
 
