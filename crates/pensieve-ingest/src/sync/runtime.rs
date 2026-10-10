@@ -387,6 +387,28 @@ async fn stop_signal(stopping: oneshot::Receiver<()>, limit: Option<Duration>) {
     }
 }
 
+fn retry_delay(job: i64, attempt: i64) -> u32 {
+    let power = u32::try_from(attempt.saturating_sub(1)).unwrap_or(6).min(6);
+    let base = 60u32.saturating_mul(1u32 << power).min(3600);
+    let jitter = (job as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (attempt as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    base.saturating_add((jitter % 31) as u32).min(3600)
+}
+
+fn data_has_headroom(ledger: &Path) -> Result<bool, RuntimeError> {
+    let directory = ledger
+        .parent()
+        .ok_or(RuntimeError::Config("ledger has no parent"))?;
+    let stats = nix::sys::statvfs::statvfs(directory)
+        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+    let available = available_bytes(stats.blocks_available(), stats.fragment_size());
+    Ok(available >= DATA_RESERVE_BYTES)
+}
+
+fn available_bytes<B: Into<u64>>(blocks: B, fragment_size: u64) -> u64 {
+    blocks.into().saturating_mul(fragment_size)
+}
+
 #[cfg(test)]
 mod canary_tests {
     use super::*;
@@ -455,28 +477,6 @@ mod canary_tests {
         sender.send(()).unwrap();
         task.await.unwrap();
     }
-}
-
-fn retry_delay(job: i64, attempt: i64) -> u32 {
-    let power = u32::try_from(attempt.saturating_sub(1)).unwrap_or(6).min(6);
-    let base = 60u32.saturating_mul(1u32 << power).min(3600);
-    let jitter = (job as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ (attempt as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    base.saturating_add((jitter % 31) as u32).min(3600)
-}
-
-fn data_has_headroom(ledger: &Path) -> Result<bool, RuntimeError> {
-    let directory = ledger
-        .parent()
-        .ok_or(RuntimeError::Config("ledger has no parent"))?;
-    let stats = nix::sys::statvfs::statvfs(directory)
-        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
-    let available = available_bytes(stats.blocks_available(), stats.fragment_size());
-    Ok(available >= DATA_RESERVE_BYTES)
-}
-
-fn available_bytes<B: Into<u64>>(blocks: B, fragment_size: u64) -> u64 {
-    blocks.into().saturating_mul(fragment_size)
 }
 
 #[cfg(all(test, not(target_os = "linux")))]
