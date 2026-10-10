@@ -110,6 +110,11 @@ impl JobLedger {
         now: i64,
         max_jobs: u32,
     ) -> Result<PlanningProgress, LedgerError> {
+        if self.is_bounded_canary()? {
+            return Err(LedgerError::Invalid(
+                "bounded canary ledger cannot run rolling planning",
+            ));
+        }
         if now < 0 || max_jobs == 0 || max_jobs > MAX_TURN {
             return Err(LedgerError::Invalid("invalid planner bounds"));
         }

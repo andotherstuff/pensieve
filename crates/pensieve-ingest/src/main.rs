@@ -367,6 +367,11 @@ struct Args {
     #[arg(long, conflicts_with = "negentropy")]
     isolated_negentropy: bool,
 
+    /// Run only three fixed 15-minute windows ending before this Unix timestamp.
+    /// One relay, fresh ledger, six attempts, 20-minute intake plus 5-minute drain.
+    #[arg(long, requires = "isolated_negentropy")]
+    isolated_negentropy_canary_until: Option<i64>,
+
     /// Explicit, strict relay allowlist for isolated reconciliation.
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_relays_file: Option<PathBuf>,
@@ -1751,6 +1756,7 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         "isolated ledger path must be absolute"
     );
     Ok(Some(RuntimeConfig {
+        canary_until: args.isolated_negentropy_canary_until,
         admission_policy: giftwrap_filter::AdmissionPolicy::new(&args.blocked_giftwrap_recipients)
             .map_err(anyhow::Error::msg)?,
         socket: args.isolated_negentropy_socket.clone(),
