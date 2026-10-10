@@ -9,6 +9,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+REASONS = frozenset({
+    "disabled", "starting", "idle", "progress_within_deadline",
+    "state_unavailable", "runtime_failed", "owner_observation_stale",
+    "capacity_exhausted", "unresolved_failures", "durable_progress_stalled",
+})
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never forward monitor credentials to a redirect destination."""
@@ -22,15 +28,22 @@ def opener():
 
 
 def probe(endpoint):
-    """Only an exact HTTP 200 is healthy; never forward remote response bodies."""
+    """Only HTTP 200 is healthy; forward only bounded, fixed reason tokens."""
     try:
-        with opener().open(endpoint, timeout=5) as response:
+        try:
+            response = opener().open(endpoint, timeout=5)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
             code = response.status
-    except urllib.error.HTTPError as error:
-        code = error.code
+            body = response.read(65)
+        reason = body.decode("ascii", errors="replace") if len(body) <= 64 else ""
+        message = f"negentropy progress HTTP {code}"
+        if reason in REASONS:
+            message += f" ({reason})"
+        return code == 200, message
     except Exception:
         return False, "negentropy progress unavailable"
-    return code == 200, f"negentropy progress HTTP {code}"
 
 
 def destination(secret):

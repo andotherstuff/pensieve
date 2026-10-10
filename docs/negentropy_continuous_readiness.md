@@ -59,12 +59,15 @@ over newly accepted receipts. The activation below uses a fresh production ledge
 and does not upgrade, reuse, or delete canary ledgers.
 
 Legacy completed rows have unknown completion times/policy identity and remain
-ineligible for automatic cleanup. New successful detail is kept at least 24 hours.
+ineligible for automatic cleanup. Legacy pending creation times also stay unknown;
+the persisted migration time starts their one-time progress grace period, never a
+fabricated completion. Restart cannot reset that deadline. New successful detail
+is kept at least 24 hours.
 Each maintenance turn considers at most one root and 2,048 tree nodes, 4,096
 detail rows and 8 MiB of estimated detail. Whole trees pinned by proof, oversized
-trees and active planners' current sweeps are skipped. An unresolved sibling root
-does not pin completed trees; its gap and split lineage remain detailed. Disabled
-planners do not pin history, and re-enabling resumes their persisted next window.
+trees are skipped. An unresolved sibling root does not pin completed trees; its
+gap and split lineage remain detailed. Neither enabled nor disabled planners pin
+completed history: they resume at their persisted next window.
 Compaction uses exact 15-minute coverage bits per relay/day/policy, together with
 frame/attempt/failure accounting. Repeated sweeps do not imply novel events.
 Summaries expire 90 days after their last compaction and are capped at 16,384 rows;
@@ -127,13 +130,35 @@ after the release gates. Store the new push URL, mode 0600 root-owned, in
 Create a **separate** Kuma push monitor with a 180-second missing-heartbeat deadline
 and Svent Bot notifications. The timer samples every 30 seconds. Test 503→200
 delivery with the explicit `--fixture` endpoint on localhost:19091; do not change
-live archive admission to synthesize an alert. Never put the push URL in argv,
+live archive admission to synthesize an alert. The probe reads at most 65 response
+bytes and forwards a reason only if the entire body is an allowlisted fixed token;
+arbitrary bodies are never sent to Kuma. Never put the push URL in argv,
 logs, Git, or evidence. When intentionally disabling reconciliation, pause its
 monitor; the explicit disabled response is not HTTP success. Keep Archive Admission
 monitor 45 and API monitor 10 unchanged.
 On this deployment, monitor 45 is an outbound **push** monitor (verified from Kuma),
 not a direct HTTP probe; only monitor 10 is HTTP. The push path intentionally keeps
 the private health endpoint unexposed rather than adding network access for Kuma.
+
+### Faults during the bounded activation
+
+A `blocked` dense one-second window is an unresolved gap, not a successful or
+acknowledged window. There is deliberately no automatic acknowledgement or blanket
+recovery procedure: operator recovery is incident-specific, and the fault must
+stay red until recovery is proven. **Any blocked job, persistent failure, capacity
+fault or stale/stalled runtime ends the bounded trial.** Do not keep running an
+indefinite worker behind a permanently red monitor.
+
+On such a fault, stop only `pensieve-negentropy-worker.service`, retain its ledger,
+receipts, inventory and journals, and leave live ingestion alone unless archive
+admission itself has failed. Keep the alert active. Capture the read-only ledger
+status and the fixed `/health/negentropy` reason, then report the exact fault for
+an operator recovery decision. Do not edit a job to `complete`, delete the gap,
+reset its ledger, or pause the monitor to make the trial appear healthy. Resolving
+a dense-second gap may require a separately reviewed inventory/partitioning change;
+no continuous-operation approval follows from this bounded activation while any
+such fault remains. The fixed reason in Kuma distinguishes the class of fault;
+it is not a claim that one aggregate alert covers multiple concurrent incidents.
 
 - Verify the new progress alert separately: archive-admission HTTP 200 does
   **not** prove reconciliation is advancing. Test both failure and recovery delivery.

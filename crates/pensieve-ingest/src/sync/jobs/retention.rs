@@ -80,10 +80,21 @@ impl JobLedger {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
         let mut pending: Option<i64> = self.db.query_row(
-            "SELECT min(recorded_at) FROM jobs WHERE state!='complete'",
+            "SELECT min(recorded_at) FROM jobs WHERE state!='complete' AND recorded_at>0",
             [],
             |r| r.get(0),
         )?;
+        // Schema 8 never recorded creation time. Zero is unknown, not the
+        // epoch: use the persisted upgrade observation as a one-time grace
+        // baseline. Reopening the ledger cannot refresh this deadline.
+        let unknown_pending: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state!='complete' AND recorded_at=0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if unknown_pending {
+            pending = Some(pending.map_or(activated, |known| known.min(activated)));
+        }
         let planning_due: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM planner_relays WHERE enabled=1 AND (next<upper OR upper!=?1))",
             [now / 900 * 900], |r| r.get(0),
@@ -186,12 +197,13 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
             ))
         },
     )?;
-    let Some(sequence) = sweep
+    if sweep
         .strip_prefix("rolling-v1:")
         .and_then(|s| s.parse::<i64>().ok())
-    else {
+        .is_none()
+    {
         return Ok(0);
-    };
+    }
     let Some(policy) = policy.filter(|p| p.len() == 32) else {
         return Ok(0);
     };
@@ -201,17 +213,9 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
     {
         return Ok(0);
     }
-    // Only active planners pin their current sweep. Disabled cursors resume at
-    // their persisted next window, not at deleted completed roots. Other roots'
-    // gaps do not pin this tree; the checks below preserve this tree's lineage.
-    let open: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM planner_relays WHERE enabled=1 AND sequence=?1)",
-        [sequence],
-        |r| r.get(0),
-    )?;
-    if open {
-        return Ok(0);
-    }
+    // Planners resume from their persisted next window, whether enabled or
+    // disabled; completed roots cannot be recreated in this reserved namespace.
+    // Other roots' gaps do not pin this tree's completed lineage.
     let ids = {
         let mut query = tx.prepare(
             "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL
@@ -380,8 +384,11 @@ mod tests {
         db.db
             .execute("UPDATE jobs SET completed_at=1 WHERE id=3", [])
             .unwrap();
-        assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 0);
-        assert!(db.get(3).is_ok());
+        assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 1);
+        assert!(db.get(3).is_err());
+        assert!(db.get(2).is_ok());
+        assert_eq!(db.plan_rolling(2700, 1).unwrap().enqueued, 1);
+        assert_eq!(db.get(4).unwrap().since, 900);
     }
 
     #[test]
@@ -558,7 +565,11 @@ mod tests {
                 "retention_roots",
             ),
             (
-                "EXPLAIN QUERY PLAN SELECT min(recorded_at) FROM jobs WHERE state!='complete'",
+                "EXPLAIN QUERY PLAN SELECT min(recorded_at) FROM jobs WHERE state!='complete' AND recorded_at>0",
+                "pending_recorded",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM jobs WHERE state!='complete' AND recorded_at=0)",
                 "pending_recorded",
             ),
             (
@@ -582,6 +593,42 @@ mod tests {
             assert!(details.contains(index), "{details}");
             assert!(!details.contains("TEMP B-TREE"), "{details}");
         }
+    }
+
+    #[test]
+    fn legacy_pending_grace_is_persisted_without_inventing_a_completion() {
+        use pensieve_core::reconciliation_health::ReconciliationHealth;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.sqlite");
+        let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        db.enqueue("legacy", "wss://relay.example", 0, 899).unwrap();
+        strip_for_legacy_fixture(&db.db);
+        drop(db);
+        let db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        let activated: i64 = db
+            .db
+            .query_row("SELECT activated_at FROM lifecycle", [], |r| r.get(0))
+            .unwrap();
+        let observation = db.progress_observation(activated).unwrap();
+        assert_eq!(observation.pending_since, Some(activated));
+        assert_eq!(observation.last_success, None);
+        let health = ReconciliationHealth::default();
+        health.enable();
+        health.observe(observation);
+        assert!(health.status(activated).0);
+        drop(db);
+        let db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        health.observe(db.progress_observation(activated + 3600).unwrap());
+        assert_eq!(
+            health.status(activated + 3600),
+            (false, "durable_progress_stalled")
+        );
+        assert_eq!(
+            db.db
+                .query_row("SELECT recorded_at FROM jobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

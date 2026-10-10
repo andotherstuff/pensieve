@@ -18,12 +18,34 @@ class KumaTests(unittest.TestCase):
     def test_exact_success_only(self):
         for code in (200, 204, 302, 503):
             response = MagicMock()
-            response.__enter__.return_value.status = code
+            response.status = code
+            response.read.return_value = b""
             with patch.object(KUMA, "opener") as make:
                 make.return_value.open.return_value = response
                 healthy, message = KUMA.probe("http://127.0.0.1/health/negentropy")
             self.assertEqual(healthy, code == 200)
             self.assertEqual(message, f"negentropy progress HTTP {code}")
+
+    def test_only_bounded_allowlisted_reasons_are_forwarded(self):
+        for body in (b"unresolved_failures", b"secret URL", b"idle" + b" " * 100, b"\xff"):
+            response = MagicMock()
+            response.status = 503
+            response.read.return_value = body
+            with patch.object(KUMA, "opener") as make:
+                make.return_value.open.return_value = response
+                healthy, message = KUMA.probe("unused")
+            self.assertFalse(healthy)
+            response.read.assert_called_once_with(65)
+            expected = "negentropy progress HTTP 503"
+            if body == b"unresolved_failures":
+                expected += " (unresolved_failures)"
+            self.assertEqual(message, expected)
+
+    def test_http_error_reason_is_allowlisted_too(self):
+        error = urllib.error.HTTPError("unused", 503, "ignored", {}, io.BytesIO(b"capacity_exhausted"))
+        with patch.object(KUMA, "opener") as make:
+            make.return_value.open.side_effect = error
+            self.assertEqual(KUMA.probe("unused"), (False, "negentropy progress HTTP 503 (capacity_exhausted)"))
 
     def test_exception_body_is_not_forwarded(self):
         with patch.object(KUMA, "opener") as make:

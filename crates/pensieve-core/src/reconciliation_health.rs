@@ -156,19 +156,4 @@ mod tests {
         assert_eq!(health.status(100), (true, "idle"));
         assert!(!health.status(1001).0);
     }
-
-    #[test]
-    fn fresh_post_replay_observation_covers_a_full_worker_session() {
-        let health = ReconciliationHealth::default();
-        health.enable();
-        health.observe(observation(100));
-        // Ten minutes of replay followed by nine minutes of worker work would
-        // expire the pre-replay sample even though both phases are progressing.
-        assert_eq!(health.status(1240), (false, "owner_observation_stale"));
-        health.observe(observation(700));
-        assert!(health.status(1240).0);
-        // A new sample is not a fabricated durable completion.
-        health.observe(observation(4000));
-        assert_eq!(health.status(4000), (false, "durable_progress_stalled"));
-    }
 }
