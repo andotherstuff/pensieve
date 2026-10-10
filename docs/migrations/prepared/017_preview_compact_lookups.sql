@@ -124,7 +124,15 @@ WHERE kind = 9735;
 -- NADDR LOOKUP: latest event pointer per (pubkey, kind, d_tag)
 -- =============================================================================
 --
--- Covers replaceable (10000-19999) and addressable (30000-39999) kinds. Stores
+-- Covers addressable kinds that nstr.to previews via naddr: articles
+-- (30023/30024), video (34235/34236), live events (30311), wiki (30818),
+-- publications (30040/30041), listings (30402/30403), calendar (31922/31923),
+-- communities (34550), marketplace (30017/30018), curation sets
+-- (30004/30005), git repos (30617), music (31337) and starter packs (39089).
+-- Bulk machine kinds (e.g. 30382/30304/30078, ~646M rows in production) and
+-- replaceable lists are excluded; those naddr previews keep the legacy query.
+-- The list must match ADDRESSABLE_KINDS in
+-- crates/pensieve-preview/src/lookups/target.rs (a unit test enforces it). Stores
 -- only the winning event id; previews fetch the row from events_local by
 -- primary key. d_tag uses the same expression as the events_local MATERIALIZED
 -- d_tag column so lookups match the legacy `d_tag = ?` filter exactly. Same
@@ -147,7 +155,7 @@ AS SELECT
     argMinState(id, CAST((-toInt64(created_at), id), 'Tuple(Int64, String)')) AS latest,
     max(indexed_at) AS last_indexed_at
 FROM nostr.events_local
-WHERE (kind >= 10000 AND kind < 20000) OR (kind >= 30000 AND kind < 40000)
+WHERE kind IN (30004, 30005, 30017, 30018, 30023, 30024, 30040, 30041, 30311, 30402, 30403, 30617, 30818, 31337, 31922, 31923, 34235, 34236, 34550, 39089)
 GROUP BY pubkey, kind, d_tag;
 
 -- =============================================================================

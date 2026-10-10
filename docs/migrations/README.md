@@ -477,8 +477,9 @@ It creates three tables, each fed by an insert-triggered view on
 - `profile_latest`: latest kind 0 per pubkey;
 - `zap_receipts_by_target`: one row per (target event, zap receipt), using
   the migration 009 amount rules;
-- `addressable_latest`: latest event id per (pubkey, kind, d_tag) for kinds
-  10000–19999 and 30000–39999.
+- `addressable_latest`: latest event id per (pubkey, kind, d_tag) for the
+  addressable kinds nstr.to previews via naddr (articles, video, live events,
+  wiki, listings, calendar and similar; bulk machine kinds are excluded).
 
 Reads stay correct before merges, with replays, and with out-of-order
 arrivals. The migration does **not** backfill or touch the projection.

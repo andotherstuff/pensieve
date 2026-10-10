@@ -21,9 +21,19 @@ pub enum Target {
     Addressable,
 }
 
-/// The kind predicate for replaceable and addressable events.
-const ADDRESSABLE_KINDS: &str =
-    "((kind >= 10000 AND kind < 20000) OR (kind >= 30000 AND kind < 40000))";
+/// Addressable kinds covered by `addressable_latest`, sorted: shareable
+/// content that nstr.to previews via naddr (articles, video, live events,
+/// wiki, publications, listings, calendar, communities, marketplace,
+/// curation sets, git repos, music, starter packs). Bulk machine kinds such
+/// as 30382/30304/30078 and relay lists are excluded; their naddr previews use
+/// the legacy query. Must match the view's `WHERE` in migration 017.
+pub const ADDRESSABLE_KINDS: [u16; 20] = [
+    30004, 30005, 30017, 30018, 30023, 30024, 30040, 30041, 30311, 30402, 30403, 30617, 30818,
+    31337, 31922, 31923, 34235, 34236, 34550, 39089,
+];
+
+/// SQL form of [`ADDRESSABLE_KINDS`].
+const ADDRESSABLE_KINDS_PREDICATE: &str = "kind IN (30004, 30005, 30017, 30018, 30023, 30024, 30040, 30041, 30311, 30402, 30403, 30617, 30818, 31337, 31922, 31923, 34235, 34236, 34550, 39089)";
 
 /// First `d` tag value, identical to the `events_local.d_tag` MATERIALIZED
 /// expression.
@@ -72,7 +82,7 @@ impl Target {
         match self {
             Self::Profiles => "kind = 0",
             Self::Zaps => "kind = 9735",
-            Self::Addressable => ADDRESSABLE_KINDS,
+            Self::Addressable => ADDRESSABLE_KINDS_PREDICATE,
         }
     }
 
@@ -235,6 +245,28 @@ mod tests {
             assert!(!target.hour_histogram_sql("db").contains('?'));
             assert!(!target.source_stats_sql("db").contains('?'));
         }
+    }
+
+    #[test]
+    fn addressable_kinds_match_predicate_and_migration() {
+        let mut sorted = ADDRESSABLE_KINDS;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ADDRESSABLE_KINDS, "keep ADDRESSABLE_KINDS sorted");
+        let expected = format!(
+            "kind IN ({})",
+            ADDRESSABLE_KINDS
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(ADDRESSABLE_KINDS_PREDICATE, expected);
+        let migration =
+            include_str!("../../../../docs/migrations/prepared/017_preview_compact_lookups.sql");
+        assert!(
+            migration.contains(&format!("WHERE {expected}\nGROUP BY pubkey, kind, d_tag;")),
+            "migration 017 addressable view must filter on exactly {expected}"
+        );
     }
 
     #[test]

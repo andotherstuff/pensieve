@@ -110,11 +110,26 @@ the v1 view.
 
 ### `addressable_latest`
 
-`AggregatingMergeTree ORDER BY (pubkey, kind, d_tag)` covering kinds
-10000–19999 and 30000–39999.
+`AggregatingMergeTree ORDER BY (pubkey, kind, d_tag)` covering the
+addressable kinds nstr.to previews via naddr (`ADDRESSABLE_KINDS` in
+`crates/pensieve-preview/src/lookups/target.rs`):
+- articles (30023/30024) and video (34235/34236);
+- live events (30311), wiki (30818) and publications (30040/30041);
+- listings (30402/30403), calendar (31922/31923) and communities (34550);
+- marketplace (30017/30018) and curation sets (30004/30005);
+- git repos (30617), music (31337) and starter packs (39089).
+
+**Why the list is narrow.** Production on 2026-10-10 had 646M rows across all
+of 10000–19999 and 30000–39999. Bulk machine kinds dominated them (30382 alone
+was 219M, then 30304, 30383 and 30078), and backfilling all of it would have
+needed ~188 GiB of worst-case headroom. The listed kinds are about 12.7M rows
+and 2.9M coordinates. Actual naddr demand was 4 requests in 7 days, all kind
+30023. The legacy naddr query never used `events_by_kind` (it reads the base
+table through the pubkey bloom filter), so naddr does not block projection
+removal either way.
 - **Winner rule:** the same `argMin` rule as profiles, but storing only the winning event id. The preview then reads the row from `events_local` in one query (`WHERE id IN (SELECT argMinMerge(latest) ...)`), which is a primary-key read.
 - **`d_tag`:** uses the same expression as the `events_local.d_tag` MATERIALIZED column, so lookups match the legacy `d_tag = ?` filter exactly.
-- **Uncovered kinds:** naddr kinds outside the covered ranges use the legacy query.
+- **Uncovered kinds:** naddr kinds outside the list use the legacy query.
 
 ### Ingest safety
 
@@ -300,7 +315,7 @@ production build) prove correctness and mechanics only.
    `events_by_author` present? Confirm that every active part has
    `events_by_kind` before relying on it for the backfill.
 2. **Sizing:** row and key counts per target from `plan`, especially
-   `addressable_latest` (kind 30078 app data may be large), the peak estimate
+   `addressable_latest` (now limited to previewable kinds), the peak estimate
    against `/data` unreserved space, and calibration after the first shards.
 3. **Backfill impact:** runtime and impact on live ingest and queries at the
    chosen `--max-threads`/`--max-memory-gib`.

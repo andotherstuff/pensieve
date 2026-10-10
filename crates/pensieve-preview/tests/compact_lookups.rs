@@ -622,7 +622,7 @@ async fn addressable_latest_handles_ties_and_falls_back_for_uncovered_kinds() {
         event(0x30, author, 5, 30023, "other", &[&["d", "other"]]),
         event(0x50, author, 7, 10002, "relays", &[&["r", "wss://x"]]),
         event(0x60, author, 9, 30023, "no-d", &[&["d"]]),
-        // Kind 1 is not covered by addressable_latest.
+        // Kinds 1 and 10002 are not covered by addressable_latest.
         event(0x70, author, 9, 1, "note", &[&["d", "n"]]),
     ];
     for e in &events {
@@ -645,11 +645,13 @@ async fn addressable_latest_handles_ties_and_falls_back_for_uncovered_kinds() {
             .unwrap()
             .unwrap();
         assert_eq!(other.id, hex(0x30));
-        let relays = compact::fetch_replaceable(c, 10002, &pk, "")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(relays.id, hex(0x50));
+        // Relay lists are not a covered kind: no compact row is stored.
+        assert!(
+            compact::fetch_replaceable(c, 10002, &pk, "")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let no_d = compact::fetch_replaceable(c, 30023, &pk, "")
             .await
             .unwrap()
@@ -670,6 +672,12 @@ async fn addressable_latest_handles_ties_and_falls_back_for_uncovered_kinds() {
             .unwrap()
             .unwrap();
         assert_eq!(note.id, hex(0x70));
+        let relays = lookups
+            .fetch_replaceable(10002, &pk, "")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relays.id, hex(0x50));
         let via_dispatch = lookups
             .fetch_replaceable(30023, &pk, "slug")
             .await

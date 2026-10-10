@@ -15,10 +15,13 @@ use serde::Deserialize;
 use crate::error::PreviewError;
 use crate::query::{EventRow, ProfileRow, ZapTotals, display_names_from_profiles};
 
-/// Whether `addressable_latest` covers a kind (replaceable 10000-19999 and
-/// addressable 30000-39999). Other naddr kinds use the legacy query.
+/// Whether `addressable_latest` covers a kind (see
+/// [`ADDRESSABLE_KINDS`](super::target::ADDRESSABLE_KINDS)). Other naddr kinds
+/// use the legacy query.
 pub fn addressable_kind_covered(kind: u16) -> bool {
-    (10_000..20_000).contains(&kind) || (30_000..40_000).contains(&kind)
+    super::target::ADDRESSABLE_KINDS
+        .binary_search(&kind)
+        .is_ok()
 }
 
 /// Fetch the latest profile (kind 0) for a pubkey from `profile_latest`.
@@ -159,17 +162,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addressable_coverage_bounds() {
-        assert!(!addressable_kind_covered(0));
-        assert!(!addressable_kind_covered(9_999));
-        assert!(addressable_kind_covered(10_000));
-        assert!(addressable_kind_covered(10_002));
-        assert!(addressable_kind_covered(19_999));
-        assert!(!addressable_kind_covered(20_000));
-        assert!(!addressable_kind_covered(29_999));
-        assert!(addressable_kind_covered(30_000));
-        assert!(addressable_kind_covered(30_023));
-        assert!(addressable_kind_covered(39_999));
-        assert!(!addressable_kind_covered(40_000));
+    fn addressable_coverage_is_the_previewable_list() {
+        for kind in [30023, 30024, 34235, 34236, 30311, 30818, 34550, 39089] {
+            assert!(addressable_kind_covered(kind), "{kind}");
+        }
+        // Bulk machine kinds, replaceable lists and non-addressable kinds fall
+        // back to the legacy query.
+        for kind in [0, 1, 10002, 30000, 30078, 30304, 30382, 30383, 40000] {
+            assert!(!addressable_kind_covered(kind), "{kind}");
+        }
     }
 }

@@ -446,8 +446,14 @@ $PL plan --max-rows-per-shard 2000000 --min-free-gib 100
 ```
 
 For each target, check source rows, keys, final and peak size, and the
-combined peak against `/data` unreserved space. If `addressable` is
-unexpectedly large, plan and backfill `--target profiles --target zaps` first.
+combined peak against `/data` unreserved space. Production measurements from
+2026-10-10, for comparison:
+- profiles: 53.8M rows, 18.4M keys, ~8 GiB final;
+- zaps: 7.2M receipts, ~0.6 GiB;
+- addressable: about 12.7M rows, 2.9M coordinates.
+
+Free space was 256 GiB. If a target comes out far larger than this, stop and
+re-check before backfilling it.
 
 ### 4. Backfill (while `events_by_kind` exists)
 
