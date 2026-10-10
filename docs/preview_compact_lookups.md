@@ -261,6 +261,22 @@ Preview queries carry `log_comment = 'pensieve-preview:<lookup>:<legacy|compact>
 so `system.query_log` gives production latency per lookup and source during
 rollout.
 
+### Projections-off rehearsal
+
+`PREVIEW_DISABLE_PROJECTIONS=true` runs **every** preview query with
+`optimize_use_projections = 0`, which is how the preview will behave once the
+projection is gone. It lets real nstr.to traffic prove the change before the
+irreversible drop. To keep the rehearsal from piling up scans, each query is
+also capped:
+- `max_execution_time = 10` with `timeout_overflow_mode = throw`, matching the
+  HTTP request timeout;
+- `cancel_http_readonly_queries_on_client_close = 1`, so a query whose request
+  was dropped is cancelled.
+
+Any lookup still on its legacy path fails fast instead of scanning for a
+minute, and startup logs a warning unless `PREVIEW_COMPACT_LOOKUPS=all`. Turn
+it off with `PREVIEW_DISABLE_PROJECTIONS=false` and a restart.
+
 ## Requires production validation
 
 The checks below can only be done on the production server. Locally, the

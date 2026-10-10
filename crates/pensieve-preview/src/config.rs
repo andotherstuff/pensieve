@@ -35,6 +35,11 @@ pub struct Config {
     /// Which lookups read the compact ClickHouse tables (migration 017)
     /// instead of `events_local`. Defaults to none (legacy reads).
     pub compact_lookups: CompactLookups,
+
+    /// Run every preview query with `optimize_use_projections = 0`, a
+    /// rehearsal of production without the `events_by_kind` projection.
+    /// Defaults to false.
+    pub disable_projections: bool,
 }
 
 impl Config {
@@ -53,6 +58,9 @@ impl Config {
     /// - `PREVIEW_VIP_FILE`: Path to VIP pubkeys file (default: ".vip")
     /// - `PREVIEW_COMPACT_LOOKUPS`: `none` (default), `all`, or a comma list of
     ///   `profiles`, `zaps`, `addressable`. An unrecognised value is an error.
+    /// - `PREVIEW_DISABLE_PROJECTIONS`: `true`/`false` (default `false`). Runs
+    ///   every preview query with projections disabled and bounded; see
+    ///   [`crate::state::PROJECTIONS_OFF_SETTINGS`].
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_addr =
             std::env::var("PREVIEW_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
@@ -79,6 +87,18 @@ impl Config {
             .parse::<CompactLookups>()
             .context("PREVIEW_COMPACT_LOOKUPS")?;
 
+        let disable_projections = parse_bool(
+            "PREVIEW_DISABLE_PROJECTIONS",
+            &std::env::var("PREVIEW_DISABLE_PROJECTIONS").unwrap_or_default(),
+        )?;
+        if disable_projections && compact_lookups != CompactLookups::ALL {
+            tracing::warn!(
+                compact_lookups = %compact_lookups,
+                "PREVIEW_DISABLE_PROJECTIONS is set while some lookups still use legacy reads; \
+                 those will scan events_local and hit the query time cap"
+            );
+        }
+
         tracing::info!(
             bind_addr = %bind_addr,
             clickhouse_url = %clickhouse_url,
@@ -87,6 +107,7 @@ impl Config {
             vip_count = vip_pubkeys.len(),
             vip_file = %vip_file,
             compact_lookups = %compact_lookups,
+            disable_projections,
             "preview configuration loaded"
         );
 
@@ -98,7 +119,18 @@ impl Config {
             site_name,
             vip_pubkeys: Arc::new(vip_pubkeys),
             compact_lookups,
+            disable_projections,
         })
+    }
+}
+
+/// Parse a boolean environment value (`1/true/yes/on`, `0/false/no/off`,
+/// empty = false).
+fn parse_bool(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        other => anyhow::bail!("{name}: expected true or false, got {other:?}"),
     }
 }
 
@@ -186,6 +218,7 @@ mod tests {
         "PREVIEW_SITE_NAME",
         "PREVIEW_VIP_FILE",
         "PREVIEW_COMPACT_LOOKUPS",
+        "PREVIEW_DISABLE_PROJECTIONS",
     ];
 
     /// Helper to run config tests with isolated env vars.
@@ -231,6 +264,27 @@ mod tests {
             assert_eq!(config.site_name, "Nostr Preview");
             assert!(config.vip_pubkeys.is_empty());
             assert_eq!(config.compact_lookups, CompactLookups::NONE);
+            assert!(!config.disable_projections);
+        });
+    }
+
+    #[test]
+    fn config_disable_projections_parsed() {
+        for (value, expected) in [
+            ("true", true),
+            ("1", true),
+            ("ON", true),
+            ("false", false),
+            ("0", false),
+            ("", false),
+        ] {
+            with_env_vars(&[("PREVIEW_DISABLE_PROJECTIONS", value)], || {
+                let config = Config::from_env().unwrap();
+                assert_eq!(config.disable_projections, expected, "{value:?}");
+            });
+        }
+        with_env_vars(&[("PREVIEW_DISABLE_PROJECTIONS", "maybe")], || {
+            assert!(Config::from_env().is_err());
         });
     }
 

@@ -534,6 +534,27 @@ For each consumer listed, measure it with
 deciding. The dashboard queries were previously measured at about 9.2 s for
 14 queries without the projection.
 
+### 9. Projections-off rehearsal (before any removal)
+
+After the preview has run on `PREVIEW_COMPACT_LOOKUPS=all` without issues:
+
+1. Set `PREVIEW_DISABLE_PROJECTIONS=true` in `/etc/pensieve/pensieve.env` and
+   restart `pensieve-preview`. Every preview query then runs with
+   `optimize_use_projections = 0`, capped at 10 s and cancelled when its
+   request is dropped.
+2. Run it for at least a day of normal traffic, watching the step 6 latency
+   query, `slow preview lookup` warnings and the preview error rate. This
+   query must show the setting applied and no projection used:
+
+   ```bash
+   just ch-query "SELECT log_comment, Settings['optimize_use_projections'] AS proj, count() n, quantile(0.95)(query_duration_ms) p95, max(query_duration_ms) max, countIf(notEmpty(projections)) used_projection FROM system.query_log WHERE event_time > now() - INTERVAL 1 DAY AND type = 'QueryFinish' AND startsWith(log_comment, 'pensieve-preview:') GROUP BY log_comment, proj ORDER BY log_comment"
+   just ch-query "SELECT log_comment, count() FROM system.query_log WHERE event_time > now() - INTERVAL 1 DAY AND type != 'QueryFinish' AND type != 'QueryStart' AND startsWith(log_comment, 'pensieve-preview:') GROUP BY log_comment"
+   ```
+
+   Pass: `proj = 0` and `used_projection = 0` everywhere, p95 well under 1 s
+   for the compact lookups, and no rise in failed queries (second query).
+3. **Rollback:** set `PREVIEW_DISABLE_PROJECTIONS=false` and restart.
+
 ### Projection removal (separate, manual)
 
 **Not part of this rollout.** Only consider it after all of these hold:
@@ -541,6 +562,7 @@ deciding. The dashboard queries were previously measured at about 9.2 s for
 - `validate` is clean;
 - `bench` meets the target;
 - the preview has run on `all` for an agreed period;
+- the projections-off rehearsal (step 9) passed;
 - the consumer audit above is clear or each consumer is accepted;
 - the removal is written up as its own prepared migration, following the
   `prepared/016` pattern (preflight, asynchronous `DROP PROJECTION`, rollback

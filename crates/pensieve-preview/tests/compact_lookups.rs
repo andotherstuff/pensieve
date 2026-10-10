@@ -1396,3 +1396,170 @@ async fn session_deadline_expiring_during_merge_wait_starts_no_insert() {
     );
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn projections_off_rehearsal_applies_to_every_preview_query() {
+    use pensieve_preview::{AppState, Config};
+
+    let db = TestDb::new().await;
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    insert_bulk(&db, 200_000).await;
+    db.apply_migration().await;
+    for target in Target::ALL {
+        let options = PlanOptions {
+            shard_by: ShardBy::CreatedAt,
+            max_rows_per_shard: 50_000,
+            id_prefix_len: 2,
+            require_projection: false,
+        };
+        let p = plan::build_plan(&db.client, &db.name, target, &options)
+            .await
+            .unwrap();
+        let dir = CheckpointDir::new(checkpoint_dir.path(), target);
+        dir.save_plan(&p, false).unwrap();
+        let report = backfill::run_backfill(&db.client, &p, &dir, &backfill_options())
+            .await
+            .unwrap();
+        assert_eq!(report.stopped, StopReason::Complete);
+    }
+
+    let state_for = |compact_lookups| {
+        AppState::new(Config {
+            bind_addr: String::new(),
+            clickhouse_url: std::env::var("PENSIEVE_TEST_CLICKHOUSE_URL").unwrap(),
+            clickhouse_database: db.name.clone(),
+            base_url: String::new(),
+            site_name: String::new(),
+            vip_pubkeys: Default::default(),
+            compact_lookups,
+            disable_projections: true,
+        })
+    };
+
+    let pubkey: String = db
+        .client
+        .query("SELECT pubkey FROM profile_latest LIMIT 1")
+        .fetch_one()
+        .await
+        .unwrap();
+    let zap_target: String = db
+        .client
+        .query("SELECT target_event_id FROM zap_receipts_by_target LIMIT 1")
+        .fetch_one()
+        .await
+        .unwrap();
+    let (author, kind, d): (String, u16, String) = db
+        .client
+        .query("SELECT pubkey, kind, d_tag FROM addressable_latest LIMIT 1")
+        .fetch_one()
+        .await
+        .unwrap();
+
+    // Full rehearsal: every lookup on the compact path, projections off.
+    let state = state_for(CompactLookups::ALL);
+    assert!(
+        state
+            .lookups
+            .fetch_profile(&pubkey)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        state
+            .lookups
+            .fetch_profiles(std::slice::from_ref(&pubkey))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    state
+        .lookups
+        .fetch_display_names(std::slice::from_ref(&pubkey))
+        .await
+        .unwrap();
+    // Engagement also reads the reaction/comment/repost tables, which this
+    // fixture lacks; zap totals are covered by the compact zap read.
+    let naddr = state
+        .lookups
+        .fetch_replaceable(kind, &author, &d)
+        .await
+        .unwrap()
+        .expect("naddr row");
+    assert!(
+        state
+            .lookups
+            .fetch_event_by_id(&naddr.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let zaps = compact::fetch_zap_totals(&state.clickhouse, &zap_target)
+        .await
+        .unwrap();
+    assert!(zaps.zap_count > 0);
+
+    // A legacy lookup under the rehearsal is bounded rather than scanning
+    // with the projection.
+    let legacy = state_for(CompactLookups::NONE);
+    legacy.lookups.fetch_profile(&pubkey).await.unwrap();
+
+    #[derive(Debug, serde::Deserialize, clickhouse::Row)]
+    struct LoggedQuery {
+        log_comment: String,
+        projections: Vec<String>,
+        use_projections: String,
+        max_time: String,
+    }
+    db.exec("SYSTEM FLUSH LOGS").await;
+    let rows = db
+        .admin
+        .query(
+            "SELECT log_comment, projections, \
+             Settings['optimize_use_projections'] AS use_projections, \
+             Settings['max_execution_time'] AS max_time \
+             FROM system.query_log \
+             WHERE event_date >= yesterday() AND type = 'QueryFinish' \
+             AND current_database = ? \
+             AND (startsWith(log_comment, 'pensieve-preview:') \
+                  OR query LIKE '%FROM zap_receipts_by_target%WHERE target_event_id%')",
+        )
+        .bind(&db.name)
+        .fetch_all::<LoggedQuery>()
+        .await
+        .unwrap();
+    let comments: Vec<&str> = rows.iter().map(|r| r.log_comment.as_str()).collect();
+    for expected in [
+        "pensieve-preview:profile:compact",
+        "pensieve-preview:profiles:compact",
+        "pensieve-preview:display_names:compact",
+        "pensieve-preview:replaceable:compact",
+        "pensieve-preview:event:legacy",
+        "pensieve-preview:profile:legacy",
+    ] {
+        assert!(
+            comments.contains(&expected),
+            "missing {expected}: {comments:?}"
+        );
+    }
+    assert!(
+        rows.iter().any(|r| r.log_comment.is_empty()),
+        "compact zap read not logged"
+    );
+    for r in &rows {
+        let comment = &r.log_comment;
+        assert_eq!(
+            r.use_projections, "0",
+            "{comment} ran with projections enabled"
+        );
+        assert!(
+            r.projections.is_empty(),
+            "{comment} used {:?}",
+            r.projections
+        );
+        assert!(!r.max_time.is_empty(), "{comment} has no execution cap");
+    }
+    db.drop().await;
+}
