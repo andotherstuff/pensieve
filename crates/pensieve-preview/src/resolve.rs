@@ -7,7 +7,7 @@ use nostr::nips::nip19::{FromBech32, Nip19, Nip19Event, Nip19Profile};
 use nostr::{EventId, PublicKey, ToBech32};
 
 use crate::error::PreviewError;
-use crate::query::{self, EngagementCounts, EventRow, ProfileMetadata};
+use crate::query::{EngagementCounts, EventRow, ProfileMetadata};
 use crate::state::AppState;
 
 /// The resolved result of a NIP-19 identifier lookup.
@@ -81,7 +81,7 @@ pub async fn resolve(state: &AppState, identifier: &str) -> Result<ResolvedConte
     if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
         // Try as event ID first
         if let Ok(event_id) = EventId::from_hex(identifier)
-            && let Ok(Some(_)) = query::fetch_event_by_id(&state.clickhouse, identifier).await
+            && let Ok(Some(_)) = state.lookups.fetch_event_by_id(identifier).await
         {
             return resolve_event_by_id(state, &event_id).await;
         }
@@ -110,7 +110,7 @@ async fn resolve_profile(
     };
 
     // Fetch profile from ClickHouse
-    let profile_row = query::fetch_profile(&state.clickhouse, &pubkey_hex).await?;
+    let profile_row = state.lookups.fetch_profile(&pubkey_hex).await?;
 
     let (metadata, profile_event_id) = match profile_row {
         Some(ref row) => (
@@ -136,7 +136,9 @@ async fn resolve_event_by_id(
 ) -> Result<ResolvedContent, PreviewError> {
     let id_hex = event_id.to_hex();
 
-    let event = query::fetch_event_by_id(&state.clickhouse, &id_hex)
+    let event = state
+        .lookups
+        .fetch_event_by_id(&id_hex)
         .await?
         .ok_or_else(|| PreviewError::NotFound(format!("event {id_hex}")))?;
 
@@ -150,7 +152,9 @@ async fn resolve_replaceable(
     pubkey: &str,
     d_tag: &str,
 ) -> Result<ResolvedContent, PreviewError> {
-    let event = query::fetch_replaceable(&state.clickhouse, kind, pubkey, d_tag)
+    let event = state
+        .lookups
+        .fetch_replaceable(kind, pubkey, d_tag)
         .await?
         .ok_or_else(|| {
             PreviewError::NotFound(format!("replaceable event {kind}:{pubkey}:{d_tag}"))
@@ -175,13 +179,14 @@ async fn build_event_content(
 
     // Fetch author profile, engagement, and reply parent name in parallel
     let (author_profile, engagement, reply_author_name) = tokio::try_join!(
-        query::fetch_profile(&state.clickhouse, &author_pubkey_hex),
-        query::fetch_engagement(&state.clickhouse, &event_id_hex),
+        state.lookups.fetch_profile(&author_pubkey_hex),
+        state.lookups.fetch_engagement(&event_id_hex),
         async {
             if let Some(parent_pk) = &reply_parent_pubkey {
-                let names =
-                    query::fetch_display_names(&state.clickhouse, std::slice::from_ref(parent_pk))
-                        .await?;
+                let names = state
+                    .lookups
+                    .fetch_display_names(std::slice::from_ref(parent_pk))
+                    .await?;
                 Ok(names.get(parent_pk).cloned())
             } else {
                 Ok(None)

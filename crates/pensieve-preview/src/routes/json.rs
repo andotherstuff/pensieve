@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::PreviewError;
-use crate::query::{self, ProfileMetadata};
+use crate::query::ProfileMetadata;
 use crate::resolve;
 use crate::state::AppState;
 
@@ -84,7 +84,9 @@ pub async fn json_handler_inner(
             mentioned_pubkeys.dedup();
             mentioned_pubkeys.truncate(MAX_MENTIONS);
 
-            let profiles = query::fetch_profiles(&state.clickhouse, &mentioned_pubkeys)
+            let profiles = state
+                .lookups
+                .fetch_profiles(&mentioned_pubkeys)
                 .await
                 .unwrap_or_default();
             let mut mentions_map = serde_json::Map::new();

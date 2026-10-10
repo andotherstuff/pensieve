@@ -4,7 +4,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use nostr::nips::nip19::{FromBech32, Nip19};
+
+use crate::lookups::CompactLookups;
 
 /// Application configuration.
 #[derive(Debug, Clone)]
@@ -28,6 +31,10 @@ pub struct Config {
     /// Set of "VIP" pubkeys (hex) that get longer cache TTLs.
     /// Loaded from a `.vip` file — one pubkey per line (hex or npub).
     pub vip_pubkeys: Arc<HashSet<String>>,
+
+    /// Which lookups read the compact ClickHouse tables (migration 017)
+    /// instead of `events_local`. Defaults to none (legacy reads).
+    pub compact_lookups: CompactLookups,
 }
 
 impl Config {
@@ -44,6 +51,8 @@ impl Config {
     /// - `PREVIEW_BASE_URL`: Base URL for links/OG tags (default: "http://localhost:8081")
     /// - `PREVIEW_SITE_NAME`: Site name (default: "Nostr Preview")
     /// - `PREVIEW_VIP_FILE`: Path to VIP pubkeys file (default: ".vip")
+    /// - `PREVIEW_COMPACT_LOOKUPS`: `none` (default), `all`, or a comma list of
+    ///   `profiles`, `zaps`, `addressable`. An unrecognised value is an error.
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_addr =
             std::env::var("PREVIEW_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
@@ -65,6 +74,11 @@ impl Config {
         let vip_file = std::env::var("PREVIEW_VIP_FILE").unwrap_or_else(|_| ".vip".to_string());
         let vip_pubkeys = load_vip_file(&vip_file);
 
+        let compact_lookups = std::env::var("PREVIEW_COMPACT_LOOKUPS")
+            .unwrap_or_default()
+            .parse::<CompactLookups>()
+            .context("PREVIEW_COMPACT_LOOKUPS")?;
+
         tracing::info!(
             bind_addr = %bind_addr,
             clickhouse_url = %clickhouse_url,
@@ -72,6 +86,7 @@ impl Config {
             site_name = %site_name,
             vip_count = vip_pubkeys.len(),
             vip_file = %vip_file,
+            compact_lookups = %compact_lookups,
             "preview configuration loaded"
         );
 
@@ -82,6 +97,7 @@ impl Config {
             base_url,
             site_name,
             vip_pubkeys: Arc::new(vip_pubkeys),
+            compact_lookups,
         })
     }
 }
@@ -169,6 +185,7 @@ mod tests {
         "PREVIEW_BASE_URL",
         "PREVIEW_SITE_NAME",
         "PREVIEW_VIP_FILE",
+        "PREVIEW_COMPACT_LOOKUPS",
     ];
 
     /// Helper to run config tests with isolated env vars.
@@ -213,6 +230,24 @@ mod tests {
             assert_eq!(config.base_url, "http://localhost:8081");
             assert_eq!(config.site_name, "Nostr Preview");
             assert!(config.vip_pubkeys.is_empty());
+            assert_eq!(config.compact_lookups, CompactLookups::NONE);
+        });
+    }
+
+    #[test]
+    fn config_compact_lookups_parsed() {
+        with_env_vars(&[("PREVIEW_COMPACT_LOOKUPS", "profiles,zaps")], || {
+            let config = Config::from_env().unwrap();
+            assert!(config.compact_lookups.profiles);
+            assert!(config.compact_lookups.zaps);
+            assert!(!config.compact_lookups.addressable);
+        });
+    }
+
+    #[test]
+    fn config_compact_lookups_invalid_is_error() {
+        with_env_vars(&[("PREVIEW_COMPACT_LOOKUPS", "everything")], || {
+            assert!(Config::from_env().is_err());
         });
     }
 

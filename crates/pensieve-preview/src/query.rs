@@ -1,7 +1,11 @@
 //! ClickHouse query layer for fetching events, profiles, and engagement data.
 //!
-//! All queries are point lookups by primary key or small result sets,
-//! designed for sub-10ms response times.
+//! These are the legacy reads against `events_local`. Profile, zap and naddr
+//! reads filter by kind and therefore rely on the `events_by_kind` projection
+//! (or the pubkey bloom filter) for speed. The compact replacements live in
+//! [`crate::lookups::compact`] and are selected per lookup by
+//! [`crate::lookups::Lookups`]. These functions stay available for comparison
+//! and rollback while the projection remains intact.
 
 use clickhouse::Client;
 use serde::Deserialize;
@@ -100,6 +104,15 @@ pub struct EngagementCounts {
     /// Total zap amount in millisatoshis.
     pub zap_msats: u64,
     /// Number of zaps.
+    pub zap_count: u64,
+}
+
+/// Zap totals for a single target event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clickhouse::Row)]
+pub struct ZapTotals {
+    /// Total zap amount in millisatoshis.
+    pub total_msats: u64,
+    /// Number of zap receipts.
     pub zap_count: u64,
 }
 
@@ -204,10 +217,20 @@ pub async fn fetch_replaceable(
     Ok(result)
 }
 
-/// Fetch engagement counts (reactions, comments, reposts) for an event.
+/// Fetch engagement counts (reactions, comments, reposts, zaps) for an event.
 pub async fn fetch_engagement(
     client: &Client,
     event_id: &str,
+) -> Result<EngagementCounts, PreviewError> {
+    fetch_engagement_with_zaps(client, event_id, fetch_zap_totals(client, event_id)).await
+}
+
+/// Fetch reaction, comment and repost counts in parallel with a caller-chosen
+/// zap totals query.
+pub(crate) async fn fetch_engagement_with_zaps(
+    client: &Client,
+    event_id: &str,
+    zaps: impl std::future::Future<Output = Result<ZapTotals, PreviewError>>,
 ) -> Result<EngagementCounts, PreviewError> {
     // Fetch all three counts in parallel using separate queries
     // (ClickHouse handles these as fast point lookups on SummingMergeTree tables)
@@ -215,12 +238,6 @@ pub async fn fetch_engagement(
     #[derive(Debug, Deserialize, clickhouse::Row)]
     struct CountRow {
         count: u64,
-    }
-
-    #[derive(Debug, Deserialize, clickhouse::Row)]
-    struct ZapRow {
-        total_msats: u64,
-        zap_count: u64,
     }
 
     let (reactions, comments, reposts, zaps) = tokio::try_join!(
@@ -263,26 +280,7 @@ pub async fn fetch_engagement(
                 .map(|r| r.map_or(0, |r| r.count))
                 .map_err(PreviewError::from)
         },
-        async {
-            client
-                .query(
-                    "SELECT sum(z.amount_msats) AS total_msats, count() AS zap_count \
-                     FROM events_local e \
-                     INNER JOIN zap_amounts_data z ON e.id = z.event_id \
-                     WHERE e.kind = 9735 \
-                     AND arrayExists(t -> t[1] = 'e' AND t[2] = ?, e.tags)",
-                )
-                .bind(event_id)
-                .fetch_optional::<ZapRow>()
-                .await
-                .map(|r| {
-                    r.unwrap_or(ZapRow {
-                        total_msats: 0,
-                        zap_count: 0,
-                    })
-                })
-                .map_err(PreviewError::from)
-        },
+        zaps,
     )?;
 
     Ok(EngagementCounts {
@@ -292,6 +290,25 @@ pub async fn fetch_engagement(
         zap_msats: zaps.total_msats,
         zap_count: zaps.zap_count,
     })
+}
+
+/// Fetch zap totals for an event by scanning kind 9735 receipts in
+/// `events_local` (legacy path; relies on the `events_by_kind` projection).
+pub async fn fetch_zap_totals(client: &Client, event_id: &str) -> Result<ZapTotals, PreviewError> {
+    let totals = client
+        .query(
+            "SELECT sum(z.amount_msats) AS total_msats, count() AS zap_count \
+             FROM events_local e \
+             INNER JOIN zap_amounts_data z ON e.id = z.event_id \
+             WHERE e.kind = 9735 \
+             AND arrayExists(t -> t[1] = 'e' AND t[2] = ?, e.tags)",
+        )
+        .bind(event_id)
+        .fetch_optional::<ZapTotals>()
+        .await?
+        .unwrap_or_default();
+
+    Ok(totals)
 }
 
 /// Batch-fetch display names for a set of pubkeys.
@@ -329,20 +346,28 @@ pub async fn fetch_display_names(
 
     let rows = query.fetch_all::<NameRow>().await?;
 
-    let names = rows
+    Ok(display_names_from_profiles(
+        rows.into_iter().map(|row| (row.pubkey, row.content)),
+    ))
+}
+
+/// Map `(pubkey, kind 0 content)` pairs to display names, dropping profiles
+/// without a usable name.
+pub(crate) fn display_names_from_profiles(
+    profiles: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::HashMap<String, String> {
+    profiles
         .into_iter()
-        .filter_map(|row| {
-            let meta = ProfileMetadata::from_json(&row.content);
+        .filter_map(|(pubkey, content)| {
+            let meta = ProfileMetadata::from_json(&content);
             let name = meta.display_name().to_string();
             if name == "Anonymous" {
                 None
             } else {
-                Some((row.pubkey, name))
+                Some((pubkey, name))
             }
         })
-        .collect();
-
-    Ok(names)
+        .collect()
 }
 
 #[cfg(test)]

@@ -380,6 +380,176 @@ pulling this change, or services break. On the box, after `git pull`:
    systemctl status pensieve pensieve-api pensieve-preview pensieve-ingest
    ```
 
+## Preview compact lookups
+
+Moves nstr.to's profile, zap and naddr reads off the `events_by_kind`
+projection and onto small lookup tables. Design, correctness model and
+behaviour differences: [`docs/preview_compact_lookups.md`](../docs/preview_compact_lookups.md).
+Every step below can be undone. **Dropping the projection is not one of these
+steps** (see the end of this section).
+
+Run the tool from the checkout as the `pensieve` user, with
+`/etc/pensieve/pensieve.env` loaded (`CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`):
+
+```bash
+cargo build --release --bin preview-lookups
+PL="target/release/preview-lookups --checkpoint-dir /home/pensieve/preview-lookups"
+```
+
+### 1. Preflight (read-only)
+
+```bash
+just ch-query "SELECT version()"
+just ch-query "SHOW CREATE TABLE nostr.events_local"
+just ch-query "SELECT name, count() parts, sum(rows) rows, formatReadableSize(sum(bytes_on_disk)) bytes FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND active GROUP BY name ORDER BY name"
+# Every active part must carry events_by_kind (expect 0):
+just ch-query "SELECT count() FROM system.parts p WHERE database = 'nostr' AND table = 'events_local' AND active AND name NOT IN (SELECT parent_name FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND name = 'events_by_kind' AND active)"
+just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks"
+just ch-query "SELECT count() FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND is_done = 0"
+just ch-query "SELECT count() FROM system.asynchronous_insert_log WHERE event_date = today()"
+```
+
+Do not continue if `events_by_kind` is missing from any part or a mutation
+is pending. Record the outputs in the change log.
+
+### 2. Create the tables and views
+
+```bash
+just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
+```
+
+This creates empty tables and three insert-triggered views on `events_local`.
+For the next 30 minutes, watch the ingest flushes and the views:
+
+```bash
+just ch-query "SELECT status, count(), any(exception) FROM system.asynchronous_insert_log WHERE event_time > now() - INTERVAL 30 MINUTE AND database = 'nostr' AND table = 'events_local' GROUP BY status"
+just ch-query "SELECT view_name, status, count(), any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name LIKE 'nostr.%' GROUP BY view_name, status"
+journalctl -u pensieve-ingest --since "30 min ago" | grep -i clickhouse
+```
+
+**Abort:** if any flush status is not `Ok`, or any view reports an
+exception, run the rollback SQL immediately (step 7). A failing view drops
+ingest rows silently under `wait_for_async_insert=0`.
+
+### 3. Plan and estimate disk
+
+```bash
+$PL plan --max-rows-per-shard 2000000 --min-free-gib 100
+```
+
+For each target, check source rows, keys, final and peak size, and the
+combined peak against `/data` unreserved space. If `addressable` is
+unexpectedly large, plan and backfill `--target profiles --target zaps` first.
+
+### 4. Backfill (while `events_by_kind` exists)
+
+Wait 10 minutes after step 2. The tool enforces this and the other gap checks.
+Then run bounded sessions; each session resumes where the last stopped:
+
+```bash
+$PL --max-threads 2 --max-memory-gib 8 backfill --max-runtime-mins 120 --delay-secs 10 --min-free-gib 100
+$PL status
+```
+
+- **Exit code 2** means the run stopped early (runtime, disk guard, or merge
+  backlog). Re-run the same command later.
+- **Error on projection or read amplification:** the tool stops if a shard
+  did not use `events_by_kind` or read far more rows than planned.
+  Investigate before continuing, and never re-run with `--allow-full-scan` on
+  production while the projection exists.
+- **Calibrate:** after the first few shards, compare `status` bytes per row
+  with the plan's estimate.
+- **Optional:** add `--gap-pass` on the final session to re-read rows indexed
+  around the views' creation time.
+
+### 5. Validate and benchmark
+
+```bash
+$PL validate --sample 1000 --hot 100 --out /home/pensieve/preview-lookups/validate.json
+$PL bench --samples 50 --out /home/pensieve/preview-lookups/bench-warm.json
+# Quiet window only (drops server-wide caches before every query):
+$PL bench --samples 50 --drop-caches --include-legacy --legacy-samples 3 --out /home/pensieve/preview-lookups/bench-cold.json
+```
+
+- **`validate`** must report `unexplained differences: 0`. Legacy
+  `tie_break`, `id_content_mix`, `duplicate_inflation` and
+  `amount_row_missing` are known legacy defects (see the design doc).
+- **`bench`** results are what decide the sub-second target. Record p95 and
+  max per lookup, and storage (compact tables vs `events_by_kind`), in the
+  change log.
+
+### 6. Switch preview reads (staged)
+
+Set `PREVIEW_COMPACT_LOOKUPS` in `/etc/pensieve/pensieve.env` one lookup at a
+time, then `sudo systemctl restart pensieve-preview`:
+
+1. `profiles`
+2. `profiles,zaps`
+3. `all`
+
+Between steps, compare live latency per lookup and source:
+
+```bash
+just ch-query "SELECT log_comment, count() n, quantile(0.5)(query_duration_ms) p50, quantile(0.95)(query_duration_ms) p95, max(query_duration_ms) max FROM system.query_log WHERE event_time > now() - INTERVAL 1 HOUR AND type = 'QueryFinish' AND startsWith(log_comment, 'pensieve-preview:') GROUP BY log_comment ORDER BY log_comment"
+journalctl -u pensieve-preview --since "1 hour ago" | grep -c "slow preview lookup"
+```
+
+Spot-check a few profiles, zapped notes and articles on nstr.to (`.json`
+routes show raw values). The 5-minute HTML cache and CDN delay what you see.
+
+### 7. Rollback
+
+- **Reads:** set `PREVIEW_COMPACT_LOOKUPS=none` and restart
+  `pensieve-preview`. The legacy reads are untouched and use the projection
+  as before.
+- **Tables and views** (only after reads are rolled back):
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/017_drop_preview_compact_lookups.sql
+  ```
+
+  Re-applying 017 later needs a fresh `plan --discard-progress` and backfill.
+
+### 8. Projection consumers (before any removal)
+
+The preview is not the only reader that may depend on `events_by_kind`. Known
+candidates from the repo:
+- `pensieve-serve` `routes/kinds.rs` and `routes/stats.rs` (kind-filtered
+  scans);
+- negentropy `seed_from_clickhouse` (a `created_at` window);
+- Grafana dashboards, which live only on the instance.
+
+With the preview fully switched, audit actual use over at least the 7-day
+`query_log` retention. `preview-lookups` tags its own queries and is
+excluded:
+
+```bash
+just ch-query "SELECT user, splitByChar(':', log_comment)[1] AS client, normalized_query_hash, any(substring(query, 1, 160)) AS example, count() runs, round(avg(query_duration_ms)) avg_ms, max(event_time) last_seen FROM system.query_log WHERE event_date >= today() - 7 AND type = 'QueryFinish' AND has(projections, 'nostr.events_local.events_by_kind') AND NOT startsWith(log_comment, 'preview-lookups') GROUP BY user, client, normalized_query_hash ORDER BY runs DESC LIMIT 100"
+```
+
+For each consumer listed, measure it with
+`SETTINGS optimize_use_projections = 0` (and `use_query_cache = 0`) before
+deciding. The dashboard queries were previously measured at about 9.2 s for
+14 queries without the projection.
+
+### Projection removal (separate, manual)
+
+**Not part of this rollout.** Only consider it after all of these hold:
+- every backfill is complete;
+- `validate` is clean;
+- `bench` meets the target;
+- the preview has run on `all` for an agreed period;
+- the consumer audit above is clear or each consumer is accepted;
+- the removal is written up as its own prepared migration, following the
+  `prepared/016` pattern (preflight, asynchronous `DROP PROJECTION`, rollback
+  with free-space check).
+
+After removal, the legacy preview reads become slow again, so rolling back
+reads means restoring the projection first. Future rebuilds of the compact
+tables (for example a zap parser correction) then need
+`plan --allow-full-scan --shard-by id-prefix`. That runs full-table reads in
+256 bounded shards; plan the I/O accordingly.
+
 ## Grafana
 
 Provisioning is no longer in the repo. Configure the Prometheus datasource

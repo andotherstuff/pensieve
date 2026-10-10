@@ -160,6 +160,10 @@ coverage-preview:
 coverage-preview-summary:
     cargo llvm-cov --lib -p pensieve-preview
 
+# Run the compact preview lookup operator tool (plan/backfill/status/validate/bench)
+run-preview-lookups *ARGS:
+    cargo run --bin preview-lookups -- {{ARGS}}
+
 # Run the relay cleanup tool
 run-relay-cleanup *ARGS:
     cargo run --bin relay-cleanup -- {{ARGS}}
@@ -269,6 +273,27 @@ ch-query query:
 ch-tables:
     @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} \
         --query "SELECT name, engine FROM system.tables WHERE database = '{{CH_DB}}' ORDER BY engine, name"
+
+# Disposable ClickHouse for integration tests (same 24.8 line as production)
+CH_TEST_CONTAINER := env_var_or_default("CH_TEST_CONTAINER", "pensieve-ch-test")
+CH_TEST_PORT := env_var_or_default("CH_TEST_PORT", "18123")
+
+# Start a disposable ClickHouse 24.8 for integration tests
+ch-test-up:
+    @docker run -d --rm --name {{CH_TEST_CONTAINER}} -p {{CH_TEST_PORT}}:8123 \
+        -e CLICKHOUSE_SKIP_USER_SETUP=1 --ulimit nofile=262144:262144 \
+        clickhouse/clickhouse-server:24.8 >/dev/null
+    @until curl -sf http://localhost:{{CH_TEST_PORT}}/ping >/dev/null; do sleep 1; done
+    @echo "✓ ClickHouse test server on http://localhost:{{CH_TEST_PORT}}"
+
+# Stop the disposable ClickHouse test server
+ch-test-down:
+    @docker rm -f {{CH_TEST_CONTAINER}} >/dev/null && echo "✓ ClickHouse test server removed"
+
+# Run ClickHouse integration tests (start a server with `just ch-test-up`)
+test-clickhouse:
+    PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
+        cargo test -p pensieve-preview --test compact_lookups -- --ignored
 
 # ============================================================================
 # Utilities

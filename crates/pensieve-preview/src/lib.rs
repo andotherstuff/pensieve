@@ -35,6 +35,7 @@
 
 pub mod config;
 pub mod error;
+pub mod lookups;
 pub mod query;
 pub mod render;
 pub mod resolve;
