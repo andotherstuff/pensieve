@@ -19,6 +19,25 @@ use super::SealedSegment;
 
 const REPLAY_POLICY_SETTING: &str = "parquet_shadow.replay_policy.v1";
 
+/// Joinable worker with cooperative shutdown at immutable work-unit boundaries.
+pub struct ParquetShadowHandle {
+    handle: JoinHandle<()>,
+    stop: crossbeam_channel::Sender<()>,
+}
+
+impl ParquetShadowHandle {
+    /// Stop after the current segment when startup replay can recover pending
+    /// work. Without replay, retain drain-to-completion semantics.
+    pub fn request_shutdown(&self) {
+        let _ = self.stop.try_send(());
+    }
+
+    /// Wait for completion; this does not itself request early shutdown.
+    pub fn join(self) -> std::thread::Result<()> {
+        self.handle.join()
+    }
+}
+
 /// Publication target for the live shadow sink.
 #[derive(Clone, Debug)]
 pub enum ParquetShadowPublisher {
@@ -52,14 +71,21 @@ pub struct ParquetShadowConfig {
 
 /// Start the shadow worker and wait until its inventory and publisher initialize.
 ///
-/// Historical replay happens inside the returned worker. Dropping every sender
-/// closes the queue; joining the handle then waits for all sealed inputs to
-/// finish publication.
+/// Historical replay happens inside the returned worker. Dropping every input
+/// sender drains publication unless `request_shutdown` explicitly defers the
+/// remaining sealed work to startup replay. The current work unit is never
+/// interrupted; its conversion/upload may still take time.
 pub fn start_parquet_shadow(
     config: ParquetShadowConfig,
     receiver: Receiver<SealedSegment>,
-) -> Result<JoinHandle<()>> {
+) -> Result<ParquetShadowHandle> {
     let (ready_sender, ready_receiver) = crossbeam_channel::bounded(1);
+    let (stop, stopping) = crossbeam_channel::bounded(1);
+    let stopping = if config.replay_dir.is_some() {
+        stopping
+    } else {
+        crossbeam_channel::never()
+    };
     let handle = std::thread::Builder::new()
         .name("parquet-shadow".to_string())
         .spawn(move || {
@@ -67,7 +93,7 @@ pub fn start_parquet_shadow(
             match initialized {
                 Ok(mut worker) => {
                     let _ = ready_sender.send(Ok(()));
-                    worker.run(receiver);
+                    worker.run(receiver, stopping);
                 }
                 Err(error) => {
                     let _ = ready_sender.send(Err(error.to_string()));
@@ -77,7 +103,7 @@ pub fn start_parquet_shadow(
         .context("failed to spawn Parquet shadow worker")?;
 
     match ready_receiver.recv() {
-        Ok(Ok(())) => Ok(handle),
+        Ok(Ok(())) => Ok(ParquetShadowHandle { handle, stop }),
         Ok(Err(error)) => {
             let _ = handle.join();
             Err(anyhow!(error))
@@ -125,8 +151,14 @@ impl ShadowWorker {
         })
     }
 
-    fn run(&mut self, receiver: Receiver<SealedSegment>) {
+    fn run(&mut self, receiver: Receiver<SealedSegment>, stopping: Receiver<()>) {
         gauge!("parquet_shadow_running").set(1.0);
+        self.run_until_stopped(receiver, stopping);
+        gauge!("parquet_shadow_running").set(0.0);
+        tracing::info!("Parquet shadow worker stopped");
+    }
+
+    fn run_until_stopped(&mut self, receiver: Receiver<SealedSegment>, mut stopping: Receiver<()>) {
         if let Some(replay_dir) = self.config.replay_dir.clone() {
             match discover_sealed_segments(&replay_dir, self.config.replay_from_segment) {
                 Ok(paths) => {
@@ -137,6 +169,12 @@ impl ShadowWorker {
                         "replaying sealed segments through Parquet shadow"
                     );
                     for path in paths {
+                        if stopping.try_recv().is_ok() {
+                            tracing::info!(
+                                "Parquet shutdown requested; sealed backlog retained for startup replay"
+                            );
+                            return;
+                        }
                         self.process(&path, true);
                     }
                 }
@@ -151,11 +189,20 @@ impl ShadowWorker {
             }
         }
 
-        for sealed in receiver {
-            self.process(&sealed.path, false);
+        loop {
+            crossbeam_channel::select_biased! {
+                recv(stopping) -> result => match result {
+                    Ok(()) => return,
+                    // Losing the control handle is not an explicit shutdown.
+                    // Match replay's try_recv behavior without busy spinning.
+                    Err(_) => stopping = crossbeam_channel::never(),
+                },
+                recv(receiver) -> sealed => match sealed {
+                    Ok(sealed) => self.process(&sealed.path, false),
+                    Err(_) => return,
+                }
+            }
         }
-        gauge!("parquet_shadow_running").set(0.0);
-        tracing::info!("Parquet shadow worker stopped");
     }
 
     fn process(&mut self, path: &Path, replayed: bool) {
@@ -477,6 +524,17 @@ mod tests {
 
         let (sender, receiver) = crossbeam_channel::unbounded();
         drop(sender);
+        let (stop, stopping) = crossbeam_channel::bounded(1);
+        stop.send(()).unwrap();
+        let mut worker = ShadowWorker::new(config.clone()).unwrap();
+        worker.run(receiver, stopping);
+        assert!(worker.inventory.active_raw_objects().unwrap().is_empty());
+        drop(worker);
+        // Deferred input remains in the authoritative archive, and the same
+        // recorded floor publishes it on the next start.
+        assert!(sealed.path.exists());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        drop(sender);
         start_parquet_shadow(config, receiver)
             .unwrap()
             .join()
@@ -490,6 +548,15 @@ mod tests {
 
     #[test]
     fn sealed_segment_is_published_after_notepack_seal() {
+        assert_sealed_segment_published(false);
+    }
+
+    #[test]
+    fn dropping_control_without_replay_still_drains_live_notifications() {
+        assert_sealed_segment_published(true);
+    }
+
+    fn assert_sealed_segment_published(drop_control: bool) {
         let directory = tempfile::tempdir().unwrap();
         let segment_dir = directory.path().join("segments");
         let lake_dir = directory.path().join("lake");
@@ -529,8 +596,17 @@ mod tests {
             .write(pack_nostr_event(&event).unwrap())
             .unwrap();
         segment_writer.seal().unwrap();
+        // Without a durable startup replay policy, shutdown must still drain
+        // live notifications even when explicitly requested.
+        shadow_handle.request_shutdown();
         drop(segment_writer);
-        shadow_handle.join().unwrap();
+        if drop_control {
+            let ParquetShadowHandle { handle, stop } = shadow_handle;
+            drop(stop);
+            handle.join().unwrap();
+        } else {
+            shadow_handle.join().unwrap();
+        }
 
         let inventory = Inventory::open(inventory_path).unwrap();
         let active = inventory.active_raw_objects().unwrap();

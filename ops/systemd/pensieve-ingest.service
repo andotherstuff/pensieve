@@ -60,7 +60,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
 # Allow writes to data directories (includes negentropy sync-state in /data)
-ReadWritePaths=/data /archive /var/lib/pensieve
+# Optional while isolated reconciliation is disabled; tmpfiles must provision
+# the socket directory before explicitly enabling isolated mode.
+ReadWritePaths=/data /archive /var/lib/pensieve -/run/pensieve
 
 [Install]
 WantedBy=multi-user.target

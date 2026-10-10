@@ -46,6 +46,17 @@ required. For deployment:
 
 The routine restart instructions below do not override an active recovery fault.
 
+For a controlled ingester stop, do not treat the exit code of `systemctl stop`
+alone as proof of graceful shutdown. Check `Result`, `ExecMainCode`,
+`ExecMainStatus`, and the journal for `shutdown complete`; a stop timeout or
+SIGKILL is an error requiring investigation before starting the replacement.
+With startup Parquet replay enabled, the shadow finishes its current immutable
+work unit and defers remaining sealed segments to the unchanged replay policy on
+restart. It does not cancel an in-flight conversion/upload. Without startup
+replay, the shadow must drain its notification queue. Check catch-up and current
+work-unit duration before choosing a stop deadline, particularly when replacing
+an older binary that still drains the entire historical replay.
+
 1. **Pull:** `cd ~/pensieve && git pull origin master`
 2. **Build (if Rust changed):** `just build-release`
 3. **Install/reload units (only if `ops/systemd/` changed):**

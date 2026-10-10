@@ -29,7 +29,9 @@ pub use admission::validate_archive_event;
 pub use clickhouse::{ClickHouseConfig, ClickHouseIndexer, EventRow, IndexerStats};
 pub use coverage::CoverageSampler;
 pub use dedupe::{DedupeIndex, DedupeStats, EventStatus, PendingAdmission};
-pub use parquet_shadow::{ParquetShadowConfig, ParquetShadowPublisher, start_parquet_shadow};
+pub use parquet_shadow::{
+    ParquetShadowConfig, ParquetShadowHandle, ParquetShadowPublisher, start_parquet_shadow,
+};
 pub use seal_timer::ArchiveSealTimer;
 pub use segment::{
     LatestEventWatermark, PackedEvent, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter,

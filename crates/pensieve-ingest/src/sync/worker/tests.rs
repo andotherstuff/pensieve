@@ -73,6 +73,8 @@ async fn relay_with_empty(
 #[derive(Default)]
 struct RelayStats {
     inject_unrequested: bool,
+    compare_delay: Duration,
+    chatter: bool,
     continuations: std::sync::atomic::AtomicUsize,
     batches: std::sync::atomic::AtomicUsize,
     max_reply: std::sync::atomic::AtomicUsize,
@@ -104,6 +106,22 @@ async fn relay_events(
             }
             let request: serde_json::Value =
                 serde_json::from_str(message.to_text().unwrap()).unwrap();
+            if stats.chatter && request[0] == "NEG-OPEN" {
+                for _ in 0..40 {
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!(["NEG-MSG", "unrelated", "00"])
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
             if stats.inject_unrequested && matches!(request[0].as_str(), Some("NEG-OPEN" | "REQ")) {
                 // Valid, in-window, but not solicited: unknown subscription during
                 // diff/fetch, and a wrong ID on the actual fetch subscription.
@@ -120,6 +138,7 @@ async fn relay_events(
             }
             let response = match request[0].as_str().unwrap() {
                 "NEG-OPEN" | "NEG-MSG" if !hang => {
+                    tokio::time::sleep(stats.compare_delay).await;
                     if request[0] == "NEG-MSG" {
                         stats
                             .continuations
@@ -173,6 +192,158 @@ async fn relay_events(
         }
     });
     (url, task)
+}
+
+#[tokio::test]
+async fn slow_comparison_can_complete_empty_without_event_admission() {
+    let stats = Arc::new(RelayStats {
+        compare_delay: Duration::from_millis(400),
+        ..Default::default()
+    });
+    let (url, server) = relay_events(false, false, vec![], stats).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        let wire = transport::read_wire(&mut stream).await.unwrap();
+        let mut session = UploadSession::new(lease.clone());
+        assert!(matches!(
+            session
+                .receive(&mut ledger, Frame::read(&mut &wire[..]).unwrap(), now())
+                .unwrap(),
+            UploadAction::ProtocolDone
+        ));
+    };
+    let (result, ()) = tokio::join!(
+        run_with_budgets(
+            &socket,
+            uid(),
+            Duration::from_secs(3),
+            Duration::from_millis(200),
+            Duration::from_secs(2)
+        ),
+        parent
+    );
+    assert!(result.is_ok(), "{result:?}");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn overall_deadline_still_bounds_long_comparison_allowance() {
+    let (url, server) = relay(false, true).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        assert!(transport::read_wire(&mut stream).await.is_err());
+    };
+    let (result, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            run_with_budgets(
+                &socket,
+                uid(),
+                Duration::from_millis(400),
+                Duration::from_secs(1),
+                Duration::from_secs(30)
+            ),
+            parent
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Deadline)));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn unrelated_protocol_chatter_does_not_extend_comparison_deadline() {
+    let (url, server) = relay_events(
+        false,
+        true,
+        vec![],
+        Arc::new(RelayStats {
+            chatter: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        assert!(transport::read_wire(&mut stream).await.is_err());
+    };
+    let (result, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            run_with_budgets(
+                &socket,
+                uid(),
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                Duration::from_millis(150)
+            ),
+            parent
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Deadline)));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn stalled_handshake_reports_relay_failure_before_connect_backstop() {
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", relay_listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (_socket, _) = relay_listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        let wire = transport::read_wire(&mut stream).await.unwrap();
+        let mut session = UploadSession::new(lease.clone());
+        assert!(matches!(
+            session
+                .receive(&mut ledger, Frame::read(&mut &wire[..]).unwrap(), now())
+                .unwrap(),
+            UploadAction::Failed(FailureKind::Relay)
+        ));
+    };
+    let (result, ()) = timeout(Duration::from_secs(28), async {
+        tokio::join!(
+            run_with_budgets(
+                &socket,
+                uid(),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(60)
+            ),
+            parent
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Incomplete)));
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
