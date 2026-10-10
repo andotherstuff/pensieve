@@ -153,24 +153,16 @@
         <asynchronous_metrics>true</asynchronous_metrics>
     </prometheus>
 
-    <!-- ═══════════════════════════════════════════════════════════════════ -->
-    <!-- User Profile Settings (query-level settings) -->
-    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <!--
+        Do not put <profiles> here. ClickHouse reads settings profiles only
+        from the users configuration (users.xml / users.d), so a profile in
+        this config.d file is silently ignored. Profiles live in users.xml.
 
-    <profiles>
-        <default>
-            <!-- Max memory per query (prevent single query from using all RAM) -->
-            <max_memory_usage>32000000000</max_memory_usage> <!-- 32 GB -->
-
-            <!-- Query timeout -->
-            <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
-
-            <!-- Enable async inserts for better batching -->
-            <async_insert>1</async_insert>
-            <wait_for_async_insert>0</wait_for_async_insert>
-            <async_insert_max_data_size>10000000</async_insert_max_data_size> <!-- 10 MB -->
-            <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
-        </default>
-    </profiles>
+        The `default` user (ingester, API, analytics jobs, `just ch-migrate`)
+        runs with stock query settings: synchronous inserts (async_insert=0),
+        no per-query max_memory_usage and no max_execution_time. Memory is
+        bounded server-wide by max_server_memory_usage_to_ram_ratio above;
+        clients that need tighter limits send them per query.
+    -->
 </clickhouse>
 

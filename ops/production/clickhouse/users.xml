@@ -4,6 +4,10 @@
 
     This file is mounted to /etc/clickhouse-server/users.d/custom.xml
     It adds a read-only 'grafana' user for dashboard queries.
+
+    Settings profiles must be defined here (or elsewhere under users.d), not
+    in config.xml: ClickHouse ignores <profiles> in server config.d files.
+    The `default` profile is intentionally left at stock settings.
 -->
 <clickhouse>
     <!-- ═══════════════════════════════════════════════════════════════════ -->
