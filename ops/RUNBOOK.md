@@ -8,6 +8,13 @@ How the production box is actually operated. The box runs at `/home/pensieve/pen
 - `ops/production/compose.yml` — Docker stack: ClickHouse, Postgres analytics,
   Prometheus, Grafana, Caddy.
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
+  ClickHouse query settings (profiles) belong in `clickhouse/users.xml` (mounted under
+  `users.d`); `<profiles>` in `clickhouse/config.xml` (`config.d`) are silently ignored.
+  The `default` user (ingest, API, migrations) uses stock settings, including
+  synchronous inserts. Check effective values by name, e.g.
+  `SELECT name, value, changed FROM system.settings WHERE name IN ('async_insert',
+  'wait_for_async_insert', 'max_memory_usage', 'max_execution_time')`
+  (`WHERE changed` lists only overrides, so it is empty for stock settings).
 - `ops/systemd/*.service`, `*.timer` — **source copies** of the installed units. Editing a
   file here does NOT change the running unit; you must install + `daemon-reload` (below).
 - `ops/scripts/sync-archive.sh` — hourly archive → Storage Box sync (run by `archive-sync.service`).
