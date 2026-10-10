@@ -134,13 +134,12 @@ async fn run_with_budgets(
     let assignment = wait_assignment(&mut stream, SETUP_TIME).await?;
     let started = Instant::now();
     let until = started + wall.min(assignment.remaining()?);
-    let progress_until = started + idle;
     let progress = Progress::new(idle, compare);
     let relay = assignment.relay.clone();
     let job = assignment.header(0).job;
     let outcome = timeout_at(until, async {
         let items = timeout_at(
-            progress_until,
+            progress.state().deadline,
             transport::assigned_inventory(&mut stream, &assignment),
         )
         .await

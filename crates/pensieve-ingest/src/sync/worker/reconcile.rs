@@ -16,6 +16,13 @@ use super::{Assignment, WorkerError};
 const NEG_FRAME: usize = 60_000;
 const FETCH_BATCH: usize = 128;
 
+fn record_reply(replies: &mut HashSet<[u8; 32]>, bytes: &[u8]) -> Result<(), WorkerError> {
+    if replies.len() >= 4096 || !replies.insert(Sha256::digest(bytes).into()) {
+        return Err(WorkerError::Incomplete);
+    }
+    Ok(())
+}
+
 /// Constructed only after a complete diff and every requested fetch reaches EOSE.
 #[cfg_attr(test, derive(Default))]
 pub(super) struct DownloadProof {
@@ -92,9 +99,7 @@ pub(super) async fn download_with_progress(
                     return Err(WorkerError::Incomplete);
                 }
                 let bytes = hex::decode(message.as_ref()).map_err(|_| WorkerError::Incomplete)?;
-                if replies.len() >= 4096 || !replies.insert(Sha256::digest(&bytes)) {
-                    return Err(WorkerError::Incomplete);
-                }
+                record_reply(&mut replies, &bytes)?;
                 let mut have = Vec::new();
                 let mut need = Vec::new();
                 let next = engine
@@ -215,6 +220,24 @@ pub(super) async fn download_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_and_excessive_replies_fail_closed() {
+        let mut replies = HashSet::new();
+        record_reply(&mut replies, b"reply").unwrap();
+        assert!(matches!(
+            record_reply(&mut replies, b"reply"),
+            Err(WorkerError::Incomplete)
+        ));
+        replies.clear();
+        for n in 0u32..4096 {
+            record_reply(&mut replies, &n.to_be_bytes()).unwrap();
+        }
+        assert!(matches!(
+            record_reply(&mut replies, b"new reply"),
+            Err(WorkerError::Incomplete)
+        ));
+    }
 
     #[tokio::test]
     async fn lagged_or_closed_notification_stream_is_incomplete() {

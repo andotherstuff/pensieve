@@ -35,7 +35,8 @@ two-minute limit; connection is bounded to 20 seconds. Comparison allows five
 minutes for the initial response and between accepted NIP-77 rounds. Only
 matching replies successfully processed by the reconciliation engine count;
 repeated reply digests, malformed replies, foreign subscriptions and pings do
-not buy time. Comparison is additionally capped at 4,096 replies. These are
+not buy time. Repeated digests and malformed replies terminate the attempt as
+incomplete; unrelated messages are ignored. Comparison is additionally capped at 4,096 replies. These are
 experimental bounded-canary settings, not a latency guarantee.
 
 Fetching/draining has a two-minute progress allowance, refreshed by parent

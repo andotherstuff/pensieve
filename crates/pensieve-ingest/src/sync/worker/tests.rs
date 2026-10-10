@@ -304,6 +304,49 @@ async fn unrelated_protocol_chatter_does_not_extend_comparison_deadline() {
 }
 
 #[tokio::test]
+async fn stalled_handshake_reports_relay_failure_before_connect_backstop() {
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", relay_listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (_socket, _) = relay_listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = dir.path().join("ipc");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (mut ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let parent = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        send_inventory(&mut stream, &lease, &url).await;
+        let wire = transport::read_wire(&mut stream).await.unwrap();
+        let mut session = UploadSession::new(lease.clone());
+        assert!(matches!(
+            session
+                .receive(&mut ledger, Frame::read(&mut &wire[..]).unwrap(), now())
+                .unwrap(),
+            UploadAction::Failed(FailureKind::Relay)
+        ));
+    };
+    let (result, ()) = timeout(Duration::from_secs(28), async {
+        tokio::join!(
+            run_with_budgets(
+                &socket,
+                uid(),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(60)
+            ),
+            parent
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(WorkerError::Incomplete)));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn closed_diff_fails_without_waiting_for_the_idle_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/", listener.local_addr().unwrap());

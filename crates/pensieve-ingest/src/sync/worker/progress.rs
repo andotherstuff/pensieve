@@ -55,7 +55,9 @@ impl Progress {
             s.phase = phase;
             s.deadline = Instant::now()
                 + match phase {
-                    Phase::Connect => super::SETUP_TIME,
+                    // Leave time for try_connect's 20s timeout to report Relay
+                    // failure instead of racing it into an unclassified EOF.
+                    Phase::Connect => super::SETUP_TIME + Duration::from_secs(10),
                     Phase::Compare => self.compare,
                     _ => self.idle,
                 };
@@ -96,6 +98,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn comparison_and_fetch_have_separate_progress_budgets() {
         let p = Progress::new(Duration::from_secs(120), Duration::from_secs(300));
+        p.phase(Phase::Connect);
+        assert!(p.state().deadline - Instant::now() > super::super::SETUP_TIME);
         p.phase(Phase::Compare);
         let first = p.state().deadline;
         tokio::time::advance(Duration::from_secs(121)).await;
