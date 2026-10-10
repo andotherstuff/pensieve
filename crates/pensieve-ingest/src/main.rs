@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+mod giftwrap_filter;
+
 /// Default seed relays to use when no CLI args or seed file is available.
 fn default_seed_relays() -> Vec<String> {
     vec![
@@ -116,6 +118,10 @@ fn record_relay_discovery(manager: &RelayManager, event: &nostr_sdk::Event) {
 #[command(about = "Live Nostr event ingestion daemon")]
 #[command(version)]
 struct Args {
+    /// Drop kind 1059 events addressed to these keys before dedupe/archive admission.
+    #[arg(long, env = "PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS", value_delimiter = ',', value_parser = giftwrap_filter::parse_recipient)]
+    blocked_giftwrap_recipients: Vec<String>,
+
     /// RocksDB path for dedupe index
     #[arg(long, default_value = "./data/dedupe")]
     rocksdb_path: PathBuf,
@@ -481,7 +487,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let blocked_giftwrap_recipients = args.blocked_giftwrap_recipients.clone();
     tracing::info!("Pensieve live ingestion daemon starting...");
+    tracing::info!(
+        recipient_count = blocked_giftwrap_recipients.len(),
+        "giftwrap recipient admission policy loaded"
+    );
 
     let archive_ready = Arc::new(AtomicBool::new(false));
     // Initialize metrics
@@ -1059,6 +1070,7 @@ async fn main() -> Result<()> {
         let negentropy_events_deduplicated = Arc::clone(&events_deduplicated);
         let negentropy_max_created_at = Arc::clone(&max_created_at);
         let negentropy_relay_manager = Arc::clone(&relay_manager);
+        let blocked_recipients = blocked_giftwrap_recipients.clone();
 
         Some(tokio::spawn(async move {
             tracing::info!("Starting negentropy sync task...");
@@ -1074,6 +1086,11 @@ async fn main() -> Result<()> {
                     }
 
                     // Get the event ID bytes for dedupe check
+                    if giftwrap_filter::is_blocked(event, &blocked_recipients) {
+                        counter!("ingest_policy_dropped_total", "source" => "negentropy", "reason" => "giftwrap_recipient").increment(1);
+                        return Ok(true);
+                    }
+
                     let event_id = event.id.as_bytes();
 
                     // Dedupe check - same logic as live ingestion
@@ -1200,6 +1217,11 @@ async fn main() -> Result<()> {
             counter!("relay_events_received_total").increment(1);
 
             // Get the event ID bytes for dedupe check (CHEAP - just a reference)
+            if giftwrap_filter::is_blocked(event, &blocked_giftwrap_recipients) {
+                counter!("ingest_policy_dropped_total", "source" => "live", "reason" => "giftwrap_recipient").increment(1);
+                return Ok(true);
+            }
+
             let event_id = event.id.as_bytes();
 
             // Dedupe check FIRST - before expensive packing
@@ -1683,6 +1705,10 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         return Ok(None);
     }
     anyhow::ensure!(
+        args.blocked_giftwrap_recipients.is_empty(),
+        "isolated reconciliation is disabled while giftwrap recipient blocking is configured; durable policy-exclusion receipts are not implemented"
+    );
+    anyhow::ensure!(
         !args.negentropy,
         "legacy and isolated negentropy are mutually exclusive"
     );
@@ -1861,6 +1887,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn recipient_policy_prevents_isolated_admission_bypass() {
+        let args = Args::try_parse_from([
+            "pensieve-ingest",
+            "--isolated-negentropy",
+            "--blocked-giftwrap-recipients",
+            "d0182d1b03c946beeb5d4b6742216c021f38322e8f089bf63722cdddc1f819aa",
+        ])
+        .unwrap();
+        let error = isolated_config(&args).unwrap_err().to_string();
+        assert!(error.contains("policy-exclusion receipts"));
+        assert!(continue_live_after_isolated_failure(isolated_config(&args)).is_none());
+    }
+
+    #[test]
+    fn giftwrap_recipient_arguments_are_validated_and_normalized() {
+        let key = "d0182d1b03c946beeb5d4b6742216c021f38322e8f089bf63722cdddc1f819aa";
+        let args = Args::try_parse_from(["pensieve-ingest", "--blocked-giftwrap-recipients", key])
+            .unwrap();
+        assert_eq!(args.blocked_giftwrap_recipients, vec![key.to_string()]);
+        assert!(
+            Args::try_parse_from([
+                "pensieve-ingest",
+                "--blocked-giftwrap-recipients",
+                "invalid"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
