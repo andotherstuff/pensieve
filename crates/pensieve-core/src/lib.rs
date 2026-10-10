@@ -12,6 +12,7 @@ mod error;
 mod event;
 pub mod metrics;
 pub mod proto;
+pub mod reconciliation_health;
 pub mod relay_url;
 mod watermark;
 

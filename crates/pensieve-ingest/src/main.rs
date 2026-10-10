@@ -513,6 +513,7 @@ async fn main() -> Result<()> {
         tracing::info!(port = args.metrics_port, "metrics server listening");
     }
     if args.isolated_negentropy {
+        pensieve_core::reconciliation_health::reconciliation_health().enable();
         gauge!("negentropy_isolated_ready").set(0.0);
         gauge!("negentropy_isolated_unhealthy").set(0.0);
     }
@@ -1485,6 +1486,7 @@ fn continue_live_after_isolated_failure<T>(result: Result<T>) -> Option<T> {
         Err(error) => {
             gauge!("negentropy_isolated_ready").set(0.0);
             gauge!("negentropy_isolated_unhealthy").set(1.0);
+            pensieve_core::reconciliation_health::reconciliation_health().fail();
             counter!("negentropy_isolated_start_failures_total").increment(1);
             tracing::error!(error = %compact_error(&error), "isolated reconciliation unavailable; live ingestion remains enabled");
             None

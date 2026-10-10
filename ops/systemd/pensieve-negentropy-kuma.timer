@@ -1,0 +1,11 @@
+[Unit]
+Description=Check reconciliation progress every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=1
+Unit=pensieve-negentropy-kuma.service
+
+[Install]
+WantedBy=timers.target

@@ -38,8 +38,11 @@ required. For deployment:
 - Verify that recovery-required state stops intake and remains observable
   without a systemd restart loop.
 - Configure Uptime Kuma to monitor `/health/archive-admission` on the private
-  ingester metrics port, accepting only HTTP 200; test notification firing and
-  resolution. The checked-in Prometheus rules alone do not notify anyone.
+  ingester metrics port, accepting only HTTP 200, either directly over existing
+  private connectivity or through a credential-protected outbound push probe.
+  Pensieve currently uses the latter; do not expose the port publicly. Test
+  notification firing and resolution. The checked-in Prometheus rules alone
+  do not notify anyone.
 - Run a read-only preflight for existing recovery markers/orphan segments and
   account for them before restarting. Preserve files and markers during an
   incident; investigate and repair before explicitly resuming admission.

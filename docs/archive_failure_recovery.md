@@ -76,9 +76,12 @@ latched fault. Rules are in `ops/production/prometheus/archive-alerts.yml`, with
 a separate ingester-unavailable rule for process/startup failure. These changes
 are not deployed automatically. Verify rule loading and the site's notification
 receiver routing before claiming operator notifications are delivered.
-The selected notification system is Uptime Kuma. Configure an HTTP monitor for
+The selected notification system is Uptime Kuma. Monitor
 `http://<private-ingester-address>:9091/health/archive-admission`, accepting only
-HTTP 200. It returns 503 during startup, recovery-required state, and shutdown.
+HTTP 200, using existing private HTTP connectivity or an outbound push probe.
+The deployed Pensieve monitor uses the outbound probe with a missing-heartbeat
+deadline; do not add public network access for monitoring. The endpoint returns
+503 during startup, recovery-required state, and shutdown.
 This endpoint is served on the existing metrics port; do not expose that port
 publicly just to monitor it. A disabled metrics port also disables this endpoint.
 

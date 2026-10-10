@@ -1,0 +1,23 @@
+[Unit]
+Description=Report private reconciliation progress to Uptime Kuma
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+LoadCredential=push-url:/etc/pensieve/negentropy-kuma.url
+ExecStart=/usr/bin/python3 /usr/local/libexec/pensieve-negentropy-kuma.py
+TimeoutStartSec=20
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+MemoryMax=64M
+TasksMax=8
+UMask=0077

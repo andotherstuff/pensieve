@@ -54,7 +54,7 @@ checked before binding. The single owner thread plans at most 32 lazy 15-minute
 windows per turn within the approved 14-day rolling horizon, replays sealed
 segments from the explicit floor, performs bounded receipt maintenance, and
 leases one job to one authenticated service process. It reserves 2,048 of the
-default 100,000 lifetime job slots for split recovery before planning more roots.
+default 100,000 retained job slots for split recovery before planning more roots.
 It preserves all unresolved gaps; neither the runtime nor planner prunes them.
 Below 20 GiB available on the ledger filesystem, it continues bounded receipt
 maintenance but pauses replay, new planning and leases, exposing
@@ -128,10 +128,13 @@ expanding the relay set or declaring indefinite unattended operation ready.
 This is a development milestone, not a rollout approval. The Linux cgroup
 OOM/hang/kill proof, alert delivery, exact canary allowlist, throughput/freshness
 targets, disk preflight and backups, three durable canary jobs with injected
-recovery, and the bounded canary remain operator gates. Repeated sweeps eventually
-reach the lifetime job ceiling; a measured terminal-summary retention design
-must precede indefinite operation. Existing older prototype ledgers are rejected
-without migration or deletion and require an explicit recovery decision.
+recovery, and the bounded canary remain operator gates. Successful closed rolling
+sweeps now have bounded detail retention and compact coverage accounting; unresolved
+gaps and exclusion-proof owners remain pinned. Schema 8 migrates transactionally
+to 9, without inventing legacy completion timestamps. Older unsupported prototype
+ledgers remain rejected without deletion. See
+[continuous readiness](negentropy_continuous_readiness.md) for the backup,
+retention, separate progress-alert, and bounded activation requirements.
 On a marked disposable systemd 257 host with the static worker unit already
 active, `ops/tests/negentropy-binding-properties.sh` exercises the real fixed
 bus query read-only; macOS fixture tests do not constitute that proof.
