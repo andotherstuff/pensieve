@@ -21,6 +21,32 @@ before creating the socket: `/run/pensieve` needs owner `pensieve`, group
 `pensieve-ipc` and setgid mode `2770` so the ingester-created `0660` socket
 inherits that IPC group. The worker unit has `pensieve-ipc` only as a
 supplementary group; it must not acquire the ingester's archive/data group.
+The ingester's `ProtectSystem=strict` sandbox must explicitly include
+`ReadWritePaths=/run/pensieve` in addition to its existing writable paths.
+Provision `/data/negentropy` with a traversable parent (for example root:pensieve
+0750) and a pensieve-owned ledger directory. Verify access as the service user
+and inside the service mount namespace, not only as root on the host.
+
+### Worker progress budgets
+
+Each assigned attempt retains its nine-minute overall limit (or the remaining
+parent lease/canary budget, whichever is shorter). Inventory transfer has a
+two-minute limit; connection is bounded to 20 seconds. Comparison allows five
+minutes for the initial response and between accepted NIP-77 rounds. Only
+matching replies successfully processed by the reconciliation engine count;
+repeated reply digests, malformed replies, foreign subscriptions and pings do
+not buy time. Comparison is additionally capped at 4,096 replies. These are
+experimental bounded-canary settings, not a latency guarantee.
+
+Fetching/draining has a two-minute progress allowance, refreshed by parent
+admission acknowledgments or completed, fully satisfied fetch batches. An
+individual IPC upload/acknowledgment also has its own two-minute bound, which
+relay progress cannot extend. Empty successful comparisons require no new
+events. None of these signals implies archive durability. Logs report local
+inventory count, comparison rounds/missing IDs, completed fetch batches and
+admitted counts, plus the current phase and wall-versus-phase deadline on
+timeout. No event payloads or capability tokens are logged. The systemd
+ten-minute worker lifetime remains the non-cooperative-process backstop.
 
 At startup, the ledger, existing inventory and writer/dedupe authority are
 checked before binding. The single owner thread plans at most 32 lazy 15-minute

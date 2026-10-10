@@ -6,9 +6,11 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use super::super::ipc::MAX_EVENTS;
+use super::progress::{Phase, Progress};
 use super::{Assignment, WorkerError};
 
 const NEG_FRAME: usize = 60_000;
@@ -28,10 +30,21 @@ async fn notification(
     receiver.recv().await.map_err(|_| WorkerError::Incomplete)
 }
 
+#[cfg(test)]
 pub(super) async fn download(
     relay: &Relay,
     job: &Assignment,
     items: Vec<(EventId, Timestamp)>,
+) -> Result<DownloadProof, WorkerError> {
+    let progress = Progress::new(super::IDLE_TIME, super::COMPARE_TIME);
+    download_with_progress(relay, job, items, &progress).await
+}
+
+pub(super) async fn download_with_progress(
+    relay: &Relay,
+    job: &Assignment,
+    items: Vec<(EventId, Timestamp)>,
+    progress: &Progress,
 ) -> Result<DownloadProof, WorkerError> {
     let mut storage = negentropy::NegentropyStorageVector::with_capacity(items.len());
     for (id, timestamp) in items {
@@ -61,6 +74,9 @@ pub(super) async fn download(
         })
         .map_err(|_| WorkerError::Incomplete)?;
     let mut remote = HashSet::new();
+    // Bound both bookkeeping and protocol-only work. Repeated replies are not
+    // useful progress, even if they decode; never let chatter extend a lease.
+    let mut replies = HashSet::new();
     loop {
         match notification(&mut notifications).await? {
             RelayNotification::Message {
@@ -76,6 +92,9 @@ pub(super) async fn download(
                     return Err(WorkerError::Incomplete);
                 }
                 let bytes = hex::decode(message.as_ref()).map_err(|_| WorkerError::Incomplete)?;
+                if replies.len() >= 4096 || !replies.insert(Sha256::digest(&bytes)) {
+                    return Err(WorkerError::Incomplete);
+                }
                 let mut have = Vec::new();
                 let mut need = Vec::new();
                 let next = engine
@@ -89,6 +108,9 @@ pub(super) async fn download(
                         return Err(WorkerError::Incomplete);
                     }
                 }
+                progress.round(remote.len());
+                let state = progress.state();
+                tracing::info!(relay = %job.relay, phase = "compare", rounds = state.rounds, missing = state.missing, "isolated comparison progress");
                 match next {
                     Some(next) => relay
                         .send_msg(ClientMessage::NegMsg {
@@ -123,6 +145,8 @@ pub(super) async fn download(
     let mut ids: Vec<_> = remote.iter().copied().collect();
     ids.sort_unstable();
     let mut received = HashSet::new();
+    progress.phase(Phase::Fetch);
+    tracing::info!(relay = %job.relay, phase = "fetch", missing = ids.len(), batches = ids.len().div_ceil(FETCH_BATCH), "isolated fetch started");
     for batch in ids.chunks(FETCH_BATCH) {
         let fetch = SubscriptionId::generate();
         relay
@@ -167,6 +191,8 @@ pub(super) async fn download(
                         .unsubscribe(&fetch)
                         .await
                         .map_err(|_| WorkerError::Incomplete)?;
+                    progress.batch();
+                    tracing::info!(relay = %job.relay, phase = "fetch", batches = progress.state().batches, received = received.len(), missing = ids.len(), "isolated fetch progress");
                     break;
                 }
                 RelayNotification::Message {

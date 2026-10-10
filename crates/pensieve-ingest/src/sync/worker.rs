@@ -3,6 +3,7 @@
 //! backstop. Wire/ID bounds do not bound all SDK decoder/allocator memory.
 
 mod capture;
+mod progress;
 mod reconcile;
 mod transport;
 
@@ -15,6 +16,7 @@ use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use self::capture::Capture;
+use self::progress::{Phase, Progress};
 #[cfg(test)]
 pub(super) use self::transport::inventory;
 pub use self::transport::{Assignment, Hello, ParentMessage, read_message, write_message};
@@ -24,6 +26,7 @@ use super::ipc::{Frame, Message, ProtocolError, VERSION};
 
 const WALL_TIME: Duration = Duration::from_secs(9 * 60);
 const IDLE_TIME: Duration = Duration::from_secs(2 * 60);
+const COMPARE_TIME: Duration = Duration::from_secs(5 * 60);
 const SETUP_TIME: Duration = Duration::from_secs(20);
 const RELAY_MESSAGE_BYTES: u32 = 5 * 1024 * 1024;
 
@@ -96,14 +99,25 @@ impl WorkerError {
 /// job deadlines start upon assignment, not during idle waiting. Dropping this
 /// future cancels idle waiting and closes its socket; no SDK exists before Job.
 pub async fn run(socket: &Path, parent_uid: u32) -> Result<(), WorkerError> {
-    run_with_limits(socket, parent_uid, WALL_TIME, IDLE_TIME).await
+    run_with_budgets(socket, parent_uid, WALL_TIME, IDLE_TIME, COMPARE_TIME).await
 }
 
+#[cfg(test)]
 async fn run_with_limits(
     socket: &Path,
     parent_uid: u32,
     wall: Duration,
     idle: Duration,
+) -> Result<(), WorkerError> {
+    run_with_budgets(socket, parent_uid, wall, idle, idle).await
+}
+
+async fn run_with_budgets(
+    socket: &Path,
+    parent_uid: u32,
+    wall: Duration,
+    idle: Duration,
+    compare: Duration,
 ) -> Result<(), WorkerError> {
     let mut stream = timeout(SETUP_TIME, async {
         let mut stream = UnixStream::connect(socket)
@@ -121,17 +135,33 @@ async fn run_with_limits(
     let started = Instant::now();
     let until = started + wall.min(assignment.remaining()?);
     let progress_until = started + idle;
-    timeout_at(until, async {
+    let progress = Progress::new(idle, compare);
+    let relay = assignment.relay.clone();
+    let job = assignment.header(0).job;
+    let outcome = timeout_at(until, async {
         let items = timeout_at(
             progress_until,
             transport::assigned_inventory(&mut stream, &assignment),
         )
         .await
         .map_err(|_| WorkerError::Deadline)??;
-        attempt(stream, assignment, items, idle, progress_until).await
+        tracing::info!(relay = %relay, job, local_ids = items.len(), "isolated inventory ready");
+        attempt(stream, assignment, items, idle, &progress).await
     })
-    .await
-    .map_err(|_| WorkerError::Deadline)?
+    .await;
+    let state = progress.state();
+    match outcome {
+        Err(_) => {
+            tracing::warn!(relay = %relay, job, phase = ?state.phase, deadline = "wall", rounds = state.rounds, missing = state.missing, batches = state.batches, admitted = state.admitted, "isolated deadline exceeded");
+            Err(WorkerError::Deadline)
+        }
+        Ok(result) => {
+            if matches!(result, Err(WorkerError::Deadline)) {
+                tracing::warn!(relay = %relay, job, phase = ?state.phase, deadline = "phase_or_parent_ack", rounds = state.rounds, missing = state.missing, batches = state.batches, admitted = state.admitted, "isolated deadline exceeded");
+            }
+            result
+        }
+    }
 }
 
 // Idle before the first byte is intentionally unbounded. Once framing starts,
@@ -154,9 +184,9 @@ async fn attempt(
     assignment: Assignment,
     items: Vec<(EventId, Timestamp)>,
     idle_time: Duration,
-    mut idle: Instant,
+    progress: &Progress,
 ) -> Result<(), WorkerError> {
-    if Instant::now() >= idle {
+    if Instant::now() >= progress.state().deadline {
         return Err(WorkerError::Deadline);
     }
     let (capture, mut events) = Capture::new(&assignment);
@@ -181,15 +211,18 @@ async fn attempt(
                 .await
                 .map_err(|_| WorkerError::Incomplete)?;
             tracing::info!(relay = %relay_url, phase = "connect", "isolated reconciliation");
+            progress.phase(Phase::Connect);
             relay
                 .try_connect(Duration::from_secs(20))
                 .await
                 .map_err(|_| WorkerError::Incomplete)?;
             tracing::info!(relay = %relay_url, phase = "sync", "isolated reconciliation");
-            reconcile::download(&relay, &assignment, items).await
+            progress.phase(Phase::Compare);
+            reconcile::download_with_progress(&relay, &assignment, items, progress).await
         }
         .await;
         tracing::info!(relay = %relay_url, phase = "disconnect", "isolated reconciliation");
+        progress.phase(Phase::Drain);
         client.disconnect().await;
         // Close under the callback lock, not by hoping SDK Arc destruction closes
         // its sender. Every callback accepted before this cut is already queued.
@@ -198,12 +231,19 @@ async fn attempt(
     tokio::pin!(sdk);
     let mut result = None;
     let mut admitted = 0;
+    let mut changes = progress.subscribe();
     loop {
+        let state = *changes.borrow_and_update();
         tokio::select! {
             value = &mut sdk, if result.is_none() => {
                 result = Some(value);
             }
-            _ = tokio::time::sleep_until(idle) => return Err(WorkerError::Deadline),
+            _ = changes.changed() => {},
+            _ = tokio::time::sleep_until(state.deadline) => {
+                if Instant::now() >= progress.state().deadline {
+                    return Err(WorkerError::Deadline);
+                }
+            },
             ready = stream.readable() => {
                 ready.map_err(ProtocolError::Io)?;
                 // No ACK is legal when there is no outstanding upload. Cancel,
@@ -216,7 +256,7 @@ async fn attempt(
             }
             event = events.recv() => {
                 let Some(event) = event else { break };
-                timeout_at(idle, async {
+                timeout(idle_time, async {
                     use tokio::io::AsyncWriteExt;
                     stream.write_all(&event.wire).await.map_err(ProtocolError::Io)?;
                     let ack: ParentMessage = read_message(&mut stream).await?;
@@ -229,20 +269,27 @@ async fn attempt(
                 // SDK progress and socket chatter do not refresh this deadline.
                 drop(event);
                 admitted += 1;
-                idle = Instant::now() + idle_time;
+                progress.admitted();
             }
         }
     }
     let outcome = match result {
         Some(summary) => summary,
-        None => timeout_at(idle, &mut sdk)
+        None => timeout_at(progress.state().deadline, &mut sdk)
             .await
             .map_err(|_| WorkerError::Deadline)?,
     };
     let (count, digest) = match outcome {
         Ok(summary) => summary,
         Err(error) => {
-            return Err(report_failure(&mut stream, &assignment, admitted, idle, error).await);
+            return Err(report_failure(
+                &mut stream,
+                &assignment,
+                admitted,
+                progress.state().deadline,
+                error,
+            )
+            .await);
         }
     };
     tracing::info!(relay = %relay_url, phase = "drained", count, "isolated reconciliation");
@@ -252,7 +299,7 @@ async fn attempt(
         digest,
     })?;
     use tokio::io::AsyncWriteExt;
-    timeout_at(idle, stream.write_all(&wire))
+    timeout_at(progress.state().deadline, stream.write_all(&wire))
         .await
         .map_err(|_| WorkerError::Deadline)?
         .map_err(ProtocolError::Io)?;
