@@ -31,6 +31,8 @@ const DATA_RESERVE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// from the public relay catalog or legacy negentropy defaults.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
+    /// Same immutable admission policy as the live source; bound to the ledger.
+    pub admission_policy: crate::giftwrap_filter::AdmissionPolicy,
     /// Unix socket in an operator-provisioned restricted runtime directory.
     pub socket: PathBuf,
     /// Dedicated, unprivileged systemd worker account's numeric UID.
@@ -103,7 +105,11 @@ impl IsolatedRuntime {
         if writer.recovery_required() {
             return Err(RuntimeError::Parent(ParentError::RecoveryRequired));
         }
-        let ledger = JobLedger::open(&config.ledger, LedgerLimits::default())?;
+        let ledger = JobLedger::open_with_policy(
+            &config.ledger,
+            LedgerLimits::default(),
+            config.admission_policy.clone(),
+        )?;
         let inventory = Arc::new(SyncStateDb::open(&config.inventory)?);
         let mut parent = ParentExecutor::new(ledger, inventory, dedupe, writer.clone())?;
         parent.configure(config.relays.clone()).await?;
@@ -316,6 +322,7 @@ mod tests {
             .unwrap(),
         );
         let config = RuntimeConfig {
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
             socket: socket.clone(),
             worker_uid: 501,
             ledger: root.path().join("jobs.sqlite"),
@@ -358,6 +365,7 @@ mod tests {
             .unwrap();
         let ledger_path = root.path().join("jobs.sqlite");
         let config = RuntimeConfig {
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
             socket: root.path().join("worker.sock"),
             worker_uid: uid,
             ledger: ledger_path.clone(),

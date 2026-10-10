@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
-mod giftwrap_filter;
+use pensieve_ingest::giftwrap_filter;
 
 /// Default seed relays to use when no CLI args or seed file is available.
 fn default_seed_relays() -> Vec<String> {
@@ -1705,10 +1705,6 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         return Ok(None);
     }
     anyhow::ensure!(
-        args.blocked_giftwrap_recipients.is_empty(),
-        "isolated reconciliation is disabled while giftwrap recipient blocking is configured; durable policy-exclusion receipts are not implemented"
-    );
-    anyhow::ensure!(
         !args.negentropy,
         "legacy and isolated negentropy are mutually exclusive"
     );
@@ -1755,6 +1751,8 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         "isolated ledger path must be absolute"
     );
     Ok(Some(RuntimeConfig {
+        admission_policy: giftwrap_filter::AdmissionPolicy::new(&args.blocked_giftwrap_recipients)
+            .map_err(anyhow::Error::msg)?,
         socket: args.isolated_negentropy_socket.clone(),
         worker_uid,
         ledger: args.isolated_negentropy_ledger.clone(),
@@ -1890,17 +1888,28 @@ mod tests {
     }
 
     #[test]
-    fn recipient_policy_prevents_isolated_admission_bypass() {
+    fn recipient_policy_is_carried_into_isolated_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let relays = root.path().join("relays.txt");
+        std::fs::write(&relays, "wss://relay.example.com\n").unwrap();
         let args = Args::try_parse_from([
             "pensieve-ingest",
             "--isolated-negentropy",
+            "--isolated-negentropy-relays-file",
+            relays.to_str().unwrap(),
+            "--isolated-negentropy-worker-uid",
+            "501",
+            "--isolated-negentropy-replay-floor",
+            "0",
             "--blocked-giftwrap-recipients",
             "d0182d1b03c946beeb5d4b6742216c021f38322e8f089bf63722cdddc1f819aa",
         ])
         .unwrap();
-        let error = isolated_config(&args).unwrap_err().to_string();
-        assert!(error.contains("policy-exclusion receipts"));
-        assert!(continue_live_after_isolated_failure(isolated_config(&args)).is_none());
+        let config = isolated_config(&args).unwrap().unwrap();
+        assert_eq!(
+            config.admission_policy,
+            giftwrap_filter::AdmissionPolicy::new(&args.blocked_giftwrap_recipients).unwrap()
+        );
     }
 
     #[test]

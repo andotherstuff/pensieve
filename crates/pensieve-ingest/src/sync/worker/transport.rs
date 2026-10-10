@@ -7,7 +7,7 @@ use nostr_sdk::prelude::{EventId, RelayUrl, Timestamp};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::super::ipc::{self, Accepted, Header, ProtocolError, VERSION};
+use super::super::ipc::{self, Accepted, AdmissionOutcome, Header, ProtocolError, VERSION};
 use super::super::{MAX_WINDOW_ITEMS, jobs::Lease};
 
 /// Fixed greeting, before receiving any lease capability.
@@ -119,8 +119,11 @@ pub enum ParentMessage {
         count: usize,
         digest: [u8; 32],
     },
-    /// Echoes the admitted event's upload identity and sequence, not durability.
-    Accepted { header: Header },
+    /// Echoes upload identity and the parent disposition, never archival proof.
+    Accepted {
+        header: Header,
+        outcome: AdmissionOutcome,
+    },
     /// Cancellation/any unexpected message makes this worker fail closed.
     Cancel { header: Header },
 }
@@ -130,6 +133,7 @@ impl ParentMessage {
     pub fn accepted(receipt: Accepted) -> Self {
         Self::Accepted {
             header: receipt.header,
+            outcome: receipt.outcome,
         }
     }
 }

@@ -26,7 +26,7 @@ use super::jobs::{
     RetryReason, SplitOutcome,
 };
 use super::worker::{self as transport, Assignment, Hello, ParentMessage};
-use super::{ArchivedWindow, MAX_WINDOW_ITEMS, SyncStateDb};
+use super::{ArchivedWindow, SyncStateDb};
 use crate::{DedupeIndex, SegmentWriter};
 
 /// Parent failures never discharge a lease or erase a received obligation.
@@ -371,11 +371,11 @@ impl ParentExecutor {
                                     let Some(candidate) = ledger.fair_candidate(now)? else {
                                         return Ok(None);
                                     };
-                                    match inventory.archived_window(
+                                    match ledger.reconciliation_window(
+                                        &inventory,
+                                        &dedupe,
                                         candidate.since as u64,
                                         candidate.until as u64,
-                                        MAX_WINDOW_ITEMS,
-                                        &dedupe,
                                     )? {
                                         ArchivedWindow::Complete(_) => {
                                             if writer.recovery_required() {
@@ -798,11 +798,11 @@ fn exchange(
     if writer.recovery_required() {
         return Err(ParentError::RecoveryRequired);
     }
-    let items = match inventory.archived_window(
+    let items = match ledger.reconciliation_window(
+        inventory,
+        dedupe,
         lease.job().since as u64,
         lease.job().until as u64,
-        MAX_WINDOW_ITEMS,
-        dedupe,
     )? {
         ArchivedWindow::Complete(items) => items,
         ArchivedWindow::TooDense => return Err(ParentError::TooDense),
@@ -1140,7 +1140,7 @@ mod tests {
             let digest =
                 ipc::extend_digest(ipc::initial_digest(), ipc::encoded_frame_digest(&bytes));
             worker.write_all(&bytes).await.unwrap();
-            let ParentMessage::Accepted { header } =
+            let ParentMessage::Accepted { header, .. } =
                 transport::read_message(&mut worker).await.unwrap()
             else {
                 panic!("accepted expected")

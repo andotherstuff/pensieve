@@ -773,6 +773,7 @@ async fn lost_or_wrong_ack_never_reports_success_and_preserves_received_obligati
                 write_message(
                     &mut stream,
                     &ParentMessage::Accepted {
+                        outcome: crate::sync::ipc::AdmissionOutcome::Admitted,
                         header: Assignment::for_lease(&lease).header(2),
                     },
                 )

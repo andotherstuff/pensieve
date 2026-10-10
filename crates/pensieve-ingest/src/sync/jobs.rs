@@ -30,6 +30,7 @@ pub const MAX_RECOVERY_JOBS: u32 = 32;
 const MAX_AWAITING_DURABILITY: u32 = 2;
 
 mod planner;
+mod policy;
 mod selector;
 pub use planner::PlanningProgress;
 
@@ -182,12 +183,27 @@ pub struct JobLedger {
     db: Connection,
     path: PathBuf,
     limits: LedgerLimits,
+    policy: crate::giftwrap_filter::AdmissionPolicy,
 }
 
 impl JobLedger {
     /// Open or initialize a dedicated ledger. Parent directory must exist.
     /// Limits are runtime policy: an operator may raise them after capacity review.
     pub fn open(path: &Path, limits: LedgerLimits) -> Result<Self, LedgerError> {
+        Self::open_with_policy(
+            path,
+            limits,
+            crate::giftwrap_filter::AdmissionPolicy::default(),
+        )
+    }
+
+    /// Open with the live admission policy. A changed policy fails closed without
+    /// mutating prior completion claims or exclusions; operator migration is required.
+    pub fn open_with_policy(
+        path: &Path,
+        limits: LedgerLimits,
+        policy: crate::giftwrap_filter::AdmissionPolicy,
+    ) -> Result<Self, LedgerError> {
         if limits.max_jobs == 0
             || limits.max_receipts == 0
             || limits.max_bytes < 4 * WRITE_RESERVE
@@ -251,12 +267,19 @@ impl JobLedger {
                     tx.execute_batch(FAILURE_SCHEMA)?;
                     tx.execute_batch(planner::SCHEMA)?;
                     tx.execute_batch(selector::SCHEMA)?;
-                    tx.pragma_update(None, "user_version", 7)?;
+                    tx.execute_batch(policy::SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 8)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 7) => {}
+                (APPLICATION_ID, 7) => {
+                    tx.execute_batch(policy::SCHEMA)?;
+                    tx.pragma_update(None, "user_version", 8)?;
+                    check_budget(&tx, path, limits, 0)?;
+                }
+                (APPLICATION_ID, 8) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
+            policy::bind(&tx, &policy, version != 8)?;
             tx.commit()?;
         }
         let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
@@ -270,6 +293,7 @@ impl JobLedger {
             db,
             path: path.canonicalize()?,
             limits,
+            policy,
         })
     }
 
@@ -638,14 +662,15 @@ impl JobLedger {
         };
         let mut satisfied = 0;
         for (attempt, sequence, event_id) in &rows {
-            if dedupe.get_status(event_id)? == Some(crate::EventStatus::Archived) {
+            let excluded = policy::contains(&tx, event_id)?;
+            if excluded || dedupe.get_status(event_id)? == Some(crate::EventStatus::Archived) {
                 tx.execute(
                     "DELETE FROM receipts WHERE job=?1 AND attempt=?2 AND sequence=?3",
                     params![job, attempt, sequence],
                 )?;
                 tx.execute(
-                    "UPDATE attempts SET archived=archived+1 WHERE job=?1 AND attempt=?2",
-                    params![job, attempt],
+                    "UPDATE attempts SET archived=archived+?3, excluded=excluded+?4 WHERE job=?1 AND attempt=?2",
+                    params![job, attempt, i64::from(!excluded), i64::from(excluded)],
                 )?;
                 satisfied += 1;
             }
@@ -853,7 +878,7 @@ pub struct MaintenanceProgress {
     pub jobs: u32,
     /// Total receipt rows checked across every visited job.
     pub checked: u32,
-    /// Archive-confirmed receipts compacted this turn.
+    /// Receipts resolved by archive evidence or explicit policy exclusions.
     pub satisfied: u32,
     /// Selected jobs newly observed complete after reconciliation.
     pub completed: u32,
@@ -870,7 +895,7 @@ fn complete_if_durable(tx: &Transaction<'_>, mut job: i64) -> Result<(), LedgerE
              AND NOT EXISTS(SELECT 1 FROM receipts WHERE job=?1)
              AND ((state='awaiting_durability' AND EXISTS(
                  SELECT 1 FROM attempts WHERE job=?1 AND attempt=jobs.attempt
-                 AND protocol_done=1 AND archived=received))
+                 AND protocol_done=1 AND archived+excluded=received))
                OR (state='split' AND (SELECT count(*) FROM jobs child WHERE child.parent=?1)=2
                  AND NOT EXISTS(SELECT 1 FROM jobs child WHERE child.parent=?1 AND child.state!='complete')))",
             [job],
@@ -900,6 +925,9 @@ pub struct AttemptProgress {
     /// Received frames independently confirmed by durable archive markers.
     /// Duplicate IDs count per received frame, not as novel archived events.
     pub archived: u64,
+    /// Frames intentionally excluded under the ledger's pinned admission policy.
+    /// These are never archived and never create dedupe markers.
+    pub excluded: u64,
 }
 
 fn attempt_progress(
@@ -909,7 +937,7 @@ fn attempt_progress(
 ) -> Result<AttemptProgress, LedgerError> {
     Ok(db
         .query_row(
-            "SELECT received,bytes,digest,protocol_done,archived FROM attempts WHERE job=?1 AND attempt=?2",
+            "SELECT received,bytes,digest,protocol_done,archived,excluded FROM attempts WHERE job=?1 AND attempt=?2",
             params![job, attempt],
             |r| {
                 Ok(AttemptProgress {
@@ -918,6 +946,7 @@ fn attempt_progress(
                     digest: r.get(2)?,
                     protocol_done: r.get(3)?,
                     archived: r.get(4)?,
+                    excluded: r.get(5)?,
                 })
             },
         )
@@ -928,6 +957,7 @@ fn attempt_progress(
             digest: super::ipc::initial_digest(),
             protocol_done: false,
             archived: 0,
+            excluded: 0,
         }))
 }
 
@@ -1199,7 +1229,7 @@ mod tests {
         JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap()
     }
 
-    fn archive(
+    pub(super) fn archive(
         dir: &tempfile::TempDir,
     ) -> (std::sync::Arc<crate::DedupeIndex>, crate::SegmentWriter) {
         let dedupe =
