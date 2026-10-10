@@ -426,6 +426,7 @@ mod tests {
         let job = db
             .enqueue("s", "wss://relay.example.com", 100, 200)
             .unwrap();
+        super::super::retention::strip_for_legacy_fixture(&db.db);
         db.db.execute_batch("DROP TABLE policy_exclusions; DROP TABLE exclusion_totals; DROP INDEX receipts_policy_id; DROP TABLE admission_policy; ALTER TABLE attempts DROP COLUMN excluded; PRAGMA user_version=7;").unwrap();
         drop(db);
         let key = Keys::generate().public_key().to_hex();
@@ -437,7 +438,7 @@ mod tests {
             db.db
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
                 .unwrap(),
-            8
+            9
         );
         drop(db);
         assert!(JobLedger::open(&path, LedgerLimits::default()).is_err());

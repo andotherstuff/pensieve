@@ -87,6 +87,9 @@ pub enum SessionOutcome {
 type Reply<T> = oneshot::Sender<Result<T, ParentError>>;
 
 enum Command {
+    Lifecycle {
+        reply: Reply<pensieve_core::reconciliation_health::ProgressObservation>,
+    },
     Configure {
         relays: Vec<String>,
         reply: Reply<()>,
@@ -173,6 +176,13 @@ pub struct ParentExecutor {
 }
 
 impl ParentExecutor {
+    /// Bounded successful-history retention and durable progress observation.
+    pub async fn lifecycle(
+        &mut self,
+    ) -> Result<pensieve_core::reconciliation_health::ProgressObservation, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::Lifecycle { reply }, response).await
+    }
     /// Replace the explicit isolated-worker relay allowlist on the owner.
     pub async fn configure(&mut self, relays: Vec<String>) -> Result<(), ParentError> {
         let (reply, response) = oneshot::channel();
@@ -261,6 +271,14 @@ impl ParentExecutor {
                 let mut consumed_attempt = None;
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
+                        Command::Lifecycle { reply } => {
+                            let result = (|| {
+                                let now = clock();
+                                ledger.retain_completed(now)?;
+                                ledger.progress_observation(now)
+                            })();
+                            let _ = reply.send(result.map_err(Into::into));
+                        }
                         Command::Configure { relays, reply } => {
                             let refs = relays.iter().map(String::as_str).collect::<Vec<_>>();
                             let _ = reply.send(ledger.configure_planner(&refs).map_err(Into::into));

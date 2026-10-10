@@ -123,6 +123,24 @@ async fn serve_metrics(
                 async move { archive_health_status(&ready) }
             }),
         );
+        app = app.route(
+            "/health/negentropy",
+            get(|| async {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_secs()).ok())
+                    .unwrap_or(-1);
+                let (healthy, reason) =
+                    crate::reconciliation_health::reconciliation_health().status(now);
+                let status = if healthy {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                };
+                (status, reason)
+            }),
+        );
     }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

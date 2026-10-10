@@ -67,11 +67,26 @@ class LedgerStatusTests(unittest.TestCase):
 
     def test_unknown_schema_is_not_migrated(self):
         with database(self.path) as db:
-            db.execute("PRAGMA user_version=9")
+            db.execute("PRAGMA user_version=10")
         before = self.path.read_bytes()
         with self.assertRaisesRegex(STATUS.Refusal, "unsupported_identity"):
             STATUS.inspect(self.path)
         self.assertEqual(before, self.path.read_bytes())
+
+    def test_schema9_separates_retained_detail_from_coverage_accounting(self):
+        with database(self.path) as db:
+            db.executescript("""
+                PRAGMA user_version=9;
+                CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
+                INSERT INTO lifecycle VALUES(1,1234);
+                CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,lease_grants INTEGER,failures INTEGER);
+                INSERT INTO completed_coverage VALUES(10,9,1,2,1);
+            """)
+        report = STATUS.inspect(self.path)
+        self.assertEqual(report["last_durable_completion_unix"], 1234)
+        self.assertEqual(report["received_frames"], 3)
+        self.assertEqual(report["retained_coverage_accounting"]["received_frames"], 10)
+        self.assertFalse(report["continuous_ready"])
 
     def test_receipt_counter_mismatch_is_not_healthy(self):
         with database(self.path) as db:

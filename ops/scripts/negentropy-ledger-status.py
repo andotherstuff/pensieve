@@ -43,7 +43,7 @@ def inspect(path, timeout=5.0):
             db.execute("PRAGMA application_id").fetchone()[0],
             db.execute("PRAGMA user_version").fetchone()[0],
         )
-        if identity != (0x504E4A31, 8):
+        if identity[0] != 0x504E4A31 or identity[1] not in (8, 9):
             raise Refusal("unsupported_identity")
         states = dict(db.execute("SELECT state,count(*) FROM jobs GROUP BY state"))
         rows = sum(states.values())
@@ -71,6 +71,15 @@ def inspect(path, timeout=5.0):
             "SELECT min(since) FROM jobs WHERE state!='complete'"
         ).fetchone()[0]
         failures = db.execute("SELECT count(*) FROM failure_reports").fetchone()[0]
+        last_success = None
+        coverage = None
+        if identity[1] == 9:
+            last_success = db.execute("SELECT last_success FROM lifecycle WHERE singleton=1").fetchone()[0]
+            coverage = db.execute(
+                "SELECT count(*),coalesce(sum(received),0),coalesce(sum(archived),0),"
+                "coalesce(sum(excluded),0),coalesce(sum(lease_grants),0),coalesce(sum(failures),0) "
+                "FROM completed_coverage"
+            ).fetchone()
         # No identifiers or lease capabilities are emitted. Event time is not a
         # creation/completion timestamp and cannot measure queue latency.
         logical_bytes = db.execute("PRAGMA page_count").fetchone()[0] * db.execute(
@@ -108,7 +117,15 @@ def inspect(path, timeout=5.0):
         "logical_database_bytes": logical_bytes,
         "freelist_pages": freelist,
         "file_bytes_nonatomic": sizes,
-        "completion_freshness": "unknown: schema 8 has no completion timestamp",
+        "completion_freshness": (
+            "unknown: schema 8 has no completion timestamp"
+            if identity[1] == 8 else "persisted timestamp; not a runtime health verdict"
+        ),
+        "last_durable_completion_unix": last_success,
+        "retained_coverage_accounting": None if coverage is None else dict(zip(
+            ("rows", "received_frames", "archived_frames", "excluded_frames", "lease_grants", "failure_reports"),
+            coverage,
+        )),
         "safe_to_prune": False,
         "continuous_ready": False,
     }

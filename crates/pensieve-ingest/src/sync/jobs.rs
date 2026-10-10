@@ -31,8 +31,10 @@ const MAX_AWAITING_DURABILITY: u32 = 2;
 
 mod planner;
 mod policy;
+mod retention;
 mod selector;
 pub use planner::PlanningProgress;
+pub use retention::RetentionProgress;
 
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
@@ -60,7 +62,7 @@ pub enum LedgerError {
 /// Independent limits on job rows and SQLite/WAL admission footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerLimits {
-    /// Includes split parents; no automatic history deletion.
+    /// Includes split parents; successful rolling history has bounded retention.
     pub max_jobs: u32,
     /// Retained, not-yet-archive-confirmed receipt rows across all attempts.
     pub max_receipts: u32,
@@ -286,10 +288,17 @@ impl JobLedger {
                     tx.pragma_update(None, "user_version", 8)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 8) => {}
+                (APPLICATION_ID, 8 | 9) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
-            policy::bind(&tx, &policy, version != 8)?;
+            policy::bind(&tx, &policy, matches!(version, 0 | 7))?;
+            if version != 9 {
+                // A versioned, transactional metadata migration. Legacy completion
+                // times remain unknown and cannot authorize history deletion.
+                tx.execute_batch(retention::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 9)?;
+                check_budget(&tx, path, limits, 0)?;
+            }
             tx.commit()?;
         }
         let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
@@ -834,11 +843,12 @@ fn split_window(
     let midpoint = parent.since + (parent.until - parent.since) / 2;
     let mut children = Vec::with_capacity(2);
     for (since, until) in [(parent.since, midpoint), (midpoint + 1, parent.until)] {
+        let id = retention::next_id(tx)?;
         tx.execute(
-            "INSERT INTO jobs(sweep,relay,since,until,parent,state) VALUES(?1,?2,?3,?4,?5,'queued')",
-            params![parent.sweep, parent.relay, since, until, parent.id],
+            "INSERT INTO jobs(sweep,relay,since,until,parent,state,id) VALUES(?1,?2,?3,?4,?5,'queued',?6)",
+            params![parent.sweep, parent.relay, since, until, parent.id, id],
         )?;
-        children.push(read_job(tx, tx.last_insert_rowid())?);
+        children.push(read_job(tx, id)?);
     }
     Ok(SplitOutcome::Children(Box::new([
         children.remove(0),
@@ -864,11 +874,12 @@ fn enqueue_window(
         return Err(LedgerError::Invalid("overlapping root window"));
     }
     check_budget(tx, path, limits, 1)?;
+    let id = retention::next_id(tx)?;
     tx.execute(
-        "INSERT INTO jobs(sweep,relay,since,until,state) VALUES(?1,?2,?3,?4,'queued')",
-        params![sweep, relay, since, until],
+        "INSERT INTO jobs(sweep,relay,since,until,state,id) VALUES(?1,?2,?3,?4,'queued',?5)",
+        params![sweep, relay, since, until, id],
     )?;
-    Ok((read_job(tx, tx.last_insert_rowid())?, true))
+    Ok((read_job(tx, id)?, true))
 }
 
 /// Result of one bounded reconciliation call; checked rows can still be missing.

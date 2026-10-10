@@ -17,7 +17,7 @@ proof of indefinite unattended operation or of multi-relay capacity.
 ## First increment: measure without deleting
 
 Run `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite`
-against schema 8. The caller must own the database and existing WAL sidecars;
+against schema 8 or 9. The caller must own the database and existing WAL sidecars;
 running as root against a pensieve-owned ledger is refused before SQLite opens.
 It opens SQL read-only, limits SQL work to five seconds, reports aggregate
 counts and separately sampled DB/WAL/SHM sizes, and refuses unknown identities.
@@ -33,6 +33,9 @@ WAL backups are deliberately unsupported by this tool.
 `states.leased` counts current leases. `attempt_summaries` may be smaller when a
 worker died before recording a receipt or protocol summary. The oldest incomplete
 event time is not queue latency. Pinning counts include jobs in all states.
+Schema 9 reports retained coverage accounting separately from detailed attempts;
+neither is an all-time unique-event count. Its last-success timestamp is a durable
+observation, not proof the runtime is currently healthy.
 File sizes are raw non-atomic observations, **not admission headroom**: Rust also
 accounts for allocated blocks, logical size and a write reserve. Default budget
 constants are intentionally not copied into the report. A successful report
@@ -44,7 +47,26 @@ Domain refusals emit stable error codes (`wrong_ledger_owner`,
 
 Test with `python3 -m unittest discover -s ops/tests -p 'test_negentropy_ledger_status.py'`.
 
-## Retention implementation contract (next increment)
+## Retention implementation and release contract
+
+Schema 9 adds completion/creation observations, a durable job-ID high-water mark,
+and bounded completed-window summaries. Opening schema 7/8 performs the metadata
+migration in one transaction; unsupported versions still fail closed. Before
+upgrading an existing ledger, stop its sole owner, preserve a consistent SQLite
+backup (including WAL state), and retain the old binary. A pre-upgrade backup is
+only a rollback option before new work is admitted; never restore an old ledger
+over newly accepted receipts. The activation below uses a fresh production ledger
+and does not upgrade, reuse, or delete canary ledgers.
+
+Legacy completed rows have unknown completion times/policy identity and remain
+ineligible for automatic cleanup. New successful detail is kept at least 24 hours.
+Each maintenance turn considers at most one root and 2,048 tree nodes, 4,096
+detail rows and 8 MiB of estimated detail. Whole trees pinned by proof, oversized
+trees, current planner sweeps, and sweeps with unresolved jobs are skipped.
+Compaction uses exact 15-minute coverage bits per relay/day/policy, together with
+frame/attempt/failure accounting. Repeated sweeps do not imply novel events.
+Summaries expire 90 days after their last compaction and are capped at 16,384 rows;
+a full summary table preserves detail rather than dropping obligations.
 
 Do not simply delete `state='complete'` rows. Schema 8 has three hazards:
 
@@ -56,9 +78,8 @@ Do not simply delete `state='complete'` rows. Schema 8 has three hazards:
    successful reconciliation. The integer primary key is not AUTOINCREMENT, so
    naive deletion can also permit job-ID reuse.
 
-Implement an explicit versioned migration, with backup and rollback tests, before
-enabling retention. Give jobs a monotonic non-reused identity and a completion
-timestamp. Maintain the original replay floor (29808 on this deployment), policy
+Validate the versioned migration with backup and rollback tests before enabling
+retention. Maintain the original replay floor (29808 on this deployment), policy
 fingerprint, planner cursor, fair selector state and every unresolved obligation.
 
 Compact only fully completed, closed rolling sweeps whose whole split trees are
@@ -83,6 +104,28 @@ reconciliation; crash/transaction rollback; schema migration/reopen; full budget
 behavior; fair leasing after cleanup; bounded query plans and WAL growth.
 
 ## Monitoring and activation gates
+
+`/health/negentropy` is separate from `/health/archive-admission`. It returns fixed,
+non-sensitive classifications: disabled, starting, idle, recent progress, stale
+owner, stalled durable progress, unresolved failures, capacity exhaustion, or
+runtime failure. Idle is only healthy with a fresh owner observation. Owner
+observations expire after 15 minutes; pending work without durable completion for
+one hour fails. Blocked jobs or still-unresolved jobs with three attempts fail
+even if another job completes. Persisted creation/completion times survive
+restart. An owner failure remains latched for that runtime; new process startup
+must still satisfy the durable ledger checks rather than refreshing a grace clock.
+
+Install `ops/scripts/negentropy-kuma.py` as
+`/usr/local/libexec/pensieve-negentropy-kuma.py` and the matching service/timer only
+after the release gates. Store the new push URL, mode 0600 root-owned, in
+`/etc/pensieve/negentropy-kuma.url`; systemd passes it with `LoadCredential`.
+Create a **separate** Kuma push monitor with a 180-second missing-heartbeat deadline
+and Svent Bot notifications. The timer samples every 30 seconds. Test 503→200
+delivery with the explicit `--fixture` endpoint on localhost:19091; do not change
+live archive admission to synthesize an alert. Never put the push URL in argv,
+logs, Git, or evidence. When intentionally disabling reconciliation, pause its
+monitor; the explicit disabled response is not HTTP success. Keep Archive Admission
+monitor 45 and API monitor 10 unchanged.
 
 - Add durable completion time and last-success/failure observations. Alert on
   stalled work, persistent missing-ID failures and ledger/admission backpressure.

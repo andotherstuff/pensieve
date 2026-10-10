@@ -158,6 +158,8 @@ impl IsolatedRuntime {
         let task = tokio::spawn(async move {
             let result = drive(&config, listener, parent, writer, stopping).await;
             gauge!("negentropy_isolated_ready").set(0.0);
+            // A stopped runtime is not healthy merely because ingestion remains up.
+            pensieve_core::reconciliation_health::reconciliation_health().fail();
             if let Err(ref error) = result {
                 gauge!("negentropy_isolated_unhealthy").set(1.0);
                 tracing::error!(error = %error, "isolated reconciliation paused; durable gaps retained");
@@ -236,6 +238,9 @@ async fn drive(
                 parent.expire(60).await?;
                 let recovered = parent.maintain_archived(32, 256).await?;
                 gauge!("negentropy_isolated_recovery_checked").set(recovered.checked as f64);
+                let mut observation = parent.lifecycle().await?;
+                observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                pensieve_core::reconciliation_health::reconciliation_health().observe(observation);
                 if config.canary_until.is_some() && canary_session_budget(started.elapsed(), canary_attempts).is_none() {
                     // Drain already-admitted work through sealing/receipt maintenance.
                     // Do not replay, plan, lease or exit merely because intake is over.
