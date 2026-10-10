@@ -60,10 +60,36 @@ archive seal timer, final seal, dedupe flush and checkpoint cleanup have run.
 Replay checks cancellation between bounded decoder batches and services receipt
 maintenance during a long sealed segment.
 
+## Bounded canary
+
+`--isolated-negentropy-canary-until <UNIX_SECONDS>` replaces rolling planning
+with exactly three adjacent 15-minute root windows immediately before the given
+exclusive upper boundary. The boundary must be past and divisible by 900. This
+mode requires exactly one explicitly approved relay and a **new dedicated ledger**;
+it refuses an existing ledger rather than mixing unrelated work or automatically
+restarting a finished canary. Never delete that ledger to retry: retain unfinished
+jobs and evidence for an explicit recovery decision.
+
+The mode admits at most six worker attempts, replays at most three sealed segments
+from the explicit floor, and cancels reconciliation intake after 25 minutes.
+The five-minute margin is for shutdown and evidence collection; an already-running
+filesystem operation cannot be forcibly interrupted safely. Live ingestion and its
+seal timer continue. Worker service management remains the operator's responsibility;
+stop the worker at the end of the test. An expired deadline or exhausted budget is
+**not success**: verify the three root windows and any split children, archive
+durability, exclusion behavior and worker-loss recovery from the retained ledger.
+
+This mode uses the existing inventory and only bounded replay; it does not certify
+full historical inventory coverage. Choose the replay floor deliberately. Do not
+run a second archive/dedupe owner to avoid an ingester restart. Production use still
+requires reviewed binaries, backups, disk preflight, isolated-worker provisioning,
+and archive-admission safety checks. A 20–30 minute canary replaces the initial
+24-hour soak gate for this rollout; it cannot prove long-term behavior or retention.
+
 This is a development milestone, not a rollout approval. The Linux cgroup
 OOM/hang/kill proof, alert delivery, exact canary allowlist, throughput/freshness
 targets, disk preflight and backups, three durable canary jobs with injected
-recovery, and a 24-hour soak remain operator gates. Repeated sweeps eventually
+recovery, and the bounded canary remain operator gates. Repeated sweeps eventually
 reach the lifetime job ceiling; a measured terminal-summary retention design
 must precede indefinite operation. Existing older prototype ledgers are rejected
 without migration or deletion and require an explicit recovery decision.

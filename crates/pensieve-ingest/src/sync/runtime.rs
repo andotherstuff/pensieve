@@ -5,7 +5,7 @@
 //! worker loss, shutdown and local faults; a socket exchange is not completion.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +49,9 @@ pub struct RuntimeConfig {
     pub replay_floor: u64,
     /// Explicit small NIP-77 relay allowlist, never catalog-augmented.
     pub relays: Vec<String>,
+    /// Exclusive upper timestamp for three fixed 15-minute canary windows.
+    /// Requires a fresh ledger and exactly one relay; never runs rolling planning.
+    pub canary_until: Option<i64>,
 }
 
 /// A local failure pauses isolated work without changing live archive ownership.
@@ -105,11 +108,24 @@ impl IsolatedRuntime {
         if writer.recovery_required() {
             return Err(RuntimeError::Parent(ParentError::RecoveryRequired));
         }
-        let ledger = JobLedger::open_with_policy(
+        if let Some(until) = config.canary_until {
+            validate_canary(until, config.relays.len())?;
+            // A fresh ledger prevents accidentally leasing unrelated retained work.
+            // Refuse reuse, including after a parent restart; preserve it for inspection.
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config.ledger)?;
+        }
+        let mut ledger = JobLedger::open_with_policy(
             &config.ledger,
             LedgerLimits::default(),
             config.admission_policy.clone(),
         )?;
+        if let Some(until) = config.canary_until {
+            seed_canary(&mut ledger, &config.relays[0], until)?;
+        }
         let inventory = Arc::new(SyncStateDb::open(&config.inventory)?);
         let mut parent = ParentExecutor::new(ledger, inventory, dedupe, writer.clone())?;
         parent.configure(config.relays.clone()).await?;
@@ -156,14 +172,22 @@ async fn drive(
     listener: UnixListener,
     mut parent: ParentExecutor,
     writer: Arc<SegmentWriter>,
-    mut stopping: oneshot::Receiver<()>,
+    stopping: oneshot::Receiver<()>,
 ) -> Result<(), RuntimeError> {
+    let stopping = stop_signal(
+        stopping,
+        config.canary_until.map(|_| Duration::from_secs(25 * 60)),
+    );
+    tokio::pin!(stopping);
     let mut interval = tokio::time::interval(TICK);
     let mut peer: Option<(UnixStream, WorkerCandidate)> = None;
+    let mut canary_attempts = 0;
+    let mut canary_replays = 0;
     gauge!("negentropy_isolated_ready").set(1.0);
     let result: Result<(), RuntimeError> = async {
     loop {
         tokio::select! {
+            biased;
             _ = &mut stopping => break Ok(()),
             accepted = listener.accept(), if peer.is_none() => {
                 let (socket, _) = accepted?;
@@ -176,6 +200,10 @@ async fn drive(
                 }
             }
             _ = interval.tick() => {
+                if config.canary_until.is_some() && canary_attempts >= 6 {
+                    tracing::info!("bounded canary attempt budget exhausted; unfinished jobs retained");
+                    break Ok(());
+                }
                 if writer.recovery_required() {
                     gauge!("negentropy_isolated_recovery_required").set(1.0);
                     break Err(RuntimeError::Parent(ParentError::RecoveryRequired));
@@ -190,14 +218,21 @@ async fn drive(
                 }
                 gauge!("negentropy_isolated_ledger_space_pause").set(0.0);
                 // Replay one sealed source segment before serving an assignment.
+                if config.canary_until.is_none() || canary_replays < 3 {
                 tokio::select! {
+                    biased;
                     _ = &mut stopping => break Ok(()),
                     result = parent.replay_next(
                         config.archive.clone(), config.segment_prefix.clone(), config.replay_floor,
-                    ) => { result?; }
+                    ) => {
+                        if result? { canary_replays += 1; }
+                    }
                 }
-                let planned = parent.plan(32).await?;
-                gauge!("negentropy_isolated_planner_backpressured").set(f64::from(planned.backpressured));
+                }
+                if config.canary_until.is_none() {
+                    let planned = parent.plan(32).await?;
+                    gauge!("negentropy_isolated_planner_backpressured").set(f64::from(planned.backpressured));
+                }
                 if let Some((socket, candidate)) = peer.take() {
                     // Revalidate the same pidfd, invocation and remaining service
                     // lifetime immediately before exporting a lease capability.
@@ -213,6 +248,9 @@ async fn drive(
                         peer = Some((socket, candidate));
                         continue;
                     };
+                    if config.canary_until.is_some() {
+                        canary_attempts += 1;
+                    }
                     if let Err(error) = candidate.recheck().await {
                         tracing::warn!(error = %error, job = lease.job().id, "worker changed before assignment");
                         parent.retry(lease, 60, RetryReason::WorkerLost).await?;
@@ -221,6 +259,7 @@ async fn drive(
                     let job = lease.job().id;
                     let attempt = lease.job().attempt;
                     let outcome = tokio::select! {
+                        biased;
                         _ = &mut stopping => break Ok(()),
                         outcome = parent.serve(socket, config.worker_uid, lease.clone(), SESSION_TIME) => outcome,
                     };
@@ -262,6 +301,10 @@ async fn drive(
                             }
                         }
                     }
+                    if config.canary_until.is_some() && canary_attempts >= 6 {
+                        tracing::info!("bounded canary attempt budget exhausted; unfinished jobs retained");
+                        break Ok(());
+                    }
                 }
             }
         }
@@ -269,6 +312,95 @@ async fn drive(
     }.await;
     let shutdown = parent.shutdown().await;
     result.and(shutdown.map(|_| ()).map_err(Into::into))
+}
+
+fn validate_canary(until: i64, relay_count: usize) -> Result<(), RuntimeError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| RuntimeError::Config("system clock precedes epoch"))?
+        .as_secs();
+    if relay_count != 1 || until < 2700 || until % 900 != 0 || until as u64 > now {
+        return Err(RuntimeError::Config(
+            "canary requires one relay and a past 15-minute boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn seed_canary(ledger: &mut JobLedger, relay: &str, until: i64) -> Result<(), RuntimeError> {
+    for offset in 0..3 {
+        let since = until - 2700 + offset * 900;
+        ledger.enqueue("bounded-canary-v1", relay, since, since + 899)?;
+    }
+    Ok(())
+}
+
+async fn stop_signal(stopping: oneshot::Receiver<()>, limit: Option<Duration>) {
+    let deadline = async {
+        if let Some(limit) = limit {
+            tokio::time::sleep(limit).await;
+            tracing::info!("bounded canary deadline reached; unfinished jobs retained");
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = stopping => {},
+        _ = deadline => {},
+    }
+}
+
+#[cfg(test)]
+mod canary_tests {
+    use super::*;
+
+    #[test]
+    fn canary_rejects_unsafe_boundaries_and_multiple_relays() {
+        assert!(validate_canary(3600, 1).is_ok());
+        for (until, relays) in [(0, 1), (3599, 1), (3600, 2), (i64::MAX, 1)] {
+            assert!(validate_canary(until, relays).is_err());
+        }
+    }
+
+    #[test]
+    fn canary_seeds_exactly_three_disjoint_windows_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("jobs.sqlite");
+        let mut ledger = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        seed_canary(&mut ledger, "wss://a.example", 3600).unwrap();
+        seed_canary(&mut ledger, "wss://a.example", 3600).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let mut query = db
+            .prepare("SELECT since,until FROM jobs ORDER BY since")
+            .unwrap();
+        let rows = query
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(900, 1799), (1800, 2699), (2700, 3599)]);
+    }
+
+    #[tokio::test]
+    async fn canary_deadline_stops_without_parent_shutdown_signal() {
+        let (_sender, receiver) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_signal(receiver, Some(Duration::from_millis(20))),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_runtime_still_requires_shutdown_signal() {
+        let (sender, receiver) = oneshot::channel();
+        let task = tokio::spawn(stop_signal(receiver, None));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        sender.send(()).unwrap();
+        task.await.unwrap();
+    }
 }
 
 fn retry_delay(job: i64, attempt: i64) -> u32 {
@@ -322,6 +454,7 @@ mod tests {
             .unwrap(),
         );
         let config = RuntimeConfig {
+            canary_until: None,
             admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
             socket: socket.clone(),
             worker_uid: 501,
@@ -338,6 +471,62 @@ mod tests {
         ));
         let _peer = UnixStream::connect(&socket).await.unwrap();
         let (_accepted, _) = active.accept().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_canary_never_runs_rolling_planning_or_reuses_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..SegmentConfig::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let config = RuntimeConfig {
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
+            socket: root.path().join("worker.sock"),
+            worker_uid: 501,
+            ledger: root.path().join("jobs.sqlite"),
+            inventory: root.path().join("inventory"),
+            archive,
+            segment_prefix: "segment".to_owned(),
+            replay_floor: 0,
+            relays: vec!["wss://a.example".to_owned()],
+            canary_until: Some(3600),
+        };
+        let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
+            .await
+            .unwrap();
+        // Two real planning ticks would normally seed dozens of rolling jobs.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        runtime.shutdown().await.unwrap();
+        assert!(!config.socket.exists());
+        let db = rusqlite::Connection::open(&config.ledger).unwrap();
+        let count: u32 = db
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let queued: u32 = db
+            .query_row("SELECT count(*) FROM jobs WHERE state='queued'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(queued, 3);
+        assert!(
+            matches!(IsolatedRuntime::start(config, dedupe, writer).await, Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        let retained: u32 = db
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(retained, 3);
     }
 
     #[tokio::test]
@@ -365,6 +554,7 @@ mod tests {
             .unwrap();
         let ledger_path = root.path().join("jobs.sqlite");
         let config = RuntimeConfig {
+            canary_until: None,
             admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
             socket: root.path().join("worker.sock"),
             worker_uid: uid,
