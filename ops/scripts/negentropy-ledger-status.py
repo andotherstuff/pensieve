@@ -3,14 +3,36 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
 
 
+class Refusal(ValueError):
+    """Stable, non-sensitive operator error code."""
+
+
+def check_owner(path):
+    """Prevent SQLite sidecar creation under a different service identity."""
+    if path.stat().st_uid != os.geteuid():
+        raise Refusal("wrong_ledger_owner")
+
+
 def inspect(path, timeout=5.0):
     """Return aggregate counts only, without lease tokens or event identifiers."""
     path = Path(path).resolve(strict=True)
+    check_owner(path)
+    with path.open("rb") as source:
+        header = source.read(20)
+    # mode=ro is not filesystem-write-free: SQLite can create WAL sidecars.
+    # Refuse quiescent WAL backups; never use immutable=1 on a live database.
+    if header[18:20] == b"\x02\x02":
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if not sidecar.is_file():
+                raise Refusal("wal_sidecars_missing")
+            check_owner(sidecar)
     deadline = time.monotonic() + timeout
     db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout)
     try:
@@ -22,11 +44,9 @@ def inspect(path, timeout=5.0):
             db.execute("PRAGMA user_version").fetchone()[0],
         )
         if identity != (0x504E4A31, 8):
-            raise ValueError("unsupported ledger identity/version")
+            raise Refusal("unsupported_identity")
         states = dict(db.execute("SELECT state,count(*) FROM jobs GROUP BY state"))
         rows = sum(states.values())
-        if rows > 100_000:
-            raise ValueError("ledger exceeds default supported job bound")
         attempts = db.execute(
             "SELECT count(*),coalesce(sum(received),0),"
             "coalesce(sum(archived),0),coalesce(sum(excluded),0) FROM attempts"
@@ -39,11 +59,11 @@ def inspect(path, timeout=5.0):
         if receipts != db.execute(
             "SELECT retained FROM receipt_totals WHERE singleton=1"
         ).fetchone()[0]:
-            raise ValueError("receipt counter mismatch")
+            raise Refusal("receipt_counter_mismatch")
         if exclusions != db.execute(
             "SELECT retained FROM exclusion_totals WHERE singleton=1"
         ).fetchone()[0]:
-            raise ValueError("exclusion counter mismatch")
+            raise Refusal("exclusion_counter_mismatch")
         pinned = db.execute(
             "SELECT count(DISTINCT first_job) FROM policy_exclusions"
         ).fetchone()[0]
@@ -75,9 +95,8 @@ def inspect(path, timeout=5.0):
         "observed_at_unix": int(time.time()),
         "states": states,
         "retained_jobs": rows,
-        "default_planner_slots_remaining": max(0, 100_000 - 2048 - rows),
         "attempt_summaries": attempts[0],
-        "leased_attempts": leased_attempts,
+        "lease_grants": leased_attempts,
         "received_frames": attempts[1],
         "archived_frames": attempts[2],
         "excluded_frames": attempts[3],
@@ -85,11 +104,10 @@ def inspect(path, timeout=5.0):
         "policy_exclusions": exclusions,
         "jobs_pinned_by_exclusion_proof": pinned,
         "failure_reports": failures,
-        "oldest_unresolved_event_since": oldest,
+        "oldest_incomplete_event_since": oldest,
         "logical_database_bytes": logical_bytes,
         "freelist_pages": freelist,
         "file_bytes_nonatomic": sizes,
-        "default_admission_budget_bytes": 1024**3,
         "completion_freshness": "unknown: schema 8 has no completion timestamp",
         "safe_to_prune": False,
         "continuous_ready": False,
@@ -102,6 +120,9 @@ def main():
     args = parser.parse_args()
     try:
         result = inspect(args.ledger)
+    except Refusal as error:
+        print(json.dumps({"status": "unavailable", "error": str(error)}))
+        return 1
     except (OSError, sqlite3.Error, ValueError, TypeError) as error:
         # Do not echo arbitrary paths, SQL, or database text in error output.
         print(json.dumps({"status": "unavailable", "error_type": type(error).__name__}))

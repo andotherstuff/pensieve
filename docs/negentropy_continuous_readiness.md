@@ -5,38 +5,42 @@ This is the follow-up to PR64, merged as `4273ba6`. Continuous operation is
 
 ## Verified bounded trial (2026-10-10)
 
-- Candidate head `06af078`: all seven CI checks passed. Reviewer findings about
-  connect deadlines, socket permissions, shutdown control and PR scope were addressed.
-- Ingester SHA256: `ce643dff93cffc7b6fceaa5eea820ee03e5bd73a81cf1723d28e1001531b5373`.
-- Worker SHA256: `3530979c422bae7a4bc1098e34045f295d4b2e726748b1e6b6fa4d8eb7846a35`.
-- Sole relay `wss://premium.primal.net`; windows `[1791599400,1791600299]`,
-  `[1791600300,1791601199]`, `[1791601200,1791602099]`.
-- Three durable completed jobs, 60 received frames / 60 archived / zero exclusions.
-  These are not 60 proven novel events. The sample did not exercise a matching
-  policy exclusion; existing regression coverage remains important.
-- Job 1 recovered from deliberate worker-only SIGKILL on attempt 1 and completed
-  on attempt 2. Jobs 2 and 3 completed on their first attempts. Four attempts total.
-- Worker stopped after approximately six minutes, below the 30-minute maximum.
-  Ingester PID stayed 171201 after the controlled restart, NRestarts=0.
-- Evidence on pensieve: `/var/lib/pensieve-canary/20261010T162833Z/`, including
-  `premium-canary-result.json`, `worker-loss-injection.json`, a consistent
-  `completed-canary-ledger.sqlite` backup and both unit journals.
-- Archive segment 29854 sealed with 58,289 events and was indexed in ClickHouse.
-  Remote Parquet verification is a separate pending check; startup replay was
-  still revalidating older segments. Do not restart to accelerate it.
+The Premium Primal-only trial completed three durable windows and recovered from
+an injected worker loss. The 60 archived frames are not 60 proven novel events.
+Evidence, exact binaries, journals and the subsequent segment-29854 Parquet
+verification are retained on pensieve under
+`/var/lib/pensieve-canary/20261010T162833Z/`.
 
 The shorter trial replaces the previously proposed 24-hour initial canary, not
 proof of indefinite unattended operation or of multi-relay capacity.
 
 ## First increment: measure without deleting
 
-Run `python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite` against
-schema 8. It opens read-only, limits SQL work to five seconds, reports aggregate
+Run `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite`
+against schema 8. The caller must own the database and existing WAL sidecars;
+running as root against a pensieve-owned ledger is refused before SQLite opens.
+It opens SQL read-only, limits SQL work to five seconds, reports aggregate
 counts and separately sampled DB/WAL/SHM sizes, and refuses unknown identities.
 It never emits lease tokens, event IDs, policy recipient lists or failure bodies.
-Its bounds assume the default 100,000-job / 1 GiB configuration. A successful
-report means measurements are available, not that retention or rollout is safe.
-Do not use SQLite `immutable=1` for the live WAL database.
+SQL read-only does not mean filesystem-write-free: SQLite can touch shared-memory
+reader coordination and recreate sidecars during concurrent writer shutdown.
+The ownership check prevents creation under another UID. A WAL database missing
+either sidecar is refused with `wal_sidecars_missing`; do not fabricate sidecars,
+change ownership or use `immutable=1` to bypass this on a live database. Closed
+WAL backups are deliberately unsupported by this tool.
+
+`lease_grants` is cumulative across all jobs and attempts, not live worker count;
+`states.leased` counts current leases. `attempt_summaries` may be smaller when a
+worker died before recording a receipt or protocol summary. The oldest incomplete
+event time is not queue latency. Pinning counts include jobs in all states.
+File sizes are raw non-atomic observations, **not admission headroom**: Rust also
+accounts for allocated blocks, logical size and a write reserve. Default budget
+constants are intentionally not copied into the report. A successful report
+means measurements are available, not that retention or rollout is safe.
+
+Domain refusals emit stable error codes (`wrong_ledger_owner`,
+`wal_sidecars_missing`, `unsupported_identity`, `receipt_counter_mismatch`,
+`exclusion_counter_mismatch`); unexpected errors never echo database text.
 
 Test with `python3 -m unittest discover -s ops/tests -p 'test_negentropy_ledger_status.py'`.
 
