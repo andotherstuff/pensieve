@@ -67,12 +67,17 @@ with exactly three adjacent 15-minute root windows immediately before the given
 exclusive upper boundary. The boundary must be past and divisible by 900. This
 mode requires exactly one explicitly approved relay and a **new dedicated ledger**;
 it refuses an existing ledger rather than mixing unrelated work or automatically
-restarting a finished canary. Never delete that ledger to retry: retain unfinished
+restarting a finished canary. Canary jobs durably prohibit rolling planning even
+if the flag is omitted on a subsequent start. Never delete that ledger to retry: retain unfinished
 jobs and evidence for an explicit recovery decision.
 
 The mode admits at most six worker attempts, replays at most three sealed segments
-from the explicit floor, and cancels reconciliation intake after 25 minutes.
-The five-minute margin is for shutdown and evidence collection; an already-running
+from the explicit floor, and budgets intake for the first 20 minutes. Reaching
+the attempt limit stops new leases, not receipt maintenance. Maintenance continues
+until the 25-minute shutdown deadline so independent live sealing can make admitted
+events durable. Require an archive seal cadence of at most 300 seconds for this
+trial. Any job still awaiting durability at shutdown is inconclusive, not a pass.
+The final five-minute margin is for worker shutdown and evidence collection; an already-running
 filesystem operation cannot be forcibly interrupted safely. Live ingestion and its
 seal timer continue. Worker service management remains the operator's responsibility;
 stop the worker at the end of the test. An expired deadline or exhausted budget is
@@ -83,8 +88,11 @@ This mode uses the existing inventory and only bounded replay; it does not certi
 full historical inventory coverage. Choose the replay floor deliberately. Do not
 run a second archive/dedupe owner to avoid an ingester restart. Production use still
 requires reviewed binaries, backups, disk preflight, isolated-worker provisioning,
-and archive-admission safety checks. A 20–30 minute canary replaces the initial
-24-hour soak gate for this rollout; it cannot prove long-term behavior or retention.
+and archive-admission safety checks. Owner decision (2026-10-09): use a 20–30 minute
+canary instead of waiting for the initial 24-hour soak because disk capacity is
+constrained. This does not certify the hour-long retry tail, long-term ledger/WAL
+growth or retention; those remain follow-up operational observations before
+expanding the relay set or declaring indefinite unattended operation ready.
 
 This is a development milestone, not a rollout approval. The Linux cgroup
 OOM/hang/kill proof, alert delivery, exact canary allowlist, throughput/freshness

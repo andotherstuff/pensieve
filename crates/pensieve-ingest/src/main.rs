@@ -368,7 +368,7 @@ struct Args {
     isolated_negentropy: bool,
 
     /// Run only three fixed 15-minute windows ending before this Unix timestamp.
-    /// One relay, fresh ledger, six attempts maximum, 25-minute intake deadline.
+    /// One relay, fresh ledger, six attempts, 20-minute intake plus 5-minute drain.
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_canary_until: Option<i64>,
 

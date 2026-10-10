@@ -108,6 +108,17 @@ impl IsolatedRuntime {
         if writer.recovery_required() {
             return Err(RuntimeError::Parent(ParentError::RecoveryRequired));
         }
+        if fs::symlink_metadata(&config.socket).is_ok() {
+            return Err(RuntimeError::SocketOccupied(config.socket.clone()));
+        }
+        // Bind before consuming the one-shot ledger. A failed startup removes
+        // only this listener's socket, never an earlier owner's path or ledger.
+        let listener = UnixListener::bind(&config.socket)?;
+        let socket_cleanup = SocketCleanup {
+            path: config.socket.clone(),
+            inode: fs::symlink_metadata(&config.socket)?.ino(),
+        };
+        fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
         if let Some(until) = config.canary_until {
             validate_canary(until, config.relays.len())?;
             // A fresh ledger prevents accidentally leasing unrelated retained work.
@@ -116,7 +127,16 @@ impl IsolatedRuntime {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&config.ledger)?;
+                .open(&config.ledger)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        RuntimeError::Config(
+                            "canary ledger already exists; retain it and choose a new path",
+                        )
+                    } else {
+                        RuntimeError::Io(error)
+                    }
+                })?;
         }
         let mut ledger = JobLedger::open_with_policy(
             &config.ledger,
@@ -126,18 +146,14 @@ impl IsolatedRuntime {
         if let Some(until) = config.canary_until {
             seed_canary(&mut ledger, &config.relays[0], until)?;
         }
+        if config.canary_until.is_none() && ledger.is_bounded_canary()? {
+            return Err(RuntimeError::Config(
+                "bounded canary ledger cannot become a rolling runtime",
+            ));
+        }
         let inventory = Arc::new(SyncStateDb::open(&config.inventory)?);
         let mut parent = ParentExecutor::new(ledger, inventory, dedupe, writer.clone())?;
         parent.configure(config.relays.clone()).await?;
-        // Refuse an existing path, including a stale socket after SIGKILL.
-        // An operator must prove ownership before recovery; never unlink an
-        // unknown active listener just to make startup succeed.
-        if fs::symlink_metadata(&config.socket).is_ok() {
-            return Err(RuntimeError::SocketOccupied(config.socket.clone()));
-        }
-        let listener = UnixListener::bind(&config.socket)?;
-        fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
-        let inode = fs::symlink_metadata(&config.socket)?.ino();
         let (stop, stopping) = oneshot::channel();
         let task = tokio::spawn(async move {
             let result = drive(&config, listener, parent, writer, stopping).await;
@@ -147,9 +163,7 @@ impl IsolatedRuntime {
                 tracing::error!(error = %error, "isolated reconciliation paused; durable gaps retained");
             }
             // Remove only the socket created here; a replacement is not ours.
-            if fs::symlink_metadata(&config.socket).is_ok_and(|meta| meta.ino() == inode) {
-                let _ = fs::remove_file(&config.socket);
-            }
+            drop(socket_cleanup);
             result
         });
         Ok(Self {
@@ -164,6 +178,19 @@ impl IsolatedRuntime {
             let _ = stop.send(());
         }
         self.task.await.map_err(|_| RuntimeError::Join)?
+    }
+}
+
+struct SocketCleanup {
+    path: PathBuf,
+    inode: u64,
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.ino() == self.inode) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -183,6 +210,7 @@ async fn drive(
     let mut peer: Option<(UnixStream, WorkerCandidate)> = None;
     let mut canary_attempts = 0;
     let mut canary_replays = 0;
+    let started = tokio::time::Instant::now();
     gauge!("negentropy_isolated_ready").set(1.0);
     let result: Result<(), RuntimeError> = async {
     loop {
@@ -200,10 +228,6 @@ async fn drive(
                 }
             }
             _ = interval.tick() => {
-                if config.canary_until.is_some() && canary_attempts >= 6 {
-                    tracing::info!("bounded canary attempt budget exhausted; unfinished jobs retained");
-                    break Ok(());
-                }
                 if writer.recovery_required() {
                     gauge!("negentropy_isolated_recovery_required").set(1.0);
                     break Err(RuntimeError::Parent(ParentError::RecoveryRequired));
@@ -212,6 +236,11 @@ async fn drive(
                 parent.expire(60).await?;
                 let recovered = parent.maintain_archived(32, 256).await?;
                 gauge!("negentropy_isolated_recovery_checked").set(recovered.checked as f64);
+                if config.canary_until.is_some() && canary_session_budget(started.elapsed(), canary_attempts).is_none() {
+                    // Drain already-admitted work through sealing/receipt maintenance.
+                    // Do not replay, plan, lease or exit merely because intake is over.
+                    continue;
+                }
                 if !data_has_headroom(&config.ledger)? {
                     gauge!("negentropy_isolated_ledger_space_pause").set(1.0);
                     continue;
@@ -244,6 +273,13 @@ async fn drive(
                             continue;
                         }
                     }
+                    let session_time = match config.canary_until {
+                        Some(_) => match canary_session_budget(started.elapsed(), canary_attempts) {
+                            Some(budget) => budget,
+                            None => { peer = Some((socket, candidate)); continue; }
+                        },
+                        None => SESSION_TIME,
+                    };
                     let Some(lease) = parent.lease_next_fair(LEASE_SECS).await? else {
                         peer = Some((socket, candidate));
                         continue;
@@ -261,7 +297,7 @@ async fn drive(
                     let outcome = tokio::select! {
                         biased;
                         _ = &mut stopping => break Ok(()),
-                        outcome = parent.serve(socket, config.worker_uid, lease.clone(), SESSION_TIME) => outcome,
+                        outcome = parent.serve(socket, config.worker_uid, lease.clone(), session_time) => outcome,
                     };
                     // Keep the pidfd alive through the whole exchange, and never
                     // infer success from process exit, EOF or a transport ACK.
@@ -301,10 +337,6 @@ async fn drive(
                             }
                         }
                     }
-                    if config.canary_until.is_some() && canary_attempts >= 6 {
-                        tracing::info!("bounded canary attempt budget exhausted; unfinished jobs retained");
-                        break Ok(());
-                    }
                 }
             }
         }
@@ -312,6 +344,11 @@ async fn drive(
     }.await;
     let shutdown = parent.shutdown().await;
     result.and(shutdown.map(|_| ()).map_err(Into::into))
+}
+
+fn canary_session_budget(elapsed: Duration, attempts: u32) -> Option<Duration> {
+    let left = Duration::from_secs(20 * 60).checked_sub(elapsed)?;
+    (attempts < 6 && !left.is_zero()).then_some(left.min(SESSION_TIME))
 }
 
 fn validate_canary(until: i64, relay_count: usize) -> Result<(), RuntimeError> {
@@ -379,6 +416,23 @@ mod canary_tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows, vec![(900, 1799), (1800, 2699), (2700, 3599)]);
+        drop(ledger);
+        let mut reopened = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        assert!(reopened.is_bounded_canary().unwrap());
+        reopened.configure_planner(&["wss://a.example"]).unwrap();
+        assert!(reopened.plan_rolling(7200, 32).is_err());
+    }
+
+    #[test]
+    fn exhausted_intake_budget_leaves_time_for_durability_drain() {
+        assert_eq!(canary_session_budget(Duration::ZERO, 0), Some(SESSION_TIME));
+        assert_eq!(
+            canary_session_budget(Duration::from_secs(1190), 5),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(canary_session_budget(Duration::ZERO, 6), None);
+        assert_eq!(canary_session_budget(Duration::from_secs(1200), 0), None);
+        assert_eq!(canary_session_budget(Duration::from_secs(1501), 0), None);
     }
 
     #[tokio::test]
@@ -454,7 +508,7 @@ mod tests {
             .unwrap(),
         );
         let config = RuntimeConfig {
-            canary_until: None,
+            canary_until: Some(3600),
             admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
             socket: socket.clone(),
             worker_uid: 501,
@@ -471,6 +525,7 @@ mod tests {
         ));
         let _peer = UnixStream::connect(&socket).await.unwrap();
         let (_accepted, _) = active.accept().await.unwrap();
+        assert!(!root.path().join("jobs.sqlite").exists());
     }
 
     #[tokio::test]
@@ -520,9 +575,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queued, 3);
-        assert!(
-            matches!(IsolatedRuntime::start(config, dedupe, writer).await, Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
-        );
+        assert!(matches!(
+            IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone()).await,
+            Err(RuntimeError::Config(_))
+        ));
+        let mut rolling = config;
+        rolling.canary_until = None;
+        assert!(matches!(
+            IsolatedRuntime::start(rolling, dedupe, writer).await,
+            Err(RuntimeError::Config(_))
+        ));
         let retained: u32 = db
             .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
             .unwrap();

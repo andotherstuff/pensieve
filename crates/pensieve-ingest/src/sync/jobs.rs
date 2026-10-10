@@ -187,6 +187,16 @@ pub struct JobLedger {
 }
 
 impl JobLedger {
+    /// Whether this ledger contains a fixed canary scope, including a partial seed.
+    /// Canary roots are retained even after completion, so this guard survives restart.
+    pub fn is_bounded_canary(&self) -> Result<bool, LedgerError> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE sweep='bounded-canary-v1')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Open or initialize a dedicated ledger. Parent directory must exist.
     /// Limits are runtime policy: an operator may raise them after capacity review.
     pub fn open(path: &Path, limits: LedgerLimits) -> Result<Self, LedgerError> {
