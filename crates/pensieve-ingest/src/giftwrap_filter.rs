@@ -1,5 +1,45 @@
 //! Narrow recipient-based admission policy, shared by live and negentropy ingestion.
 
+use sha2::{Digest, Sha256};
+
+/// Immutable, normalized parent admission policy. No worker controls these rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdmissionPolicy {
+    recipients: Vec<String>,
+}
+
+impl AdmissionPolicy {
+    /// Validate and canonicalize keys so ordering and encoding do not alter identity.
+    pub fn new(recipients: &[String]) -> Result<Self, String> {
+        let mut recipients = recipients
+            .iter()
+            .map(|key| parse_recipient(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        recipients.sort();
+        recipients.dedup();
+        Ok(Self { recipients })
+    }
+
+    /// Versioned digest of the exact rule semantics and canonical configuration.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut hash = Sha256::new_with_prefix(b"pensieve-giftwrap-recipient-policy-v1\0");
+        for key in &self.recipients {
+            hash.update(key.as_bytes());
+        }
+        hash.finalize().into()
+    }
+
+    /// Parent-only decision using the same predicate as live admission.
+    pub fn blocks(&self, event: &nostr_sdk::Event) -> bool {
+        is_blocked(event, &self.recipients)
+    }
+
+    /// Canonical keys for durable policy compatibility checks.
+    pub(crate) fn recipients(&self) -> &[String] {
+        &self.recipients
+    }
+}
+
 /// Parse a configured hex or npub key once, rejecting invalid configuration.
 pub fn parse_recipient(value: &str) -> Result<String, String> {
     nostr_sdk::PublicKey::parse(value)
@@ -48,6 +88,20 @@ mod tests {
         assert_eq!(parse_recipient(NPUB).unwrap(), KEY);
         assert_eq!(parse_recipient(KEY).unwrap(), KEY);
         assert!(parse_recipient("invalid").is_err());
+        assert_eq!(
+            AdmissionPolicy::new(&[KEY.to_string(), NPUB.to_string()])
+                .unwrap()
+                .fingerprint(),
+            AdmissionPolicy::new(&[NPUB.to_string()])
+                .unwrap()
+                .fingerprint()
+        );
+        assert_ne!(
+            AdmissionPolicy::default().fingerprint(),
+            AdmissionPolicy::new(&[KEY.to_string()])
+                .unwrap()
+                .fingerprint()
+        );
     }
 
     #[test]

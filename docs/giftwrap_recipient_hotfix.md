@@ -10,23 +10,21 @@ writing, or downstream indexing. Hex matching is case insensitive. The author
 key and relay URL do not affect this rule. Both live and negentropy admission
 use the same predicate. Rejection continues ingestion rather than stopping it.
 
-`ingest_policy_dropped_total{source="live|negentropy",reason="giftwrap_recipient"}`
+`ingest_policy_dropped_total{source="live|negentropy|isolated",reason="giftwrap_recipient"}`
 counts rejections without per-event logs or recipient/relay label cardinality.
 The startup log reports the number of configured recipients. This is a local
 admission filter, not a network subscription exclusion: downloading and SDK
 validation still occur. Existing archived events and offline import tools are
-not changed. Negentropy may download rejected events again in future cycles.
+not changed. Legacy negentropy may download rejected events again in future cycles.
 
 ## Master integration safety boundary
 
 Live and legacy negentropy admission honor the filter. Isolated reconciliation
-fails closed at startup when any blocked recipients are configured, while live
-ingestion continues and the existing isolated-unhealthy metric reports the fault.
-The isolated IPC ledger currently requires durable archive proof for every
-received event; silently dropping and acknowledging one would break that contract.
-Explicit durable policy-exclusion semantics must be implemented and tested before
-activating isolated reconciliation with this policy. Removing the configured
-block is not an acceptable activation workaround. This integration does not
+now records explicit durable policy exclusions rather than claiming blocked
+events were archived; see [policy exclusions](negentropy_policy_exclusions.md).
+Its ledger is bound to the configured policy and refuses a changed policy rather
+than silently reusing old completion claims. Removing the configured block is
+not an activation workaround. This integration remains default-off and does not
 authorize production deployment or change the deployed hotfix.
 
 ## Incident baseline

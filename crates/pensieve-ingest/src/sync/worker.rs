@@ -221,7 +221,7 @@ async fn attempt(
                     stream.write_all(&event.wire).await.map_err(ProtocolError::Io)?;
                     let ack: ParentMessage = read_message(&mut stream).await?;
                     match ack {
-                        ParentMessage::Accepted { header } if assignment.matches(&header, event.sequence) => Ok(()),
+                        ParentMessage::Accepted { header, .. } if assignment.matches(&header, event.sequence) => Ok(()),
                         _ => Err(ProtocolError::State),
                     }
                 }).await.map_err(|_| WorkerError::Deadline)??;

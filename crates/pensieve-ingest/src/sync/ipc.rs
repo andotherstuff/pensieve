@@ -17,8 +17,8 @@ use thiserror::Error;
 use super::failure::{FailureDiagnostic, FailureKind};
 use super::jobs::{JobLedger, Lease, LedgerError};
 
-/// Upload protocol version; inventory/handshake integration is not implemented.
-pub const VERSION: u32 = 1;
+/// Version two distinguishes archive admission from durable policy exclusion.
+pub const VERSION: u32 = 2;
 /// Maximum JSON payload; the four-byte big-endian length prefix is additional.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum received event frames per attempt (not distinct event IDs).
@@ -232,11 +232,22 @@ impl RegisteredEvent {
     }
 }
 
-/// Parent acknowledgement: received/admission ownership only, never archived.
+/// Explicit parent disposition; neither variant claims a new archived event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionOutcome {
+    /// Parent archive pipeline owns the received obligation; seal still required.
+    Admitted,
+    /// Parent durably recorded a policy exclusion, without archive admission.
+    PolicyExcluded,
+}
+
+/// Parent acknowledgement: admission ownership or policy exclusion, never archived.
 /// The future parent transport must frame this under its own sequence contract.
 #[derive(Serialize)]
 pub struct Accepted {
     pub(super) header: Header,
+    pub(super) outcome: AdmissionOutcome,
 }
 
 /// Result of processing one upload message. No variant means job complete.
@@ -397,8 +408,21 @@ impl UploadSession {
     where
         C: FnMut() -> i64,
     {
-        self.check_ack(ledger, &event, clock())?;
+        let admission_time = clock();
+        self.check_ack(ledger, &event, admission_time)?;
         self.closed = true;
+        if ledger.exclude_by_policy(
+            &self.lease,
+            event.header.sequence,
+            &event.event,
+            admission_time,
+        )? {
+            metrics::counter!("ingest_policy_dropped_total", "source" => "isolated", "reason" => "giftwrap_recipient").increment(1);
+            self.closed = false;
+            let mut accepted = self.accepted(ledger, event, clock())?;
+            accepted.outcome = AdmissionOutcome::PolicyExcluded;
+            return Ok(accepted);
+        }
         if writer.recovery_required() {
             return Err(ProtocolError::State);
         }
@@ -435,6 +459,7 @@ impl UploadSession {
         self.outstanding_bytes -= bytes;
         Ok(Accepted {
             header: event.header,
+            outcome: AdmissionOutcome::Admitted,
         })
     }
 
