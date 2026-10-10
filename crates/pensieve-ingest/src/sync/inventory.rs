@@ -177,9 +177,10 @@ impl<'a> InventoryReplay<'a> {
             Some(bytes) => {
                 let cursor = decode_cursor(&bytes)?;
                 if cursor.archive != archive || cursor.prefix != prefix || cursor.floor != floor {
-                    return Err(Error::Config(
-                        "replay cursor identity differs; preserve existing state".to_owned(),
-                    ));
+                    return Err(Error::Config(format!(
+                        "replay cursor identity differs; preserve existing state (stored floor={}, next={}, configured floor={floor})",
+                        cursor.floor, cursor.next,
+                    )));
                 }
                 cursor
             }
@@ -634,6 +635,29 @@ mod tests {
         );
         assert_eq!(h.state.replay_cursor().unwrap(), original);
         assert_eq!(h.cursor().next, 0);
+    }
+
+    #[test]
+    fn restoring_original_floor_resumes_without_resetting_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(dir.path());
+        h.seal(3);
+        let mut replay = h.begin().unwrap().unwrap();
+        while !replay.step(4).unwrap().segment_complete {}
+        drop(replay);
+        let original = h.state.replay_cursor().unwrap();
+        assert_eq!(h.cursor().next, 1);
+        assert!(
+            InventoryReplay::begin(&h.state, &h.dedupe, &h.writer, &h.archive, "segment", 1)
+                .is_err()
+        );
+        assert_eq!(h.state.replay_cursor().unwrap(), original);
+        assert!(h.begin().unwrap().is_none());
+        assert_eq!(h.state.replay_cursor().unwrap(), original);
+        assert!(
+            matches!(h.state.archived_window(100, 100, 3, &h.dedupe).unwrap(),
+            ArchivedWindow::Complete(rows) if rows.len() == 3)
+        );
     }
 
     #[test]

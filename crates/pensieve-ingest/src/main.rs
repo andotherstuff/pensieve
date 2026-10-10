@@ -36,8 +36,8 @@ use pensieve_ingest::pipeline::ArchiveSealTimer;
 use pensieve_ingest::sync::runtime::{IsolatedRuntime, RuntimeConfig};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
-    NegentropySyncer, ParquetShadowConfig, ParquetShadowPublisher, RelayManager,
-    RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
+    NegentropySyncer, ParquetShadowConfig, ParquetShadowHandle, ParquetShadowPublisher,
+    RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
     logging::compact_error,
     pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
@@ -1422,6 +1422,12 @@ async fn main() -> Result<()> {
         // compression threads finish sending their final notifications.
         drop(segment_writer);
 
+        // The archive is durable now. Do not hold shutdown hostage to a full
+        // historical Parquet replay; finish its current immutable work unit.
+        if let Some(ref handle) = parquet_shadow_handle {
+            handle.request_shutdown();
+        }
+
         // Wait for ClickHouse indexer if running
         if let Some(handle) = indexer_handle {
             tracing::info!("Waiting for ClickHouse indexer to finish...");
@@ -1516,7 +1522,7 @@ type PipelineComponents = (
     Arc<SegmentWriter>,
     Arc<DedupeIndex>,
     Option<std::thread::JoinHandle<()>>,
-    Option<std::thread::JoinHandle<()>>,
+    Option<ParquetShadowHandle>,
 );
 
 /// Initialize pipeline components.
@@ -1671,7 +1677,7 @@ fn start_optional_parquet_shadow(
     config: Result<ParquetShadowConfig>,
 ) -> Option<(
     crossbeam_channel::Sender<SealedSegment>,
-    std::thread::JoinHandle<()>,
+    ParquetShadowHandle,
 )> {
     let config = match config {
         Ok(config) => config,

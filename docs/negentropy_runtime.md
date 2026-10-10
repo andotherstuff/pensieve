@@ -112,7 +112,11 @@ stop the worker at the end of the test. An expired deadline or exhausted budget 
 durability, exclusion behavior and worker-loss recovery from the retained ledger.
 
 This mode uses the existing inventory and only bounded replay; it does not certify
-full historical inventory coverage. Choose the replay floor deliberately. Do not
+full historical inventory coverage. Choose the replay floor deliberately. On a
+repeat canary with the same sync database, retain its original replay floor:
+the persisted cursor resumes at its recorded next segment. A fresh job ledger
+does not reset inventory identity. Never calculate a new floor from the newest
+archive segment or delete the inventory to bypass a mismatch. Do not
 run a second archive/dedupe owner to avoid an ingester restart. Production use still
 requires reviewed binaries, backups, disk preflight, isolated-worker provisioning,
 and archive-admission safety checks. Owner decision (2026-10-09): use a 20–30 minute
