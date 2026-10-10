@@ -98,12 +98,42 @@ jobs:
       # nextest does not run doctests, so cover them separately.
       - run: cargo test --workspace --doc
 
+  clickhouse:
+    name: ClickHouse integration (24.8)
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        # Same release line as production.
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget -qO- http://localhost:8123/ping || exit 1"
+          --health-interval 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev protobuf-compiler
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clickhouse
+      # Same as `just test-clickhouse`.
+      - run: cargo test -p pensieve-preview --test compact_lookups -- --ignored
+        env:
+          PENSIEVE_TEST_CLICKHOUSE_URL: http://localhost:8123
+
   # Single required status check that aggregates the matrix + other jobs, so branch
   # protection only needs to require "CI success".
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, doctest, ops-test]
+    needs: [fmt, clippy, test, doctest, ops-test, clickhouse]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all jobs passed

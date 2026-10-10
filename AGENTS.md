@@ -49,6 +49,7 @@ just test-preview           # Run preview tests
 just test-preview-verbose   # Run with output
 just coverage-preview       # HTML coverage report (requires cargo-llvm-cov)
 just coverage-preview-summary  # Coverage summary
+just run-preview-lookups --help  # Compact lookup plan/backfill/status/validate/bench
 ```
 
 ### Agent Commit Requirement
@@ -67,6 +68,8 @@ just ch-migrate <file>        # Run a single migration
 just ch-migrate-all           # Run active top-level docs/migrations/*.sql only
 just ch-query "<sql>"         # Run raw SQL query
 just ch-tables                # List tables and views
+just ch-test-up               # Disposable ClickHouse 24.8 for integration tests
+just test-clickhouse          # ClickHouse integration tests (needs ch-test-up)
 ```
 
 ## Project Structure

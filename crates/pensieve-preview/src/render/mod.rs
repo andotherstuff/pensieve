@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use maud::Markup;
 
-use crate::query::{self, ProfileMetadata};
+use crate::query::ProfileMetadata;
 use crate::resolve::ResolvedContent;
 use crate::state::AppState;
 
@@ -65,7 +65,10 @@ pub async fn render_page(
             let display_names = if referenced_pubkeys.is_empty() {
                 HashMap::new()
             } else {
-                query::fetch_display_names(&state.clickhouse, &referenced_pubkeys).await?
+                state
+                    .lookups
+                    .fetch_display_names(&referenced_pubkeys)
+                    .await?
             };
 
             // Fetch quoted events for inline card rendering (depth 1 only)
@@ -121,25 +124,24 @@ pub async fn render_page(
                         .find(|t| t.len() >= 2 && t[0] == "e")
                         .map(|t| t[1].clone());
 
-                    let (original_event, original_author, original_npub) = if let Some(ref id) =
-                        reposted_id
-                    {
-                        let orig = query::fetch_event_by_id(&state.clickhouse, id).await?;
-                        if let Some(ref orig_event) = orig {
-                            let orig_profile =
-                                query::fetch_profile(&state.clickhouse, &orig_event.pubkey).await?;
-                            let orig_meta =
-                                orig_profile.map(|p| ProfileMetadata::from_json(&p.content));
-                            let orig_npub = nostr::PublicKey::from_hex(&orig_event.pubkey)
-                                .ok()
-                                .and_then(|pk| nostr::ToBech32::to_bech32(&pk).ok());
-                            (Some(orig_event.clone()), orig_meta, orig_npub)
+                    let (original_event, original_author, original_npub) =
+                        if let Some(ref id) = reposted_id {
+                            let orig = state.lookups.fetch_event_by_id(id).await?;
+                            if let Some(ref orig_event) = orig {
+                                let orig_profile =
+                                    state.lookups.fetch_profile(&orig_event.pubkey).await?;
+                                let orig_meta =
+                                    orig_profile.map(|p| ProfileMetadata::from_json(&p.content));
+                                let orig_npub = nostr::PublicKey::from_hex(&orig_event.pubkey)
+                                    .ok()
+                                    .and_then(|pk| nostr::ToBech32::to_bech32(&pk).ok());
+                                (Some(orig_event.clone()), orig_meta, orig_npub)
+                            } else {
+                                (None, None, None)
+                            }
                         } else {
                             (None, None, None)
-                        }
-                    } else {
-                        (None, None, None)
-                    };
+                        };
 
                     Ok(repost::render(
                         event,
@@ -228,7 +230,7 @@ async fn fetch_quoted_events(
     let futures: Vec<_> = event_ids
         .iter()
         .map(|id| async {
-            let row = query::fetch_event_by_id(&state.clickhouse, id).await;
+            let row = state.lookups.fetch_event_by_id(id).await;
             (id.clone(), row)
         })
         .collect();
@@ -247,7 +249,7 @@ async fn fetch_quoted_events(
     let profile_futures: Vec<_> = found
         .iter()
         .map(|(id, row)| async {
-            let profile = query::fetch_profile(&state.clickhouse, &row.pubkey).await;
+            let profile = state.lookups.fetch_profile(&row.pubkey).await;
             (id.clone(), profile)
         })
         .collect();

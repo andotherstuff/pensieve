@@ -6,6 +6,7 @@ use clickhouse::Client;
 use moka::future::Cache;
 
 use crate::config::Config;
+use crate::lookups::Lookups;
 
 /// Cached HTML response with metadata for TTL decisions.
 #[derive(Clone, Debug)]
@@ -42,6 +43,9 @@ pub struct AppState {
     /// ClickHouse client for database queries.
     pub clickhouse: Client,
 
+    /// Preview read layer (legacy or compact source per lookup).
+    pub lookups: Lookups,
+
     /// Application configuration.
     pub config: Arc<Config>,
 
@@ -52,12 +56,37 @@ pub struct AppState {
     pub og_cache: OgImageCache,
 }
 
+/// ClickHouse settings applied to every preview query when
+/// `PREVIEW_DISABLE_PROJECTIONS` is set.
+///
+/// Besides disabling projections, they bound any query that would now scan
+/// `events_local` (a lookup still on its legacy path): it fails after 10
+/// seconds, matching the HTTP request timeout, and is cancelled if the request
+/// is dropped first, so a rehearsal cannot pile up long-running scans.
+pub const PROJECTIONS_OFF_SETTINGS: [(&str, &str); 4] = [
+    ("optimize_use_projections", "0"),
+    ("max_execution_time", "10"),
+    ("timeout_overflow_mode", "throw"),
+    ("cancel_http_readonly_queries_on_client_close", "1"),
+];
+
+/// Build the preview's ClickHouse client from configuration.
+pub fn clickhouse_client(config: &Config) -> Client {
+    let mut client = Client::default()
+        .with_url(&config.clickhouse_url)
+        .with_database(&config.clickhouse_database);
+    if config.disable_projections {
+        for (name, value) in PROJECTIONS_OFF_SETTINGS {
+            client = client.with_option(name, value);
+        }
+    }
+    client
+}
+
 impl AppState {
     /// Create a new application state from configuration.
     pub fn new(config: Config) -> Self {
-        let clickhouse = Client::default()
-            .with_url(&config.clickhouse_url)
-            .with_database(&config.clickhouse_database);
+        let clickhouse = clickhouse_client(&config);
 
         let cache = Cache::builder()
             .max_capacity(DEFAULT_CACHE_CAPACITY)
@@ -77,8 +106,11 @@ impl AppState {
             "application state initialized"
         );
 
+        let lookups = Lookups::new(clickhouse.clone(), config.compact_lookups);
+
         Self {
             clickhouse,
+            lookups,
             config: Arc::new(config),
             cache,
             og_cache,

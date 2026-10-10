@@ -44,6 +44,7 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 014_relay_distribution.sql | Pre-aggregate NIP-65 relay distribution data | **Yes** (runs automatically) |
 | 015_kinds_stats.sql | Pre-aggregate event kind statistics | **Yes** (runs automatically) |
 | prepared/016_drop_events_by_time_projection.sql | Prepared removal of the full-row time projection; excluded from `ch-migrate-all` | No (background removal mutation) |
+| prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all` | **Yes** (`preview-lookups backfill`, bounded and resumable) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -462,6 +463,37 @@ Monitor the `MATERIALIZE PROJECTION events_by_time` mutation in
 `system.mutations`. The projection is not fully restored for historical
 queries until that mutation reaches `is_done = 1`. If materialization threatens
 the disk reserve, stop and investigate rather than forcing a final optimize.
+
+---
+
+### prepared/017_preview_compact_lookups.sql
+
+**Purpose:** Let nstr.to's profile, zap and naddr previews read three compact
+tables instead of filtering `events_local` by kind through the full-row
+`events_by_kind` projection.
+
+It creates three tables, each fed by an insert-triggered view on
+`events_local`:
+- `profile_latest`: latest kind 0 per pubkey;
+- `zap_receipts_by_target`: one row per (target event, zap receipt), using
+  the migration 009 amount rules;
+- `addressable_latest`: latest event id per (pubkey, kind, d_tag) for the
+  addressable kinds nstr.to previews via naddr (articles, video, live events,
+  wiki, listings, calendar and similar; bulk machine kinds are excluded).
+
+Reads stay correct before merges, with replays, and with out-of-order
+arrivals. The migration does **not** backfill or touch the projection.
+
+**Apply, backfill, validate and roll out:** follow
+[`ops/RUNBOOK.md` → Preview compact lookups](../../ops/RUNBOOK.md#preview-compact-lookups).
+Design and behaviour differences:
+[`docs/preview_compact_lookups.md`](../preview_compact_lookups.md).
+
+**Rollback:** set `PREVIEW_COMPACT_LOOKUPS=none`, restart `pensieve-preview`, then:
+
+```bash
+just ch-migrate docs/migrations/rollback/017_drop_preview_compact_lookups.sql
+```
 
 ---
 

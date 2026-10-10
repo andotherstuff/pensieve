@@ -105,6 +105,11 @@ ORDER BY (id)
 SETTINGS index_granularity = 8192,
          deduplicate_merge_projection_mode = 'rebuild';
 
+-- Compact preview lookups (profile_latest, zap_receipts_by_target,
+-- addressable_latest) are created by
+-- docs/migrations/prepared/017_preview_compact_lookups.sql, not here; apply it
+-- after this file on fresh installs. See docs/preview_compact_lookups.md.
+
 -- =============================================================================
 -- TAG MATERIALIZED VIEW
 -- =============================================================================
