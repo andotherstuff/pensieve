@@ -518,9 +518,14 @@ projection on `events_local` in production.
   benchmarked at p95 ≤ 183 ms with projections and query cache off; preview
   switched to `PREVIEW_COMPACT_LOOKUPS=all`.
 
-**Guards in the file:** it refuses to run if the 017 views are missing, if
-any query outside the `preview-lookups` tool used `events_by_kind` in the last
-6 hours, or if another `events_local` mutation is pending.
+**Guards in the file:** it flushes the query log, then refuses to run if the
+017 views are missing, if any query outside the `preview-lookups` tool used
+`events_by_kind` in the last 6 hours, or if another `events_local` mutation is
+pending.
+
+**Fresh installs** keep `events_by_kind` in `docs/clickhouse_self_hosted.sql`:
+the preview's default legacy reads and the 017 backfill rely on it. Remove it
+only through this migration, after 017 is applied, backfilled and enabled.
 
 **Apply and monitor:** see
 [`ops/RUNBOOK.md` → Projection removal](../../ops/RUNBOOK.md#projection-removal-migration-018).
@@ -529,6 +534,7 @@ any query outside the `preview-lookups` tool used `events_by_kind` in the last
 start without 1.6 TiB unreserved, so it is effectively unavailable on the
 current production disk. After removal, `PREVIEW_COMPACT_LOOKUPS=none` would
 bring back 10–30 s legacy reads, so the compact path is the way forward.
+
 ---
 
 ## Full Deployment Checklist

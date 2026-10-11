@@ -27,6 +27,10 @@
 --     legacy reads, and preview-lookups plan/validate/bench need
 --     --allow-full-scan (rebuilds use --shard-by id-prefix).
 --   - Do not use OPTIMIZE TABLE ... FINAL to accelerate cleanup.
+--   - ClickHouse 24.8 silently postpones mutating any part larger than
+--     unreserved disk space / 1.1. Run the part-size preflight in
+--     ops/RUNBOOK.md first; a stuck parts_to_do with an empty
+--     latest_fail_reason means such parts are waiting for free space.
 
 -- Return immediately after scheduling the per-part projection removal.
 SET mutations_sync = 0;
@@ -52,7 +56,11 @@ FROM system.tables
 WHERE database = 'nostr'
   AND name IN ('profile_latest_mv', 'zap_receipts_by_target_mv', 'addressable_latest_mv');
 
--- Nothing but the operator tool may still depend on the projection.
+-- Nothing but the operator tool may still depend on the projection. Flush the
+-- buffered query log first so a query that finished seconds ago is visible;
+-- if the flush fails, the migration stops here (clickhouse-client stops at
+-- the first error), before the DROP.
+SYSTEM FLUSH LOGS;
 SELECT throwIf(
     count() > 0,
     'events_by_kind was used in the last 6 hours outside preview-lookups; run the consumer audit in ops/RUNBOOK.md'

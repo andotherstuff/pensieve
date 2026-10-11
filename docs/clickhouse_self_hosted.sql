@@ -62,9 +62,11 @@ USE nostr;
 --
 -- PROJECTIONS provide alternate sort orders for common query patterns:
 -- - Time-range queries use idx_created_at without duplicating every full row.
--- - Kind-filtered preview lookups use the compact tables from
---   docs/migrations/prepared/017_preview_compact_lookups.sql; the full-row
---   events_by_kind projection was removed by prepared migration 018.
+-- - events_by_kind: Optimized for kind-filtered queries (e.g., "all reactions").
+--   Fresh installs keep it: pensieve-preview's default (legacy) reads and the
+--   preview-lookups backfill rely on it. An installation removes it only after
+--   applying and backfilling prepared migration 017, switching the preview to
+--   PREVIEW_COMPACT_LOOKUPS=all, and then running prepared migration 018.
 -- - events_by_author: Optimized for author queries (e.g., "videos by pubkey X")
 CREATE TABLE IF NOT EXISTS events_local (
     -- Event fields (NIP-01)
@@ -93,6 +95,10 @@ CREATE TABLE IF NOT EXISTS events_local (
 
     -- Projections for alternate query patterns
     -- ClickHouse automatically selects the best projection for each query
+    PROJECTION events_by_kind (
+        SELECT *
+        ORDER BY (kind, created_at, pubkey)
+    ),
     PROJECTION events_by_author (
         SELECT *
         ORDER BY (pubkey, created_at, kind)
