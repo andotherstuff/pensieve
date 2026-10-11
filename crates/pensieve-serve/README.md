@@ -28,7 +28,12 @@ Generate a token: `openssl rand -hex 32`
 | `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(required for `overview`)* | Canonical ingestion-owned watermark file |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | `900` | Maximum accepted watermark publication age |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
-| `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints |
+| `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints; ignored if the file does not exist |
+| `RUST_LOG` | `info` | Log filter (`tracing` `EnvFilter` syntax) |
+
+On startup the server loads a `.env` file if one exists. Override its location with
+`--dotenv <path>` or the `DOTENV_PATH` environment variable (default `.env`).
+Variables already set in the process environment take precedence over the file.
 
 The Postgres selector fails closed and defaults every analytics route to
 ClickHouse. Supported family names are `overview`, `events`, `active_users`,
@@ -206,7 +211,7 @@ Event counts with optional filters and grouping.
 | `kind` | integer | Filter by event kind |
 | `since` | date | Events created on or after (YYYY-MM-DD) |
 | `until` | date | Events created before (YYYY-MM-DD) |
-| `days` | integer | Shorthand: events from last N days (overrides `since`/`until`) |
+| `days` | integer | Shorthand: events from last N days (overrides `since`/`until`). Defaults to 30 when none of `days`, `since`, or `until` is given |
 | `group_by` | string | Group results: `day`, `week`, or `month` |
 | `limit` | integer | Max results (default: 100, max: 1000) |
 
@@ -239,7 +244,7 @@ Event counts with optional filters and grouping.
 **Examples**
 
 ```bash
-# Total events of kind 1 (text notes)
+# Kind 1 (text note) events in the last 30 days (default window)
 GET /api/v1/stats/events?kind=1
 
 # Events in the last 7 days
@@ -277,7 +282,7 @@ GET /api/v1/stats/events?since=2024-01-01&until=2024-02-01
 
 ### Active Users
 
-Active user metrics exclude throwaway keys (kinds 445 and 1059 per NIP-59).
+Active user metrics exclude throwaway keys: kind 1059 (NIP-59 gift wraps) and kind 445 (Marmot/MLS group messages), both signed by ephemeral keys.
 
 #### `GET /api/v1/stats/users/active`
 
@@ -437,7 +442,7 @@ Cohort retention analysis showing how users return over time.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `cohort_start` | date | 12 weeks ago | Start date for first cohort |
+| `cohort_start` | date | `limit` × `cohort_size` ago | Start date for first cohort (Postgres backend: when omitted, returns the latest `limit` cohorts) |
 | `cohort_size` | string | `week` | Cohort size: `week` or `month` |
 | `limit` | integer | 12 | Number of cohorts (max: 52) |
 
@@ -599,6 +604,10 @@ Zap amount distribution across meaningful buckets.
 #### `GET /api/v1/stats/engagement`
 
 Reply and reaction ratios relative to original notes.
+
+Only served from Postgres: unless `engagement` is selected in
+`PENSIEVE_POSTGRES_API_FAMILIES`, this endpoint returns `503` with
+`{"error": "metric_unavailable"}`.
 
 **Query Parameters**
 
@@ -886,13 +895,13 @@ GET /api/v1/stats/relays/distribution?limit=50
 GET /api/v1/stats/relays/distribution
 ```
 
-**Suggested cache TTL:** 10 minutes
+**Suggested cache TTL:** 1 minute (the server sends `Cache-Control: public, max-age=60, stale-while-revalidate=300`)
 
 ---
 
 ### Relays
 
-Relay endpoints require the `RELAY_DB_PATH` environment variable to be set to the path of the ingester's SQLite relay stats database.
+Relay endpoints require the `RELAY_DB_PATH` environment variable to be set to the path of the ingester's SQLite relay stats database. If it is unset or the file does not exist at startup, these endpoints return `500` (`internal_error`).
 
 #### `GET /api/v1/relays/summary`
 
@@ -990,6 +999,8 @@ All errors return JSON with the following structure:
 }
 ```
 
+`message` is omitted for `unauthorized`, `analytics_busy`, and `metric_unavailable`.
+
 | Status | Error Code | Description |
 |--------|------------|-------------|
 | 400 | `bad_request` | Invalid request parameters |
@@ -997,6 +1008,9 @@ All errors return JSON with the following structure:
 | 404 | `not_found` | Resource not found |
 | 500 | `internal_error` | Server error |
 | 500 | `database_error` | Database query failed |
+| 500 | `serialization_error` | Response serialization failed |
+| 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out; retry later |
+| 503 | `metric_unavailable` | Metric temporarily disabled (e.g. `/stats/engagement` without the Postgres `engagement` family) |
 
 ---
 

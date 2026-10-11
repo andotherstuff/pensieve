@@ -1,5 +1,7 @@
 # Isolated worker: parent session executor
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 This is an inactive library boundary, not an ingester endpoint or scheduler. It
 opens no listener, launches no process, changes no service and retries no work.
 

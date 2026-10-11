@@ -1,5 +1,7 @@
 # Parent maintenance commands (inactive library)
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 The existing dedicated parent owner now exposes explicit expire, same-window retry,
 durability retry and archive maintenance commands. These are mechanisms, not retry
 policy or a scheduler. There is no listener, process launch, main wiring or deployment.

@@ -1,5 +1,7 @@
 # Stability Fixes Plan
 
+> Historical audit (2026-02-08). File/line references and statuses reflect the code at that date; some items have since been fixed or superseded (marked below).
+
 Audit conducted 2026-02-08 covering the full ingestion pipeline, relay management, and sync subsystems. Findings are grouped into tiers by severity and organized for tackling in separate sessions.
 
 ---
@@ -10,12 +12,16 @@ These issues can cause permanent event loss or undefined behavior. Fix first.
 
 ### 1.1 Unsafe raw pointer use-after-free in ClickHouse indexer
 
+> **Fixed** in #22 (`a89cec2`, 2026-05-21): `clickhouse.rs` now holds the counters as `Arc<AtomicUsize>`.
+
 - **File:** `crates/pensieve-ingest/src/pipeline/clickhouse.rs:112-120`
 - **Severity:** Critical (undefined behavior)
 - **Description:** `start()` casts `&self.segments_indexed` and `&self.events_indexed` to raw pointers via `usize`, then dereferences them inside a spawned thread. If the `ClickHouseIndexer` struct is dropped while the thread is still running, the thread reads dangling memory. Today this likely works because `main.rs` joins the handle before the indexer is dropped, but any refactor, panic unwind, or early-return error path that drops the indexer early causes a use-after-free.
 - **Fix:** Replace the raw pointer casts with `Arc<AtomicUsize>`, the same pattern already used for `self.running`. This is a ~10 line change.
 
 ### 1.2 Event loss on segment write failure
+
+> **Superseded** by the fail-closed archive I/O policy (#41, 2026-09-23) in [archive_failure_recovery.md](archive_failure_recovery.md): a write failure latches the writer, stops admission and requires incident-specific operator recovery.
 
 - **Files:** `main.rs:808-826`, `pipeline/dedupe.rs`, `pipeline/segment.rs`
 - **Severity:** High (permanent data loss)

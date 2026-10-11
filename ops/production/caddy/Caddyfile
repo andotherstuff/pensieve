@@ -1,11 +1,13 @@
 # Pensieve Caddy Configuration
 #
 # Two domains:
-#   DOMAIN        - API, Grafana, Prometheus (internal/admin tools)
+#   DOMAIN        - API and Grafana (the Prometheus block below is commented out)
 #   PREVIEW_DOMAIN - Public Nostr event preview pages
 #
-# For local development (no HTTPS):
-#   Set DOMAIN=localhost and PREVIEW_DOMAIN=localhost:8081 in .env
+# DOMAIN and PREVIEW_DOMAIN come from /etc/pensieve/pensieve.env (passed to
+# Compose with --env-file; there is no .env in ops/production). The compose.yml
+# fallbacks (localhost, localhost:8081) are not a working local setup: the
+# container publishes only 80/443, and 8081 is the preview binary's own port.
 #
 # For production with auto-HTTPS:
 #   Set DOMAIN=api.example.com and PREVIEW_DOMAIN=preview.example.com
@@ -13,7 +15,7 @@
 #   Caddy will auto-provision HTTPS certificates for both
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main domain — API, Grafana, Prometheus
+# Main domain — API, Grafana (Prometheus exposure commented out below)
 # ═══════════════════════════════════════════════════════════════════════════════
 {$DOMAIN:localhost} {
     # =========================================================================

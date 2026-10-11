@@ -46,10 +46,12 @@ the original proposal is not evidence that any runtime or production gate passed
 | 3b session, #54 | Authenticated one-attempt parent session and bounded owner executor | Merged; no listener or process launch |
 | 3b inventory, #55 | Source-bound inventory and seal-race handling | Merged; no replay activation |
 | 3b maintenance, #56 | Same-owner recovery commands and persisted bounded receipt fairness | Merged; no runtime policy in that slice |
-| 3b clock, #58 and planner, #59 | Owner-time lifecycle commands and bounded rolling planner | #58 merged; #59 is a separate reviewed prerequisite, not a deployment gate |
-| 3b runtime integration | Default-off ingester listener, fair leasing, replay, maintenance and paced retry | Implemented in this development branch; CI/review and Linux activation proof remain |
-| 4 | Static Linux worker unit, binding, metrics and operations | Unit and synthetic harness added here; Linux isolation and real alert-delivery proof remain |
-| 5 | Controlled production canary and soak | Not started; separate readiness decision |
+| 3b clock, #58 and planner, #59 | Owner-time lifecycle commands and bounded rolling planner | #58 and #59 merged |
+| 3b runtime integration, #60 | Default-off ingester listener, fair leasing, replay, maintenance and paced retry | Merged (2026-09-26) behind `pensieve-ingest --isolated-negentropy`; see [negentropy_runtime.md](negentropy_runtime.md) |
+| 4, #60 | Static Linux worker unit, binding, metrics and operations | Merged with #60 (`ops/systemd/pensieve-negentropy-worker.service`, tmpfiles, `ops/tests/` harness); [negentropy_runtime.md](negentropy_runtime.md) still lists the Linux cgroup OOM/hang/kill proof and alert delivery as operator gates |
+| Admission and policy, #61, #62 | Giftwrap recipient block on master, gated isolated admission, durable policy exclusions | Merged (2026-10-10); see [negentropy_policy_exclusions.md](negentropy_policy_exclusions.md) |
+| 5, #63, #64 | Controlled production canary (bounded canary mode, phase-aware deadlines, Parquet shutdown replay) | Merged (2026-10-10). Bounded Premium Primal-only trial on 2026-10-10 completed three durable windows and recovered from an injected worker loss; per the 2026-10-09 owner decision it replaces the 24-hour soak (see [negentropy_continuous_readiness.md](negentropy_continuous_readiness.md)) |
+| Continuous readiness, #65, #66 | Read-only ledger status tool, bounded completed-history retention (schema 9), `/health/negentropy` and separate Kuma progress probe | Merged (2026-10-10). Continuous operation is **not enabled**; remaining activation gates are in [negentropy_continuous_readiness.md](negentropy_continuous_readiness.md) Observed on the host 2026-10-11 20:06 CEST: the ingester restarted with `--isolated-negentropy`, no `--isolated-negentropy-canary-until`, and a `production-premium-20261011T180545Z` ledger (see [ops/RUNBOOK.md](../ops/RUNBOOK.md#negentropy-reconciliation)). |
 
 An earlier in-process hardening draft (#42) is not a prerequisite or a second
 runtime to enable alongside this worker. Library merges are not deployment claims.
@@ -126,7 +128,8 @@ no public listener. Verify effective limits and sandbox access on Linux.
    with the operator. These are not yet selected by this document.
 4. One deliberate graceful ingester restart enables IPC and disables the old loop.
    At least three durable canary jobs plus injected worker recovery must pass.
-5. Soak for 24 hours, measuring backlog age, throughput, memory and live admission.
+5. (Superseded 2026-10-09 by the bounded canary; see
+   [negentropy_runtime.md](negentropy_runtime.md#bounded-canary).) Soak for 24 hours, measuring backlog age, throughput, memory and live admission.
    Expand only if service capacity exceeds incoming work. Rollback disables worker
    and new leases but preserves live ingestion, ledger and unresolved gaps.
 

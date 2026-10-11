@@ -1,5 +1,7 @@
 # Isolated reconciliation: bounded upload and received receipts (increment 1b)
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 Builds on the merged job-ledger foundation from PR #45. This is library code and temporary
 database tests only: **no listener, worker executable, runtime wiring, service
 changes, or production migration**. It does not replace the existing reconciler.

@@ -1,5 +1,7 @@
 # Isolated reconciliation worker (increment 3a)
 
+> Point-in-time increment note. The ingester listener, scheduler and static systemd worker unit (`ops/systemd/pensieve-negentropy-worker.service`) are now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 `pensieve-negentropy-worker --socket PATH --parent-uid UID` runs at most one
 assignment, then exits. This increment does **not** add the ingester listener,
 scheduler, systemd unit or production activation. Do not enable it operationally

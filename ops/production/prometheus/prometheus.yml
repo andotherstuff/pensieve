@@ -4,7 +4,7 @@
 # - Prometheus itself
 # - ClickHouse (built-in metrics)
 # - Pensieve ingester (native binary on host, port 9091)
-# - Pensieve backfill (native binary on host, port 9092)
+# - node_exporter on the host (port 9100), if installed
 
 global:
   scrape_interval: 15s
@@ -21,9 +21,6 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # ClickHouse metrics
-  # ═══════════════════════════════════════════════════════════════════════════
   # ═══════════════════════════════════════════════════════════════════════════
   # Pensieve Ingester (native binary on host via systemd)
   # Metrics exposed on port 9091
@@ -44,12 +41,9 @@ scrape_configs:
   # ═══════════════════════════════════════════════════════════════════════════
   # Node Exporter (host machine metrics)
   # Metrics exposed on port 9100
+  # node_exporter is not part of compose.yml; it must be installed on the host
+  # separately (this target is down if it is absent).
   # ═══════════════════════════════════════════════════════════════════════════
   - job_name: 'node'
     static_configs:
       - targets: ['host.docker.internal:9100']
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Pensieve Backfill (native binary on host, when running)
-  # Metrics exposed on port 9092
-  # ═══════════════════════════════════════════════════════════════════════════

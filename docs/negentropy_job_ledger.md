@@ -1,5 +1,7 @@
 # Isolated reconciliation: durable job ledger (increment 1a)
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 This increment implements the persistent obligation ledger, **not a running
 replacement for the current negentropy scheduler**. It is exported as
 `pensieve_ingest::sync::jobs` but has no runtime callers, CLI, migrations against

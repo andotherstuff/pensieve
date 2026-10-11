@@ -1,5 +1,7 @@
 # Negentropy Sync for Live Ingestion
 
+> Historical design for the legacy in-process `--negentropy` loop; see [negentropy_runtime.md](negentropy_runtime.md) for the isolated mode (`--isolated-negentropy`).
+
 **Status:** Planning
 **Branch:** `negentropy`
 **Created:** 2026-01-04

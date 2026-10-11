@@ -1,5 +1,7 @@
 # Isolated reconciliation: bounded archive inventory (increment 2c)
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 Library only; no startup scan, scheduler, pruning change or production activation.
 Use after the archive recovery gate on the parent-owned bounded database executor.
 

@@ -1,0 +1,36 @@
+# Production systemd drop-ins (record)
+
+Production does not run the `ExecStart` lines in `ops/systemd/*.service`.
+Drop-ins under `/etc/systemd/system/<unit>.d/` reset `ExecStart=` and point each
+service at a release build (see [`ops/RUNBOOK.md` → Routine deploy](../../RUNBOOK.md#routine-deploy)).
+This directory records those drop-ins so the repo shows how services actually
+start. Paths mirror `/etc/systemd/system/`.
+
+Captured from the production host on 2026-10-11 (ingester drop-in as of 20:15 CEST). These are **records, not
+install sources**: they name specific release directories and canary files
+that change on every deploy. When you change a drop-in on the host, update the
+copy here in the same PR as the code it deploys.
+
+| Unit | Drop-in | Effect |
+|------|---------|--------|
+| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-7ac5121/pensieve-serve` with `PENSIEVE_POSTGRES_API_FAMILIES=none` (all routes on ClickHouse) and the latest-event watermark path |
+| `pensieve-preview` | `10-release.conf` | Runs `releases/preview-3ab1045/pensieve-preview` |
+| `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
+| `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
+| `pensieve-ingest` | `override.conf` | `RUST_BACKTRACE=1` |
+| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `/data/pensieve-build/negentropy-20f0b4b/release/pensieve-ingest` with `--isolated-negentropy` (production pilot started 2026-10-11 20:06 CEST, replacing an earlier bounded canary), adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
+
+The comment inside `10-release.conf` ("Rollback: remove this file") predates
+migration 018. Removing it now would start the 2026-07-27 build in
+`~/pensieve/target/release/`, which has no compact lookups and would scan
+`events_local` for every profile, zap and naddr preview. Roll back by pointing
+`ExecStart` at another `releases/` directory instead.
+
+Drop-ins apply in lexical order and each `ExecStart=` line clears the previous
+value, so the last file that sets `ExecStart` wins (`zzzz-…` for the ingester).
+Check what is really running with:
+
+```bash
+systemctl show pensieve-ingest -p DropInPaths -p ExecStart
+readlink /proc/$(systemctl show -p MainPID --value pensieve-ingest)/exe
+```

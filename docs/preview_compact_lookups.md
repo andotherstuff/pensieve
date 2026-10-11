@@ -1,9 +1,15 @@
 # Compact ClickHouse lookups for pensieve-preview
 
-nstr.to (`pensieve-preview`) answers profile, zap and naddr lookups by
-filtering `events_local` on `kind`. `events_local` is
+> **Status (2026-10-11):** 017 is applied, backfilled and validated in
+> production, the preview runs with `PREVIEW_COMPACT_LOOKUPS=all`, and
+> migration 018 has removed `events_by_kind`; `events_local` has no
+> projections. Only naddr kinds outside `ADDRESSABLE_KINDS` still use the
+> legacy read.
+
+Before 017, nstr.to (`pensieve-preview`) answered profile, zap and naddr
+lookups by filtering `events_local` on `kind`. `events_local` is
 `ReplacingMergeTree(indexed_at) ORDER BY id` with no partitions, so without
-the full-row `events_by_kind` projection (about 1.33 TiB) those reads become
+the full-row `events_by_kind` projection (about 1.34 TiB) those reads become
 table scans:
 - sampled profile lookups took 21–30 s;
 - an event-zap lookup took more than 60 s.
@@ -180,11 +186,17 @@ Connection settings also come from `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`,
 
 | Command | Purpose |
 |---------|---------|
-| `plan` | Reads source statistics and an hourly histogram through `events_by_kind`. It writes `<checkpoint-dir>/<target>/plan.json` with contiguous `created_at` shards; the first and last are open-ended, so `created_at = 0` and future timestamps are covered. It also prints the disk estimate. |
+| `plan` | Reads source statistics and an hourly histogram through `events_by_kind` (by default; see the note below the table). It writes `<checkpoint-dir>/<target>/plan.json` with contiguous `created_at` shards; the first and last are open-ended, so `created_at = 0` and future timestamps are covered. It also prints the disk estimate. |
 | `backfill` | Runs remaining shards (resumable, idempotent). See the guards below. |
 | `status` | Shards done, parts, rows, bytes and freshness lag per table. |
 | `validate` | Compares compact and legacy reads with a Rust oracle computed from source events, at a fixed cutoff. Exits non-zero on any unexplained difference. |
 | `bench` | Lookup latency with `optimize_use_projections=0` and `use_query_cache=0`, plus storage. |
+
+`plan`, `validate` and `bench` default to requiring `events_by_kind`
+(`force_optimize_projection=1` on their source reads). Since migration 018
+removed the projection, pass `--allow-full-scan` to each of them; a backfill
+inherits the setting from its plan. Rebuilds use
+`plan --allow-full-scan --shard-by id-prefix`.
 
 ### Backfill guards
 
@@ -289,6 +301,11 @@ rollout.
 
 ### Projections-off rehearsal
 
+> **Historical:** this rehearsal was skipped before migration 018 (see
+> [`ops/RUNBOOK.md`](../ops/RUNBOOK.md#projection-removal-migration-018)).
+> With no projections left, `optimize_use_projections = 0` has no effect;
+> the flag only adds the query caps below.
+
 `PREVIEW_DISABLE_PROJECTIONS=true` runs **every** preview query with
 `optimize_use_projections = 0`, which is how the preview will behave once the
 projection is gone. It lets real nstr.to traffic prove the change before the
@@ -304,6 +321,13 @@ minute, and startup logs a warning unless `PREVIEW_COMPACT_LOOKUPS=all`. Turn
 it off with `PREVIEW_DISABLE_PROJECTIONS=false` and a restart.
 
 ## Requires production validation
+
+> **Completed (2026-10-11):** 017 was backfilled and validated with 0
+> unexplained differences, compact lookups benchmarked at p95 ≤ 183 ms with
+> projections and query cache off, the preview was switched to `all`, and the
+> consumer audit preceded migration 018 (see
+> [`docs/migrations/README.md`](migrations/README.md)). `events_by_author` is
+> not present in production. The list is kept as a record.
 
 The checks below can only be done on the production server. Locally, the
 integration suite and an end-to-end CLI run against ClickHouse 24.8.14.39 (the

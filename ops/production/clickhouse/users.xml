@@ -19,11 +19,14 @@
             Password is set via environment variable CLICKHOUSE_GRAFANA_PASSWORD
         -->
         <grafana>
-            <!-- Password set from env var (double SHA1 hash) -->
-            <!-- Generate with: echo -n "password" | sha256sum | cut -d' ' -f1 | xxd -r -p | sha256sum -->
+            <!-- Plaintext password read from env var CLICKHOUSE_GRAFANA_PASSWORD (not hashed) -->
             <password from_env="CLICKHOUSE_GRAFANA_PASSWORD"/>
 
-            <!-- Network access - internal Docker network only -->
+            <!--
+                Network access - any address (::/0). Exposure is limited by
+                compose.yml, which publishes 8123/9000 on 127.0.0.1 only;
+                containers on the Docker network can also connect.
+            -->
             <networks>
                 <ip>::/0</ip>
             </networks>
@@ -34,7 +37,11 @@
             <!-- Default quota (unlimited) -->
             <quota>default</quota>
 
-            <!-- Grant access to nostr database only -->
+            <!--
+                No SQL user/grant management for this user. This grants nothing
+                and does not restrict databases: without <grants>/<databases>,
+                the readonly profile allows reads of every database.
+            -->
             <access_management>0</access_management>
 
             <!--

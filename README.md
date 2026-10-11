@@ -42,10 +42,12 @@ Pensieve is an **archive-first** Nostr indexer. It stores canonical events in a 
 |-----------|--------|
 | `pensieve-core` | ✅ Event validation, notepack encoding, metrics |
 | `pensieve-ingest` | ✅ Live relay ingestion + optional inventoried Parquet shadow sink |
-| `pensieve-negentropy-worker` | Experimental one-job isolated worker; `--socket PATH --parent-uid UID`. Not enabled by ingestion; requires the pending parent scheduler and Linux isolation gate. See [worker contract](docs/negentropy_worker.md). |
+| `pensieve-negentropy-worker` | Experimental one-job isolated worker; `--socket PATH --parent-uid UID`. The parent scheduler runs behind `pensieve-ingest --isolated-negentropy` (not enabled by default); unit in `ops/systemd/pensieve-negentropy-worker.service`. See [worker contract](docs/negentropy_worker.md) and [runtime](docs/negentropy_runtime.md). |
 | `pensieve-parquet` | 🚧 Accepted V1 writer, strict validator, fixtures, and notepack converter prototype |
 | `pensieve-lake` | 🚧 Resumable notepack campaign, SQLite inventory, and immutable local/S3 publication |
-| `pensieve-serve` | 🚧 Placeholder |
+| `pensieve-serve` | ✅ Authenticated analytics HTTP API (~30 routes; each analytics family served from ClickHouse or Postgres). See [API docs](crates/pensieve-serve/README.md) |
+| `pensieve-preview` | ✅ Static HTML preview pages for Nostr events/profiles, plus the `preview-lookups` compact-lookup operator tool |
+| `pensieve-analytics` | 🚧 DuckDB batch tools that build analytics from Parquet snapshots and publish serving tables to Postgres |
 | Deployment | ✅ Docker + systemd setup in `ops/` |
 
 ## Ingestion Modes
@@ -92,11 +94,12 @@ its cadence is not a hard wall-clock bound on slow disk operations.
 **Options:**
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-o, --output` | `./segments` | Output directory for notepack segments |
+| `-o, --output-dir` | `./segments` | Output directory for notepack segments |
 | `--rocksdb-path` | `./data/dedupe` | RocksDB path for deduplication |
 | `--clickhouse-url` | (none) | ClickHouse URL for indexing |
 | `--clickhouse-db` | `nostr` | ClickHouse database name |
-| `--seed-relays` | 8 public relays | Comma-separated relay URLs |
+| `--seed-relays` | (none) | Comma-separated seed relay URLs; overrides the seed file |
+| `--seed-file` | `./data/relays/seed.txt` | Seed relay file (one URL per line, `#` comments); if absent or empty, 10 built-in public relays are used |
 | `--max-relays` | `30` | Maximum concurrent relay connections |
 | `--no-discovery` | `false` | Disable NIP-65 relay discovery |
 | `--segment-size` | `268435456` | Max segment size before sealing (256MB) |
@@ -104,8 +107,16 @@ its cadence is not a hard wall-clock bound on slow disk operations.
 | `--no-compress` | `false` | Disable gzip compression |
 | `--metrics-port` | `9091` | Prometheus metrics port (0 to disable) |
 | `--relay-db-path` | `./data/relay-stats.db` | SQLite path for relay quality tracking |
-| `--import-relays-csv` | (none) | Import relays from georelays CSV |
+| `--import-discovered-json` | (none) | Import relays from a discovery JSON file as `discovered` tier |
 | `--score-interval-secs` | `300` | Score recomputation interval |
+
+This table covers the basics; run `pensieve-ingest --help` (or `just run-ingest --help`)
+for the full list. Other flags used in production include `--tor-proxy` (SOCKS5 for
+`.onion` relays), `--nip66-monitor-relays`, `--negentropy` and the
+`--isolated-negentropy*` family, `--blocked-giftwrap-recipients`
+(env `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS`), `--archive-seal-interval-secs`
+(env `PENSIEVE_ARCHIVE_SEAL_INTERVAL_SECS`), and the `--parquet-shadow-*` family
+(env `PENSIEVE_PARQUET_SHADOW_*`; see [`ops/parquet-shadow.env.example`](ops/parquet-shadow.env.example)).
 
 ### 2. JSONL Backfill (Batch)
 
@@ -134,14 +145,16 @@ Import events from JSONL files (one JSON event per line). Useful for importing s
 **Options:**
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i, --input` | (required) | Input JSONL file or directory |
-| `-o, --output` | (required) | Output directory for segments |
+| `-i, --input` | (required unless `--index-segments`) | Input JSONL file or directory |
+| `-o, --output` | (required unless `--index-segments`) | Output directory for segments |
 | `--rocksdb-path` | (none) | RocksDB path for deduplication |
 | `--clickhouse-url` | (none) | ClickHouse URL for indexing |
 | `--skip-validation` | `false` | Skip ID/signature verification |
 | `--limit` | (none) | Limit number of files to process |
 | `--progress-interval` | `100000` | Log progress every N events |
 | `--metrics-port` | `9091` | Prometheus metrics port |
+
+See `backfill-jsonl --help` for the remaining flags (e.g. `--index-segments`, `--progress-file`, `--no-compress`).
 
 ### 3. Protobuf Backfill (Batch)
 
@@ -229,18 +242,19 @@ Relays are ranked by score. Seed relays (manually curated) get a floor score of 
 - Low-scoring discovered relays are replaced with higher-scoring unconnected ones
 - Relays with 10+ consecutive failures are blocked
 
-**Bootstrap from georelays:**
+**Bootstrap from a relay discovery file:**
 
-You can import relay lists from the [georelays](https://github.com/permissionlesstech/georelays) project:
+`--import-discovered-json` imports relays as `discovered` tier (eligible for swapping).
+The file must be a JSON object with a `functioning_relays` array of relay URL strings;
+URLs are normalized, and invalid or blocked URLs are skipped.
+
+```json
+{ "functioning_relays": ["wss://relay.example.com", "wss://nostr.example.org"] }
+```
 
 ```bash
-# Download the georelays CSV
-curl -o data/relays/georelays.csv \
-  https://raw.githubusercontent.com/permissionlesstech/georelays/main/nostr_relays.csv
-
-# Run with import
 ./target/release/pensieve-ingest \
-  --import-relays-csv ./data/relays/georelays.csv \
+  --import-discovered-json ./data/relays/relay_discovery_results.json \
   -o ./segments
 ```
 
@@ -258,12 +272,21 @@ sqlite3 ./data/relay-stats.db "
 
 ## Configuration
 
-Environment variables are documented in two example files at the repo root:
+Environment variables are documented in example files:
 
 | File | Use | Copy to |
 |------|-----|---------|
-| [`env.local.example`](env.local.example) | Local native dev (`just run-serve` / `just run-ingest`) | `.env` (repo root) |
+| [`env.local.example`](env.local.example) | Local native dev for `pensieve-serve` / `pensieve-preview` | `.env` (repo root) |
 | [`env.production.example`](env.production.example) | Production Docker + systemd stack | `/etc/pensieve/pensieve.env` |
+| [`ops/parquet-shadow.env.example`](ops/parquet-shadow.env.example) | `pensieve-ingest` Parquet shadow settings | `/etc/pensieve/parquet-shadow.env` |
+| [`ops/parquet-campaign.env.example`](ops/parquet-campaign.env.example) | Parquet campaign service | `/etc/pensieve/parquet-campaign.env` |
+| [`ops/analytics.env.example`](ops/analytics.env.example) | Analytics batch tools | `/etc/pensieve/analytics.env` |
+| [`ops/analytics-refresh.env.example`](ops/analytics-refresh.env.example) | Analytics refresh timer | `/etc/pensieve/analytics-refresh.env` |
+
+Only `pensieve-serve` and `pensieve-preview` load a `.env` file (default `.env`; override
+with `--dotenv <path>` or `DOTENV_PATH`). `pensieve-ingest` never loads `.env`: it is
+configured with CLI flags, and its env-aliased flags are read from the process
+environment only (e.g. a systemd `EnvironmentFile`).
 
 ## Deployment
 
@@ -272,7 +295,9 @@ See [`ops/RUNBOOK.md`](ops/RUNBOOK.md) for production setup and the deploy/cutov
 ## Documentation
 
 - [`docs/ingestion_pipeline.md`](docs/ingestion_pipeline.md) — Pipeline architecture and design decisions
-- [`docs/clickhouse_self_hosted.sql`](docs/clickhouse_self_hosted.sql) — ClickHouse schema
+- [`docs/clickhouse_self_hosted.sql`](docs/clickhouse_self_hosted.sql) — Base ClickHouse schema for fresh installs (not a production snapshot)
+- [`docs/migrations/README.md`](docs/migrations/README.md) — ClickHouse migrations and production schema state
+- [`docs/migration-plan.md`](docs/migration-plan.md) — Lakehouse (Parquet + DuckDB + Postgres) migration plan
 
 ## License
 

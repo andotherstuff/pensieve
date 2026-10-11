@@ -1,15 +1,24 @@
 # Pensieve Production Docker Compose
 #
 # This runs the infrastructure services (ClickHouse, Grafana, Prometheus, Caddy).
-# The Rust binaries (API, Ingester) run as native binaries via systemd.
+# postgres-analytics is manual-only (profile "manual-postgres") and is not
+# started by a normal `up`.
+# The Rust binaries (API, Ingester, Preview) run as native binaries via systemd.
 #
-# Start infrastructure:  docker compose up -d
-# Stop infrastructure:   docker compose down
-# Logs:                  docker compose logs -f
-# Status:                docker compose ps
+# Normally manage infrastructure through systemd (ops/systemd/pensieve.service):
+#   sudo systemctl restart pensieve
 #
-# Start Rust services:   sudo systemctl start pensieve-api pensieve-ingest
-# Stop Rust services:    sudo systemctl stop pensieve-api pensieve-ingest
+# Manual commands must pass the production env file. Without it, Compose
+# refuses to run at all (POSTGRES_ANALYTICS_PASSWORD is required even though
+# its service is in a profile), and with a partial file it would fall back to
+# defaults such as DOMAIN=localhost and GRAFANA_PASSWORD=admin:
+#   Start:   docker compose --env-file /etc/pensieve/pensieve.env up -d
+#   Stop:    docker compose --env-file /etc/pensieve/pensieve.env down
+#   Logs:    docker compose --env-file /etc/pensieve/pensieve.env logs -f
+#   Status:  docker compose --env-file /etc/pensieve/pensieve.env ps
+#
+# Start Rust services:   sudo systemctl start pensieve-api pensieve-ingest pensieve-preview
+# Stop Rust services:    sudo systemctl stop pensieve-ingest pensieve-api pensieve-preview
 
 # Pin the Compose project name so every invocation (systemd, justfile, manual)
 # uses the same project/volumes/network regardless of the directory name. Without
@@ -181,7 +190,7 @@ services:
   # The ingester and API server run as native binaries managed by systemd.
   # This provides better I/O performance and simpler debugging.
   #
-  # See systemd/ directory for service files:
+  # See ops/systemd/ for service files:
   #   - pensieve-api.service     (API server on port 8080)
   #   - pensieve-ingest.service  (Ingester with metrics on port 9091)
   #   - pensieve-preview.service (Preview server on port 8081)
