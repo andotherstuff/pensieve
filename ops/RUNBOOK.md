@@ -526,8 +526,10 @@ routes show raw values). The 5-minute HTML cache and CDN delay what you see.
 ### 7. Rollback
 
 - **Reads:** set `PREVIEW_COMPACT_LOOKUPS=none` and restart
-  `pensieve-preview`. The legacy reads are untouched and use the projection
-  as before.
+  `pensieve-preview`. While `events_by_kind` exists, the legacy reads use it
+  as before. **After migration 018 has removed it, `none` means 10–30 s table
+  scans** (and the restore needs 1.6 TiB free), so fix forward instead: switch
+  only the affected lookup back via its flag, or rebuild the compact table.
 - **Tables and views** (only after reads are rolled back):
 
   ```bash
@@ -579,24 +581,56 @@ After the preview has run on `PREVIEW_COMPACT_LOOKUPS=all` without issues:
    for the compact lookups, and no rise in failed queries (second query).
 3. **Rollback:** set `PREVIEW_DISABLE_PROJECTIONS=false` and restart.
 
-### Projection removal (separate, manual)
+### Projection removal (migration 018)
 
-**Not part of this rollout.** Only consider it after all of these hold:
-- every backfill is complete;
-- `validate` is clean;
-- `bench` meets the target;
-- the preview has run on `all` for an agreed period;
-- the projections-off rehearsal (step 9) passed;
-- the consumer audit above is clear or each consumer is accepted;
-- the removal is written up as its own prepared migration, following the
-  `prepared/016` pattern (preflight, asynchronous `DROP PROJECTION`, rollback
-  with free-space check).
+The removal was accelerated (2026-10-11) because `/data` reached 94% used. The
+7-day consumer audit showed the preview's legacy lookups were the only users of
+`events_by_kind`, and those had already moved to the compact tables. The
+projections-off rehearsal was skipped: `query_log` already showed no preview
+query using a projection after the switch to `all`.
 
-After removal, the legacy preview reads become slow again, so rolling back
-reads means restoring the projection first. Future rebuilds of the compact
-tables (for example a zap parser correction) then need
-`plan --allow-full-scan --shard-by id-prefix`. That runs full-table reads in
-256 bounded shards; plan the I/O accordingly.
+1. Re-run the step 8 consumer audit query exactly as written (7 days,
+   excluding `preview-lookups`). It must return zero rows other than the
+   preview's own legacy lookups from before the switch to `all`.
+2. Part-size preflight. ClickHouse 24.8 silently postpones mutating any part
+   larger than unreserved space / 1.1. Rows here will wait until free space
+   grows (other parts finishing frees space and raises the ceiling); this is
+   informational, not a blocker:
+
+   ```bash
+   just ch-query "SELECT name, formatReadableSize(bytes_on_disk) AS bytes FROM system.parts WHERE database = 'nostr' AND table = 'events_local' AND active AND bytes_on_disk >= (SELECT toUInt64(unreserved_space / 1.1) FROM system.disks WHERE name = 'default') ORDER BY bytes_on_disk DESC"
+   ```
+
+   (2026-10-11: no rows; ceiling ~204 GiB, largest part 150 GiB.)
+3. Apply. The file checks that the 017 views exist, that nothing outside
+   `preview-lookups` used the projection in the last 6 hours, and that no
+   mutation is pending:
+
+   ```bash
+   just ch-migrate docs/migrations/prepared/018_drop_events_by_kind_projection.sql
+   ```
+
+4. Monitor until `is_done = 1` and no active `events_by_kind` parts remain;
+   free space returns as the outdated parts age out. An empty
+   `latest_fail_reason` does not by itself mean progress: if `parts_to_do`
+   stops falling, re-run the step 2 preflight.
+
+   ```bash
+   just ch-query "SELECT mutation_id, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND command LIKE '%DROP PROJECTION%events_by_kind%' ORDER BY create_time DESC LIMIT 3"
+   just ch-query "SELECT count() parts, formatReadableSize(sum(bytes_on_disk)) bytes FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND name = 'events_by_kind' AND active"
+   df -h /data
+   ```
+
+5. Verify the preview and the API: the step 6 latency query, `curl
+   http://localhost:8080/health`, and a few nstr.to pages.
+
+After removal:
+- `PREVIEW_COMPACT_LOOKUPS=none` brings back 10–30 s legacy reads; the
+  rollback SQL needs 1.6 TiB free and is effectively unavailable.
+- `preview-lookups plan`, `validate` and `bench` force the projection by
+  default; pass `--allow-full-scan`. Rebuilding a compact table (for example
+  a zap parser correction) uses `plan --allow-full-scan --shard-by id-prefix`:
+  full-table reads in 256 bounded shards, so plan the I/O accordingly.
 
 ## Grafana
 

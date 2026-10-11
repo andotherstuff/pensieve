@@ -45,6 +45,7 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 015_kinds_stats.sql | Pre-aggregate event kind statistics | **Yes** (runs automatically) |
 | prepared/016_drop_events_by_time_projection.sql | Prepared removal of the full-row time projection; excluded from `ch-migrate-all` | No (background removal mutation) |
 | prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all` | **Yes** (`preview-lookups backfill`, bounded and resumable) |
+| prepared/018_drop_events_by_kind_projection.sql | Prepared removal of the full-row kind projection after 017; excluded from `ch-migrate-all` | No (background removal mutation) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -494,6 +495,45 @@ Design and behaviour differences:
 ```bash
 just ch-migrate docs/migrations/rollback/017_drop_preview_compact_lookups.sql
 ```
+
+
+---
+
+### prepared/018_drop_events_by_kind_projection.sql
+
+**Purpose:** Reclaim the ~1.34 TiB full-row `events_by_kind` projection once
+`pensieve-preview` reads the compact lookup tables from 017. This was the last
+projection on `events_local` in production.
+
+**Production evidence captured before preparation (2026-10-11):**
+
+- ClickHouse version: `24.8.14.39`
+- Projection definition: `SELECT * ORDER BY (kind, created_at, pubkey)`
+- Active projection rows: `2,412,442,249`, size about `1.34 TiB`
+- `/data` at 93.5% used, `225 GiB` free, growing ~40 GiB/day
+- 7-day `system.query_log` audit: the only queries that used the projection
+  were the preview's legacy profile/display-name/zap lookups, replaced by 017.
+  No `pensieve-serve`, Grafana or negentropy query used it.
+- 017 backfilled and validated (0 unexplained differences); compact lookups
+  benchmarked at p95 ≤ 183 ms with projections and query cache off; preview
+  switched to `PREVIEW_COMPACT_LOOKUPS=all`.
+
+**Guards in the file:** it flushes the query log, then refuses to run if the
+017 views are missing, if any query outside the `preview-lookups` tool used
+`events_by_kind` in the last 6 hours, or if another `events_local` mutation is
+pending.
+
+**Fresh installs** keep `events_by_kind` in `docs/clickhouse_self_hosted.sql`:
+the preview's default legacy reads and the 017 backfill rely on it. Remove it
+only through this migration, after 017 is applied, backfilled and enabled.
+
+**Apply and monitor:** see
+[`ops/RUNBOOK.md` → Projection removal](../../ops/RUNBOOK.md#projection-removal-migration-018).
+
+**Rollback:** `rollback/018_restore_events_by_kind_projection.sql` refuses to
+start without 1.6 TiB unreserved, so it is effectively unavailable on the
+current production disk. After removal, `PREVIEW_COMPACT_LOOKUPS=none` would
+bring back 10–30 s legacy reads, so the compact path is the way forward.
 
 ---
 
