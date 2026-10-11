@@ -579,24 +579,43 @@ After the preview has run on `PREVIEW_COMPACT_LOOKUPS=all` without issues:
    for the compact lookups, and no rise in failed queries (second query).
 3. **Rollback:** set `PREVIEW_DISABLE_PROJECTIONS=false` and restart.
 
-### Projection removal (separate, manual)
+### Projection removal (migration 018)
 
-**Not part of this rollout.** Only consider it after all of these hold:
-- every backfill is complete;
-- `validate` is clean;
-- `bench` meets the target;
-- the preview has run on `all` for an agreed period;
-- the projections-off rehearsal (step 9) passed;
-- the consumer audit above is clear or each consumer is accepted;
-- the removal is written up as its own prepared migration, following the
-  `prepared/016` pattern (preflight, asynchronous `DROP PROJECTION`, rollback
-  with free-space check).
+The removal was accelerated (2026-10-11) because `/data` reached 94% used. The
+7-day consumer audit showed the preview's legacy lookups were the only users of
+`events_by_kind`, and those had already moved to the compact tables. The
+projections-off rehearsal was skipped: `query_log` already showed no preview
+query using a projection after the switch to `all`.
 
-After removal, the legacy preview reads become slow again, so rolling back
-reads means restoring the projection first. Future rebuilds of the compact
-tables (for example a zap parser correction) then need
-`plan --allow-full-scan --shard-by id-prefix`. That runs full-table reads in
-256 bounded shards; plan the I/O accordingly.
+1. Re-run the consumer audit (step 8) for the last day; it must show nothing
+   besides `preview-lookups` queries.
+2. Apply. The file checks that the 017 views exist, that nothing outside
+   `preview-lookups` used the projection in the last 6 hours, and that no
+   mutation is pending:
+
+   ```bash
+   just ch-migrate docs/migrations/prepared/018_drop_events_by_kind_projection.sql
+   ```
+
+3. Monitor until `is_done = 1` and no active `events_by_kind` parts remain;
+   free space returns as the outdated parts age out:
+
+   ```bash
+   just ch-query "SELECT mutation_id, create_time, parts_to_do, is_done, latest_fail_reason FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND command LIKE '%DROP PROJECTION%events_by_kind%' ORDER BY create_time DESC LIMIT 3"
+   just ch-query "SELECT count() parts, formatReadableSize(sum(bytes_on_disk)) bytes FROM system.projection_parts WHERE database = 'nostr' AND table = 'events_local' AND name = 'events_by_kind' AND active"
+   df -h /data
+   ```
+
+4. Verify the preview and the API: the step 6 latency query, `curl
+   http://localhost:8080/health`, and a few nstr.to pages.
+
+After removal:
+- `PREVIEW_COMPACT_LOOKUPS=none` brings back 10–30 s legacy reads; the
+  rollback SQL needs 1.6 TiB free and is effectively unavailable.
+- `preview-lookups plan`, `validate` and `bench` force the projection by
+  default; pass `--allow-full-scan`. Rebuilding a compact table (for example
+  a zap parser correction) uses `plan --allow-full-scan --shard-by id-prefix`:
+  full-table reads in 256 bounded shards, so plan the I/O accordingly.
 
 ## Grafana
 

@@ -10,9 +10,9 @@ table scans:
 
 This change adds three small lookup tables, keyed the way preview reads them.
 A reversible flag selects them, and the legacy reads stay available for
-comparison and rollback. Removing the projection is **not** part of this
-change. It stays a separate manual operation after validation (see
-[`ops/RUNBOOK.md`](../ops/RUNBOOK.md#preview-compact-lookups)).
+comparison and rollback. The projection itself is removed separately by
+prepared migration 018, after validation and the consumer audit (see
+[`ops/RUNBOOK.md`](../ops/RUNBOOK.md#projection-removal-migration-018)).
 
 | Piece | Location |
 |-------|----------|
