@@ -19,7 +19,7 @@ copy here in the same PR as the code it deploys.
 | `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
 | `pensieve-ingest` | `override.conf` | `RUST_BACKTRACE=1` |
 | `pensieve-ingest` | `stop-timeout.conf` | `TimeoutStopSec=15min` (added 2026-10-12): a ClickHouse insert slowed by the hourly refreshable views must finish instead of being killed mid-segment |
-| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
+| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 14:36 UTC; previously `/data/pensieve-build/negentropy-ba0c4a1`, the PR #72 build) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
 
 ### Obsolete settings in the API drop-in
 
