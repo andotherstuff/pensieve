@@ -40,10 +40,15 @@ pub const LONGFORM_VIEW: &str = "longform_latest_mv";
 /// `publisher_activity` TTL in days (`TTL period + INTERVAL 400 DAY`).
 pub const PUBLISHER_TTL_DAYS: u32 = 400;
 
-/// Largest `days` window `/stats/publishers` accepts. With month rows starting
-/// at the first month boundary inside the window, no read needs a period older
-/// than this many days, well inside [`PUBLISHER_TTL_DAYS`].
-pub const PUBLISHER_MAX_DAYS: u32 = 366;
+/// Largest `days` window `/stats/publishers` accepts.
+///
+/// Longer windows exceed the API's 20 s ClickHouse cap: since mid-2026 20-45
+/// million distinct pubkeys are active per month, so a 366-day ranking
+/// aggregated ~150M (month, pubkey) rows and took 39 s in production
+/// (2026-10-12), while 90 days answers in a few seconds. The rollup still keeps
+/// [`PUBLISHER_TTL_DAYS`] of history, so this cap can be raised without a
+/// migration once long windows have a precomputed path.
+pub const PUBLISHER_MAX_DAYS: u32 = 90;
 
 /// Kinds left out of `publisher_activity`: signed by throwaway keys (one
 /// pubkey per event), so they carry no publisher signal. Same list as
@@ -458,11 +463,11 @@ mod tests {
     fn publisher_params_bound_days_and_kinds() {
         assert_eq!(publisher_params(30, None), Ok(ALL_KINDS));
         assert_eq!(publisher_params(1, Some(1)), Ok(1));
-        assert_eq!(publisher_params(366, Some(30023)), Ok(30023));
+        assert_eq!(publisher_params(90, Some(30023)), Ok(30023));
         assert_eq!(publisher_params(0, None), Err(PublisherParamError::Days(0)));
         assert_eq!(
-            publisher_params(367, None),
-            Err(PublisherParamError::Days(367))
+            publisher_params(91, None),
+            Err(PublisherParamError::Days(91))
         );
         assert_eq!(
             publisher_params(30, Some(1059)),
@@ -475,7 +480,7 @@ mod tests {
         assert!(
             PublisherParamError::Days(0)
                 .to_string()
-                .contains("between 1 and 366")
+                .contains("between 1 and 90")
         );
     }
 
