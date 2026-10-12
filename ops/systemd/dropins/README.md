@@ -13,7 +13,7 @@ copy here in the same PR as the code it deploys.
 
 | Unit | Drop-in | Effect |
 |------|---------|--------|
-| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-7ac5121/pensieve-serve` with `PENSIEVE_POSTGRES_API_FAMILIES=none` (all routes on ClickHouse) and the latest-event watermark path |
+| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12; previously `api-7ac5121`), plus `RELAY_DB_PATH=/data/relay-stats.db` with `PENSIEVE_POSTGRES_API_FAMILIES=none` (all routes on ClickHouse) and the latest-event watermark path |
 | `pensieve-preview` | `10-release.conf` | Runs `releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
 | `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
