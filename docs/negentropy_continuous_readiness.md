@@ -38,8 +38,22 @@ stopped the worker after 20 minutes:
   admission stayed `200`. The worker was left stopped afterwards, so progress
   health drifts back to stalled until the next run.
 
-Continuous operation remains **not enabled**: this is still a single relay, a
-20-minute window, and the worker is started only for monitored runs.
+## Continuous Premium Primal operation (since 2026-10-12)
+
+After the pilot, the maintainer turned on continuous reconciliation against
+`wss://premium.primal.net` only (the same allowlist, ledger and replay floor), to
+observe it for a while before adding relays. The worker was started at 15:22:59 UTC
+with no stop timer, and `pensieve-ingest.service.d/negentropy-worker.conf`
+(`Wants=pensieve-negentropy-worker.service`) starts it whenever the ingester starts,
+including at boot. In the first 20 minutes: 148 jobs complete (from 69), 2,010 frames
+received and 2,009 archived, 0 failures, 0 blocked jobs, health
+`progress_within_deadline`, ledger ~184 KiB + ~105 KiB WAL.
+
+The fault policy above still applies: on a blocked job, persistent failure, capacity
+fault or stale runtime, stop only the worker, keep the ledger, and leave Kuma monitor 46
+red until an operator decides. To turn reconciliation off deliberately, remove the
+`negentropy-worker.conf` drop-in, `daemon-reload`, stop the worker, and pause monitor 46.
+Expanding beyond Premium Primal is a separate decision.
 
 ## First increment: measure without deleting
 
