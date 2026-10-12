@@ -10,9 +10,8 @@ host on that date.
 ## Layout
 
 - `ops/production/compose.yml` — Docker stack: ClickHouse, Prometheus, Grafana, Caddy.
-  (`master` dropped the never-started `postgres-analytics` service on 2026-10-12; the
-  host checkout still defines it until fast-forwarded, see
-  [Postgres analytics leftovers](#postgres-analytics-leftovers).)
+  (The never-started `postgres-analytics` service was removed on 2026-10-12; see
+  [Postgres analytics removal](#postgres-analytics-removal-2026-10-12).)
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
   ClickHouse query settings (profiles) belong in `clickhouse/users.xml` (mounted under
   `users.d`); `<profiles>` in `clickhouse/config.xml` (`config.d`) are silently ignored.
@@ -42,12 +41,11 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-f60f003/pensieve-serve` (master, since 2026-10-12 10:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
-| shadow analytics refresh | `pensieve-analytics-refresh.timer` (**disabled**, obsolete) | removed from `master` 2026-10-12; see [Postgres analytics leftovers](#postgres-analytics-leftovers) |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
 
@@ -166,9 +164,8 @@ resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --pr
    in the PR, and keep the previous `releases/` directory for rollback.
 
 Drop-ins per service (2026-10-11): `pensieve-api.service.d/90-postgres-cutover.conf`
-(also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_POSTGRES_API_FAMILIES=none` and
-`PENSIEVE_LATEST_EVENT_WATERMARK_PATH` inline; builds from 2026-10-12 on ignore
-`PENSIEVE_POSTGRES_API_FAMILIES`), `pensieve-preview.service.d/10-release.conf`,
+(also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` and
+`RELAY_DB_PATH` inline), `pensieve-preview.service.d/10-release.conf`,
 and for the ingester `giftwrap-recipient-block.conf`, `nip66-monitor.conf`,
 `override.conf`, `stop-timeout.conf` (`TimeoutStopSec=15min`), `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
 
@@ -207,7 +204,8 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   2026-10-05 giftwrap hotfix). The comment inside `10-release.conf` that says "remove
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
-  unmerged `codex/negentropy-hardening` branch; previous), `api-8bdac94` (master, current) and
+  unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
+  (master after the Postgres removal, current) and
   only `preview-3ab1045`.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
@@ -363,39 +361,26 @@ and pass `--local-object-root`. See
 [`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md) for the Slice A
 build itself.
 
-## Postgres analytics leftovers
+## Postgres analytics removal (2026-10-12)
 
-The Postgres analytics serving store was abandoned on 2026-10-12 and its code,
-units, scripts and Compose service were removed from `master`. Production
-never served from it (`PENSIEVE_POSTGRES_API_FAMILIES=none`), the container was
-not running, and `pensieve-analytics-refresh.timer` was disabled. What remains
-on the host, to clean up with the maintainers (do not run these from an agent
-session):
+The Postgres analytics serving store was abandoned on 2026-10-12. Its code, units,
+scripts and Compose service were removed from `master` (#75); production never served
+from it. On the host the same day:
 
-- **Compose and `POSTGRES_ANALYTICS_PASSWORD`.** Until the `~/pensieve` checkout is
-  fast-forwarded past this change, its `compose.yml` still defines `postgres-analytics` with
-  `POSTGRES_ANALYTICS_PASSWORD:?`. Remove that variable from
-  `/etc/pensieve/pensieve.env` only **after** the checkout's `compose.yml` no
-  longer requires it; otherwise every `docker compose` command, including
-  `pensieve.service`, fails.
-- **Refresh units.** `/etc/systemd/system/pensieve-analytics-refresh.{service,timer}`
-  (disabled) and `/etc/pensieve/analytics-refresh.env`; remove the units and
-  `daemon-reload`.
-- **API drop-in.** `pensieve-api.service.d/90-postgres-cutover.conf` sets
-  `PENSIEVE_POSTGRES_API_FAMILIES=none`, which builds from 2026-10-12 on ignore.
-  Drop it at the next API deploy; keep `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`
-  (it serves `latest_event` without a ClickHouse scan). See
-  [`systemd/dropins/README.md`](systemd/dropins/README.md).
-- **Data.** `/archive/analytics` (3.1 TB on the archive disk on 2026-10-12): two local
-  snapshots of the Parquet lake (`full-input`, 13 Aug, hard-linked into `lake`, 27 Aug;
-  ~1.17 TB together), staged `deltas`, the intermediate build outputs for each Postgres
-  product, and the Slice A DuckDB databases and backups. All of it is derived: the lake
-  itself lives in object storage. The maintainers decided on 2026-10-12 to delete all of it
-  (researchers will query the current lake, not a stale snapshot) after checking every
-  staged Parquet file against object storage. Also `/var/lib/pensieve-analytics`
-  (refresh state). `/data/postgres-analytics` never existed on the host.
-- **`DATABASE_URL` / `POSTGRES_ANALYTICS_PASSWORD` in `/etc/pensieve/analytics.env`**
-  are no longer read by any binary.
+- The checkout was fast-forwarded to `f60f003`, so `compose.yml` no longer defines
+  `postgres-analytics`; then `POSTGRES_ANALYTICS_PASSWORD` was removed from
+  `/etc/pensieve/pensieve.env` (in that order: Compose requires the variable while the
+  service is defined). The `postgres:16-alpine` image was removed.
+- The API moved to `releases/api-f60f003` and its drop-in dropped
+  `PENSIEVE_POSTGRES_API_FAMILIES`.
+- `pensieve-analytics-refresh.{service,timer}`, `/etc/pensieve/analytics-refresh.env` and
+  every analytics env backup were deleted; `DATABASE_URL` was removed from
+  `/etc/pensieve/analytics.env`, which keeps only the AWS settings the DuckDB builders read.
+- `/archive/analytics` (3.1 TB) and `/var/lib/pensieve-analytics` (4.7 GB) were deleted.
+  They held two stale local snapshots of the Parquet lake, staged deltas, intermediate
+  build outputs and Slice A DuckDB databases. All 39,004 staged Parquet files were first
+  confirmed present in object storage with identical sizes. `/archive` went from 77% to
+  23% used. Researchers query the current lake in object storage.
 
 ## One-time cutover (ops/ move + secrets → /etc)
 

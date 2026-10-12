@@ -13,7 +13,7 @@ copy here in the same PR as the code it deploys.
 
 | Unit | Drop-in | Effect |
 |------|---------|--------|
-| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12; previously `api-7ac5121`), plus `RELAY_DB_PATH=/data/relay-stats.db` with `PENSIEVE_POSTGRES_API_FAMILIES=none` (all routes on ClickHouse) and the latest-event watermark path |
+| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-f60f003/pensieve-serve` (master, since 2026-10-12; previously `api-8bdac94`, `api-7ac5121`), plus `RELAY_DB_PATH=/data/relay-stats.db` and the latest-event watermark path |
 | `pensieve-preview` | `10-release.conf` | Runs `releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
 | `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
@@ -23,20 +23,8 @@ copy here in the same PR as the code it deploys.
 
 ### Obsolete settings in the API drop-in
 
-The Postgres analytics backend was removed from `pensieve-serve` on
-2026-10-12. Once an API build from that date or later is deployed:
-
-- `PENSIEVE_POSTGRES_API_FAMILIES=none` in `90-postgres-cutover.conf` is
-  obsolete. The binary no longer reads it, so leaving it in place is harmless;
-  drop it at the next edit of this drop-in. `DATABASE_URL`,
-  `POSTGRES_ANALYTICS_PASSWORD` and `PENSIEVE_POSTGRES_POOL_SIZE` are also no
-  longer read (production never set them for the API).
-- `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` is **still used**: with it set,
-  `latest_event` in `/api/v1/stats` and `/api/v1/stats/events/latest` comes
-  from the ingester's watermark file instead of a `max(created_at)` scan of
-  `events_local`. Keep it.
-- The file name `90-postgres-cutover.conf` is historical. Renaming it is
-  optional; if you do, record the new name here in the same PR.
+The Postgres analytics backend was removed from `pensieve-serve` on 2026-10-12, and the
+API drop-in no longer sets `PENSIEVE_POSTGRES_API_FAMILIES` (since `api-f60f003`).
 
 The comment inside `10-release.conf` ("Rollback: remove this file") predates
 migration 018. Removing it now would start the 2026-07-27 build in
