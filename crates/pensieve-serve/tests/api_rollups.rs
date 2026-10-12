@@ -430,7 +430,7 @@ async fn read_longform(c: &Client, days: Option<u32>) -> (u64, u64, u64) {
 async fn assert_endpoints_match(db: &TestDb, phase: &str) {
     let rows = db.stored().await;
     let now = db.now().await;
-    for days in [1, 7, 30, 90] {
+    for days in [1, 7, 30, 90, 366] {
         for kind in [None, Some(1), Some(30023), Some(6)] {
             for limit in [1000, 2] {
                 let got = read_publishers(&db.client, days, kind, limit).await;
@@ -840,8 +840,8 @@ async fn plan_refuses_a_boundary_racing_view_creation_and_recovery_works() {
     let rows = db.stored().await;
     let now = db.now().await;
     assert_eq!(
-        read_publishers(&db.client, 90, None, 1000).await,
-        expected_publishers(&rows, now, 90, None, 1000)
+        read_publishers(&db.client, 366, None, 1000).await,
+        expected_publishers(&rows, now, 366, None, 1000)
     );
 
     // Recreating the view after planning invalidates the plan.
