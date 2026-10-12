@@ -8,14 +8,26 @@
 //! The indexer is a derived consumer of the notepack archive:
 //! - It receives notifications of sealed segments
 //! - Reads each segment and batch-inserts events
-//! - Tracks checkpoints for crash recovery
+//! - Records per-batch progress in an [`IndexQueue`] for crash recovery
 //!
-//! # Checkpoint Strategy
+//! # Recovery
 //!
-//! Checkpoints are per-segment: when a segment is fully indexed, we record
-//! "segment N fully processed". On restart, we query ClickHouse to reconcile
-//! any partially-indexed segment.
+//! When an [`IndexQueue`] is configured, the segment writer journals every
+//! segment as it is sealed, and the indexer records its offset before each
+//! insert batch, removing the entry once the segment is fully indexed. On
+//! start, the indexer first resumes every segment left in the journal by a
+//! previous run (killed, timed out, stopped early, or failed after retries).
+//!
+//! Downstream materialized views on `events_local` are not duplicate-safe, so
+//! recovery never re-inserts a committed row: batches before the recorded
+//! offset are skipped, and the batch that may have been in flight is checked
+//! against `events_local` so only missing IDs are inserted. Retries within a
+//! run use the same rule.
+//!
+//! A shutdown request stops the indexer at the next batch boundary and leaves
+//! the rest of the segment (and any segments still queued) in the journal.
 
+use super::index_queue::{IndexProgress, IndexQueue, resolve_segment};
 use super::segment::SealedSegment;
 use crate::logging::compact_error;
 use crate::{Error, Result};
@@ -25,12 +37,21 @@ use flate2::read::GzDecoder;
 use metrics::counter;
 use pensieve_parquet::CanonicalEvent;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
+
+/// IDs per existence-check query. 1,000 hex IDs keep the query text (~68 KB)
+/// well under ClickHouse's default 256 KiB `max_query_size`.
+const EXISTS_QUERY_IDS: usize = 1_000;
+
+/// Attempts per segment before it is left in the journal for the next start.
+const MAX_ATTEMPTS: u32 = 3;
 
 /// Configuration for the ClickHouse indexer.
 #[derive(Debug, Clone)]
@@ -47,10 +68,12 @@ pub struct ClickHouseConfig {
     /// Batch size for inserts
     pub batch_size: usize,
 
-    /// Optional path to a newline-delimited file of segment paths that failed to
-    /// index. Failed segments are appended here and re-indexed on the next start,
-    /// so ClickHouse self-heals from the canonical archive.
-    pub reindex_queue_path: Option<PathBuf>,
+    /// Optional durable journal of segments pending index. When set, the
+    /// indexer records per-batch progress there, resumes unfinished segments
+    /// on start, and may stop mid-segment on shutdown. The segment writer
+    /// should share the same queue (see `SegmentWriter::with_index_queue`) so
+    /// segments are journaled at seal time.
+    pub index_queue: Option<Arc<IndexQueue>>,
 }
 
 impl Default for ClickHouseConfig {
@@ -60,7 +83,7 @@ impl Default for ClickHouseConfig {
             database: "nostr".to_string(),
             table: "events_local".to_string(),
             batch_size: 10000,
-            reindex_queue_path: None,
+            index_queue: None,
         }
     }
 }
@@ -78,11 +101,62 @@ pub struct EventRow {
     pub relay_source: String,
 }
 
+/// Result of indexing one segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOutcome {
+    /// Every event is in ClickHouse; `inserted` rows were written by this call
+    /// and `already_present` were skipped because ClickHouse had them.
+    Complete {
+        /// Rows inserted.
+        inserted: usize,
+        /// Rows skipped because their ID was already in the table.
+        already_present: usize,
+    },
+    /// Shutdown was requested; progress is recorded in the index queue.
+    Interrupted,
+}
+
+/// Handle to a running indexer thread.
+pub struct ClickHouseIndexerHandle {
+    thread: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ClickHouseIndexerHandle {
+    /// Ask the indexer to stop. With an index queue it stops at the next batch
+    /// boundary and leaves unfinished work journaled; without one it finishes
+    /// the current segment first.
+    pub fn request_shutdown(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the indexer thread has exited.
+    pub fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    /// Wait for the indexer thread to exit.
+    pub fn join(self) -> thread::Result<()> {
+        self.thread.join()
+    }
+}
+
 /// ClickHouse indexer that consumes sealed segments.
 pub struct ClickHouseIndexer {
     client: Client,
     config: ClickHouseConfig,
     running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    segments_indexed: Arc<AtomicUsize>,
+    events_indexed: Arc<AtomicUsize>,
+}
+
+/// State shared by the indexer thread's helpers.
+struct Worker {
+    client: Client,
+    config: ClickHouseConfig,
+    rt: tokio::runtime::Runtime,
+    stop: Arc<AtomicBool>,
     segments_indexed: Arc<AtomicUsize>,
     events_indexed: Arc<AtomicUsize>,
 }
@@ -105,6 +179,7 @@ impl ClickHouseIndexer {
             client,
             config,
             running: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
             segments_indexed: Arc::new(AtomicUsize::new(0)),
             events_indexed: Arc::new(AtomicUsize::new(0)),
         })
@@ -112,17 +187,19 @@ impl ClickHouseIndexer {
 
     /// Start the indexer, consuming from the segment channel.
     ///
-    /// This runs in a background thread until `stop()` is called.
-    pub fn start(&self, receiver: Receiver<SealedSegment>) -> thread::JoinHandle<()> {
+    /// This runs in a background thread until the channel disconnects or a
+    /// shutdown is requested through the returned handle (or `stop()`).
+    pub fn start(&self, receiver: Receiver<SealedSegment>) -> ClickHouseIndexerHandle {
         let client = self.client.clone();
         let config = self.config.clone();
         let running = Arc::clone(&self.running);
+        let stop = Arc::clone(&self.stop);
         let segments_indexed = Arc::clone(&self.segments_indexed);
         let events_indexed = Arc::clone(&self.events_indexed);
 
         self.running.store(true, Ordering::SeqCst);
 
-        thread::spawn(move || {
+        let thread = thread::spawn(move || {
             tracing::info!("ClickHouse indexer thread started");
 
             // Create a runtime for async operations
@@ -131,209 +208,127 @@ impl ClickHouseIndexer {
                 .build()
                 .expect("Failed to create tokio runtime");
 
-            // Re-index any segments that failed in a previous run before consuming
-            // new ones, so ClickHouse catches up with the archive.
-            Self::drain_reindex_queue(&client, &config, &rt, &segments_indexed, &events_indexed);
+            let worker = Worker {
+                client,
+                config,
+                rt,
+                stop,
+                segments_indexed,
+                events_indexed,
+            };
+            worker.run(&receiver);
+            running.store(false, Ordering::SeqCst);
+            tracing::info!("ClickHouse indexer thread stopped");
+        });
 
-            while running.load(Ordering::SeqCst) {
-                match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(sealed) => {
-                        tracing::info!(
-                            "Indexing segment {}: {} events from {}",
-                            sealed.segment_number,
-                            sealed.event_count,
-                            sealed.path.display()
-                        );
+        ClickHouseIndexerHandle {
+            thread,
+            stop: Arc::clone(&self.stop),
+        }
+    }
 
-                        match Self::index_with_retry(&client, &config, &rt, &sealed) {
-                            Ok(count) => {
-                                segments_indexed.fetch_add(1, Ordering::Relaxed);
-                                events_indexed.fetch_add(count, Ordering::Relaxed);
-                                tracing::info!(
-                                    "Indexed segment {}: {} events",
-                                    sealed.segment_number,
-                                    count
-                                );
-                            }
-                            Err(e) => {
-                                // Retries exhausted: record the failure and queue the
-                                // segment for later reindex (the archive is canonical).
-                                counter!("clickhouse_insert_errors_total").increment(1);
-                                tracing::error!(
-                                    segment = sealed.segment_number,
-                                    error = %compact_error(&e),
-                                    "failed to index segment after retries; queued for reindex"
-                                );
-                                Self::enqueue_failed(&config, &sealed.path);
-                            }
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Continue waiting
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        tracing::info!("Segment channel disconnected, stopping indexer");
-                        break;
-                    }
-                }
+    /// Request the indexer to stop (see [`ClickHouseIndexerHandle::request_shutdown`]).
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Insert `events`, resuming from `progress`.
+    ///
+    /// Batches before `progress.committed` are skipped; batches overlapping
+    /// `progress.committed..progress.verify_end` insert only IDs missing from
+    /// the table. When `queue` is set, progress is made durable before every
+    /// batch, and a set `stop` flag ends the call at a batch boundary.
+    /// `progress` is updated in place, so a failed call can be retried with it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_resumable(
+        client: &Client,
+        config: &ClickHouseConfig,
+        queue: Option<&IndexQueue>,
+        stop: &AtomicBool,
+        segment: &Path,
+        events: &[EventRow],
+        progress: &mut IndexProgress,
+    ) -> Result<IndexOutcome> {
+        let batch = config.batch_size.max(1);
+        let mut inserted = 0;
+        let mut already_present = 0;
+        while progress.committed < events.len() {
+            if let Some(queue) = queue
+                && stop.load(Ordering::SeqCst)
+            {
+                queue.record_progress(segment, *progress)?;
+                return Ok(IndexOutcome::Interrupted);
+            }
+            let start = progress.committed;
+            let end = start.saturating_add(batch).min(events.len());
+            let chunk = &events[start..end];
+            let verify = progress.needs_verify(start);
+
+            // Durable before the insert: if we die mid-batch, recovery knows
+            // this batch is the only one whose outcome is unknown.
+            progress.verify_end = progress.verify_end.max(end);
+            if let Some(queue) = queue {
+                queue.record_progress(segment, *progress)?;
             }
 
-            tracing::info!("ClickHouse indexer thread stopped");
+            let rows: Vec<&EventRow> = if verify {
+                let ids: Vec<&str> = chunk.iter().map(|row| row.id.as_str()).collect();
+                let present = Self::existing_ids(client, &config.table, &ids).await?;
+                chunk
+                    .iter()
+                    .filter(|row| !present.contains(row.id.as_str()))
+                    .collect()
+            } else {
+                chunk.iter().collect()
+            };
+            let skipped = chunk.len() - rows.len();
+
+            if !rows.is_empty() {
+                let mut inserter = client.insert(&config.table)?;
+                for row in &rows {
+                    inserter.write(*row).await?;
+                }
+                inserter.end().await?;
+            }
+            progress.committed = end;
+            inserted += rows.len();
+            already_present += skipped;
+            if skipped > 0 {
+                counter!("clickhouse_index_rows_already_present_total").increment(skipped as u64);
+            }
+        }
+        Ok(IndexOutcome::Complete {
+            inserted,
+            already_present,
         })
     }
 
-    /// Stop the indexer.
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    /// Read a segment file and insert its events into ClickHouse (in batches).
-    async fn index_path(client: &Client, config: &ClickHouseConfig, path: &Path) -> Result<usize> {
-        let events = Self::read_segment(path)?;
-        Self::insert_events(client, config, &events).await
-    }
-
-    /// Insert events in `batch_size`-sized chunks so a single insert request never
-    /// holds an entire 256 MB segment, and a transient failure only affects one
-    /// chunk (the whole segment is re-indexed idempotently via ReplacingMergeTree).
-    async fn insert_events(
+    /// IDs from `ids` that are already in `table`.
+    pub async fn existing_ids(
         client: &Client,
-        config: &ClickHouseConfig,
-        events: &[EventRow],
-    ) -> Result<usize> {
-        if events.is_empty() {
-            return Ok(0);
-        }
-        let batch = config.batch_size.max(1);
-        for chunk in events.chunks(batch) {
-            let mut inserter = client.insert(&config.table)?;
-            for event in chunk {
-                inserter.write(event).await?;
-            }
-            inserter.end().await?;
-        }
-        Ok(events.len())
-    }
-
-    /// Index a sealed segment with bounded retries + exponential backoff.
-    fn index_with_retry(
-        client: &Client,
-        config: &ClickHouseConfig,
-        rt: &tokio::runtime::Runtime,
-        sealed: &SealedSegment,
-    ) -> Result<usize> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut attempt = 0;
-        loop {
-            match rt.block_on(Self::index_path(client, config, &sealed.path)) {
-                Ok(count) => return Ok(count),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(e);
-                    }
-                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
-                    tracing::warn!(
-                        segment = sealed.segment_number,
-                        attempt,
-                        error = %compact_error(&e),
-                        "clickhouse index attempt failed; retrying in {:?}",
-                        backoff
-                    );
-                    std::thread::sleep(backoff);
+        table: &str,
+        ids: &[&str],
+    ) -> Result<HashSet<String>> {
+        let mut present = HashSet::new();
+        for chunk in ids.chunks(EXISTS_QUERY_IDS) {
+            let mut list = String::with_capacity(chunk.len() * 67);
+            for (i, id) in chunk.iter().enumerate() {
+                // IDs come from hex::encode, so this never fires; it keeps the
+                // hand-built literal list safe regardless.
+                if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error::Serialization(format!("non-hex event id: {id:?}")));
                 }
-            }
-        }
-    }
-
-    /// Append a failed segment's path to the reindex queue (best-effort).
-    fn enqueue_failed(config: &ClickHouseConfig, path: &Path) {
-        let Some(queue) = &config.reindex_queue_path else {
-            return;
-        };
-        use std::io::Write;
-        let result = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(queue)
-            .and_then(|mut f| writeln!(f, "{}", path.display()));
-        match result {
-            Ok(()) => tracing::info!(segment = %path.display(), "queued segment for reindex"),
-            Err(e) => {
-                tracing::warn!(error = %e, queue = %queue.display(), "failed to enqueue segment for reindex")
-            }
-        }
-    }
-
-    /// Re-index every segment listed in the reindex queue, rewriting the queue with
-    /// the ones that still fail. Runs once at indexer start.
-    fn drain_reindex_queue(
-        client: &Client,
-        config: &ClickHouseConfig,
-        rt: &tokio::runtime::Runtime,
-        segments_indexed: &AtomicUsize,
-        events_indexed: &AtomicUsize,
-    ) {
-        let Some(queue) = &config.reindex_queue_path else {
-            return;
-        };
-        if !queue.exists() {
-            return;
-        }
-        let contents = match std::fs::read_to_string(queue) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, queue = %queue.display(), "failed to read reindex queue");
-                return;
-            }
-        };
-        let mut paths: Vec<String> = contents
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        paths.sort();
-        paths.dedup();
-        if paths.is_empty() {
-            let _ = std::fs::remove_file(queue);
-            return;
-        }
-
-        tracing::info!(count = paths.len(), "draining clickhouse reindex queue");
-        let mut still_failing: Vec<String> = Vec::new();
-        for p in paths {
-            let path = Path::new(&p);
-            if !path.exists() {
-                tracing::warn!(segment = %p, "queued segment no longer exists; dropping from queue");
-                continue;
-            }
-            match rt.block_on(Self::index_path(client, config, path)) {
-                Ok(count) => {
-                    segments_indexed.fetch_add(1, Ordering::Relaxed);
-                    events_indexed.fetch_add(count, Ordering::Relaxed);
-                    tracing::info!(segment = %p, count, "reindexed queued segment");
+                if i > 0 {
+                    list.push(',');
                 }
-                Err(e) => {
-                    tracing::error!(segment = %p, error = %compact_error(&e), "reindex still failing");
-                    still_failing.push(p);
-                }
+                list.push('\'');
+                list.push_str(id);
+                list.push('\'');
             }
+            let query = format!("SELECT id FROM {table} WHERE id IN ({list})");
+            present.extend(client.query(&query).fetch_all::<String>().await?);
         }
-
-        let write_result = if still_failing.is_empty() {
-            std::fs::remove_file(queue).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-        } else {
-            std::fs::write(queue, format!("{}\n", still_failing.join("\n")))
-        };
-        if let Err(e) = write_result {
-            tracing::warn!(error = %e, queue = %queue.display(), "failed to update reindex queue");
-        }
+        Ok(present)
     }
 
     /// Read a notepack segment file and parse into EventRows.
@@ -411,11 +406,27 @@ impl ClickHouseIndexer {
     }
 
     /// Index a segment file directly (for batch operations without channel).
+    ///
+    /// Inserts every event in the file; there is no journal or existence check.
     pub async fn index_segment_file(&self, path: &Path) -> Result<usize> {
-        let count = Self::index_path(&self.client, &self.config, path).await?;
-        self.events_indexed.fetch_add(count, Ordering::Relaxed);
+        let events = Self::read_segment(path)?;
+        let mut progress = IndexProgress::default();
+        let outcome = Self::insert_resumable(
+            &self.client,
+            &self.config,
+            None,
+            &AtomicBool::new(false),
+            path,
+            &events,
+            &mut progress,
+        )
+        .await?;
+        let IndexOutcome::Complete { inserted, .. } = outcome else {
+            unreachable!("insert without a queue is never interrupted");
+        };
+        self.events_indexed.fetch_add(inserted, Ordering::Relaxed);
         self.segments_indexed.fetch_add(1, Ordering::Relaxed);
-        Ok(count)
+        Ok(inserted)
     }
 
     /// Get statistics about the indexer.
@@ -439,6 +450,224 @@ impl ClickHouseIndexer {
         let count: u64 = self.client.query(&query).fetch_one().await?;
         Ok(count)
     }
+}
+
+impl Worker {
+    fn queue(&self) -> Option<&IndexQueue> {
+        self.config.index_queue.as_deref()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn run(&self, receiver: &Receiver<SealedSegment>) {
+        // Finish what a previous run left behind before consuming new
+        // segments, so ClickHouse catches up with the archive in order.
+        if !self.resume_previous_run() {
+            loop {
+                if self.stop_requested() {
+                    break;
+                }
+                match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(sealed) => {
+                        tracing::info!(
+                            "Indexing segment {}: {} events from {}",
+                            sealed.segment_number,
+                            sealed.event_count,
+                            sealed.path.display()
+                        );
+                        let progress = self
+                            .queue()
+                            .and_then(|queue| queue.progress(&sealed.path))
+                            .unwrap_or_default();
+                        if self.index_segment(&sealed.path, progress) == Step::Interrupted {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        tracing::info!("Segment channel disconnected, stopping indexer");
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Stopping early: make sure every segment still waiting on the channel
+        // is journaled (the writer normally did this at seal time already).
+        let Some(queue) = self.queue() else {
+            return;
+        };
+        while let Ok(sealed) = receiver.try_recv() {
+            if let Err(e) = queue.record_sealed(&sealed.path) {
+                tracing::error!(
+                    segment = sealed.segment_number,
+                    error = %compact_error(&e),
+                    "failed to journal unindexed segment at shutdown"
+                );
+            }
+        }
+        if !queue.is_empty() {
+            tracing::info!(
+                pending = queue.len(),
+                queue = %queue.path().display(),
+                "clickhouse indexer stopped early; pending segments resume on next start"
+            );
+        }
+    }
+
+    /// Resume segments journaled by a previous run. Returns true if a shutdown
+    /// request interrupted it.
+    fn resume_previous_run(&self) -> bool {
+        let Some(queue) = self.queue() else {
+            return false;
+        };
+        let pending = queue.previous_run();
+        if pending.is_empty() {
+            return false;
+        }
+        tracing::info!(
+            count = pending.len(),
+            "resuming segments left unindexed by a previous run"
+        );
+        for (path, progress) in pending {
+            if self.stop_requested() {
+                return true;
+            }
+            let Some(resolved) = resolve_segment(&path) else {
+                tracing::warn!(segment = %path.display(), "queued segment no longer exists; dropping from queue");
+                if let Err(e) = queue.complete(&path) {
+                    tracing::warn!(error = %compact_error(&e), "failed to update clickhouse index queue");
+                }
+                continue;
+            };
+            tracing::info!(
+                segment = %resolved.display(),
+                committed = progress.committed,
+                verify_end = progress.verify_end,
+                "resuming queued segment"
+            );
+            if self.index_segment(&resolved, progress) == Step::Interrupted {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Index one segment with bounded retries, keeping the journal in step.
+    fn index_segment(&self, path: &Path, mut progress: IndexProgress) -> Step {
+        let queue = self.queue();
+        let events = match ClickHouseIndexer::read_segment(path) {
+            Ok(events) => events,
+            Err(e) => {
+                counter!("clickhouse_insert_errors_total").increment(1);
+                tracing::error!(segment = %path.display(), error = %compact_error(&e), "failed to read segment for clickhouse; left queued");
+                self.keep_queued(path, progress);
+                return Step::Failed;
+            }
+        };
+
+        let mut attempt = 0;
+        loop {
+            let result = self.rt.block_on(ClickHouseIndexer::insert_resumable(
+                &self.client,
+                &self.config,
+                queue,
+                &self.stop,
+                path,
+                &events,
+                &mut progress,
+            ));
+            match result {
+                Ok(IndexOutcome::Complete {
+                    inserted,
+                    already_present,
+                }) => {
+                    self.segments_indexed.fetch_add(1, Ordering::Relaxed);
+                    self.events_indexed.fetch_add(inserted, Ordering::Relaxed);
+                    if let Some(queue) = queue
+                        && let Err(e) = queue.complete(path)
+                    {
+                        // Harmless: a later resume finds every row present.
+                        tracing::warn!(error = %compact_error(&e), "failed to remove indexed segment from queue");
+                    }
+                    tracing::info!(
+                        segment = %path.display(),
+                        inserted,
+                        already_present,
+                        "indexed segment"
+                    );
+                    return Step::Done;
+                }
+                Ok(IndexOutcome::Interrupted) => {
+                    tracing::info!(
+                        segment = %path.display(),
+                        committed = progress.committed,
+                        total = events.len(),
+                        "clickhouse indexing stopped mid-segment for shutdown; progress saved"
+                    );
+                    return Step::Interrupted;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        counter!("clickhouse_insert_errors_total").increment(1);
+                        tracing::error!(
+                            segment = %path.display(),
+                            error = %compact_error(&e),
+                            "failed to index segment after retries; left queued for next start"
+                        );
+                        self.keep_queued(path, progress);
+                        return Step::Failed;
+                    }
+                    let backoff = Duration::from_secs(2u64.pow(attempt));
+                    tracing::warn!(
+                        segment = %path.display(),
+                        attempt,
+                        error = %compact_error(&e),
+                        "clickhouse index attempt failed; retrying in {:?}",
+                        backoff
+                    );
+                    if self.sleep_unless_stopped(backoff) {
+                        self.keep_queued(path, progress);
+                        return Step::Interrupted;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sleep, waking early for a shutdown request when a queue can hold the
+    /// remaining work. Returns true if interrupted.
+    fn sleep_unless_stopped(&self, duration: Duration) -> bool {
+        let deadline = std::time::Instant::now() + duration;
+        loop {
+            if self.queue().is_some() && self.stop_requested() {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(200)));
+        }
+    }
+
+    fn keep_queued(&self, path: &Path, progress: IndexProgress) {
+        if let Some(queue) = self.queue()
+            && let Err(e) = queue.record_progress(path, progress)
+        {
+            tracing::error!(segment = %path.display(), error = %compact_error(&e), "failed to journal unindexed segment");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Done,
+    Failed,
+    Interrupted,
 }
 
 /// Statistics about the ClickHouse indexer.

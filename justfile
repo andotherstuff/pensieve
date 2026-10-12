@@ -301,6 +301,8 @@ ch-test-down:
 test-clickhouse:
     PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
         cargo test -p pensieve-preview --test compact_lookups -- --ignored
+    PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
+        cargo test -p pensieve-ingest --test clickhouse_index_recovery -- --ignored
 
 # ============================================================================
 # Utilities

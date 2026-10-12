@@ -43,8 +43,8 @@ use pensieve_core::{
     pack_event_binary_into, validate_proto_event,
 };
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, PackedEvent, SealedSegment, SegmentConfig,
-    SegmentWriter, logging::compact_error,
+    ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, DedupeIndex, PackedEvent,
+    SealedSegment, SegmentConfig, SegmentWriter, logging::compact_error,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -693,7 +693,7 @@ fn collect_local_files(input: &PathBuf, limit: Option<usize>) -> Result<Vec<Path
 type PipelineComponents = (
     Arc<SegmentWriter>,
     Option<Arc<DedupeIndex>>,
-    Option<std::thread::JoinHandle<()>>,
+    Option<ClickHouseIndexerHandle>,
 );
 
 fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
@@ -742,7 +742,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
                 database: args.clickhouse_db.clone(),
                 table: "events_local".to_string(),
                 batch_size: 10000,
-                reindex_queue_path: None,
+                index_queue: None,
             };
             let indexer = ClickHouseIndexer::new(ch_config)?;
             Some(indexer.start(receiver))
