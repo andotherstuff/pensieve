@@ -41,7 +41,7 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-f60f003/pensieve-serve` (master, since 2026-10-12 10:36 CEST) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-60c4bfe/pensieve-serve` (master with migration 019 rollups, since 2026-10-12 14:52 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
@@ -205,7 +205,7 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, current) and
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`, current) and
   only `preview-3ab1045`.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
@@ -680,9 +680,19 @@ at the API's 20 s cap since the projections were dropped) and onto two small
 tables fed by insert-triggered views. Design, correctness model and behaviour
 changes: [`docs/api_rollups.md`](../docs/api_rollups.md).
 
-**Status (2026-10-12):** prepared, not applied. The API build that reads the
-tables answers both endpoints with `503 metric_unavailable` until 019 exists,
-so deploy it only after step 5.
+**Status:** Applied, backfilled and deployed on 2026-10-12: migration at 09:14:29 UTC
+(boundary `indexed_at < 1791796480`, 11 s after the views); backfill 09:25–12:15 UTC
+(publishers 256/256, ~2 h incl. quiet-minute pauses; longform 256/256, ~50 min; ingest p95
+insert latency rose from ~8 s to ~19 s during the publisher shards, no insert errors, no
+indexing backlog); `validate` 0 failed rows (publishers 22,175 rows / 667 pubkeys incl. 200
+around the boundary; longform 108,895 rows; `addressable_latest` cross-check 466,207 matched,
+0 different); API `releases/api-60c4bfe` since 12:52 UTC. Query timings with the cache off:
+publishers 30 d 4.9 s, longform 0.4 s, publishers 366 d **39 s**.
+
+**Known limit:** windows longer than about 90 days still exceed the API's 20 s cap
+(`503 analytics_busy`). Since mid-2026 20–45 million distinct pubkeys are active per month
+(mostly single-use keys), so a one-year ranking aggregates ~150M (month, pubkey) rows
+however they are stored. The default 30-day window and 90 days work.
 
 Run the tool as the `pensieve` user with `/etc/pensieve/pensieve.env` loaded
 (`CLICKHOUSE_URL`; `CLICKHOUSE_DATABASE` defaults to `nostr`). Build
@@ -885,11 +895,8 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
-- `/api/v1/stats/longform` and `/api/v1/stats/publishers` time out (20 s cap) on ClickHouse:
-  longform scans `events_local` for kind 30023 (fast only with the dropped `events_by_kind`
-  projection) and publishers scans 30 days by `created_at` (fast only with the dropped
-  `events_by_time` projection). The fix is small insert-fed ClickHouse tables (prepared
-  migration 019, in progress), not Postgres.
+- `/api/v1/stats/publishers` with `days` beyond ~90 times out (20 s cap) even on the 019
+  rollup; see [API rollups](#api-rollups-migration-019) → Known limit.
 - The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
   ingester keeps writing the WAL database, so relay endpoints can be stale.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
