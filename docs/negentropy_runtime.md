@@ -30,7 +30,9 @@ and inside the service mount namespace, not only as root on the host.
 ### Worker progress budgets
 
 Each assigned attempt retains its nine-minute overall limit (or the remaining
-parent lease/canary budget, whichever is shorter). Inventory transfer has a
+parent lease/canary budget, whichever is shorter). The parent also caps the
+session by the remaining worker service lifetime as described below.
+Inventory transfer has a
 two-minute limit; connection is bounded to 20 seconds. Comparison allows five
 minutes for the initial response and between accepted NIP-77 rounds. Only
 matching replies successfully processed by the reconciliation engine count;
@@ -70,8 +72,8 @@ by the fixed-canary intake budget when applicable). At least two minutes must
 remain after that margin to admit a session; otherwise no work is assigned to
 that process. The ten-minute systemd backstop and all identity checks remain
 unchanged. Session-budget logs expose the actual admitted duration.
-It never infers a verified OOM from EOF. Local
-inventory density is checked before leasing and split atomically without an
+The listener never infers a verified OOM from EOF. Local inventory density is
+checked before leasing and split atomically without an
 attempt; a one-second dense interval is blocked and logged. A concurrent append
 between preflight and session can still cause a later TooDense outcome, which
 remains an unresolved gap. Only an authenticated `Volume` report from the worker

@@ -23,6 +23,10 @@ const WORKER_CGROUP: &str = "/system.slice/pensieve-negentropy-worker.service";
 const PARENT_CGROUP: &str = "/system.slice/pensieve-ingest.service";
 #[cfg(any(target_os = "linux", test))]
 const JOB_US: u64 = 540_000_000;
+// Match the inventory/fetch progress allowance as a minimum useful opportunity,
+// not a promise that the five-minute comparison allowance fits. A parent-cut
+// attempt remains incomplete and consumes paced retry budget; slow replays
+// must be watched through the admitted session_seconds log during rollout.
 #[cfg(any(target_os = "linux", test))]
 const MIN_JOB_US: u64 = 120_000_000;
 #[cfg(any(target_os = "linux", test))]

@@ -115,10 +115,12 @@ task-abort claim that all SDK background tasks have joined.
 
 This worker-only change does not alter the approved static systemd service.
 RuntimeMaxSec still counts process time, including idle time. Before offering a
-lease, the future authenticated process-binding gate must verify at least 540
-seconds plus safety margin remain under that backstop. An aged idle worker gets
-no lease and is recycled by systemd. No listener or lifetime-management mechanism
-is activated here.
+lease, the authenticated process-binding gate verifies that at least 120 seconds
+plus a ten-second safety margin remain under that backstop. The parent caps the
+session at the smaller of 540 seconds and that remaining lifetime minus margin;
+an older worker with too little time receives no assignment. A shortened session
+may end before the worker's own phase allowance; incomplete work remains under
+paced retry. See [runtime budgets](negentropy_runtime.md#worker-progress-budgets).
 
 The binary exits without waiting for SDK background-task destruction on either
 result. It owns no durable writes; OS process exit closes remaining sockets. Async
