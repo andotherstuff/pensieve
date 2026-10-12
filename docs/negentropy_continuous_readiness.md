@@ -14,6 +14,33 @@ verification are retained on pensieve under
 The shorter trial replaces the previously proposed 24-hour initial canary, not
 proof of indefinite unattended operation or of multi-relay capacity.
 
+## Rolling Premium Primal pilot (2026-10-12)
+
+The first rolling pilot (2026-10-11 20:07 CEST, build `20f0b4b`) admitted no
+work: the worker waited 82 s through archive replay and was rejected with
+`worker service lifetime insufficient`, because admission reserved a full
+nine-minute session inside the ten-minute service lifetime. PR #72 caps each
+session by the remaining lifetime instead.
+
+The repeat ran 08:47:18–09:07:18 CEST on 2026-10-12 with the PR #72 ingester and
+worker (build `ba0c4a1`, same code as `66a3459`), the preserved ledger
+`/data/negentropy/production-premium-20261011T180545Z/jobs.sqlite` (32 queued,
+0 attempts beforehand), replay floor 29808, and a `systemd-run` timer that
+stopped the worker after 20 minutes:
+
+- 70 worker processes and lease grants; 69 jobs durably complete.
+- 709 frames received and 709 archived; 0 failures, 0 policy exclusions,
+  0 unresolved receipts after the final seal.
+- Every session was admitted: 69 with `session_seconds=540`, 1 with 519.
+- The job in flight at the timed stop logged `Broken pipe` and was retained as
+  `retry_wait`; nothing was lost.
+- `/health/negentropy` reported `progress_within_deadline` throughout and archive
+  admission stayed `200`. The worker was left stopped afterwards, so progress
+  health drifts back to stalled until the next run.
+
+Continuous operation remains **not enabled**: this is still a single relay, a
+20-minute window, and the worker is started only for monitored runs.
+
 ## First increment: measure without deleting
 
 Run `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite`
