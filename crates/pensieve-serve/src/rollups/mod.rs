@@ -51,11 +51,12 @@ pub const PUBLISHER_ROLLUP_DAYS: u32 = 366;
 /// Longer windows exceed the API's 20 s ClickHouse cap: since mid-2026 20-45
 /// million distinct pubkeys are active per month, so a 366-day ranking
 /// aggregated ~150M (month, pubkey) rows and took 39 s in production
-/// (2026-10-12), while 90 days answers in a few seconds. The rollup still keeps
+/// (2026-10-12); 90 days read ~71M rows and hit the cap at ~20 s, while 60 days
+/// read ~46M rows in ~9.5 s at the API's 4 threads. The rollup still keeps
 /// [`PUBLISHER_TTL_DAYS`] of history and is validated over
 /// [`PUBLISHER_ROLLUP_DAYS`], so this cap can be raised without a migration once
 /// long windows have a precomputed path.
-pub const PUBLISHER_MAX_DAYS: u32 = 90;
+pub const PUBLISHER_MAX_DAYS: u32 = 60;
 
 /// Kinds left out of `publisher_activity`: signed by throwaway keys (one
 /// pubkey per event), so they carry no publisher signal. Same list as
@@ -470,11 +471,11 @@ mod tests {
     fn publisher_params_bound_days_and_kinds() {
         assert_eq!(publisher_params(30, None), Ok(ALL_KINDS));
         assert_eq!(publisher_params(1, Some(1)), Ok(1));
-        assert_eq!(publisher_params(90, Some(30023)), Ok(30023));
+        assert_eq!(publisher_params(60, Some(30023)), Ok(30023));
         assert_eq!(publisher_params(0, None), Err(PublisherParamError::Days(0)));
         assert_eq!(
-            publisher_params(91, None),
-            Err(PublisherParamError::Days(91))
+            publisher_params(61, None),
+            Err(PublisherParamError::Days(61))
         );
         assert_eq!(
             publisher_params(30, Some(1059)),
@@ -487,7 +488,7 @@ mod tests {
         assert!(
             PublisherParamError::Days(0)
                 .to_string()
-                .contains("between 1 and 90")
+                .contains("between 1 and 60")
         );
     }
 

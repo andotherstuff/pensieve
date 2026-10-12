@@ -627,7 +627,7 @@ oracle on `events_local`.
 - longform `articles_count` counts distinct articles (latest version per
   pubkey and d tag), not every version; content statistics come from that
   latest version, and `days` filters on its `created_at`;
-- publishers use whole UTC days, accept `days` 1–90 (366 until 2026-10-12; capped because one-year windows exceeded the 20 s query cap), and reject kinds 445
+- publishers use whole UTC days, accept `days` 1–60 (366 until 2026-10-12; capped because longer windows exceed the 20 s query cap), and reject kinds 445
   and 1059; events dated more than a day after ingestion count on the day
   after ingestion.
 
