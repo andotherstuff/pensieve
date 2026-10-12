@@ -133,13 +133,15 @@ pub async fn table_created_at(client: &Client, database: &str, name: &str) -> Re
         .with_context(|| format!("reading creation time of {database}.{name}"))
 }
 
-/// Fail unless the materialized view exists; returns its creation time.
-pub async fn require_view(client: &Client, database: &str, view: &str) -> Result<u32> {
+/// Fail unless the target's materialized view exists; returns its creation
+/// time.
+pub async fn require_view(client: &Client, database: &str, target: super::Target) -> Result<u32> {
+    let view = target.materialized_view();
     match table_created_at(client, database, view).await? {
         Some(t0) => Ok(t0),
         None => bail!(
-            "{database}.{view} does not exist; apply \
-             docs/migrations/prepared/019_api_publishers_longform.sql first"
+            "{database}.{view} does not exist; apply {} first",
+            target.migration_file()
         ),
     }
 }

@@ -13,7 +13,11 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 mod rollup_reads;
-use rollup_reads::{fetch_clickhouse_longform, fetch_clickhouse_publishers};
+pub(crate) use rollup_reads::fetch_kind_totals;
+use rollup_reads::{
+    fetch_clickhouse_longform, fetch_clickhouse_publishers, fetch_rollup_earliest_event,
+    fetch_rollup_total_kinds,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Overview
@@ -99,7 +103,8 @@ pub async fn total_pubkeys(State(state): State<AppState>) -> Result<Json<CountRe
 
 /// `GET /api/v1/stats/kinds/total`
 ///
-/// Returns distinct event kinds seen in the last 30 days.
+/// Returns distinct event kinds with an event created in the last 30 days
+/// (from the migration 020 `kind_totals` rollup, instant).
 /// Cached for 1 hour (kinds are stable).
 pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResponse>, ApiError> {
     let cache = state.cache.clone();
@@ -114,7 +119,8 @@ pub async fn total_kinds(State(state): State<AppState>) -> Result<Json<CountResp
 
 /// `GET /api/v1/stats/events/earliest`
 ///
-/// Returns earliest event timestamp (from aggregated first-seen data).
+/// Returns earliest event timestamp (from the migration 020 `kind_totals`
+/// rollup's first-seen times).
 /// Cached for 1 hour (rarely changes).
 pub async fn earliest_event(
     State(state): State<AppState>,
@@ -186,29 +192,16 @@ async fn fetch_total_pubkeys(state: &AppState) -> Result<u64, ApiError> {
 }
 
 async fn fetch_total_kinds(state: &AppState) -> Result<u64, ApiError> {
-    state
-        .clickhouse
-        .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY")
-        .fetch_one::<u64>()
-        .await
+    // Same set as `uniq(kind) FROM events_local WHERE created_at >= now() - 30
+    // days`: a kind qualifies iff its latest created_at is in the window.
+    fetch_rollup_total_kinds(state).await
 }
 
 async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
-    // Share this stable result with overview, which otherwise repeats the full scan.
-    let client = state.clickhouse.clone();
-    get_or_compute_with_ttl(
-        &state.cache,
-        "earliest_event_scan",
-        ttl::STABLE,
-        move || async move {
-            let ts = client
-                .query("SELECT toUInt32(min(created_at)) FROM events_local")
-                .fetch_one::<u32>()
-                .await?;
-            Ok(ts.max(NOSTR_GENESIS_TIMESTAMP))
-        },
-    )
-    .await
+    // min(created_at) over events_local is the min of the per-kind minimums.
+    Ok(fetch_rollup_earliest_event(state)
+        .await?
+        .max(NOSTR_GENESIS_TIMESTAMP))
 }
 
 async fn fetch_latest_event(state: &AppState) -> Result<u32, ApiError> {
@@ -1668,7 +1661,8 @@ pub struct RelayDistributionRow {
 ///
 /// Returns relay popularity distribution from NIP-65 relay lists (kind 10002).
 /// Only includes each user's latest relay list event.
-/// Cached for 10 minutes (data refreshes every 6 hours via MV).
+/// Cached for 10 minutes (the table refreshes hourly from `relay_list_latest`
+/// since migration 020, every 6 hours before).
 pub async fn relay_distribution(
     State(state): State<AppState>,
     Query(params): Query<RelayDistributionQuery>,

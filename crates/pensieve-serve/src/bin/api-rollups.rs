@@ -1,4 +1,4 @@
-//! Operator tool for the API rollup tables (migration 019).
+//! Operator tool for the insert-fed rollup tables (migrations 019 and 020).
 //!
 //! Subcommands:
 //! - `plan`: fix the view boundary, size a sample shard, write a shard plan
@@ -6,8 +6,10 @@
 //! - `status`: backfill progress, table sizes, freshness and the boundary
 //! - `validate`: compare the rollups with a direct oracle on `events_local`
 //! - `resolve`: settle a pending shard by hand when the tool cannot
+//! - `cutover`: migration 020 phase 2, guarded (switch the old views over)
 //!
-//! See `docs/api_rollups.md` and `ops/RUNBOOK.md`.
+//! `plan`, `backfill` and `validate` take `--migration 019|020` or explicit
+//! `--target`s. See `docs/api_rollups.md` and `ops/RUNBOOK.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,12 +21,14 @@ use tracing_subscriber::EnvFilter;
 
 use pensieve_serve::rollups::Target;
 use pensieve_serve::rollups::backfill::{self, BackfillOptions, QuietMinutes, StopReason};
+use pensieve_serve::rollups::cutover::{self, CutoverOptions};
 use pensieve_serve::rollups::ops::{self, ConnectionArgs, GIB, LimitArgs};
 use pensieve_serve::rollups::plan::{self, CheckpointDir, PlanOptions};
 use pensieve_serve::rollups::status;
-use pensieve_serve::rollups::validate::{self, ValidateOptions};
+use pensieve_serve::rollups::validate::{self, ValidateInputs, ValidateOptions};
 
-/// Manage the ClickHouse rollups behind /stats/publishers and /stats/longform.
+/// Manage the ClickHouse rollups of migrations 019 (/stats/publishers,
+/// /stats/longform) and 020 (user flags, relay lists, kind totals).
 #[derive(Parser, Debug)]
 #[command(name = "api-rollups", version)]
 struct Args {
@@ -46,31 +50,30 @@ struct Args {
 enum Command {
     /// Fix the view boundary, size a sample shard and write a shard plan.
     Plan {
-        /// Targets to plan (repeatable; default all).
-        #[arg(long = "target", value_enum)]
-        targets: Vec<Target>,
+        #[command(flatten)]
+        select: Selection,
         /// Hex prefix length of the id shards (16^n shards). Each shard is one
         /// INSERT whose whole output is held as one block and written as one
         /// part: use 3 if a shard exceeds --max-memory-gib.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
         id_prefix_len: u8,
-        /// Publishers: required gap between the view's creation and the first
-        /// second it captured.
+        /// Additive targets (publishers, kinds): required gap between the
+        /// view's creation and the first second it captured.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(2..))]
         boundary_margin_secs: u32,
         /// Free-space reserve shown in the estimate, in GiB.
         #[arg(long, default_value_t = 100)]
         min_free_gib: u64,
-        /// Replace an existing plan and delete its checkpoints. For publishers
-        /// only after truncating the table and recreating its view.
+        /// Replace an existing plan and delete its checkpoints. For additive
+        /// targets (publishers, kinds) only after truncating the table and
+        /// recreating its view.
         #[arg(long)]
         discard_progress: bool,
     },
     /// Run planned shards (resumable; completed shards are skipped).
     Backfill {
-        /// Targets to backfill (repeatable; default all).
-        #[arg(long = "target", value_enum)]
-        targets: Vec<Target>,
+        #[command(flatten)]
+        select: Selection,
         /// Stop after this many minutes (checked before every shard).
         #[arg(long)]
         max_runtime_mins: Option<u64>,
@@ -99,14 +102,14 @@ enum Command {
     Status,
     /// Compare the rollups with a direct oracle on events_local.
     Validate {
-        /// Targets to validate (repeatable; default all).
-        #[arg(long = "target", value_enum)]
-        targets: Vec<Target>,
+        #[command(flatten)]
+        select: Selection,
         /// Keys per sampling source.
         #[arg(long, default_value_t = 300)]
         sample: usize,
-        /// Publishers: pubkeys sampled around the view boundary (full read of
-        /// the indexed_at column; 0 to skip).
+        /// Publishers and user flags: pubkeys sampled around the view boundary
+        /// or the recorded cutover (full read of the indexed_at column; 0 to
+        /// skip).
         #[arg(long, default_value_t = 200)]
         boundary_sample: usize,
         /// Publishers: half-width of the boundary window in seconds.
@@ -124,9 +127,21 @@ enum Command {
         /// Keys per oracle query.
         #[arg(long, default_value_t = 100)]
         batch: usize,
-        /// Publishers: skip pubkeys with more events than this in the window.
+        /// Publishers and user flags: skip pubkeys with more events than this
+        /// in the window.
         #[arg(long, default_value_t = 5000)]
         max_key_events: u64,
+        /// User flags: days of daily_user_stats whose stored flags must all be
+        /// backed by pubkey_flags.
+        #[arg(long, default_value_t = 7)]
+        flag_days: u32,
+        /// User flags: days of daily_user_stats compared per sampled pubkey.
+        #[arg(long, default_value_t = 3)]
+        user_days: u32,
+        /// Kinds: largest allowed difference (percent) between the approximate
+        /// and exact (kinds_stats_mv) distinct pubkeys.
+        #[arg(long, default_value_t = 2.0)]
+        pubkeys_tolerance_pct: f64,
         /// Write the JSON report here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -151,19 +166,80 @@ enum Command {
         #[arg(long)]
         not_committed: bool,
     },
+    /// Migration 020 phase 2: switch the active-users refreshes and
+    /// daily_user_stats_mv to pubkey_flags, recompute relay_distribution from
+    /// relay_list_latest and drop kinds_stats_mv. Refuses unless the 020
+    /// backfills are complete and nothing still reads kinds_stats_mv.
+    Cutover {
+        /// Run the checks and print the statements without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse while a query outside this tool read kinds_stats_mv within
+        /// this many minutes (0 disables the check).
+        #[arg(long, default_value_t = 15)]
+        reader_window_mins: u32,
+        /// Do not run in these UTC minutes of each hour (START-END), or `none`.
+        #[arg(long, default_value = "58-7")]
+        quiet_minutes: String,
+    },
 }
 
-fn targets_or_all(targets: Vec<Target>) -> Vec<Target> {
-    if targets.is_empty() {
-        Target::ALL.to_vec()
-    } else {
+/// Which targets a command acts on.
+#[derive(clap::Args, Debug)]
+struct Selection {
+    /// Targets (repeatable).
+    #[arg(long = "target", value_enum)]
+    targets: Vec<Target>,
+    /// Every target of a migration.
+    #[arg(long, value_enum)]
+    migration: Option<Migration>,
+}
+
+/// A migration's targets.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum Migration {
+    /// publishers, longform
+    #[value(name = "019")]
+    M019,
+    /// user-flags, relay-lists, kinds
+    #[value(name = "020")]
+    M020,
+}
+
+impl Selection {
+    /// The selected targets in order, without duplicates.
+    fn targets(&self) -> Result<Vec<Target>> {
+        let mut all: Vec<Target> = match self.migration {
+            Some(Migration::M019) => Target::MIGRATION_019.to_vec(),
+            Some(Migration::M020) => Target::MIGRATION_020.to_vec(),
+            None => Vec::new(),
+        };
+        all.extend(self.targets.iter().copied());
+        if all.is_empty() {
+            bail!(
+                "choose targets with --migration 019|020 or --target \
+                 publishers|longform|user-flags|relay-lists|kinds"
+            );
+        }
         let mut seen = Vec::new();
-        for t in targets {
+        for t in all {
             if !seen.contains(&t) {
                 seen.push(t);
             }
         }
-        seen
+        Ok(seen)
+    }
+}
+
+fn parse_quiet_minutes(value: &str) -> Result<Option<QuietMinutes>> {
+    match value {
+        "none" => Ok(None),
+        window => Ok(Some(
+            window
+                .parse::<QuietMinutes>()
+                .map_err(anyhow::Error::msg)
+                .context("--quiet-minutes")?,
+        )),
     }
 }
 
@@ -193,7 +269,7 @@ async fn run(args: Args) -> Result<ExitCode> {
 
     match args.command {
         Command::Plan {
-            targets,
+            select,
             id_prefix_len,
             boundary_margin_secs,
             min_free_gib,
@@ -204,7 +280,7 @@ async fn run(args: Args) -> Result<ExitCode> {
                 boundary_margin_secs,
             };
             let mut peak_total = 0u64;
-            for target in targets_or_all(targets) {
+            for target in select.targets()? {
                 let checkpoints = CheckpointDir::new(&args.checkpoint_dir, target);
                 // Refuse before doing any work if progress would be lost.
                 if !discard_progress
@@ -232,7 +308,7 @@ async fn run(args: Args) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Backfill {
-            targets,
+            select,
             max_runtime_mins,
             max_shards,
             delay_secs,
@@ -241,18 +317,10 @@ async fn run(args: Args) -> Result<ExitCode> {
             max_target_parts,
             quiet_minutes,
         } => {
-            let quiet_minutes = match quiet_minutes.as_str() {
-                "none" => None,
-                window => Some(
-                    window
-                        .parse::<QuietMinutes>()
-                        .map_err(anyhow::Error::msg)
-                        .context("--quiet-minutes")?,
-                ),
-            };
+            let quiet_minutes = parse_quiet_minutes(&quiet_minutes)?;
             let started = std::time::Instant::now();
             let max_runtime = max_runtime_mins.map(|m| Duration::from_secs(m * 60));
-            for target in targets_or_all(targets) {
+            for target in select.targets()? {
                 let checkpoints = CheckpointDir::new(&args.checkpoint_dir, target);
                 let Some(plan) = checkpoints.load_plan()? else {
                     bail!("no plan for {target}; run `api-rollups plan --target {target}` first");
@@ -285,10 +353,17 @@ async fn run(args: Args) -> Result<ExitCode> {
         Command::Status => {
             let statuses = status::collect(&client, &database, &args.checkpoint_dir).await?;
             print!("{}", status::render(&statuses));
+            match cutover::load_record(&args.checkpoint_dir)? {
+                Some(r) => println!(
+                    "migration 020 cutover: done at {} ({} statements, database {})",
+                    r.finished_at, r.statements, r.database
+                ),
+                None => println!("migration 020 cutover: not run"),
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Validate {
-            targets,
+            select,
             sample,
             boundary_sample,
             boundary_window_secs,
@@ -297,9 +372,12 @@ async fn run(args: Args) -> Result<ExitCode> {
             cutoff_margin_secs,
             batch,
             max_key_events,
+            flag_days,
+            user_days,
+            pubkeys_tolerance_pct,
             out,
         } => {
-            let targets = targets_or_all(targets);
+            let targets = select.targets()?;
             for target in &targets {
                 let checkpoints = CheckpointDir::new(&args.checkpoint_dir, *target);
                 if !backfill::is_complete(&checkpoints)? {
@@ -311,6 +389,8 @@ async fn run(args: Args) -> Result<ExitCode> {
             }
             let publisher_plan =
                 CheckpointDir::new(&args.checkpoint_dir, Target::Publishers).load_plan()?;
+            let kinds_plan = CheckpointDir::new(&args.checkpoint_dir, Target::Kinds).load_plan()?;
+            let cutover_at = cutover::load_record(&args.checkpoint_dir)?.map(|r| r.finished_at);
             let options = ValidateOptions {
                 targets,
                 sample,
@@ -322,9 +402,16 @@ async fn run(args: Args) -> Result<ExitCode> {
                 batch,
                 max_key_events,
                 max_examples: 20,
+                flag_days,
+                user_days,
+                pubkeys_tolerance_pct,
             };
-            let report =
-                validate::run(&client, &database, &options, publisher_plan.as_ref()).await?;
+            let inputs = ValidateInputs {
+                publisher_plan: publisher_plan.as_ref(),
+                kinds_plan: kinds_plan.as_ref(),
+                cutover_at,
+            };
+            let report = validate::run_with(&client, &database, &options, &inputs).await?;
             print!("{}", report.render());
             if let Some(path) = out {
                 if let Some(parent) = path.parent() {
@@ -357,6 +444,29 @@ async fn run(args: Args) -> Result<ExitCode> {
                     "not committed (it will run again)"
                 }
             );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Cutover {
+            dry_run,
+            reader_window_mins,
+            quiet_minutes,
+        } => {
+            let options = CutoverOptions {
+                dry_run,
+                reader_window_mins,
+                quiet_minutes: parse_quiet_minutes(&quiet_minutes)?,
+            };
+            match cutover::run(&client, &database, &args.checkpoint_dir, &options).await? {
+                Some(record) => println!(
+                    "cutover complete: {} statements, {}..{}; recorded in {}. Watch \
+                     system.view_refreshes for the four refreshes it started.",
+                    record.statements,
+                    record.started_at,
+                    record.finished_at,
+                    cutover::record_path(&args.checkpoint_dir).display()
+                ),
+                None => println!("dry run: checks passed, nothing changed"),
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

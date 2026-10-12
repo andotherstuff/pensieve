@@ -1,19 +1,26 @@
-//! ClickHouse reads for `/stats/publishers` and `/stats/longform` from the
-//! migration 019 rollup tables (`publisher_activity`, `longform_latest`).
+//! ClickHouse reads from the rollup tables:
 //!
-//! Both endpoints used to scan `events_local` and time out at the 20 s query
-//! cap. When the rollup tables do not exist (019 not applied, or rolled back)
-//! they answer `503 metric_unavailable` at once instead of falling back to a
-//! scan. See `crate::rollups` and `docs/api_rollups.md`.
+//! - `/stats/publishers` and `/stats/longform` from migration 019's
+//!   `publisher_activity` and `longform_latest`;
+//! - `/kinds`, `/stats/kinds/total` and `/stats/events/earliest` (and the
+//!   overview) from migration 020's `kind_totals`.
+//!
+//! These endpoints used to scan `events_local` (or read the hourly
+//! `kinds_stats_mv` rescan). When a rollup table does not exist (migration not
+//! applied, or rolled back) they answer `503 metric_unavailable` at once
+//! instead of falling back to a scan. See `crate::rollups` and
+//! `docs/api_rollups.md`.
 
 use clickhouse::Row;
 use serde::Deserialize;
 
 use super::{LongformStats, PublisherRow};
 use crate::error::ApiError;
+use crate::rollups::derived::{KindsSort, earliest_event_sql, kinds_list_sql, total_kinds_sql};
 use crate::rollups::{
     PublisherParamError, is_unknown_table, longform_sql, publisher_params, publishers_sql,
 };
+use crate::routes::kinds::KindSummary;
 use crate::state::AppState;
 
 /// Map a missing rollup table to `503 metric_unavailable`.
@@ -22,7 +29,8 @@ fn missing_rollup_is_unavailable(error: ApiError) -> ApiError {
         ApiError::Database(inner) if is_unknown_table(inner) => {
             tracing::warn!(
                 error = %inner,
-                "API rollup table missing; apply docs/migrations/prepared/019_api_publishers_longform.sql"
+                "rollup table missing; apply docs/migrations/prepared/019_api_publishers_longform.sql \
+                 (publishers, longform) or 020_incremental_derived_views.sql (kinds)"
             );
             ApiError::MetricUnavailable
         }
@@ -83,6 +91,43 @@ pub(super) async fn fetch_clickhouse_longform(
         totals.unique_authors,
         totals.total_content_length,
     ))
+}
+
+/// Per-kind totals from `kind_totals`: exact event counts and first/last
+/// `created_at`, approximate (`uniqCombined64`, ~0.3% standard error)
+/// distinct pubkeys.
+pub(crate) async fn fetch_kind_totals(
+    state: &AppState,
+    sort: KindsSort,
+    limit: u32,
+) -> Result<Vec<KindSummary>, ApiError> {
+    state
+        .clickhouse
+        .query(&kinds_list_sql(sort))
+        .bind(limit)
+        .fetch_all()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// Kinds with an event created in the last 30 days, from `kind_totals`.
+pub(super) async fn fetch_rollup_total_kinds(state: &AppState) -> Result<u64, ApiError> {
+    state
+        .clickhouse
+        .query(&total_kinds_sql())
+        .fetch_one::<u64>()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// Earliest `created_at` of any event, from `kind_totals` (0 when empty).
+pub(super) async fn fetch_rollup_earliest_event(state: &AppState) -> Result<u32, ApiError> {
+    state
+        .clickhouse
+        .query(&earliest_event_sql())
+        .fetch_one::<u32>()
+        .await
+        .map_err(missing_rollup_is_unavailable)
 }
 
 /// Response for the given totals; an empty set averages to 0.

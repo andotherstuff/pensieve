@@ -2,16 +2,17 @@
 //!
 //! # No gaps, no double counts
 //!
-//! - **Longform** (`argMin`, idempotent) follows migration 017: once the view
-//!   exists (`T0`), the grace period has passed and no insert that started
-//!   before `T0` is still running, every row the view missed is committed and
-//!   visible to every shard. Overlap with the view, or a re-run shard, is
-//!   harmless.
-//! - **Publishers** (sums, additive) split the source by `indexed_at` at the
-//!   view boundary `C` fixed by the plan ([`super::plan::capture_boundary`]):
-//!   shards read only `indexed_at < C`, the view owns everything else. Before
-//!   the first shard the boundary is re-checked: no view row may lie below
-//!   `C` and no insert started before `C` may still be running.
+//! - **Idempotent targets** (longform, relay lists: `argMin`; user flags:
+//!   `min`/`max`) follow migration 017: once the view exists (`T0`), the grace
+//!   period has passed and no insert that started before `T0` is still
+//!   running, every row the view missed is committed and visible to every
+//!   shard. Overlap with the view, or a re-run shard, is harmless.
+//! - **Additive targets** (publishers, kinds: sums) split the source by
+//!   `indexed_at` at the view boundary `C` fixed by the plan
+//!   ([`super::plan::capture_boundary`]): shards read only `indexed_at < C`,
+//!   the view owns everything else. Before the first shard the boundary is
+//!   re-checked: no view row may lie below `C` and no insert started before
+//!   `C` may still be running.
 //! - **Exactly once.** Each shard is a single `INSERT ... SELECT` squashed into
 //!   one block, so it writes one part into the unpartitioned table and commits
 //!   atomically. A pending marker with the query id is written before the
@@ -40,7 +41,6 @@ use anyhow::{Context, Result, bail};
 use clickhouse::Client;
 use serde::Serialize;
 
-use super::PUBLISHER_TABLE;
 use super::ops;
 use super::plan::{
     CheckpointDir, PendingShard, Plan, Shard, ShardCheckpoint, first_captured_second,
@@ -195,11 +195,11 @@ pub struct BackfillReport {
 /// Verify that the backfill cannot leave a gap or double count.
 pub async fn preflight(client: &Client, plan: &Plan, grace: Duration) -> Result<()> {
     let view = plan.target.materialized_view();
-    let t0 = ops::require_view(client, &plan.database, view).await?;
+    let t0 = ops::require_view(client, &plan.database, plan.target).await?;
     if t0 != plan.view_created_at {
         bail!(
             "{}.{view} was (re)created at {t0}, after the plan ({}); re-run `plan` \
-             (for publishers, truncate the table first)",
+             (for publishers and kinds, truncate the table first)",
             plan.database,
             plan.view_created_at
         );
@@ -216,10 +216,8 @@ pub async fn preflight(client: &Client, plan: &Plan, grace: Duration) -> Result<
     }
 
     // Rows the view did not capture must be committed before shards read.
-    let before = match &plan.publisher_bounds {
-        Some(bounds) => bounds.indexed_before.max(t0),
-        None => t0,
-    };
+    let boundary = plan.source_bounds().indexed_before;
+    let before = boundary.map_or(t0, |c| c.max(t0));
     let running = ops::inserts_started_before(client, &plan.database, before).await?;
     if running > 0 {
         bail!(
@@ -235,19 +233,19 @@ pub async fn preflight(client: &Client, plan: &Plan, grace: Duration) -> Result<
         );
     }
 
-    if let Some(bounds) = &plan.publisher_bounds {
+    if let Some(boundary) = boundary {
         // No view row may lie below the boundary (TTL can only raise the
         // minimum, so `>=` rather than `==`).
-        let first = first_captured_second(client, &plan.database).await?;
+        let table = plan.target.table();
+        let first = first_captured_second(client, &plan.database, table).await?;
         if let Some(first) = first
-            && first < bounds.indexed_before
+            && first < boundary
         {
             bail!(
-                "{}.{PUBLISHER_TABLE} has view rows indexed at {first}, before the planned \
-                 boundary {}; the table is not the one planned. Truncate it, recreate the \
-                 view and re-plan",
-                plan.database,
-                bounds.indexed_before
+                "{}.{table} has view rows indexed at {first}, before the planned boundary \
+                 {boundary}; the table is not the one planned. Truncate it, recreate the view \
+                 and re-plan",
+                plan.database
             );
         }
     }
@@ -502,8 +500,8 @@ async fn run_shard(
     let query_id = ops::new_query_id(&format!("api-rollups-backfill-{}", plan.target));
     let sql = plan.target.backfill_sql(
         &plan.database,
-        &shard.range.predicate(),
-        plan.publisher_bounds.as_ref(),
+        &plan.shard_predicate(shard),
+        &plan.source_bounds(),
     );
     let pending = PendingShard {
         index: shard.index,

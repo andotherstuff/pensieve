@@ -1,4 +1,4 @@
-//! Backfill progress, table sizes and freshness for the API rollup tables.
+//! Backfill progress, table sizes and freshness for the rollup tables.
 
 use std::path::Path;
 
@@ -23,8 +23,8 @@ pub struct TargetStatus {
     pub shards_done: usize,
     /// Shards started but not yet resolved.
     pub shards_pending: usize,
-    /// Publishers: the planned view boundary, and the earliest second the view
-    /// wrote now (must never be below the boundary).
+    /// Additive targets: the planned view boundary, and the earliest second
+    /// the view wrote now (must never be below the boundary).
     pub boundary: Option<(u32, Option<u32>)>,
     /// Active-part statistics.
     pub parts: TableParts,
@@ -68,10 +68,10 @@ pub async fn collect(
             (TableParts::default(), None)
         };
 
-        let boundary = match plan.as_ref().and_then(|p| p.publisher_bounds.as_ref()) {
-            Some(bounds) if table_exists => Some((
-                bounds.indexed_before,
-                first_captured_second(client, database).await?,
+        let boundary = match plan.as_ref().and_then(|p| p.source_bounds().indexed_before) {
+            Some(planned) if table_exists => Some((
+                planned,
+                first_captured_second(client, database, target.table()).await?,
             )),
             _ => None,
         };

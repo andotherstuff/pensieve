@@ -2,7 +2,8 @@
 //!
 //! `events_local` has no projections, so every plan shards the table by event
 //! id prefix: shard `i` reads one primary-key range of the full table and
-//! filters it. Plans and checkpoints are JSON files under
+//! filters it. (The user-flags seed shards its two small lookup tables by
+//! pubkey prefix instead.) Plans and checkpoints are JSON files under
 //! `<checkpoint_dir>/<target>/`, which makes backfills resumable:
 //!
 //! - `plan.json`: the plan;
@@ -10,10 +11,12 @@
 //!   id) but whose outcome is not yet recorded;
 //! - `shards/<shard>.json`: completed shards.
 //!
-//! For publishers the plan also fixes the view boundary (see
-//! [`capture_boundary`]): the first second the materialized view captured.
+//! For additive targets (publishers, kinds) the plan also fixes the view
+//! boundary (see [`capture_boundary`]): the first second the materialized view
+//! captured.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate};
@@ -21,7 +24,7 @@ use clickhouse::Client;
 use serde::{Deserialize, Serialize};
 
 use super::ops::{self, GIB};
-use super::{BACKFILL_SENTINEL_INDEXED_AT, PUBLISHER_TABLE, PublisherBounds, Target};
+use super::{BACKFILL_SENTINEL_INDEXED_AT, PublisherBounds, SourceBounds, Target};
 
 /// Plan file format version.
 pub const PLAN_FORMAT_VERSION: u32 = 1;
@@ -38,8 +41,26 @@ const DEFAULT_PUBLISHER_ROW_BYTES: u64 = 60;
 /// winning id and fixed-width state).
 const DEFAULT_LONGFORM_ROW_BYTES: u64 = 120;
 
-/// A contiguous `start <= id < end` range; `None` is unbounded. Bounds are
-/// lowercase hex.
+/// Assumed compressed bytes per `pubkey_flags` row (64-hex pubkey, three
+/// timestamps that are mostly constant).
+const DEFAULT_USER_FLAGS_ROW_BYTES: u64 = 45;
+
+/// Assumed compressed bytes per `relay_list_latest` row (pubkey, winning id
+/// and a handful of relay URLs).
+const DEFAULT_RELAY_LISTS_ROW_BYTES: u64 = 300;
+
+/// Assumed compressed bytes per `kind_totals` row: dominated by the
+/// `uniqCombined64` sketch (up to ~96 KiB dense, tiny for rare kinds).
+const DEFAULT_KINDS_ROW_BYTES: u64 = 16 * 1024;
+
+/// Seconds a shard pauses after it by default (`backfill --delay-secs`).
+const DEFAULT_DELAY_SECS: u64 = 5;
+
+/// UTC minutes per hour in which no shard starts by default (:58–:07).
+const DEFAULT_QUIET_MINUTES: u64 = 10;
+
+/// A contiguous `start <= key < end` range over a hex-keyed column; `None` is
+/// unbounded. Bounds are lowercase hex.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdRange {
     /// Inclusive lower bound.
@@ -49,17 +70,22 @@ pub struct IdRange {
 }
 
 impl IdRange {
-    /// SQL predicate for this range. Bounds are validated hex, so the result
-    /// is safe to embed.
+    /// SQL predicate for this range over `id`. Bounds are validated hex, so
+    /// the result is safe to embed.
     pub fn predicate(&self) -> String {
+        self.predicate_on("id")
+    }
+
+    /// SQL predicate for this range over `column` (a trusted column name).
+    pub fn predicate_on(&self, column: &str) -> String {
         let mut parts = Vec::new();
         if let Some(start) = &self.start {
             assert!(is_hex(start), "id prefix bound must be lowercase hex");
-            parts.push(format!("id >= '{start}'"));
+            parts.push(format!("{column} >= '{start}'"));
         }
         if let Some(end) = &self.end {
             assert!(is_hex(end), "id prefix bound must be lowercase hex");
-            parts.push(format!("id < '{end}'"));
+            parts.push(format!("{column} < '{end}'"));
         }
         if parts.is_empty() {
             "1".to_string()
@@ -68,7 +94,6 @@ impl IdRange {
         }
     }
 }
-
 fn is_hex(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -127,6 +152,10 @@ pub struct SourceStats {
     /// Final target rows, when known (longform: kind 30023 coordinates in
     /// `addressable_latest`), else 0.
     pub known_final_rows: u64,
+    /// Client-observed duration of the sample shard's `SELECT`, in
+    /// milliseconds (0 in plans made before it was recorded).
+    #[serde(default)]
+    pub sample_elapsed_ms: u64,
 }
 
 /// Disk estimate for a backfill.
@@ -156,6 +185,14 @@ pub fn estimate_disk(stats: &SourceStats, shards: usize, bytes_per_row: u64) -> 
     }
 }
 
+/// Estimated wall-clock seconds of a whole backfill at the plan's limits: the
+/// sample shard's duration for every shard, the default 5 s pause after each,
+/// and no shard starting in the default 10 quiet minutes of each hour.
+pub fn estimate_runtime_secs(stats: &SourceStats, shards: usize) -> u64 {
+    let work = (stats.sample_elapsed_ms / 1000 + DEFAULT_DELAY_SECS).saturating_mul(shards as u64);
+    work.saturating_mul(60) / (60 - DEFAULT_QUIET_MINUTES)
+}
+
 /// A persisted backfill plan for one target.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
@@ -171,6 +208,10 @@ pub struct Plan {
     pub planned_at: u32,
     /// Publisher source bounds (view boundary and TTL window).
     pub publisher_bounds: Option<PublisherBounds>,
+    /// Kinds: the view boundary (first second the view captured). Backfill
+    /// shards read only rows indexed before it.
+    #[serde(default)]
+    pub view_boundary: Option<u32>,
     /// Hex prefix length of the id shards.
     pub id_prefix_len: usize,
     /// Source statistics at planning time.
@@ -181,13 +222,32 @@ pub struct Plan {
     pub shards: Vec<Shard>,
 }
 
+impl Plan {
+    /// The source rows the shards read.
+    pub fn source_bounds(&self) -> SourceBounds {
+        SourceBounds {
+            indexed_before: self
+                .publisher_bounds
+                .as_ref()
+                .map(|b| b.indexed_before)
+                .or(self.view_boundary),
+            window_start: self.publisher_bounds.as_ref().map(|b| b.window_start),
+        }
+    }
+
+    /// SQL predicate of a shard's range over the target's shard column.
+    pub fn shard_predicate(&self, shard: &Shard) -> String {
+        shard.range.predicate_on(self.target.shard_column())
+    }
+}
+
 /// Options for [`build_plan`].
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
     /// Hex prefix length of the id shards (16^n shards).
     pub id_prefix_len: usize,
-    /// Publishers: the view's first captured second must be at least this
-    /// many seconds after its creation time.
+    /// Additive targets: the view's first captured second must be at least
+    /// this many seconds after its creation time.
     pub boundary_margin_secs: u32,
 }
 
@@ -200,14 +260,15 @@ impl Default for PlanOptions {
     }
 }
 
-/// The first second the publisher view captured, made stable and checked.
+/// The first second an additive target's view captured, made stable and
+/// checked.
 ///
 /// The view writes `live_min_indexed_at = min(indexed_at)`; the backfill
 /// writes a sentinel. So `C = min(live_min_indexed_at)` over non-sentinel rows
-/// is the earliest `indexed_at` of any in-window row the view wrote. An
-/// `events_local` insert gets `indexed_at = now()` at query start and is
-/// captured iff its pipeline was built after the view was attached (within a
-/// second of `T0`, the view's creation time). Therefore:
+/// is the earliest `indexed_at` of any row the view wrote. An `events_local`
+/// insert gets `indexed_at = now()` at query start and is captured iff its
+/// pipeline was built after the view was attached (within a second of `T0`,
+/// the view's creation time). Therefore:
 ///
 /// - every captured row has `indexed_at >= C` (definition of `C`, once no
 ///   insert that started before `C` is still running — checked here);
@@ -215,27 +276,32 @@ impl Default for PlanOptions {
 ///   (margin >= 2) proves no uncaptured row has `indexed_at >= C`.
 ///
 /// So the backfill reads exactly the rows with `indexed_at < C` and the view
-/// owns the rest: no gap and no double count.
+/// owns the rest: no gap and no double count. (Publishers only see rows in
+/// their TTL window, so `C` is the first in-window second; rows outside the
+/// window are dropped by both paths.)
 pub async fn capture_boundary(
     client: &Client,
     database: &str,
+    target: Target,
     view_created_at: u32,
     margin_secs: u32,
 ) -> Result<u32> {
-    let first = first_captured_second(client, database).await?;
+    let table = target.table();
+    let view = target.materialized_view();
+    let first = first_captured_second(client, database, table).await?;
     let Some(boundary) = first else {
         bail!(
-            "{database}.{PUBLISHER_TABLE} has no rows from the view yet; wait for the next \
-             ingest insert and re-run plan"
+            "{database}.{table} has no rows from the view yet; wait for the next ingest insert \
+             and re-run plan"
         );
     };
     if boundary < view_created_at.saturating_add(margin_secs) {
         bail!(
-            "the publisher view's first captured insert was indexed at {boundary}, within \
-             {margin_secs}s of the view's creation ({view_created_at}); an insert racing the \
-             view's creation could be counted twice or not at all. Recreate the view: \
-             DROP VIEW {database}.publisher_activity_mv; TRUNCATE TABLE \
-             {database}.{PUBLISHER_TABLE}; re-apply migration 019, then plan again"
+            "{view}'s first captured insert was indexed at {boundary}, within {margin_secs}s of \
+             the view's creation ({view_created_at}); an insert racing the view's creation could \
+             be counted twice or not at all. Recreate the view: DROP VIEW {database}.{view}; \
+             TRUNCATE TABLE {database}.{table}; re-apply {}, then plan again",
+            target.migration_file()
         );
     }
     let running = ops::inserts_started_before(client, database, boundary).await?;
@@ -253,23 +319,28 @@ pub async fn capture_boundary(
         );
     }
     // Inserts that committed while we checked could only lower the minimum.
-    let again = first_captured_second(client, database).await?;
+    let again = first_captured_second(client, database, table).await?;
     if again != Some(boundary) {
         bail!("the view boundary moved from {boundary} to {again:?} while planning; retry plan");
     }
     Ok(boundary)
 }
 
-/// Earliest `indexed_at` the publisher view wrote, or `None` if none yet.
-pub async fn first_captured_second(client: &Client, database: &str) -> Result<Option<u32>> {
+/// Earliest `indexed_at` the view of an additive target (`table` has a
+/// `live_min_indexed_at` column) wrote, or `None` if none yet.
+pub async fn first_captured_second(
+    client: &Client,
+    database: &str,
+    table: &str,
+) -> Result<Option<u32>> {
     let (seconds, rows) = client
         .query(&format!(
-            "SELECT toUInt32(min(live_min_indexed_at)), count() FROM {database}.{PUBLISHER_TABLE} \
+            "SELECT toUInt32(min(live_min_indexed_at)), count() FROM {database}.{table} \
              WHERE live_min_indexed_at < toDateTime({BACKFILL_SENTINEL_INDEXED_AT})"
         ))
         .fetch_one::<(u32, u64)>()
         .await
-        .context("reading the publisher view boundary")?;
+        .with_context(|| format!("reading the view boundary of {table}"))?;
     Ok((rows > 0).then_some(seconds))
 }
 
@@ -287,51 +358,69 @@ pub async fn build_plan(
     target: Target,
     options: &PlanOptions,
 ) -> Result<Plan> {
-    let view_created_at = ops::require_view(client, database, target.materialized_view()).await?;
+    let view_created_at = ops::require_view(client, database, target).await?;
     let planned_at = ops::server_now(client).await?;
 
-    let publisher_bounds = match target {
-        Target::Publishers => Some(PublisherBounds {
-            indexed_before: capture_boundary(
+    let boundary = if target.is_additive() {
+        Some(
+            capture_boundary(
                 client,
                 database,
+                target,
                 view_created_at,
                 options.boundary_margin_secs,
             )
             .await?,
-            window_start: PublisherBounds::window_start_for(utc_day(planned_at)),
-        }),
-        Target::Longform => None,
+        )
+    } else {
+        None
+    };
+    let (publisher_bounds, view_boundary) = match (target, boundary) {
+        (Target::Publishers, Some(indexed_before)) => (
+            Some(PublisherBounds {
+                indexed_before,
+                window_start: PublisherBounds::window_start_for(utc_day(planned_at)),
+            }),
+            None,
+        ),
+        (_, boundary) => (None, boundary),
+    };
+    let bounds = SourceBounds {
+        indexed_before: boundary,
+        window_start: publisher_bounds.as_ref().map(|b| b.window_start),
     };
 
-    let table_rows = ops::table_parts(client, database, "events_local")
-        .await?
-        .rows;
-    let read = ops::column_bytes(client, database, "events_local", target.source_columns()).await?;
+    let mut table_rows = 0;
+    let mut read = ops::ColumnBytes::default();
+    for source in target.source_tables() {
+        table_rows += ops::table_parts(client, database, source).await?.rows;
+        let bytes = ops::column_bytes(client, database, source, target.source_columns()).await?;
+        read.compressed += bytes.compressed;
+        read.uncompressed += bytes.uncompressed;
+    }
     let shards = id_prefix_shards(options.id_prefix_len, table_rows);
 
     // Measure shard 0 with the real backfill SELECT: one primary-key range.
-    let sample = shards[0].range.predicate();
+    let sample = shards[0].range.predicate_on(target.shard_column());
     let (sample_rows, sample_source_rows) = client
-        .query(&format!(
-            "SELECT count(), countIf({}) FROM {database}.events_local WHERE {sample}",
-            target.source_filter(publisher_bounds.as_ref())
-        ))
+        .query(&target.sample_count_sql(database, &sample, &bounds))
         .fetch_one::<(u64, u64)>()
         .await
         .with_context(|| format!("sizing the {target} sample shard"))?;
+    let started = Instant::now();
     let sample_output_rows = client
         .query(&format!(
             "SELECT count() FROM ({})",
-            target.backfill_select_sql(database, &sample, publisher_bounds.as_ref())
+            target.backfill_select_sql(database, &sample, &bounds)
         ))
         .fetch_one::<u64>()
         .await
         .with_context(|| format!("running the {target} sample shard"))?;
+    let sample_elapsed_ms = started.elapsed().as_millis() as u64;
 
     let known_final_rows = match target {
         Target::Longform => longform_coordinates(client, database).await?,
-        Target::Publishers => 0,
+        _ => 0,
     };
 
     let bytes_per_row = measured_bytes_per_row(client, database, target).await?;
@@ -343,6 +432,7 @@ pub async fn build_plan(
         sample_source_rows,
         sample_output_rows,
         known_final_rows,
+        sample_elapsed_ms,
     };
     let estimate = estimate_disk(&source, shards.len(), bytes_per_row);
 
@@ -353,6 +443,7 @@ pub async fn build_plan(
         view_created_at,
         planned_at,
         publisher_bounds,
+        view_boundary,
         id_prefix_len: options.id_prefix_len,
         source,
         estimate,
@@ -385,6 +476,10 @@ async fn measured_bytes_per_row(client: &Client, database: &str, target: Target)
     let default = match target {
         Target::Publishers => DEFAULT_PUBLISHER_ROW_BYTES,
         Target::Longform => DEFAULT_LONGFORM_ROW_BYTES,
+        Target::UserFlags => DEFAULT_USER_FLAGS_ROW_BYTES,
+        Target::RelayLists => DEFAULT_RELAY_LISTS_ROW_BYTES,
+        // Few rows, each a sketch: the view's rows say little about a shard's.
+        Target::Kinds => return Ok(DEFAULT_KINDS_ROW_BYTES),
     };
     // Tiny parts are dominated by per-part overhead; only trust real volume.
     if parts.rows >= 100_000 {
@@ -393,7 +488,6 @@ async fn measured_bytes_per_row(client: &Client, database: &str, target: Target)
         Ok(default)
     }
 }
-
 /// Result of one completed shard, persisted as its checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShardCheckpoint {
@@ -571,29 +665,44 @@ pub fn describe_plan(plan: &Plan, min_free_bytes: u64) -> String {
     let s = &plan.source;
     let shards = plan.shards.len().max(1) as u64;
     let required = e.peak_bytes.saturating_add(min_free_bytes);
-    let bounds = plan.publisher_bounds.as_ref().map_or_else(
-        || "  source bounds:        all kind 30023 rows (idempotent argMin)\n".to_string(),
-        |b| {
-            format!(
-                "  view boundary:        indexed_at < {} (view created at {})\n\
-                 \x20 activity window:      day >= {} (TTL window at planning)\n",
-                b.indexed_before, plan.view_created_at, b.window_start
-            )
-        },
-    );
+    let bounds = match (&plan.publisher_bounds, plan.view_boundary, plan.target) {
+        (Some(b), _, _) => format!(
+            "  view boundary:        indexed_at < {} (view created at {})\n\
+             \x20 activity window:      day >= {} (TTL window at planning)\n",
+            b.indexed_before, plan.view_created_at, b.window_start
+        ),
+        (None, Some(c), _) => format!(
+            "  view boundary:        indexed_at < {c} (view created at {})\n",
+            plan.view_created_at
+        ),
+        (None, None, Target::UserFlags) => "  source bounds:        every pubkey of \
+             pubkeys_with_profile_data / pubkeys_with_follows_data (idempotent min)\n"
+            .to_string(),
+        (None, None, Target::RelayLists) => {
+            "  source bounds:        all kind 10002 rows (idempotent argMin)\n".to_string()
+        }
+        (None, None, _) => {
+            "  source bounds:        all kind 30023 rows (idempotent argMin)\n".to_string()
+        }
+    };
     let final_rows = if s.known_final_rows > 0 {
         format!("{} (from addressable_latest)", s.known_final_rows)
     } else {
         "unknown; at most the pre-merge rows".to_string()
     };
+    let sources = plan.target.source_tables().join(" + ");
+    let runtime = estimate_runtime_secs(s, plan.shards.len());
     format!(
         "target {target} ({table}) in {db}\n\
          {bounds}\
-         \x20 shards:               {n} by id prefix of length {len}\n\
-         \x20 events_local rows:    {table_rows} (~{per_shard} per shard)\n\
+         \x20 shards:               {n} by {column} prefix of length {len}\n\
+         \x20 source rows:          {table_rows} in {sources} (~{per_shard} per shard)\n\
          \x20 source read (est):    {read_c} compressed, {read_u} uncompressed in total \
-         (~{shard_c} per shard; every shard reads its id range of the full table)\n\
-         \x20 sample shard 0:       {sample_rows} rows, {sample_source} usable, {sample_out} target rows\n\
+         (~{shard_c} per shard; every shard reads its {column} range of the full table)\n\
+         \x20 sample shard 0:       {sample_rows} rows, {sample_source} usable, {sample_out} target \
+         rows in {sample_s:.1} s\n\
+         \x20 runtime (est):        ~{hours:.1} h wall-clock = {n} x (sample shard + {delay} s pause), \
+         no starts in {quiet} quiet minutes per hour\n\
          \x20 target rows (merged): {final_rows}\n\
          \x20 bytes per row (est):  {bpr}\n\
          \x20 pre-merge size (est): {pre} ({pre_rows} rows)\n\
@@ -603,6 +712,7 @@ pub fn describe_plan(plan: &Plan, min_free_bytes: u64) -> String {
         table = plan.target.table(),
         db = plan.database,
         n = plan.shards.len(),
+        column = plan.target.shard_column(),
         len = plan.id_prefix_len,
         table_rows = s.table_rows,
         per_shard = s.table_rows / shards,
@@ -612,6 +722,10 @@ pub fn describe_plan(plan: &Plan, min_free_bytes: u64) -> String {
         sample_rows = s.sample_rows,
         sample_source = s.sample_source_rows,
         sample_out = s.sample_output_rows,
+        sample_s = s.sample_elapsed_ms as f64 / 1000.0,
+        hours = runtime as f64 / 3600.0,
+        delay = DEFAULT_DELAY_SECS,
+        quiet = DEFAULT_QUIET_MINUTES,
         bpr = e.bytes_per_row,
         pre = ops::human_bytes(e.pre_merge_bytes),
         pre_rows = e.pre_merge_rows,
@@ -661,6 +775,44 @@ mod tests {
         assert_eq!(e.pre_merge_rows, 4_096_000);
         assert_eq!(e.pre_merge_bytes, 4_096_000 * 60);
         assert_eq!(e.peak_bytes, 2 * e.pre_merge_bytes);
+
+        // 256 shards of 25 s plus 5 s pauses, started in 50 of 60 minutes.
+        let stats = SourceStats {
+            sample_elapsed_ms: 25_000,
+            ..SourceStats::default()
+        };
+        assert_eq!(estimate_runtime_secs(&stats, 256), 256 * 30 * 60 / 50);
+    }
+
+    #[test]
+    fn plans_without_new_fields_still_load_and_bounds_follow_the_target() {
+        let mut plan = plan();
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json.as_object_mut().unwrap().remove("view_boundary");
+        json["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sample_elapsed_ms");
+        let loaded: Plan = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded, plan);
+        assert_eq!(
+            plan.source_bounds(),
+            SourceBounds {
+                indexed_before: Some(20),
+                window_start: NaiveDate::from_ymd_opt(2025, 9, 8),
+            }
+        );
+        plan.target = Target::Kinds;
+        plan.publisher_bounds = None;
+        plan.view_boundary = Some(30);
+        assert_eq!(plan.source_bounds().indexed_before, Some(30));
+        assert_eq!(
+            plan.shard_predicate(&plan.shards[1]),
+            "id >= '1' AND id < '2'"
+        );
+        plan.target = Target::UserFlags;
+        assert_eq!(plan.shard_predicate(&plan.shards[15]), "pubkey >= 'f'");
+        assert!(describe_plan(&plan, 0).contains("by pubkey prefix"));
     }
 
     #[test]
@@ -683,6 +835,7 @@ mod tests {
                 indexed_before: 20,
                 window_start: NaiveDate::from_ymd_opt(2025, 9, 8).unwrap(),
             }),
+            view_boundary: None,
             id_prefix_len: 1,
             source: SourceStats::default(),
             estimate: DiskEstimate::default(),
