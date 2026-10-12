@@ -45,9 +45,9 @@ Pensieve is an **archive-first** Nostr indexer. It stores canonical events in a 
 | `pensieve-negentropy-worker` | Experimental one-job isolated worker; `--socket PATH --parent-uid UID`. The parent scheduler runs behind `pensieve-ingest --isolated-negentropy` (not enabled by default); unit in `ops/systemd/pensieve-negentropy-worker.service`. See [worker contract](docs/negentropy_worker.md) and [runtime](docs/negentropy_runtime.md). |
 | `pensieve-parquet` | 🚧 Accepted V1 writer, strict validator, fixtures, and notepack converter prototype |
 | `pensieve-lake` | 🚧 Resumable notepack campaign, SQLite inventory, and immutable local/S3 publication |
-| `pensieve-serve` | ✅ Authenticated analytics HTTP API (~30 routes; each analytics family served from ClickHouse or Postgres). See [API docs](crates/pensieve-serve/README.md) |
+| `pensieve-serve` | ✅ Authenticated analytics HTTP API (~30 routes, served from ClickHouse). See [API docs](crates/pensieve-serve/README.md) |
 | `pensieve-preview` | ✅ Static HTML preview pages for Nostr events/profiles, plus the `preview-lookups` compact-lookup operator tool |
-| `pensieve-analytics` | 🚧 DuckDB batch tools that build analytics from Parquet snapshots and publish serving tables to Postgres |
+| `pensieve-analytics` | 🚧 DuckDB batch tools that build exact analytics from Parquet snapshots into local DuckDB databases and evidence-checked artifacts (research tooling; not served by the API) |
 | Deployment | ✅ Docker + systemd setup in `ops/` |
 
 ## Ingestion Modes
@@ -280,8 +280,7 @@ Environment variables are documented in example files:
 | [`env.production.example`](env.production.example) | Production Docker + systemd stack | `/etc/pensieve/pensieve.env` |
 | [`ops/parquet-shadow.env.example`](ops/parquet-shadow.env.example) | `pensieve-ingest` Parquet shadow settings | `/etc/pensieve/parquet-shadow.env` |
 | [`ops/parquet-campaign.env.example`](ops/parquet-campaign.env.example) | Parquet campaign service | `/etc/pensieve/parquet-campaign.env` |
-| [`ops/analytics.env.example`](ops/analytics.env.example) | Analytics batch tools | `/etc/pensieve/analytics.env` |
-| [`ops/analytics-refresh.env.example`](ops/analytics-refresh.env.example) | Analytics refresh timer | `/etc/pensieve/analytics-refresh.env` |
+| [`ops/analytics.env.example`](ops/analytics.env.example) | DuckDB analytics batch tools | `/etc/pensieve/analytics.env` |
 
 Only `pensieve-serve` and `pensieve-preview` load a `.env` file (default `.env`; override
 with `--dotenv <path>` or `DOTENV_PATH`). `pensieve-ingest` never loads `.env`: it is
@@ -297,7 +296,7 @@ See [`ops/RUNBOOK.md`](ops/RUNBOOK.md) for production setup and the deploy/cutov
 - [`docs/ingestion_pipeline.md`](docs/ingestion_pipeline.md) — Pipeline architecture and design decisions
 - [`docs/clickhouse_self_hosted.sql`](docs/clickhouse_self_hosted.sql) — Base ClickHouse schema for fresh installs (not a production snapshot)
 - [`docs/migrations/README.md`](docs/migrations/README.md) — ClickHouse migrations and production schema state
-- [`docs/migration-plan.md`](docs/migration-plan.md) — Lakehouse (Parquet + DuckDB + Postgres) migration plan
+- [`docs/migration-plan.md`](docs/migration-plan.md) — Lakehouse migration plan (its Postgres serving store was abandoned on 2026-10-12)
 
 ## License
 

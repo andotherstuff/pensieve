@@ -2,26 +2,15 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{DateTime, NaiveDate};
+use chrono::NaiveDate;
 use clickhouse::Row;
-use pensieve_core::{
-    LatestEventWatermark, NOSTR_GENESIS_TIMESTAMP, ZAP_HISTOGRAM_UPPER_SATS,
-    read_latest_event_watermark,
-};
+use pensieve_core::{LatestEventWatermark, NOSTR_GENESIS_TIMESTAMP, read_latest_event_watermark};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
-use crate::postgres_analytics::{
-    EventDistinctGrain, ZapPeriodGrain, current_event_products, current_longform_products,
-    current_publisher_product, current_serving_product, current_zap_products,
-    estimate_event_distinct, estimate_event_distinct_periods, estimate_flexible_distinct,
-    estimate_zap_distinct_periods, estimate_zap_distinct_roles, event_period_expression,
-    zap_period_expression,
-};
-use crate::state::{AnalyticsFamily, AppState};
+use crate::state::AppState;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Overview
@@ -161,28 +150,6 @@ pub async fn latest_event(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_overview(state: &AppState) -> Result<OverviewResponse, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
-        let client = state
-            .postgres_client(AnalyticsFamily::Overview)
-            .await
-            .map_err(ApiError::Internal)?;
-        let row = client
-            .query_one(
-                "SELECT total_events,total_pubkeys,kinds_30d,earliest_event
-                   FROM pensieve_analytics.current_overview",
-                &[],
-            )
-            .await
-            .map_err(|error| ApiError::Internal(error.into()))?;
-        return Ok(OverviewResponse {
-            total_events: nonnegative_u64(row.get(0), "total_events")?,
-            total_pubkeys: nonnegative_u64(row.get(1), "total_pubkeys")?,
-            total_kinds: nonnegative_u64(row.get(2), "total_kinds")?,
-            earliest_event: api_timestamp(row.get(3), "earliest_event")?
-                .max(NOSTR_GENESIS_TIMESTAMP),
-            latest_event: read_fresh_watermark(state)?,
-        });
-    }
     // A single refresh must not exhaust the two-query pool with siblings that
     // time out waiting for each other. Fail before starting later reads on error.
     let total_events = fetch_total_events(state).await?;
@@ -200,9 +167,6 @@ async fn fetch_overview(state: &AppState) -> Result<OverviewResponse, ApiError> 
 }
 
 async fn fetch_total_events(state: &AppState) -> Result<u64, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
-        return fetch_postgres_overview_metric(state, "total_events").await;
-    }
     state
         .clickhouse
         .query("SELECT sum(rows) FROM system.parts WHERE database = currentDatabase() AND table = 'events_local' AND active")
@@ -211,9 +175,6 @@ async fn fetch_total_events(state: &AppState) -> Result<u64, ApiError> {
 }
 
 async fn fetch_total_pubkeys(state: &AppState) -> Result<u64, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
-        return fetch_postgres_overview_metric(state, "total_pubkeys").await;
-    }
     state
         .clickhouse
         .query("SELECT count() FROM pubkey_first_seen_data")
@@ -222,9 +183,6 @@ async fn fetch_total_pubkeys(state: &AppState) -> Result<u64, ApiError> {
 }
 
 async fn fetch_total_kinds(state: &AppState) -> Result<u64, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
-        return fetch_postgres_overview_metric(state, "kinds_30d").await;
-    }
     state
         .clickhouse
         .query("SELECT uniq(kind) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY")
@@ -233,12 +191,6 @@ async fn fetch_total_kinds(state: &AppState) -> Result<u64, ApiError> {
 }
 
 async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview) {
-        let value = fetch_postgres_overview_metric(state, "earliest_event").await?;
-        return Ok(u32::try_from(value)
-            .map_err(|_| ApiError::Internal(anyhow::anyhow!("earliest_event exceeds u32")))?
-            .max(NOSTR_GENESIS_TIMESTAMP));
-    }
     // Share this stable result with overview, which otherwise repeats the full scan.
     let client = state.clickhouse.clone();
     get_or_compute_with_ttl(
@@ -257,9 +209,7 @@ async fn fetch_earliest_event(state: &AppState) -> Result<u32, ApiError> {
 }
 
 async fn fetch_latest_event(state: &AppState) -> Result<u32, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::Overview)
-        || state.config.latest_event_watermark_path.is_some()
-    {
+    if state.config.latest_event_watermark_path.is_some() {
         return read_fresh_watermark(state);
     }
     // Use max() aggregate, excluding future timestamps
@@ -268,32 +218,6 @@ async fn fetch_latest_event(state: &AppState) -> Result<u32, ApiError> {
         .query("SELECT toUInt32(max(created_at)) FROM events_local WHERE created_at <= now()")
         .fetch_one::<u32>()
         .await
-}
-
-async fn fetch_postgres_overview_metric(
-    state: &AppState,
-    column: &'static str,
-) -> Result<u64, ApiError> {
-    let query = match column {
-        "total_events" => "SELECT total_events FROM pensieve_analytics.current_overview",
-        "total_pubkeys" => "SELECT total_pubkeys FROM pensieve_analytics.current_overview",
-        "kinds_30d" => "SELECT kinds_30d FROM pensieve_analytics.current_overview",
-        "earliest_event" => "SELECT earliest_event FROM pensieve_analytics.current_overview",
-        _ => {
-            return Err(ApiError::Internal(anyhow::anyhow!(
-                "invalid overview metric"
-            )));
-        }
-    };
-    let client = state
-        .postgres_client(AnalyticsFamily::Overview)
-        .await
-        .map_err(ApiError::Internal)?;
-    let row = client
-        .query_one(query, &[])
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    nonnegative_u64(row.get(0), column)
 }
 
 fn read_fresh_watermark(state: &AppState) -> Result<u32, ApiError> {
@@ -343,25 +267,11 @@ fn validate_watermark_freshness(
         })
 }
 
-fn nonnegative_u64(value: i64, name: &'static str) -> Result<u64, ApiError> {
-    u64::try_from(value).map_err(|_| ApiError::Internal(anyhow::anyhow!("{name} is negative")))
-}
-
-fn api_timestamp(value: i64, name: &'static str) -> Result<u32, ApiError> {
-    u32::try_from(value)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("{name} is outside the API domain")))
-}
-
 #[cfg(test)]
-mod postgres_analytics_tests {
+mod watermark_tests {
     use pensieve_core::LatestEventWatermark;
 
-    use super::{
-        api_timestamp, engagement_response, longform_response, nonnegative_u64,
-        resolve_event_window, retention_response, rounded_percent,
-        validate_postgres_publisher_days, validate_postgres_zap_days, validate_watermark_freshness,
-        zap_aggregate_response, zap_bucket_contract,
-    };
+    use super::validate_watermark_freshness;
 
     fn watermark() -> LatestEventWatermark {
         LatestEventWatermark {
@@ -375,15 +285,6 @@ mod postgres_analytics_tests {
     }
 
     #[test]
-    fn postgres_scalars_fail_closed_outside_the_api_domain() {
-        assert_eq!(nonnegative_u64(7, "metric").unwrap(), 7);
-        assert!(nonnegative_u64(-1, "metric").is_err());
-        assert_eq!(api_timestamp(7, "timestamp").unwrap(), 7);
-        assert!(api_timestamp(-1, "timestamp").is_err());
-        assert!(api_timestamp(i64::from(u32::MAX) + 1, "timestamp").is_err());
-    }
-
-    #[test]
     fn watermark_freshness_rejects_stale_future_and_invalid_api_values() {
         assert_eq!(
             validate_watermark_freshness(&watermark(), 110, 10).unwrap(),
@@ -394,104 +295,6 @@ mod postgres_analytics_tests {
         let mut empty = watermark();
         empty.max_eligible_created_at = None;
         assert_eq!(validate_watermark_freshness(&empty, 101, 10).unwrap(), 0);
-    }
-
-    #[test]
-    fn retention_adapter_uses_the_explicit_period_zero_denominator() {
-        let response = retention_response(
-            "2026-01-05".to_owned(),
-            vec![
-                ("2026-01-12".to_owned(), 4),
-                ("2026-01-05".to_owned(), 10),
-                ("2026-01-19".to_owned(), 2),
-            ],
-        );
-        assert_eq!(response.cohort_size, 10);
-        assert_eq!(response.retention, vec![4, 10, 2]);
-        assert_eq!(response.retention_pct, vec![40.0, 100.0, 20.0]);
-
-        let missing_period_zero =
-            retention_response("2026-01-05".to_owned(), vec![("2026-01-12".to_owned(), 4)]);
-        assert_eq!(missing_period_zero.cohort_size, 0);
-        assert_eq!(missing_period_zero.retention_pct, vec![0.0]);
-    }
-
-    #[test]
-    fn engagement_adapter_preserves_zero_denominator_behavior() {
-        let populated = engagement_response(30, 10, 4, 5);
-        assert_eq!(populated.replies_per_note, 0.4);
-        assert_eq!(populated.reactions_per_note, 0.5);
-
-        let empty = engagement_response(30, 0, 0, 0);
-        assert_eq!(empty.replies_per_note, 0.0);
-        assert_eq!(empty.reactions_per_note, 0.0);
-    }
-
-    #[test]
-    fn longform_adapter_preserves_exact_totals_and_zero_behavior() {
-        let populated = longform_response(4, 3, 100);
-        assert_eq!(populated.articles_count, 4);
-        assert_eq!(populated.unique_authors, 3);
-        assert_eq!(populated.avg_content_length, 25.0);
-        assert_eq!(populated.estimated_total_words, 20);
-
-        let empty = longform_response(0, 0, 0);
-        assert_eq!(empty.avg_content_length, 0.0);
-        assert_eq!(empty.estimated_total_words, 0);
-    }
-
-    #[test]
-    fn zap_adapter_preserves_millisatoshi_totals_and_zero_behavior() {
-        let populated = zap_aggregate_response(2, 2_501, 2, 1);
-        assert_eq!(populated.total_sats, 2);
-        assert_eq!(populated.avg_zap_sats, 1.2505);
-        assert_eq!(populated.unique_senders, 2);
-        assert_eq!(populated.unique_recipients, 1);
-
-        let empty = zap_aggregate_response(0, 0, 0, 0);
-        assert_eq!(empty.avg_zap_sats, 0.0);
-    }
-
-    #[test]
-    fn zap_histogram_contract_matches_public_boundaries_and_rounding() {
-        assert_eq!(zap_bucket_contract(0), ("1-10 sats", 1, 10));
-        assert_eq!(zap_bucket_contract(1), ("11-21 sats", 11, 21));
-        assert_eq!(
-            zap_bucket_contract(16),
-            ("100K+ sats", 100_001, 999_999_999)
-        );
-        assert_eq!(rounded_percent(1, 3), 33.33);
-        assert_eq!(rounded_percent(2, 3), 66.67);
-        assert_eq!(rounded_percent(0, 0), 0.0);
-    }
-
-    #[test]
-    fn postgres_zap_windows_are_strictly_bounded() {
-        assert!(validate_postgres_zap_days(1).is_ok());
-        assert!(validate_postgres_zap_days(366).is_ok());
-        assert!(validate_postgres_zap_days(0).is_err());
-        assert!(validate_postgres_zap_days(367).is_err());
-    }
-
-    #[test]
-    fn postgres_event_windows_use_complete_hours_and_hard_bounds() {
-        let complete = 400 * 86_400 + 3_600;
-        assert_eq!(
-            resolve_event_window(complete, Some(30), None, None).unwrap(),
-            (complete - 30 * 86_400, complete)
-        );
-        assert!(resolve_event_window(complete, Some(0), None, None).is_err());
-        assert!(resolve_event_window(complete, Some(367), None, None).is_err());
-    }
-
-    #[test]
-    fn postgres_publishers_accept_only_materialized_exact_windows() {
-        for days in [1, 7, 30, 90, 365] {
-            assert!(validate_postgres_publisher_days(days).is_ok());
-        }
-        for days in [0, 2, 29, 366] {
-            assert!(validate_postgres_publisher_days(days).is_err());
-        }
     }
 }
 
@@ -585,18 +388,6 @@ pub async fn events(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Events) {
-            return fetch_postgres_events(
-                &state,
-                kind,
-                days,
-                since,
-                until,
-                group_by.as_deref(),
-                limit,
-            )
-            .await;
-        }
         // Use pre-aggregated daily_user_stats when possible (no kind filter)
         // This is MUCH faster than scanning events_local
         let use_preaggregated = kind.is_none() && group_by.is_some();
@@ -774,147 +565,6 @@ pub async fn events(
     Ok(Json(result))
 }
 
-async fn fetch_postgres_events(
-    state: &AppState,
-    kind: Option<u16>,
-    days: Option<u32>,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-    group_by: Option<&str>,
-    limit: u32,
-) -> Result<serde_json::Value, ApiError> {
-    let client = state
-        .postgres_client(AnalyticsFamily::Events)
-        .await
-        .map_err(ApiError::Internal)?;
-    let products = current_event_products(&client)
-        .await
-        .map_err(ApiError::Internal)?;
-    let (since_epoch, until_epoch) =
-        resolve_event_window(products.complete_through_epoch, days, since, until)?;
-    let kind_key = kind.map_or(-1, i32::from);
-    let Some(group_by) = group_by else {
-        let row = client
-            .query_one(
-                "SELECT COALESCE(SUM(event_count),0)::bigint
-                   FROM pensieve_analytics.serving_hourly_counts
-                  WHERE product_id=$1 AND kind=$2
-                    AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600",
-                &[
-                    &products.serving_product_id,
-                    &kind_key,
-                    &since_epoch,
-                    &until_epoch,
-                ],
-            )
-            .await
-            .map_err(|error| ApiError::Internal(error.into()))?;
-        let count = nonnegative_u64(row.get(0), "event count")?;
-        let unique_pubkeys =
-            estimate_event_distinct(&client, &products, since_epoch, until_epoch, kind)
-                .await
-                .map_err(ApiError::Internal)?;
-        return Ok(serde_json::to_value(EventCountResponse {
-            count,
-            unique_pubkeys,
-        })?);
-    };
-    let grain = match group_by {
-        "day" => EventDistinctGrain::Day,
-        "week" => EventDistinctGrain::Week,
-        "month" => EventDistinctGrain::Month,
-        _ => unreachable!("group_by was validated before caching"),
-    };
-    // Serving facts store hour ordinals; sketch leaves store Unix seconds.
-    let period_expression =
-        event_period_expression(grain).replace("hour_epoch", "(hour_epoch * 3600)");
-    let query = format!(
-        "SELECT {period_expression} AS period_key,SUM(event_count)::bigint
-           FROM pensieve_analytics.serving_hourly_counts
-          WHERE product_id=$1 AND kind=$2
-            AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600
-          GROUP BY period_key ORDER BY period_key DESC LIMIT $5"
-    );
-    let counts = client
-        .query(
-            &query,
-            &[
-                &products.serving_product_id,
-                &kind_key,
-                &since_epoch,
-                &until_epoch,
-                &i64::from(limit),
-            ],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let distinct =
-        estimate_event_distinct_periods(&client, &products, since_epoch, until_epoch, kind, grain)
-            .await
-            .map_err(ApiError::Internal)?
-            .into_iter()
-            .map(|period| (period.period_key, period.unique_pubkeys))
-            .collect::<BTreeMap<_, _>>();
-    let mut response = Vec::with_capacity(counts.len());
-    for row in counts {
-        let period_key: i64 = row.get(0);
-        let unique_pubkeys = distinct.get(&period_key).copied().ok_or_else(|| {
-            ApiError::Internal(anyhow::anyhow!(
-                "event count period has no accepted distinct leaf"
-            ))
-        })?;
-        response.push(EventCountByPeriod {
-            period: period_label(period_key)?,
-            count: nonnegative_u64(row.get(1), "period event count")?,
-            unique_pubkeys,
-        });
-    }
-    Ok(serde_json::to_value(response)?)
-}
-
-fn resolve_event_window(
-    complete_through_epoch: i64,
-    days: Option<u32>,
-    since: Option<NaiveDate>,
-    until: Option<NaiveDate>,
-) -> Result<(i64, i64), ApiError> {
-    let (since_epoch, until_epoch) = if let Some(days @ 1..=366) = days {
-        (
-            complete_through_epoch - i64::from(days) * 86_400,
-            complete_through_epoch,
-        )
-    } else if let Some(days) = days {
-        return Err(ApiError::BadRequest(format!(
-            "days must be between 1 and 366, got {days}"
-        )));
-    } else {
-        let since_epoch = since.map_or(i64::from(NOSTR_GENESIS_TIMESTAMP), naive_date_epoch);
-        let until_epoch = until
-            .map(naive_date_epoch)
-            .unwrap_or(complete_through_epoch)
-            .min(complete_through_epoch);
-        (since_epoch, until_epoch)
-    };
-    if since_epoch < 0
-        || since_epoch >= until_epoch
-        || since_epoch % 3_600 != 0
-        || until_epoch % 3_600 != 0
-        || until_epoch - since_epoch > 366 * 86_400
-    {
-        return Err(ApiError::BadRequest(
-            "event window must be non-empty, hour-aligned, and at most 366 days".to_owned(),
-        ));
-    }
-    Ok((since_epoch, until_epoch))
-}
-
-fn naive_date_epoch(date: NaiveDate) -> i64 {
-    date.and_hms_opt(0, 0, 0)
-        .expect("midnight is valid")
-        .and_utc()
-        .timestamp()
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Active Users
 // ═══════════════════════════════════════════════════════════════════════════
@@ -964,9 +614,6 @@ pub async fn active_users_summary(
 
 /// Fetch the most recent daily active users from the pre-computed table.
 async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-        return fetch_latest_postgres_active_users(state, "day").await;
-    }
     state
         .clickhouse
         .query(
@@ -987,9 +634,6 @@ async fn fetch_latest_daily_active_users(state: &AppState) -> Result<ActiveUsers
 
 /// Fetch the most recent weekly active users from the pre-computed table.
 async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-        return fetch_latest_postgres_active_users(state, "week").await;
-    }
     state
         .clickhouse
         .query(
@@ -1010,9 +654,6 @@ async fn fetch_latest_weekly_active_users(state: &AppState) -> Result<ActiveUser
 
 /// Fetch the most recent monthly active users from the pre-computed table.
 async fn fetch_latest_monthly_active_users(state: &AppState) -> Result<ActiveUsersCount, ApiError> {
-    if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-        return fetch_latest_postgres_active_users(state, "month").await;
-    }
     state
         .clickhouse
         .query(
@@ -1073,9 +714,6 @@ pub async fn active_users_daily(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-            return fetch_postgres_active_users(&state, "day", since, limit).await;
-        }
         // Fetch all daily data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -1128,9 +766,6 @@ pub async fn active_users_weekly(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-            return fetch_postgres_active_users(&state, "week", since, limit).await;
-        }
         // Fetch all weekly data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -1183,9 +818,6 @@ pub async fn active_users_monthly(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::ActiveUsers) {
-            return fetch_postgres_active_users(&state, "month", since, limit).await;
-        }
         // Fetch all monthly data from the small summary table, filter in Rust
         let mut rows: Vec<ActiveUsersRow> = state
             .clickhouse
@@ -1216,77 +848,6 @@ pub async fn active_users_monthly(
     .await?;
 
     Ok(Json(result))
-}
-
-async fn fetch_latest_postgres_active_users(
-    state: &AppState,
-    grain: &'static str,
-) -> Result<ActiveUsersCount, ApiError> {
-    let client = state
-        .postgres_client(AnalyticsFamily::ActiveUsers)
-        .await
-        .map_err(ApiError::Internal)?;
-    let row = client
-        .query_one(
-            "SELECT active_users,has_profile,has_follows_list,
-                    has_profile_and_follows_list,total_events
-               FROM pensieve_analytics.current_active_users_period
-              WHERE grain=$1
-              ORDER BY period_start DESC
-              LIMIT 1",
-            &[&grain],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    postgres_active_users_count(&row)
-}
-
-async fn fetch_postgres_active_users(
-    state: &AppState,
-    grain: &'static str,
-    since: Option<NaiveDate>,
-    limit: usize,
-) -> Result<Vec<ActiveUsersRow>, ApiError> {
-    let client = state
-        .postgres_client(AnalyticsFamily::ActiveUsers)
-        .await
-        .map_err(ApiError::Internal)?;
-    let limit = i64::try_from(limit)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("active-user limit exceeds i64")))?;
-    let rows = client
-        .query(
-            "SELECT to_char(period_start,'YYYY-MM-DD'),active_users,has_profile,
-                    has_follows_list,has_profile_and_follows_list,total_events
-               FROM pensieve_analytics.current_active_users_period
-              WHERE grain=$1 AND ($2::date IS NULL OR period_start >= $2)
-              ORDER BY period_start DESC
-              LIMIT $3",
-            &[&grain, &since, &limit],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    rows.iter().map(postgres_active_users_row).collect()
-}
-
-fn postgres_active_users_count(row: &tokio_postgres::Row) -> Result<ActiveUsersCount, ApiError> {
-    Ok(ActiveUsersCount {
-        active_users: nonnegative_u64(row.get(0), "active_users")?,
-        has_profile: nonnegative_u64(row.get(1), "has_profile")?,
-        has_follows_list: nonnegative_u64(row.get(2), "has_follows_list")?,
-        has_profile_and_follows_list: nonnegative_u64(row.get(3), "has_profile_and_follows_list")?,
-        total_events: nonnegative_u64(row.get(4), "total_events")?,
-    })
-}
-
-fn postgres_active_users_row(row: &tokio_postgres::Row) -> Result<ActiveUsersRow, ApiError> {
-    Ok(ActiveUsersRow {
-        period: row.get(0),
-        active_users: nonnegative_u64(row.get(1), "active_users")?,
-        has_profile: nonnegative_u64(row.get(2), "has_profile")?,
-        has_follows_list: nonnegative_u64(row.get(3), "has_follows_list")?,
-        has_profile_and_follows_list: nonnegative_u64(row.get(4), "has_profile_and_follows_list")?,
-        total_events: nonnegative_u64(row.get(5), "total_events")?,
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1332,37 +893,6 @@ pub async fn throughput(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Events) {
-            let client = state
-                .postgres_client(AnalyticsFamily::Events)
-                .await
-                .map_err(ApiError::Internal)?;
-            let product = current_serving_product(&client)
-                .await
-                .map_err(ApiError::Internal)?;
-            let since_epoch = product.complete_through_epoch - 7 * 86_400;
-            let kind_key = kind.map_or(-1, i32::from);
-            let row = client
-                .query_one(
-                    "SELECT COALESCE(SUM(event_count),0)::bigint
-                       FROM pensieve_analytics.serving_hourly_counts
-                      WHERE product_id=$1 AND kind=$2
-                        AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600",
-                    &[
-                        &product.product_id,
-                        &kind_key,
-                        &since_epoch,
-                        &product.complete_through_epoch,
-                    ],
-                )
-                .await
-                .map_err(|error| ApiError::Internal(error.into()))?;
-            let total_events_7d = nonnegative_u64(row.get(0), "throughput events")?;
-            return Ok(ThroughputResponse {
-                events_per_hour: total_events_7d as f64 / 168.0,
-                total_events_7d,
-            });
-        }
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),
@@ -1463,10 +993,6 @@ pub async fn user_retention(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Retention) {
-            return fetch_postgres_retention(&state, cohort_size, cohort_start, limit as usize)
-                .await;
-        }
         // Build cohort filter clause
         let cohort_filter = match cohort_start {
             Some(date) => format!("WHERE cohort >= '{}'", date),
@@ -1543,82 +1069,6 @@ pub async fn user_retention(
     Ok(Json(result))
 }
 
-async fn fetch_postgres_retention(
-    state: &AppState,
-    grain: &str,
-    cohort_start: Option<NaiveDate>,
-    limit: usize,
-) -> Result<Vec<CohortRetention>, ApiError> {
-    let client = state
-        .postgres_client(AnalyticsFamily::Retention)
-        .await
-        .map_err(ApiError::Internal)?;
-    let limit = i64::try_from(limit)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("retention limit exceeds i64")))?;
-    let rows = client
-        .query(
-            "WITH selected AS (
-                 SELECT DISTINCT cohort_start
-                   FROM pensieve_analytics.current_cohort_retention_period
-                  WHERE grain=$1 AND ($2::date IS NULL OR cohort_start >= $2)
-                  ORDER BY cohort_start DESC
-                  LIMIT $3
-             )
-             SELECT to_char(retention.cohort_start,'YYYY-MM-DD'),
-                    to_char(retention.activity_period,'YYYY-MM-DD'),
-                    retention.active_pubkeys
-               FROM pensieve_analytics.current_cohort_retention_period retention
-               JOIN selected USING (cohort_start)
-              WHERE retention.grain=$1
-              ORDER BY retention.cohort_start DESC, retention.activity_period ASC",
-            &[&grain, &cohort_start, &limit],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let mut groups = Vec::<(String, Vec<(String, u64)>)>::new();
-    for row in rows {
-        let cohort: String = row.get(0);
-        let activity_period: String = row.get(1);
-        let active_count = nonnegative_u64(row.get(2), "active_pubkeys")?;
-        if groups.last().is_none_or(|(current, _)| current != &cohort) {
-            groups.push((cohort.clone(), Vec::new()));
-        }
-        groups
-            .last_mut()
-            .expect("retention group was just inserted")
-            .1
-            .push((activity_period, active_count));
-    }
-    Ok(groups
-        .into_iter()
-        .map(|(cohort, periods)| retention_response(cohort, periods))
-        .collect())
-}
-
-fn retention_response(cohort: String, periods: Vec<(String, u64)>) -> CohortRetention {
-    let cohort_size = periods
-        .iter()
-        .find(|(period, _)| period == &cohort)
-        .map_or(0, |(_, count)| *count);
-    let retention = periods.iter().map(|(_, count)| *count).collect::<Vec<_>>();
-    let retention_pct = retention
-        .iter()
-        .map(|count| {
-            if cohort_size == 0 {
-                0.0
-            } else {
-                (*count as f64 / cohort_size as f64) * 100.0
-            }
-        })
-        .collect();
-    CohortRetention {
-        cohort,
-        cohort_size,
-        retention,
-        retention_pct,
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // New Users
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1680,15 +1130,6 @@ pub async fn new_users(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::NewUsers) {
-            return fetch_postgres_new_users(
-                &state,
-                group_by.as_deref().unwrap_or("day"),
-                since,
-                limit as usize,
-            )
-            .await;
-        }
         let since_clause = match since {
             Some(date) => format!("AND date >= '{}'", date),
             None => String::new(),
@@ -1715,50 +1156,6 @@ pub async fn new_users(
     .await?;
 
     Ok(Json(result))
-}
-
-async fn fetch_postgres_new_users(
-    state: &AppState,
-    grain: &str,
-    since: Option<NaiveDate>,
-    limit: usize,
-) -> Result<Vec<NewUsersRow>, ApiError> {
-    let period = match grain {
-        "day" => "day",
-        "week" => "date_trunc('week',day)::date",
-        "month" => "date_trunc('month',day)::date",
-        _ => {
-            return Err(ApiError::Internal(anyhow::anyhow!(
-                "invalid new-user grain"
-            )));
-        }
-    };
-    let query = format!(
-        "SELECT to_char({period},'YYYY-MM-DD'),SUM(new_pubkeys)::bigint
-           FROM pensieve_analytics.current_new_users_daily
-          WHERE ($1::date IS NULL OR day >= $1)
-          GROUP BY {period}
-          ORDER BY {period} DESC
-          LIMIT $2"
-    );
-    let limit = i64::try_from(limit)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("new-user limit exceeds i64")))?;
-    let client = state
-        .postgres_client(AnalyticsFamily::NewUsers)
-        .await
-        .map_err(ApiError::Internal)?;
-    client
-        .query(&query, &[&since, &limit])
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?
-        .iter()
-        .map(|row| {
-            Ok(NewUsersRow {
-                period: row.get(0),
-                new_users: nonnegative_u64(row.get(1), "new_users")?,
-            })
-        })
-        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1805,9 +1202,6 @@ pub async fn hourly_activity(
     let cache = state.cache.clone();
     let result =
         get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            if state.uses_postgres(AnalyticsFamily::Activity) {
-                return fetch_postgres_hourly_activity(&state, days, kind).await;
-            }
             let kind_clause = match kind {
                 Some(kind) => format!("AND kind = {}", kind),
                 None => String::new(),
@@ -1836,74 +1230,6 @@ pub async fn hourly_activity(
         .await?;
 
     Ok(Json(result))
-}
-
-async fn fetch_postgres_hourly_activity(
-    state: &AppState,
-    days: u32,
-    kind: Option<u16>,
-) -> Result<Vec<HourlyActivityRow>, ApiError> {
-    if days == 0 {
-        return Err(ApiError::BadRequest("days must be at least 1".to_owned()));
-    }
-    let client = state
-        .postgres_client(AnalyticsFamily::Activity)
-        .await
-        .map_err(ApiError::Internal)?;
-    let products = current_event_products(&client)
-        .await
-        .map_err(ApiError::Internal)?;
-    let until_epoch = products.complete_through_epoch;
-    let since_epoch = until_epoch - i64::from(days) * 86_400;
-    let kind_key = kind.map_or(-1, i32::from);
-    let rows = client
-        .query(
-            "SELECT hour_epoch % 24 AS hour_of_day,
-                    SUM(event_count)::bigint
-               FROM pensieve_analytics.serving_hourly_counts
-              WHERE product_id=$1 AND kind=$2
-                AND hour_epoch >= $3::bigint / 3600 AND hour_epoch < $4::bigint / 3600
-              GROUP BY hour_of_day ORDER BY hour_of_day",
-            &[
-                &products.serving_product_id,
-                &kind_key,
-                &since_epoch,
-                &until_epoch,
-            ],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let distinct = estimate_event_distinct_periods(
-        &client,
-        &products,
-        since_epoch,
-        until_epoch,
-        kind,
-        EventDistinctGrain::HourOfDay,
-    )
-    .await
-    .map_err(ApiError::Internal)?
-    .into_iter()
-    .map(|period| (period.period_key, period.unique_pubkeys))
-    .collect::<BTreeMap<_, _>>();
-    rows.iter()
-        .map(|row| {
-            let hour_key: i64 = row.get(0);
-            let event_count = nonnegative_u64(row.get(1), "hour-of-day event count")?;
-            let unique_pubkeys = distinct.get(&hour_key).copied().ok_or_else(|| {
-                ApiError::Internal(anyhow::anyhow!(
-                    "hour-of-day count has no accepted distinct leaf"
-                ))
-            })?;
-            Ok(HourlyActivityRow {
-                hour: u8::try_from(hour_key)
-                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("hour-of-day exceeds u8")))?,
-                event_count,
-                unique_pubkeys,
-                avg_per_day: event_count as f64 / f64::from(days),
-            })
-        })
-        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1973,9 +1299,6 @@ pub async fn zap_stats(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Zaps) {
-            return fetch_postgres_zap_stats(&state, days, group_by.as_deref(), limit).await;
-        }
         match group_by.as_deref() {
             Some("day") => {
                 let rows: Vec<ZapStatsByPeriod> = state
@@ -2073,103 +1396,6 @@ pub async fn zap_stats(
     Ok(Json(result))
 }
 
-async fn fetch_postgres_zap_stats(
-    state: &AppState,
-    days: u32,
-    group_by: Option<&str>,
-    limit: u32,
-) -> Result<serde_json::Value, ApiError> {
-    validate_postgres_zap_days(days)?;
-    let client = state
-        .postgres_client(AnalyticsFamily::Zaps)
-        .await
-        .map_err(ApiError::Internal)?;
-    let products = current_zap_products(&client)
-        .await
-        .map_err(ApiError::Internal)?;
-    let until_epoch = products.complete_through_epoch;
-    let since_epoch = until_epoch
-        .checked_sub(i64::from(days) * 86_400)
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap window underflow")))?;
-    let Some(group_by) = group_by else {
-        let row = client
-            .query_one(
-                "SELECT COALESCE(SUM(accepted),0)::bigint,
-                        COALESCE(SUM(amount_msats),0)::bigint
-                   FROM pensieve_analytics.semantic_zap_daily
-                  WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3",
-                &[&products.semantic_product_id, &since_epoch, &until_epoch],
-            )
-            .await
-            .map_err(|error| ApiError::Internal(error.into()))?;
-        let total_zaps = nonnegative_u64(row.get(0), "zap count")?;
-        let amount_msats = nonnegative_u64(row.get(1), "zap amount")?;
-        let (unique_senders, unique_recipients) =
-            estimate_zap_distinct_roles(&client, &products, since_epoch, until_epoch)
-                .await
-                .map_err(ApiError::Internal)?;
-        return Ok(serde_json::to_value(zap_aggregate_response(
-            total_zaps,
-            amount_msats,
-            unique_senders,
-            unique_recipients,
-        ))?);
-    };
-
-    let grain = match group_by {
-        "day" => ZapPeriodGrain::Day,
-        "week" => ZapPeriodGrain::Week,
-        "month" => ZapPeriodGrain::Month,
-        _ => unreachable!("group_by was validated before caching"),
-    };
-    let period_expression = zap_period_expression(grain);
-    let query = format!(
-        "SELECT {period_expression} AS period_epoch,
-                SUM(accepted)::bigint,SUM(amount_msats)::bigint
-           FROM pensieve_analytics.semantic_zap_daily
-          WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3
-          GROUP BY period_epoch ORDER BY period_epoch DESC LIMIT $4"
-    );
-    let rows = client
-        .query(
-            &query,
-            &[
-                &products.semantic_product_id,
-                &since_epoch,
-                &until_epoch,
-                &i64::from(limit),
-            ],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let distinct =
-        estimate_zap_distinct_periods(&client, &products, since_epoch, until_epoch, grain)
-            .await
-            .map_err(ApiError::Internal)?
-            .into_iter()
-            .map(|period| {
-                (
-                    period.period_epoch,
-                    (period.unique_senders, period.unique_recipients),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-    let mut response = Vec::with_capacity(rows.len());
-    for row in rows {
-        let period_epoch: i64 = row.get(0);
-        let (unique_senders, unique_recipients) =
-            distinct.get(&period_epoch).copied().unwrap_or((0, 0));
-        response.push(zap_period_response(
-            period_label(period_epoch)?,
-            nonnegative_u64(row.get(1), "period zap count")?,
-            nonnegative_u64(row.get(2), "period zap amount")?,
-            unique_senders,
-            unique_recipients,
-        ));
-    }
-    Ok(serde_json::to_value(response)?)
-}
-
 /// Query parameters for zap histogram.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZapHistogramQuery {
@@ -2221,9 +1447,6 @@ pub async fn zap_histogram(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Zaps) {
-            return fetch_postgres_zap_histogram(&state, days).await;
-        }
         // Use ClickHouse's multiIf to bucket amounts, then aggregate
         // 17 buckets for granular distribution analysis
         let rows: Vec<ZapHistogramBucket> = state
@@ -2311,167 +1534,6 @@ pub async fn zap_histogram(
     Ok(Json(result))
 }
 
-async fn fetch_postgres_zap_histogram(
-    state: &AppState,
-    days: u32,
-) -> Result<Vec<ZapHistogramBucket>, ApiError> {
-    validate_postgres_zap_days(days)?;
-    let client = state
-        .postgres_client(AnalyticsFamily::Zaps)
-        .await
-        .map_err(ApiError::Internal)?;
-    let products = current_zap_products(&client)
-        .await
-        .map_err(ApiError::Internal)?;
-    let until_epoch = products.complete_through_epoch;
-    let since_epoch = until_epoch
-        .checked_sub(i64::from(days) * 86_400)
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap window underflow")))?;
-    let rows = client
-        .query(
-            "SELECT bucket,SUM(zap_count)::bigint,SUM(amount_msats)::bigint
-               FROM pensieve_analytics.semantic_zap_histogram_daily
-              WHERE product_id=$1 AND day_epoch >= $2 AND day_epoch < $3
-              GROUP BY bucket ORDER BY bucket",
-            &[&products.semantic_product_id, &since_epoch, &until_epoch],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let mut buckets = Vec::new();
-    let mut total_count = 0_u64;
-    let mut total_msats = 0_u64;
-    for row in rows {
-        let bucket = usize::try_from(row.get::<_, i16>(0))
-            .map_err(|_| ApiError::Internal(anyhow::anyhow!("zap histogram bucket is negative")))?;
-        let count = nonnegative_u64(row.get(1), "zap histogram count")?;
-        let amount_msats = nonnegative_u64(row.get(2), "zap histogram amount")?;
-        if bucket > ZAP_HISTOGRAM_UPPER_SATS.len() {
-            return Err(ApiError::Internal(anyhow::anyhow!(
-                "zap histogram bucket exceeds the public contract"
-            )));
-        }
-        total_count = total_count
-            .checked_add(count)
-            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap histogram count overflow")))?;
-        total_msats = total_msats
-            .checked_add(amount_msats)
-            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap histogram amount overflow")))?;
-        if count > 0 {
-            buckets.push((bucket, count, amount_msats));
-        }
-    }
-    Ok(buckets
-        .into_iter()
-        .map(|(bucket, count, amount_msats)| {
-            let (label, min_sats, max_sats) = zap_bucket_contract(bucket);
-            ZapHistogramBucket {
-                bucket: label.to_owned(),
-                min_sats,
-                max_sats,
-                count,
-                total_sats: amount_msats / 1_000,
-                pct_count: rounded_percent(count, total_count),
-                pct_sats: rounded_percent(amount_msats, total_msats),
-            }
-        })
-        .collect())
-}
-
-fn validate_postgres_zap_days(days: u32) -> Result<(), ApiError> {
-    if !(1..=366).contains(&days) {
-        return Err(ApiError::BadRequest(format!(
-            "days must be between 1 and 366, got {days}"
-        )));
-    }
-    Ok(())
-}
-
-fn zap_aggregate_response(
-    total_zaps: u64,
-    amount_msats: u64,
-    unique_senders: u64,
-    unique_recipients: u64,
-) -> ZapStatsAggregate {
-    ZapStatsAggregate {
-        total_zaps,
-        total_sats: amount_msats / 1_000,
-        unique_senders,
-        unique_recipients,
-        avg_zap_sats: average_zap_sats(total_zaps, amount_msats),
-    }
-}
-
-fn zap_period_response(
-    period: String,
-    total_zaps: u64,
-    amount_msats: u64,
-    unique_senders: u64,
-    unique_recipients: u64,
-) -> ZapStatsByPeriod {
-    ZapStatsByPeriod {
-        period,
-        total_zaps,
-        total_sats: amount_msats / 1_000,
-        unique_senders,
-        unique_recipients,
-        avg_zap_sats: average_zap_sats(total_zaps, amount_msats),
-    }
-}
-
-fn average_zap_sats(total_zaps: u64, amount_msats: u64) -> f64 {
-    if total_zaps == 0 {
-        0.0
-    } else {
-        amount_msats as f64 / total_zaps as f64 / 1_000.0
-    }
-}
-
-fn period_label(period_epoch: i64) -> Result<String, ApiError> {
-    DateTime::from_timestamp(period_epoch, 0)
-        .map(|timestamp| timestamp.date_naive().to_string())
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("zap period is outside chrono range")))
-}
-
-fn rounded_percent(value: u64, total: u64) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        (10_000.0 * value as f64 / total as f64).round() / 100.0
-    }
-}
-
-fn zap_bucket_contract(bucket: usize) -> (&'static str, u64, u64) {
-    const LABELS: [&str; 17] = [
-        "1-10 sats",
-        "11-21 sats",
-        "22-50 sats",
-        "51-100 sats",
-        "101-250 sats",
-        "251-500 sats",
-        "501-750 sats",
-        "751-1K sats",
-        "1K-2.5K sats",
-        "2.5K-5K sats",
-        "5K-7.5K sats",
-        "7.5K-10K sats",
-        "10K-25K sats",
-        "25K-50K sats",
-        "50K-75K sats",
-        "75K-100K sats",
-        "100K+ sats",
-    ];
-    let min_sats = if bucket == 0 {
-        1
-    } else {
-        ZAP_HISTOGRAM_UPPER_SATS[bucket - 1] + 1
-    };
-    let max_sats = ZAP_HISTOGRAM_UPPER_SATS
-        .get(bucket)
-        .copied()
-        .unwrap_or(999_999_999);
-    (LABELS[bucket], min_sats, max_sats)
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Engagement Stats
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2480,6 +1542,7 @@ fn zap_bucket_contract(bucket: usize) -> (&'static str, u64, u64) {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngagementQuery {
     /// Number of days to include (default: 30).
+    #[allow(dead_code)] // Still parsed so malformed queries keep returning 400.
     pub days: Option<u32>,
 }
 
@@ -2502,99 +1565,14 @@ pub struct EngagementStats {
 
 /// `GET /api/v1/stats/engagement`
 ///
-/// Returns reply and reaction ratios relative to original notes.
-/// Cached for 10 minutes.
+/// Reply and reaction ratios relative to original notes. Currently always
+/// returns 503 `metric_unavailable`: computing it on ClickHouse needs an
+/// unbounded raw tag scan, and no bounded engagement source exists yet.
 pub async fn engagement(
-    State(state): State<AppState>,
-    Query(params): Query<EngagementQuery>,
+    State(_state): State<AppState>,
+    Query(_params): Query<EngagementQuery>,
 ) -> Result<Json<EngagementStats>, ApiError> {
-    // Temporarily fail explicitly instead of launching an unbounded raw tag scan.
-    // Postgres serving is not selected or enabled by this guard.
-    if !state.uses_postgres(AnalyticsFamily::Engagement) {
-        return Err(ApiError::MetricUnavailable);
-    }
-    let days = params.days.unwrap_or(30);
-    let cache_key = format!("engagement:days={}", days);
-
-    let cache = state.cache.clone();
-    let result =
-        get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            fetch_postgres_engagement(&state, days).await
-        })
-        .await?;
-
-    Ok(Json(result))
-}
-
-async fn fetch_postgres_engagement(
-    state: &AppState,
-    days: u32,
-) -> Result<EngagementStats, ApiError> {
-    let days = i64::from(days);
-    let client = state
-        .postgres_client(AnalyticsFamily::Engagement)
-        .await
-        .map_err(ApiError::Internal)?;
-    let row = client
-        .query_one(
-            "WITH product AS (
-                 SELECT products.product_id,
-                        (products.as_of_epoch / 86400) * 86400 AS complete_through
-                   FROM pensieve_analytics.semantic_products products
-                   JOIN pensieve_analytics.current_run_metadata current USING (run_id)
-                  WHERE products.evidence_sha256 =
-                        current.validation ->> 'semantic_evidence_sha256'
-             )
-             SELECT COUNT(DISTINCT product.product_id)::bigint,
-                    COALESCE(SUM(daily.original_notes),0)::bigint,
-                    COALESCE(SUM(daily.replies),0)::bigint,
-                    COALESCE(SUM(daily.reactions),0)::bigint
-               FROM product
-               LEFT JOIN pensieve_analytics.semantic_engagement_daily daily
-                 ON daily.product_id=product.product_id
-                AND daily.day_epoch >= product.complete_through - $1::bigint * 86400
-                AND daily.day_epoch < product.complete_through",
-            &[&days],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    if row.get::<_, i64>(0) != 1 {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "current semantic engagement product is unavailable"
-        )));
-    }
-    let original_notes = nonnegative_u64(row.get(1), "original_notes")?;
-    let replies = nonnegative_u64(row.get(2), "replies")?;
-    let reactions = nonnegative_u64(row.get(3), "reactions")?;
-    let period_days = u32::try_from(days)
-        .map_err(|_| ApiError::Internal(anyhow::anyhow!("engagement days exceeds u32")))?;
-    Ok(engagement_response(
-        period_days,
-        original_notes,
-        replies,
-        reactions,
-    ))
-}
-
-fn engagement_response(
-    period_days: u32,
-    original_notes: u64,
-    replies: u64,
-    reactions: u64,
-) -> EngagementStats {
-    let denominator = if original_notes == 0 {
-        1.0
-    } else {
-        original_notes as f64
-    };
-    EngagementStats {
-        period_days,
-        original_notes,
-        replies,
-        reactions,
-        replies_per_note: replies as f64 / denominator,
-        reactions_per_note: reactions as f64 / denominator,
-    }
+    Err(ApiError::MetricUnavailable)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2635,9 +1613,6 @@ pub async fn longform(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Longform) {
-            return fetch_postgres_longform(&state, days).await;
-        }
         let days_clause = match days {
             Some(days) => format!("AND created_at >= now() - INTERVAL {} DAY", days),
             None => String::new(),
@@ -2665,113 +1640,6 @@ pub async fn longform(
     .await?;
 
     Ok(Json(result))
-}
-
-async fn fetch_postgres_longform(
-    state: &AppState,
-    days: Option<u32>,
-) -> Result<LongformStats, ApiError> {
-    let client = state
-        .postgres_client(AnalyticsFamily::Longform)
-        .await
-        .map_err(ApiError::Internal)?;
-    let (articles, unique_authors, content_bytes) = match days {
-        Some(days @ 1..=366) => {
-            let days = i64::from(days);
-            let products = current_longform_products(&client)
-                .await
-                .map_err(ApiError::Internal)?;
-            let complete_through = products.complete_through_epoch;
-            let since_epoch = complete_through
-                .checked_sub(days * 86_400)
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("longform window underflow")))?;
-            let row = client
-                .query_one(
-                    "SELECT COALESCE(SUM(daily.articles),0)::bigint,
-                            COALESCE(SUM(daily.content_bytes),0)::bigint
-                       FROM pensieve_analytics.semantic_longform_daily daily
-                      WHERE daily.product_id=$1
-                        AND daily.day_epoch >= $2 AND daily.day_epoch < $3",
-                    &[
-                        &products.semantic_product_id,
-                        &since_epoch,
-                        &complete_through,
-                    ],
-                )
-                .await
-                .map_err(|error| ApiError::Internal(error.into()))?;
-            let unique_authors = estimate_flexible_distinct(
-                &client,
-                &products,
-                since_epoch,
-                complete_through,
-                Some(30_023),
-            )
-            .await
-            .map_err(ApiError::Internal)?;
-            (
-                nonnegative_u64(row.get(0), "longform articles")?,
-                unique_authors,
-                nonnegative_u64(row.get(1), "longform content bytes")?,
-            )
-        }
-        Some(days) => {
-            return Err(ApiError::BadRequest(format!(
-                "days must be between 1 and 366, got {days}"
-            )));
-        }
-        None => {
-            let row = client
-                .query_one(
-                    "WITH product AS (
-                         SELECT products.product_id
-                           FROM pensieve_analytics.serving_fact_products products
-                           JOIN pensieve_analytics.current_run_metadata current USING (run_id)
-                          WHERE products.evidence_sha256 =
-                                current.validation ->> 'serving_facts_evidence_sha256'
-                     )
-                     SELECT COUNT(DISTINCT product.product_id)::bigint,
-                            COALESCE(SUM(summary.event_count),0)::bigint,
-                            COALESCE(SUM(summary.unique_pubkeys),0)::bigint,
-                            COALESCE(SUM(summary.content_bytes),0)::bigint
-                       FROM product
-                       LEFT JOIN pensieve_analytics.serving_kind_summaries summary
-                         ON summary.product_id=product.product_id AND summary.kind=30023",
-                    &[],
-                )
-                .await
-                .map_err(|error| ApiError::Internal(error.into()))?;
-            if row.get::<_, i64>(0) != 1 {
-                return Err(ApiError::Internal(anyhow::anyhow!(
-                    "current all-time longform product is unavailable"
-                )));
-            }
-            (
-                nonnegative_u64(row.get(1), "longform articles")?,
-                nonnegative_u64(row.get(2), "longform authors")?,
-                nonnegative_u64(row.get(3), "longform content bytes")?,
-            )
-        }
-    };
-    Ok(longform_response(articles, unique_authors, content_bytes))
-}
-
-fn longform_response(
-    articles_count: u64,
-    unique_authors: u64,
-    total_content_length: u64,
-) -> LongformStats {
-    LongformStats {
-        articles_count,
-        unique_authors,
-        avg_content_length: if articles_count == 0 {
-            0.0
-        } else {
-            total_content_length as f64 / articles_count as f64
-        },
-        total_content_length,
-        estimated_total_words: total_content_length / 5,
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2827,9 +1695,6 @@ pub async fn relay_distribution(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::RelayDistribution) {
-            return fetch_postgres_relay_distribution(&state, limit).await;
-        }
         let rows: Vec<RelayDistributionRow> = state
             .clickhouse
             .query(&format!(
@@ -2851,62 +1716,6 @@ pub async fn relay_distribution(
     .await?;
 
     Ok(Json(result))
-}
-
-async fn fetch_postgres_relay_distribution(
-    state: &AppState,
-    limit: u32,
-) -> Result<Vec<RelayDistributionRow>, ApiError> {
-    let limit = i64::from(limit);
-    let client = state
-        .postgres_client(AnalyticsFamily::RelayDistribution)
-        .await
-        .map_err(ApiError::Internal)?;
-    let rows = client
-        .query(
-            "WITH product AS (
-                 SELECT products.product_id
-                   FROM pensieve_analytics.current_run_metadata current
-                   LEFT JOIN pensieve_analytics.relay_distribution_products products
-                     ON products.run_id=current.run_id
-                    AND products.evidence_sha256 =
-                        current.validation ->> 'relay_distribution_evidence_sha256'
-             )
-             SELECT product.product_id,rows.relay_url,rows.user_count,
-                    rows.read_count,rows.write_count
-               FROM product
-               LEFT JOIN LATERAL (
-                    SELECT relay_url,user_count,read_count,write_count
-                      FROM pensieve_analytics.relay_distribution_rows rows
-                     WHERE rows.product_id=product.product_id
-                     ORDER BY rows.user_count DESC,rows.relay_url ASC
-                     LIMIT $1
-               ) rows ON true
-              ORDER BY rows.user_count DESC NULLS LAST,rows.relay_url ASC",
-            &[&limit],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    if rows
-        .first()
-        .and_then(|row| row.get::<_, Option<String>>(0))
-        .is_none()
-    {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "current relay-distribution product is unavailable"
-        )));
-    }
-    rows.iter()
-        .filter(|row| row.get::<_, Option<String>>(1).is_some())
-        .map(|row| {
-            Ok(RelayDistributionRow {
-                relay_url: row.get::<_, Option<String>>(1).expect("filtered relay URL"),
-                user_count: nonnegative_u64(row.get(2), "relay user_count")?,
-                read_count: nonnegative_u64(row.get(3), "relay read_count")?,
-                write_count: nonnegative_u64(row.get(4), "relay write_count")?,
-            })
-        })
-        .collect()
 }
 
 /// Publisher statistics.
@@ -2940,9 +1749,6 @@ pub async fn publishers(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        if state.uses_postgres(AnalyticsFamily::Publishers) {
-            return fetch_postgres_publishers(&state, days, kind, limit).await;
-        }
         let kind_clause = match kind {
             Some(kind) => format!("AND kind = {}", kind),
             None => String::new(),
@@ -2973,64 +1779,4 @@ pub async fn publishers(
     .await?;
 
     Ok(Json(result))
-}
-
-fn validate_postgres_publisher_days(days: u32) -> Result<(), ApiError> {
-    if [1, 7, 30, 90, 365].contains(&days) {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(format!(
-            "Postgres publisher rankings support days=1,7,30,90,365; got {days}"
-        )))
-    }
-}
-
-async fn fetch_postgres_publishers(
-    state: &AppState,
-    days: u32,
-    kind: Option<u16>,
-    limit: u32,
-) -> Result<Vec<PublisherRow>, ApiError> {
-    validate_postgres_publisher_days(days)?;
-    let client = state
-        .postgres_client(AnalyticsFamily::Publishers)
-        .await
-        .map_err(ApiError::Internal)?;
-    let product = current_publisher_product(&client)
-        .await
-        .map_err(ApiError::Internal)?;
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let days = i32::try_from(days).expect("accepted publisher days fit i32");
-    let kind = kind.map_or(-1_i32, i32::from);
-    let limit = i64::from(limit);
-    let rows = client
-        .query(
-            "SELECT encode(pubkey,'hex'),event_count,kinds_count,
-                    first_event,last_event
-               FROM pensieve_analytics.publisher_ranking_rows
-              WHERE product_id=$1 AND days=$2 AND kind=$3
-              ORDER BY event_count DESC,pubkey ASC LIMIT $4",
-            &[&product.product_id, &days, &kind, &limit],
-        )
-        .await
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    rows.iter()
-        .map(|row| {
-            let first_event: i64 = row.get(3);
-            let last_event: i64 = row.get(4);
-            Ok(PublisherRow {
-                pubkey: row.get(0),
-                event_count: nonnegative_u64(row.get(1), "publisher event_count")?,
-                kinds_count: nonnegative_u64(row.get(2), "publisher kinds_count")?,
-                first_event: u32::try_from(first_event).map_err(|_| {
-                    ApiError::Internal(anyhow::anyhow!("publisher first_event exceeds u32"))
-                })?,
-                last_event: u32::try_from(last_event).map_err(|_| {
-                    ApiError::Internal(anyhow::anyhow!("publisher last_event exceeds u32"))
-                })?,
-            })
-        })
-        .collect()
 }

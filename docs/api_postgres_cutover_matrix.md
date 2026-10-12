@@ -1,5 +1,10 @@
 # Postgres API cutover matrix
 
+> **Postgres analytics abandoned 2026-10-12; kept as history.** The API cutover
+> described here will not happen: every route stays on ClickHouse, and the
+> Postgres backend, the `pensieve-api-cutover-compare` gate and
+> `ops/api-cutover-cases.example.json` were removed.
+
 Status: pre-cutover audit  
 Scope: the 24 ClickHouse-backed analytics routes under `/api/v1`  
 Out of scope: `/ping` and the three operational `/relays` routes, which read

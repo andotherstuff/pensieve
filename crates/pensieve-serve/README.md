@@ -21,11 +21,7 @@ Generate a token: `openssl rand -hex 32`
 | `PENSIEVE_BIND_ADDR` | `0.0.0.0:8080` | Server bind address |
 | `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse connection URL |
 | `CLICKHOUSE_DATABASE` | `nostr` | ClickHouse database name |
-| `DATABASE_URL` | *(required for Postgres families)* | Postgres analytics connection URL |
-| `POSTGRES_ANALYTICS_PASSWORD` | *(optional)* | Password override kept outside `DATABASE_URL` |
-| `PENSIEVE_POSTGRES_POOL_SIZE` | `4` | Bounded persistent Postgres connections (1-32) |
-| `PENSIEVE_POSTGRES_API_FAMILIES` | *(empty)* | Comma-separated route families selected for Postgres |
-| `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(required for `overview`)* | Canonical ingestion-owned watermark file |
+| `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(optional)* | Canonical ingestion-owned watermark file; when set, `latest_event` (in `/stats` and `/stats/events/latest`) is read from it instead of scanning `events_local` |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | `900` | Maximum accepted watermark publication age |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
 | `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints; ignored if the file does not exist |
@@ -35,13 +31,8 @@ On startup the server loads a `.env` file if one exists. Override its location w
 `--dotenv <path>` or the `DOTENV_PATH` environment variable (default `.env`).
 Variables already set in the process environment take precedence over the file.
 
-The Postgres selector fails closed and defaults every analytics route to
-ClickHouse. Supported family names are `overview`, `events`, `active_users`,
-`new_users`, `retention`, `activity`, `zaps`, `engagement`, `longform`,
-`publishers`, `relay_distribution`, and `kinds`; `all` selects every analytics
-family and `none` selects none. The three operational relay routes continue to
-use `RELAY_DB_PATH`. Removing one family from the list rolls only that family
-back to ClickHouse without changing ingestion or the selected analytics run.
+Every analytics route is served from ClickHouse. The three operational relay
+routes use `RELAY_DB_PATH`.
 
 ---
 
@@ -442,7 +433,7 @@ Cohort retention analysis showing how users return over time.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `cohort_start` | date | `limit` × `cohort_size` ago | Start date for first cohort (Postgres backend: when omitted, returns the latest `limit` cohorts) |
+| `cohort_start` | date | `limit` × `cohort_size` ago | Start date for first cohort |
 | `cohort_size` | string | `week` | Cohort size: `week` or `month` |
 | `limit` | integer | 12 | Number of cohorts (max: 52) |
 
@@ -605,9 +596,10 @@ Zap amount distribution across meaningful buckets.
 
 Reply and reaction ratios relative to original notes.
 
-Only served from Postgres: unless `engagement` is selected in
-`PENSIEVE_POSTGRES_API_FAMILIES`, this endpoint returns `503` with
-`{"error": "metric_unavailable"}`.
+Currently disabled: this endpoint always returns `503` with
+`{"error": "metric_unavailable"}`, because computing it on ClickHouse needs an
+unbounded raw tag scan. The parameters and response shape below describe the
+contract it will serve once a bounded source exists.
 
 **Query Parameters**
 
@@ -1010,7 +1002,7 @@ All errors return JSON with the following structure:
 | 500 | `database_error` | Database query failed |
 | 500 | `serialization_error` | Response serialization failed |
 | 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out; retry later |
-| 503 | `metric_unavailable` | Metric temporarily disabled (e.g. `/stats/engagement` without the Postgres `engagement` family) |
+| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`) |
 
 ---
 

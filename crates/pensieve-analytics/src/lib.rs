@@ -1,7 +1,8 @@
 //! Rebuildable analytics products derived from canonical Parquet snapshots.
 //!
-//! DuckDB performs large object scans and exact aggregation. Postgres receives
-//! only small serving relations, all keyed by one immutable analytics run.
+//! DuckDB performs large object scans and exact aggregation; results are kept
+//! as local DuckDB databases and immutable, evidence-checked artifacts for
+//! research over the Parquet lake.
 
 mod bounded;
 mod build;
@@ -10,28 +11,19 @@ mod error;
 mod event_facts;
 mod fixed_activity;
 mod flexible_distinct;
-mod flexible_distinct_publish;
 mod flexible_distinct_validation;
 mod incremental;
 mod input;
 mod plan;
 mod pubkey_first_seen;
-mod publish;
 mod publisher_benchmark;
 mod publisher_product;
-mod publisher_publish;
-mod reconcile;
 mod relay_build;
 mod relay_distribution;
-mod relay_publish;
-mod schema;
 mod semantic_build;
 mod semantic_facts;
-mod semantic_publish;
 mod serving_facts;
-mod serving_publish;
 mod zap_distinct;
-mod zap_distinct_publish;
 
 pub use bounded::{
     ArtifactIdentity, BOUNDED_CHECKPOINT_SCHEMA_VERSION, BOUNDED_RUNNER_VERSION, BatchLimits,
@@ -72,10 +64,6 @@ pub use flexible_distinct::{
     load_and_estimate_flexible_distinct_windows, load_bounded_flexible_distinct,
     visit_flexible_distinct_leaves,
 };
-pub use flexible_distinct_publish::{
-    FlexibleDistinctPublishOutcome, estimate_published_flexible_distinct,
-    publish_flexible_distinct_leaves,
-};
 pub use flexible_distinct_validation::{
     FLEXIBLE_DISTINCT_TOLERANCE_PPM, FLEXIBLE_DISTINCT_VALIDATION_RUNNER,
     FlexibleDistinctValidationEvidence, FlexibleDistinctValidationSample,
@@ -88,28 +76,12 @@ pub use pensieve_core::{
     DISTINCT_SKETCH_RELATIVE_TOLERANCE, DistinctSketch, DistinctSketchBuilder, DistinctSketchError,
     DistinctSketchUnion, ZAP_DISTINCT_SKETCH_LG_K, ZAP_HISTOGRAM_UPPER_SATS,
 };
-pub use plan::{
-    AppliedObject, CatalogDeltaPlan, PlannedRunKind, plan_catalog_delta,
-    plan_catalog_delta_for_query_version, plan_catalog_delta_from_run,
-};
+pub use plan::{AppliedObject, CatalogDeltaPlan, PlannedRunKind};
 pub use pubkey_first_seen::{
     BoundedPubkeyFirstSeen, NewUsersDaily, PUBKEY_FIRST_SEEN_BYTES, PUBKEY_FIRST_SEEN_KEY_BYTES,
     PUBKEY_FIRST_SEEN_VERSION, PubkeyFirstSeenConfig, PubkeyFirstSeenEvidence,
     advance_bounded_pubkey_first_seen, build_bounded_pubkey_first_seen,
     load_bounded_pubkey_first_seen,
-};
-pub use publish::{
-    AllBoundedProducts, AllRecurringProducts, AllRecurringProductsWithPublisher,
-    AllRecurringProductsWithRelay, AllRecurringProductsWithServing, FlexibleDistinctPublication,
-    PublishOutcome, SemanticPublication, acquire_publication_lock, publish, publish_incremental,
-    publish_incremental_with_all_bounded_products,
-    publish_incremental_with_all_bounded_products_and_flexible,
-    publish_incremental_with_all_bounded_products_flexible_and_semantic,
-    publish_incremental_with_all_recurring_products_and_publisher,
-    publish_incremental_with_all_recurring_products_and_relay,
-    publish_incremental_with_all_recurring_products_and_serving, publish_incremental_with_identity,
-    publish_incremental_with_identity_and_activity, publish_with_all_bounded_products,
-    publish_with_identity, publish_with_identity_and_activity,
 };
 pub use publisher_benchmark::{
     PUBLISHER_BENCHMARK_VERSION, PUBLISHER_DAILY_FACT_BYTES, PUBLISHER_DAILY_KIND_FACT_BYTES,
@@ -122,13 +94,6 @@ pub use publisher_product::{
     advance_bounded_publisher_ranking, build_bounded_publisher_ranking,
     load_bounded_publisher_ranking, visit_publisher_ranking_rows,
 };
-pub use publisher_publish::{
-    PublisherRankingPublishOutcome, publish_publisher_ranking, query_published_publisher_ranking,
-};
-pub use reconcile::{
-    Classification, ComparisonGate, DifferenceExample, InputAlignment, MetricComparison,
-    ReconciliationSummary, SeriesComparison, compare_metric, compare_series,
-};
 pub use relay_build::{
     BoundedRelayDistribution, RelayDistributionConfig, RelayDistributionEvidence,
     advance_bounded_relay_distribution, build_bounded_relay_distribution,
@@ -137,9 +102,6 @@ pub use relay_build::{
 pub use relay_distribution::{
     RELAY_DISTRIBUTION_VERSION, RelayDistributionRow, RelayListIdentity, RelayMembership,
     relay_list_wins, relay_memberships,
-};
-pub use relay_publish::{
-    RelayDistributionPublishOutcome, publish_relay_distribution, query_published_relay_distribution,
 };
 pub use semantic_build::{
     BoundedSemanticFacts, SEMANTIC_FACTS_RUNNER_VERSION, SEMANTIC_FACTS_VERSION,
@@ -153,7 +115,6 @@ pub use semantic_facts::{
     classify_engagement, classify_longform, classify_zap, scan_semantic_facts,
     write_semantic_facts, zap_histogram_bucket,
 };
-pub use semantic_publish::{SemanticPublishOutcome, publish_semantic_facts};
 pub use serving_facts::{
     BoundedServingFacts, CONTENT_FACT_BYTES, HOURLY_COUNT_BYTES, KIND_SUMMARY_BYTES,
     SERVING_FACTS_RUNNER_VERSION, SERVING_FACTS_VERSION, ServingFactsConfig, ServingFactsEvidence,
@@ -161,15 +122,8 @@ pub use serving_facts::{
     build_bounded_serving_facts, load_bounded_serving_facts, visit_serving_hourly_rows,
     visit_serving_kind_rows,
 };
-pub use serving_publish::{
-    ServingFactsPublishOutcome, publish_serving_facts, query_published_serving_hourly,
-    query_published_serving_kind,
-};
 pub use zap_distinct::{
     BoundedZapDistinct, ZAP_DISTINCT_VERSION, ZAP_IDENTITY_BYTES, ZapDistinctConfig,
     ZapDistinctEvidence, ZapDistinctLeaf, ZapParticipantRole, build_bounded_zap_distinct,
     load_bounded_zap_distinct,
-};
-pub use zap_distinct_publish::{
-    ZapDistinctPublishOutcome, estimate_published_zap_distinct, publish_zap_distinct,
 };

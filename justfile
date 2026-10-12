@@ -69,33 +69,21 @@ salvage-notepack *ARGS:
 lake-catalog *ARGS:
     cargo run -p pensieve-lake --bin pensieve-lake-catalog -- {{ARGS}}
 
-# Build and optionally publish exact Slice A analytics.
+# Build exact Slice A analytics rollups into a local DuckDB database.
 analytics-build *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics -- {{ARGS}}
 
-# Plan the object delta from the currently published analytics run.
-analytics-plan *ARGS:
-    cargo run -p pensieve-analytics --bin pensieve-analytics-plan -- {{ARGS}}
+# Build or advance bounded pubkey first-seen (identity) state.
+analytics-identity *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-identity -- {{ARGS}}
 
-# Apply one verified append-only analytics delta.
-analytics-incremental *ARGS:
-    cargo run -p pensieve-analytics --bin pensieve-analytics-incremental -- {{ARGS}}
-
-# Build and optionally atomically add Slice B2 activity to current Slice B1.
-analytics-activity-publish *ARGS:
-    cargo run -p pensieve-analytics --bin pensieve-analytics-activity-publish -- {{ARGS}}
+# Build or advance bounded fixed-activity state.
+analytics-activity *ARGS:
+    cargo run -p pensieve-analytics --bin pensieve-analytics-activity -- {{ARGS}}
 
 # Build and validate exact bounded cohort-retention evidence.
 analytics-cohort-retention *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-retention -- {{ARGS}}
-
-# Build exact cohort retention and atomically upgrade one Slice B2 publication.
-analytics-cohort-publish *ARGS:
-    cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-publish -- {{ARGS}}
-
-# Compare current Postgres Slice A products with deduplicated ClickHouse values.
-analytics-compare *ARGS:
-    cargo run -p pensieve-analytics --bin pensieve-analytics-compare -- {{ARGS}}
 
 # ============================================================================
 # Build

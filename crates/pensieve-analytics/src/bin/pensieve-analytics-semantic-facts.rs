@@ -1,4 +1,4 @@
-//! Build resumable bounded Slice 7 semantic facts without publishing Postgres.
+//! Build resumable bounded Slice 7 semantic facts.
 
 use std::path::PathBuf;
 

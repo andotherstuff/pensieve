@@ -111,12 +111,11 @@ pub struct BoundedPubkeyFirstSeen {
 }
 
 impl BoundedPubkeyFirstSeen {
-    /// Revalidate immutable identity products immediately before publication.
+    /// Revalidate immutable identity products immediately before they are used.
     ///
-    /// Publication deliberately re-reads the high-cardinality artifact instead
-    /// of trusting an in-memory completion value. This keeps a transient
-    /// Postgres failure safely retryable and makes artifact replacement or
-    /// truncation fail before the current-run pointer can move.
+    /// This deliberately re-reads the high-cardinality artifact instead of
+    /// trusting an in-memory completion value, so artifact replacement or
+    /// truncation fails before a consumer relies on it.
     pub fn validate_for_publication(&self, snapshot_id: &str, as_of_epoch: u64) -> Result<()> {
         let evidence = &self.evidence;
         if evidence.schema_version != 1

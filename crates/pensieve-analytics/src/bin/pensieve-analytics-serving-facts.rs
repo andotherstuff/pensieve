@@ -1,4 +1,4 @@
-//! Build resumable bounded Slice 9.5 serving facts without publishing Postgres.
+//! Build resumable bounded Slice 9.5 serving facts.
 
 use std::path::PathBuf;
 

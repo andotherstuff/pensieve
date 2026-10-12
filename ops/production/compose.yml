@@ -1,17 +1,14 @@
 # Pensieve Production Docker Compose
 #
 # This runs the infrastructure services (ClickHouse, Grafana, Prometheus, Caddy).
-# postgres-analytics is manual-only (profile "manual-postgres") and is not
-# started by a normal `up`.
 # The Rust binaries (API, Ingester, Preview) run as native binaries via systemd.
 #
 # Normally manage infrastructure through systemd (ops/systemd/pensieve.service):
 #   sudo systemctl restart pensieve
 #
-# Manual commands must pass the production env file. Without it, Compose
-# refuses to run at all (POSTGRES_ANALYTICS_PASSWORD is required even though
-# its service is in a profile), and with a partial file it would fall back to
-# defaults such as DOMAIN=localhost and GRAFANA_PASSWORD=admin:
+# Manual commands must pass the production env file. Without it (or with a
+# partial file) Compose falls back to defaults such as DOMAIN=localhost and
+# GRAFANA_PASSWORD=admin:
 #   Start:   docker compose --env-file /etc/pensieve/pensieve.env up -d
 #   Stop:    docker compose --env-file /etc/pensieve/pensieve.env down
 #   Logs:    docker compose --env-file /etc/pensieve/pensieve.env logs -f
@@ -28,33 +25,6 @@
 name: pensieve-deploy
 
 services:
-  # PostgreSQL - shadow lakehouse analytics serving store
-  postgres-analytics:
-    image: postgres:16-alpine
-    container_name: pensieve-postgres-analytics
-    # Retained for manual use only; excluded from normal boot-time compose up.
-    profiles: ["manual-postgres"]
-    restart: "no"
-    ports:
-      - "127.0.0.1:5432:5432"
-    volumes:
-      - /data/postgres-analytics:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_DB=pensieve
-      - POSTGRES_USER=pensieve_analytics
-      - POSTGRES_PASSWORD=${POSTGRES_ANALYTICS_PASSWORD:?set POSTGRES_ANALYTICS_PASSWORD}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pensieve_analytics -d pensieve"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "3"
-
   # ═══════════════════════════════════════════════════════════════════════════
   # Caddy - Reverse Proxy with Auto-HTTPS
   # ═══════════════════════════════════════════════════════════════════════════

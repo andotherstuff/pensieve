@@ -105,7 +105,7 @@ pub struct BuildSummary {
     pub kind_all_time_rows: u64,
 }
 
-/// One completed DuckDB build, ready for Postgres publication.
+/// One completed, reconciled DuckDB build.
 pub struct AnalyticsBuild {
     pub(crate) connection: Connection,
     /// Validated catalog and exact object locations used by the build.
@@ -139,7 +139,7 @@ impl AnalyticsBuild {
     /// Build all Slice A products in `work_database`.
     ///
     /// The work database is persistent so large scans can spill out of core and
-    /// the completed products survive a transient Postgres publication failure.
+    /// the completed products survive a failure in a later step.
     pub fn create(
         work_database: impl AsRef<Path>,
         snapshot: ResolvedSnapshot,
@@ -180,7 +180,7 @@ impl AnalyticsBuild {
 
     /// Open and revalidate a completed work database without rebuilding it.
     ///
-    /// This supports publication retries after a downstream Postgres failure.
+    /// This supports re-reading or retrying work against an existing build.
     /// Missing, partial, or snapshot-inconsistent products fail the same
     /// reconciliation checks as a fresh build.
     pub fn open_completed(

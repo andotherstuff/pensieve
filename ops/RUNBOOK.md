@@ -9,9 +9,10 @@ host on that date.
 
 ## Layout
 
-- `ops/production/compose.yml` — Docker stack: ClickHouse, Prometheus, Grafana, Caddy,
-  plus `postgres-analytics`, which sits in the `manual-postgres` profile with
-  `restart: "no"` and is not started by `pensieve.service` (not running on 2026-10-11).
+- `ops/production/compose.yml` — Docker stack: ClickHouse, Prometheus, Grafana, Caddy.
+  (`master` dropped the never-started `postgres-analytics` service on 2026-10-12; the
+  host checkout still defines it until fast-forwarded, see
+  [Postgres analytics leftovers](#postgres-analytics-leftovers).)
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
   ClickHouse query settings (profiles) belong in `clickhouse/users.xml` (mounted under
   `users.d`); `<profiles>` in `clickhouse/config.xml` (`config.d`) are silently ignored.
@@ -27,11 +28,11 @@ host on that date.
 - `ops/scripts/sync-archive.sh` — hourly archive → Storage Box sync (run by `archive-sync.service`
   straight from the checkout, so the checkout's copy is the one that runs).
 - Secrets: **`/etc/pensieve/pensieve.env`** (outside the repo). Read by Docker Compose
-  (`--env-file`), `pensieve-api`, `pensieve-preview`, `archive-sync` and
-  `pensieve-analytics-refresh` (systemd `EnvironmentFile`). **Not** read by
+  (`--env-file`), `pensieve-api`, `pensieve-preview` and `archive-sync` (systemd
+  `EnvironmentFile`). **Not** read by
   `pensieve-ingest`, which is configured by its `ExecStart` flags, drop-ins and the optional
   root-only `/etc/pensieve/parquet-shadow.env`. Other root-only files: `analytics.env`,
-  `analytics-refresh.env`, `negentropy-worker.env`, the Kuma push URLs. Template:
+  `negentropy-worker.env`, the Kuma push URLs. Template:
   repo-root [`env.production.example`](../env.production.example) and `ops/*.env.example`.
 
 ## What runs how
@@ -41,13 +42,12 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| Postgres analytics | manual only (`manual-postgres` profile) | not running; start it as in [Shadow analytics Postgres](#shadow-analytics-postgres) |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12), `PENSIEVE_POSTGRES_API_FAMILIES=none` |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
-| shadow analytics refresh (daily) | `pensieve-analytics-refresh.timer` (**disabled**) → `.service` | `~/pensieve/ops/scripts/run-analytics-refresh.sh` |
+| shadow analytics refresh | `pensieve-analytics-refresh.timer` (**disabled**, obsolete) | removed from `master` 2026-10-12; see [Postgres analytics leftovers](#postgres-analytics-leftovers) |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
 
@@ -167,7 +167,8 @@ resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --pr
 
 Drop-ins per service (2026-10-11): `pensieve-api.service.d/90-postgres-cutover.conf`
 (also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_POSTGRES_API_FAMILIES=none` and
-`PENSIEVE_LATEST_EVENT_WATERMARK_PATH` inline), `pensieve-preview.service.d/10-release.conf`,
+`PENSIEVE_LATEST_EVENT_WATERMARK_PATH` inline; builds from 2026-10-12 on ignore
+`PENSIEVE_POSTGRES_API_FAMILIES`), `pensieve-preview.service.d/10-release.conf`,
 and for the ingester `giftwrap-recipient-block.conf`, `nip66-monitor.conf`,
 `override.conf`, `stop-timeout.conf` (`TimeoutStopSec=15min`), `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
 
@@ -347,142 +348,54 @@ separate inventories, publish them under the same canonical object prefix, and
 merge their active fragments into the unified snapshot. Never delete the
 failed historical inventory row to make the completion report green.
 
-## Shadow analytics Postgres
+## DuckDB analytics (research)
 
-`postgres-analytics` is a localhost-only serving store for the DuckDB-built
-shadow analytics products. It is in the Compose profile `manual-postgres` with
-`restart: "no"`, so `pensieve.service` never starts it and it stays down after a
-reboot (on 2026-10-11 it was not running, `pensieve-analytics-refresh.timer` was
-disabled, and the API served every family from ClickHouse). Compose still
-requires `POSTGRES_ANALYTICS_PASSWORD` in `/etc/pensieve/pensieve.env` for any
-`docker compose` command, including the normal stack. Start only this dependency with:
+`pensieve-analytics` builds exact analytics from an active-file Parquet
+snapshot into a local DuckDB database and immutable, evidence-checked
+artifacts. These are batch research tools: nothing is served from them and no
+unit runs them. Use the private `/etc/pensieve/analytics.env`
+([template](analytics.env.example)) for S3 credentials and DuckDB limits, and
+give manual runs the same resource envelope as other heavy jobs (for example
+`systemd-run --property=CPUQuota=200% --property=MemoryHigh=20G
+--property=MemoryMax=24G --property=IOWeight=25`). To read from a local copy
+instead of S3, stage the snapshot with `ops/scripts/stage-active-raw-snapshot.sh`
+and pass `--local-object-root`. See
+[`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md) for the Slice A
+build itself.
 
-```bash
-sudo docker compose \
-  --project-directory /home/pensieve/pensieve/ops/production \
-  --env-file /etc/pensieve/pensieve.env \
-  -f /home/pensieve/pensieve/ops/production/compose.yml \
-  up -d postgres-analytics
-```
+## Postgres analytics leftovers
 
-Install `/etc/pensieve/analytics.env` with mode `0600`; its `DATABASE_URL`
-must use `127.0.0.1`, the `pensieve` database, and the
-`pensieve_analytics` user. Run Slice A as a batch job following
-[`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md). Do not point the
-API or Grafana at the shadow views until the fixed-`as_of` comparison gate is
-accepted.
+The Postgres analytics serving store was abandoned on 2026-10-12 and its code,
+units, scripts and Compose service were removed from `master`. Production
+never served from it (`PENSIEVE_POSTGRES_API_FAMILIES=none`), the container was
+not running, and `pensieve-analytics-refresh.timer` was disabled. What remains
+on the host, to clean up with the maintainers (do not run these from an agent
+session):
 
-### Recurring Slice A refresh
-
-The daily refresh advances only the `production-live-shadow` fragment in the
-currently selected catalog generation. It publishes the immutable catalog,
-plans against the current Postgres object ledger, stages only added objects,
-takes a copy-on-write DuckDB backup, and atomically applies and publishes an
-append-only delta. `no_change` is a successful no-op. Removals, immutable-key
-changes, full rebuilds, affected-period plans, staging-limit violations, or any
-failed validation leave the generation pointer unchanged and fail the unit for
-operator inspection.
-
-Bootstrap the generation pointer once from the exact snapshot and live
-fragment used by the current published run. The two files must be a matching
-pair; `advance` checks that relationship on every refresh:
-
-```bash
-snapshot_hex=90658e6f86fb7430642082369ecf59e3282f1b58c9f6767fec916c26f81ac6fa
-sudo install -d -m 0750 -o pensieve -g pensieve \
-  /var/lib/pensieve-analytics/refresh \
-  /var/lib/pensieve-analytics/refresh/generations \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex \
-  /var/lib/pensieve-analytics/refresh/runs \
-  /archive/analytics/deltas /archive/analytics/backups
-sudo install -m 0640 -o pensieve -g pensieve \
-  /var/lib/pensieve-parquet/catalog/incremental-20260804T055921Z/active-raw.json \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/active-raw.json
-sudo install -m 0640 -o pensieve -g pensieve \
-  /var/lib/pensieve-parquet/catalog/incremental-20260804T055921Z/production-live.json \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/production-live.json
-printf 'sha256:%s\n' "$snapshot_hex" | sudo tee \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED >/dev/null
-sudo chown pensieve:pensieve \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED
-sudo chmod 0640 \
-  /var/lib/pensieve-analytics/refresh/generations/$snapshot_hex/APPLIED
-sudo ln -sfn generations/$snapshot_hex \
-  /var/lib/pensieve-analytics/refresh/current
-sudo chown -h pensieve:pensieve /var/lib/pensieve-analytics/refresh/current
-```
-
-Install a non-secret `/etc/pensieve/analytics-refresh.env` based on
-[`analytics-refresh.env.example`](analytics-refresh.env.example). Point
-`PENSIEVE_ANALYTICS_WORK_DATABASE` at the current persistent DuckDB file. Then
-install and activate the units:
-
-The service runs `ops/scripts/run-analytics-refresh.sh` straight from the
-checkout (already mode 0755 in Git), so there is nothing to install for it.
-
-```bash
-sudo install -m 0644 ops/systemd/pensieve-analytics-refresh.service \
-  ops/systemd/pensieve-analytics-refresh.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now pensieve-analytics-refresh.timer
-sudo systemctl start pensieve-analytics-refresh.service
-```
-
-The timer runs daily at 03:20 local time with up to 20 minutes of jitter. The
-service is limited to two CPUs, a 20 GiB memory soft limit, a 24 GiB hard limit,
-and reduced I/O weight. It retains the newest three copy-on-write DuckDB
-backups and two verified local delta caches. Compact catalogs, plans,
-verification receipts, status JSON, and checksums remain under
-`/var/lib/pensieve-analytics/refresh/runs/` for audit.
-
-Verify a run without exposing secrets:
-
-```bash
-systemctl status pensieve-analytics-refresh.service
-journalctl -u pensieve-analytics-refresh.service --since today --no-pager
-readlink -f /var/lib/pensieve-analytics/refresh/current
-jq . /var/lib/pensieve-analytics/refresh/runs/*/status.json
-systemctl is-active pensieve-ingest
-systemctl show pensieve-ingest -p NRestarts
-```
-
-### Slice A comparison evidence
-
-After a successful refresh, run the read-only comparison harness before any
-reader cutover. It obtains the fixed `as_of` from the current Postgres run and
-uses `events_local FINAL` for ID-deduplicated ClickHouse values. Do not pass
-secrets on the command line. Give a root-owned systemd unit or transient
-service these environment files:
-
-- `/etc/pensieve/analytics.env` for the Postgres connection and password; and
-- `/etc/pensieve/pensieve.env` for the ClickHouse connection, when its
-  defaults are not sufficient.
-
-The first production probe should use the same resource envelope as the
-refresh job because exact `FINAL` scans are expensive:
-
-```bash
-sudo install -d -m 0750 -o pensieve -g pensieve \
-  /var/lib/pensieve-analytics/comparisons
-sudo systemd-run --wait --pipe --collect \
-  --unit=pensieve-analytics-compare-manual \
-  --uid=pensieve --gid=pensieve \
-  --working-directory=/home/pensieve/pensieve \
-  --property=EnvironmentFile=/etc/pensieve/analytics.env \
-  --property=EnvironmentFile=/etc/pensieve/pensieve.env \
-  --property=CPUQuota=200% \
-  --property=MemoryHigh=20G --property=MemoryMax=24G \
-  --property=IOWeight=25 \
-  /home/pensieve/pensieve/target/release/pensieve-analytics-compare \
-    --output /var/lib/pensieve-analytics/comparisons/<snapshot-id>.json \
-    --completed-days 30
-```
-
-The exact command, exit-status meanings, alignment-evidence schema, and
-resource warnings are documented in
-[`docs/analytics_slice_a.md`](../docs/analytics_slice_a.md#fixed-as-of-comparison-harness).
-An unproven report is useful reconciliation evidence but cannot approve the
-P3 parity gate. Keep `pensieve-serve` and Grafana on ClickHouse.
+- **Compose and `POSTGRES_ANALYTICS_PASSWORD`.** Until the `~/pensieve` checkout is
+  fast-forwarded past this change, its `compose.yml` still defines `postgres-analytics` with
+  `POSTGRES_ANALYTICS_PASSWORD:?`. Remove that variable from
+  `/etc/pensieve/pensieve.env` only **after** the checkout's `compose.yml` no
+  longer requires it; otherwise every `docker compose` command, including
+  `pensieve.service`, fails.
+- **Refresh units.** `/etc/systemd/system/pensieve-analytics-refresh.{service,timer}`
+  (disabled) and `/etc/pensieve/analytics-refresh.env`; remove the units and
+  `daemon-reload`.
+- **API drop-in.** `pensieve-api.service.d/90-postgres-cutover.conf` sets
+  `PENSIEVE_POSTGRES_API_FAMILIES=none`, which builds from 2026-10-12 on ignore.
+  Drop it at the next API deploy; keep `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`
+  (it serves `latest_event` without a ClickHouse scan). See
+  [`systemd/dropins/README.md`](systemd/dropins/README.md).
+- **Data.** `/archive/analytics` (3.1 TB on the archive disk on 2026-10-12): two local
+  snapshots of the Parquet lake (`full-input`, 13 Aug, hard-linked into `lake`, 27 Aug;
+  ~1.17 TB together), staged `deltas`, the intermediate build outputs for each Postgres
+  product, and the Slice A DuckDB databases and backups. All of it is derived: the lake
+  itself lives in object storage. The maintainers decided on 2026-10-12 to delete all of it
+  (researchers will query the current lake, not a stale snapshot) after checking every
+  staged Parquet file against object storage. Also `/var/lib/pensieve-analytics`
+  (refresh state). `/data/postgres-analytics` never existed on the host.
+- **`DATABASE_URL` / `POSTGRES_ANALYTICS_PASSWORD` in `/etc/pensieve/analytics.env`**
+  are no longer read by any binary.
 
 ## One-time cutover (ops/ move + secrets → /etc)
 
@@ -803,8 +716,8 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `/api/v1/stats/longform` and `/api/v1/stats/publishers` time out (20 s cap) on ClickHouse:
   longform scans `events_local` for kind 30023 (fast only with the dropped `events_by_kind`
   projection) and publishers scans 30 days by `created_at` (fast only with the dropped
-  `events_by_time` projection). Their Postgres families exist but Postgres analytics is not
-  running.
+  `events_by_time` projection). The fix is small insert-fed ClickHouse tables (prepared
+  migration 019, in progress), not Postgres.
 - The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
   ingester keeps writing the WAL database, so relay endpoints can be stale.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in

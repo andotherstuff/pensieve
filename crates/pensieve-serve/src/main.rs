@@ -1,7 +1,6 @@
 //! Pensieve Serve - HTTP API server for Nostr analytics.
 //!
-//! This binary starts the API server with independently selectable ClickHouse
-//! and versioned Postgres analytics route families.
+//! This binary starts the ClickHouse-backed analytics API server.
 
 use axum::http::Request;
 use clap::Parser;
