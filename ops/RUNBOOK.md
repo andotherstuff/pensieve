@@ -44,7 +44,7 @@ Observed 2026-10-11:
 | Postgres analytics | manual only (`manual-postgres` profile) | not running; start it as in [Shadow analytics Postgres](#shadow-analytics-postgres) |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-7ac5121/pensieve-serve`, `PENSIEVE_POSTGRES_API_FAMILIES=none` |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 4 drop-ins | `/data/pensieve-build/negentropy-20f0b4b/release/pensieve-ingest` with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`; replaced 20:06 CEST for a production pilot) |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | shadow analytics refresh (daily) | `pensieve-analytics-refresh.timer` (**disabled**) → `.service` | `~/pensieve/ops/scripts/run-analytics-refresh.sh` |
@@ -91,6 +91,27 @@ restart. It does not cancel an in-flight conversion/upload. Without startup
 replay, the shadow must drain its notification queue. Check catch-up and current
 work-unit duration before choosing a stop deadline, particularly when replacing
 an older binary that still drains the entire historical replay.
+
+**Do not stop the ingester during :00–:07 UTC.** Refreshable views rescan all of
+`events_local` at those times: `kinds_stats_mv` and `active_users_daily_mv` every
+hour, and `relay_distribution_mv` (1.3 TiB read) at 00/06/12/18 UTC. They saturate
+the CPU, ingest inserts slow from ~8 s to ~50 s per batch, and shutdown waits for
+the in-flight segment to finish indexing. On 2026-10-12 a stop at 06:04 UTC
+exceeded the then 90 s `TimeoutStopSec` and was killed; `stop-timeout.conf` now
+allows 15 minutes. Check `system.view_refreshes` (`status`, `next_refresh_time`)
+before stopping.
+
+**After a killed shutdown, repair ClickHouse.** The indexer only requeues segments
+whose inserts *failed* (`/archive/segments/.clickhouse_reindex_queue`); a segment
+in flight at SIGKILL, and any sealed-but-not-yet-indexed segment, stays partially
+or entirely missing from `events_local` after restart. Find them from the journal
+(`Indexing segment N` without a matching `Indexed segment N`, plus the final
+sealed segment). Insert only the missing IDs: re-indexing a whole segment
+double-counts the summing views (reactions, replies, reposts, daily user stats).
+The 2026-10-12 repair converted each segment with `notepack-to-parquet`, selected
+the IDs absent from `events_local` through a `clickhouse-client --external` table
+into a Native file, checked its row count, inserted it, and re-counted to zero
+missing.
 
 Production deploys one component at a time from a release build of an exact
 commit. Do **not** deploy with `git pull` + `just build-release` in `~/pensieve`:
@@ -139,7 +160,7 @@ Drop-ins per service (2026-10-11): `pensieve-api.service.d/90-postgres-cutover.c
 (also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_POSTGRES_API_FAMILIES=none` and
 `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` inline), `pensieve-preview.service.d/10-release.conf`,
 and for the ingester `giftwrap-recipient-block.conf`, `nip66-monitor.conf`,
-`override.conf`, `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
+`override.conf`, `stop-timeout.conf` (`TimeoutStopSec=15min`), `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
 
 **Ingester exception.** The running ingester was built from a plain source copy in
 `~/releases/negentropy-<sha>/` with `CARGO_TARGET_DIR=/data/pensieve-build/negentropy-<sha>`
@@ -756,8 +777,9 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. On 2026-10-11 a production pilot started at
-20:06 CEST from `zzzz-bounded-canary.conf` (build `negentropy-20f0b4b`); expect that drop-in to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
+not covered by the routine deploy above. Since 2026-10-12 08:29 CEST the ingester runs
+build `negentropy-ba0c4a1` (PR #72) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
+the worker is started only for monitored pilots. Expect that drop-in to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
 and [`docs/negentropy_continuous_readiness.md`](../docs/negentropy_continuous_readiness.md).
 Its Kuma probe is `pensieve-negentropy-kuma.timer` (`/health/negentropy`); the
 archive-admission probe is `pensieve-archive-admission-kuma.timer` (`/health/archive-admission`).

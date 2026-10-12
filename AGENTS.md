@@ -321,7 +321,7 @@ summary below is a quick reference.
 | ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` (Postgres analytics is defined there but is not running) |
 | `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-7ac5121/pensieve-serve` via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
-| `pensieve-ingest` | `pensieve-ingest.service` | `/data/pensieve-build/negentropy-20f0b4b/release/pensieve-ingest` via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (isolated-negentropy pilot started 20:06 CEST; sets `Restart=no`) |
+| `pensieve-ingest` | `pensieve-ingest.service` | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72 build, since 2026-10-12 08:29 CEST) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | Archive sync, analytics refresh | `archive-sync.timer`, `pensieve-analytics-refresh.timer` (disabled) | scripts in the `~/pensieve/ops/scripts/` checkout |
 | Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
