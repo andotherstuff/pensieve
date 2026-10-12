@@ -147,9 +147,9 @@ conditional, checksum-confirming immutable S3 machinery as Parquet objects:
 ```bash
 just lake-catalog publish \
   --snapshot active-raw.json \
-  --s3-bucket "$PENSIEVE_PARQUET_S3_BUCKET" \
+  --s3-bucket "$S3_BUCKET" \
   --s3-region "$AWS_REGION" \
-  --s3-endpoint-url "$AWS_ENDPOINT_URL_S3" \
+  --s3-endpoint-url "$S3_ENDPOINT_URL" \
   --s3-force-path-style
 ```
 

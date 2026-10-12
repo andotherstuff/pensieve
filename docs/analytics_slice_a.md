@@ -157,7 +157,7 @@ Use a fixed `as_of` value so the run is reproducible:
 ```bash
 just analytics-build \
   --catalog /var/lib/pensieve-parquet/catalog/active-raw.json \
-  --work-database /var/lib/pensieve-analytics/slice-a.duckdb \
+  --work-database /archive/analytics/slice-a.duckdb \
   --as-of 1785232800
 ```
 

@@ -1,5 +1,7 @@
 # Isolated worker: durable failure diagnostics
 
+> Point-in-time increment note. The runtime is now wired behind `pensieve-ingest --isolated-negentropy` (off by default); see [negentropy_runtime.md](negentropy_runtime.md).
+
 This inactive slice preserves bounded failure information before scheduler policy
 is introduced. It launches no workers and changes no production configuration.
 

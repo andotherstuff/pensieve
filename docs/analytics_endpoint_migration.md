@@ -30,7 +30,9 @@ The old migration-plan count of 32 analytics endpoints is stale. The router in
 `crates/pensieve-serve/src/routes/mod.rs` is authoritative.
 
 The separate `pensieve-preview` event/profile lookup service is out of scope.
-The migration plan retires it. If random event lookup remains a product
+The migration plan retires it (retirement not currently scheduled; the
+preview gained compact lookups in Oct 2026, see
+[preview_compact_lookups.md](preview_compact_lookups.md)). If random event lookup remains a product
 requirement, it needs a separate ID/address index and cannot be served from the
 small analytics rollups described here.
 

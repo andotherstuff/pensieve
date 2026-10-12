@@ -9,7 +9,7 @@ default:
 # Development
 # ============================================================================
 
-# Run all precommit checks (fmt, clippy, test)
+# Run all precommit checks (fmt rewrites files; clippy, test, ops-test)
 precommit: fmt clippy test ops-test
     @echo "✓ All precommit checks passed"
 
@@ -71,7 +71,7 @@ lake-catalog *ARGS:
 
 # Build and optionally publish exact Slice A analytics.
 analytics-build *ARGS:
-    cargo run -p pensieve-analytics -- {{ARGS}}
+    cargo run -p pensieve-analytics --bin pensieve-analytics -- {{ARGS}}
 
 # Plan the object delta from the currently published analytics run.
 analytics-plan *ARGS:
@@ -85,9 +85,11 @@ analytics-incremental *ARGS:
 analytics-activity-publish *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-activity-publish -- {{ARGS}}
 
+# Build and validate exact bounded cohort-retention evidence.
 analytics-cohort-retention *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-retention -- {{ARGS}}
 
+# Build exact cohort retention and atomically upgrade one Slice B2 publication.
 analytics-cohort-publish *ARGS:
     cargo run -p pensieve-analytics --bin pensieve-analytics-cohort-publish -- {{ARGS}}
 
@@ -116,6 +118,8 @@ build-release-sizes: build-release
 clean:
     cargo clean
 
+# Delete local dedupe/relay state. Note: the ingester's default --output-dir is
+# ./segments, not data/segments, so default-run archives survive this.
 clean-data:
     rm -rf data/dedupe data/segments data/relay-stats.db
     mkdir -p data/dedupe data/segments
@@ -144,11 +148,11 @@ run-backfill-proto *ARGS:
 run-preview *ARGS:
     cargo run --bin pensieve-preview -- {{ARGS}}
 
-# Test the preview crate
+# Test the preview crate (lib unit tests only)
 test-preview:
     cargo test -p pensieve-preview --lib -- --nocapture
 
-# Test the preview crate (verbose)
+# Test the preview crate (all targets, including tests/ and bins)
 test-preview-verbose:
     cargo test -p pensieve-preview -- --nocapture
 
@@ -224,7 +228,7 @@ prod-restart: prod-ingest-restart prod-api-restart
 prod-grafana-restart:
     cd ~/pensieve/ops/production && docker compose --env-file /etc/pensieve/pensieve.env restart grafana
 
-# Show status of all Pensieve services
+# Show status of the API and ingester (preview: `systemctl status pensieve-preview`)
 prod-status:
     sudo systemctl status pensieve-api pensieve-ingest --no-pager
 
@@ -240,17 +244,20 @@ prod-logs-api:
 # ClickHouse
 # ============================================================================
 
-# Container name for local dev
+# ClickHouse container (production Compose name; override with CH_CONTAINER)
 CH_CONTAINER := env_var_or_default("CH_CONTAINER", "pensieve-clickhouse")
 CH_DB := env_var_or_default("CH_DB", "nostr")
 
-# Run a ClickHouse migration (idempotent - safe to run multiple times)
+# Run one ClickHouse migration. Re-running is NOT always safe: several drop,
+# truncate or backfill tables. Read the file and docs/migrations/README.md first.
 ch-migrate file:
     @echo "Running migration: {{file}}"
     @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} < {{file}}
     @echo "✓ Migration complete"
 
-# Run all pending migrations in order
+# FRESH, EMPTY DATABASES ONLY. Re-runs every top-level docs/migrations/*.sql
+# (no ledger, prepared/ excluded), including drops, TRUNCATE (009) and full
+# backfills. Never run against production; use ch-migrate <file> there.
 ch-migrate-all:
     @echo "Running all migrations..."
     @for f in docs/migrations/*.sql; do \
@@ -259,7 +266,7 @@ ch-migrate-all:
     done
     @echo "✓ All migrations complete"
 
-# Initialize ClickHouse with full schema (fresh deployment)
+# Load the base schema on a fresh deployment (the nostr database must exist)
 ch-init:
     @echo "Initializing ClickHouse schema..."
     @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} < docs/clickhouse_self_hosted.sql

@@ -1,0 +1,24 @@
+[Unit]
+Description=Report private archive admission health to Uptime Kuma
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+LoadCredential=push-url:/etc/pensieve/archive-admission-kuma.url
+ExecStart=/usr/bin/python3 /usr/local/libexec/pensieve-archive-admission-kuma.py
+TimeoutStartSec=20
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+MemoryMax=64M
+TasksMax=8
+UMask=0077
+

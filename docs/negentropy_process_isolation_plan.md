@@ -214,7 +214,7 @@ code sandbox. Host-wide OOM remains outside this guarantee.
    seal cadence, bounded sealed replay. Gate: pending-vs-archived races, concurrent
    live duplicates, crash before/after seal/dedupe/ledger commit, missing-segment
    cursor tests and Parquet-disabled durability test. No success from notifications alone.
-3. **Worker executable and scheduler** (`src/bin/negentropy-worker.rs` plus sync
+3. **Worker executable and scheduler** (`crates/pensieve-ingest/src/bin/pensieve-negentropy-worker.rs` plus sync
    modules): one job/process, unchanged SDK, exact interval, streamed IPC, parent
    scheduler, explicit allowlist, persisted backoff. Gate: fake relay floods/hangs,
    no progress, IPC loss, truncated output, failed callback and partial-fetch tests;
@@ -229,6 +229,8 @@ code sandbox. Host-wide OOM remains outside this guarantee.
    disable old reconciliation; initial worker canary on one approved relay.
    Gate: at least three successful durable jobs plus injected worker recovery,
    then 24-hour soak with backlog age, throughput, memory and ingestion rates.
+   (The 24-hour soak was superseded on 2026-10-09 by a 20–30 minute bounded
+   canary; see [negentropy_runtime.md](negentropy_runtime.md#bounded-canary).)
    Expand only when service capacity exceeds incoming job demand. No automatic
    adoption of all catalog relays. Rollback stops worker and leases, preserves ledger.
 
@@ -259,7 +261,7 @@ duplicates, pending duplicates, transferred bytes and runtime. Pending and merel
 accepted events must not inflate durable novelty. Bound detailed attempt retention
 and retain compact summaries without deleting unresolved gap state. Successful
 zero-new-event checks are not evidence that a relay has no events in the interval.
-Automatic historical exploration is deferred to `negentropy_historical_exploration.md`;
+Automatic historical exploration is deferred to a separate future feature (issue #39);
 it is not a prerequisite for the reliability rollout.
 
 No additional product decision is needed to begin the ledger/protocol slice.

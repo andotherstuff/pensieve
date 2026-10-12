@@ -24,7 +24,8 @@
     <!-- ═══════════════════════════════════════════════════════════════════ -->
 
     <merge_tree>
-        <!-- Background merge threads (more = faster merges, more CPU) -->
+        <!-- Minimum free background-pool entries required before a part mutation
+             starts (default 20). 0 lets mutations run even when merges fill the pool. -->
         <number_of_free_entries_in_pool_to_execute_mutation>0</number_of_free_entries_in_pool_to_execute_mutation>
 
         <!-- Parts management -->

@@ -7,22 +7,60 @@ This directory contains incremental schema migrations for the Pensieve ClickHous
 Migrations can be run using the `just` commands:
 
 ```bash
-# Run a single migration
-just ch-migrate docs/migrations/001_active_user_views.sql
+# Run a single migration (the only form to use on production)
+just ch-migrate docs/migrations/NNN_description.sql
 
-# Run all migrations in order
+# Fresh, empty database only: base schema, then every top-level migration
+just ch-init
 just ch-migrate-all
+just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
 ```
 
-`just ch-migrate-all` runs only active top-level `docs/migrations/*.sql`
-files. Prepared operations live under `docs/migrations/prepared/` and require
-an explicit `just ch-migrate <file>` command after their documented preflight.
+> **⚠️ `just ch-migrate-all` is for empty databases only.** Nothing records
+> which migrations have run, so it re-executes every top-level
+> `docs/migrations/*.sql` (001–015) in order. On a database with data that
+> means: 004, 005, 006, 008, 012, 013 and 014 drop and rebuild derived
+> tables; 009 runs `TRUNCATE TABLE zap_amounts_data` and re-inserts every zap
+> receipt; 005 and 008 expect services to be stopped first. Never run it
+> against production. Prepared operations under `prepared/` are excluded and
+> need an explicit `just ch-migrate <file>` after their documented preflight.
+>
+> "Idempotent" in these files means "does not fail if objects exist", not
+> "safe to re-run": read a migration before running it twice.
+
+`just ch-init` needs the `nostr` database to exist (the production Compose
+file creates it with `CLICKHOUSE_DB=nostr`; on a bare server run
+`CREATE DATABASE nostr` first). The sequence above, run on ClickHouse 24.8 on
+2026-10-11, produced exactly the tables, materialized views and views that
+production has. The one difference is `events_local`: the fresh install keeps
+the `events_by_kind` and `events_by_author` projections, which production has
+dropped (see [Production state](#production-state)).
 
 Or directly via Docker:
 
 ```bash
 docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/migrations/001_active_user_views.sql
 ```
+
+## Production state
+
+As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
+
+- 001–015 are applied, along with prepared 016, 017 and 018.
+- `nostr.events_local` has **no projections**. Each projection's
+  `DROP PROJECTION` mutation finished (`is_done = 1`):
+
+  | Projection | Dropped | How |
+  |---|---|---|
+  | `events_by_author` | 2026-06-13 | by hand; no migration in this repo |
+  | `events_by_time` | 2026-07-27 | `prepared/016` |
+  | `events_by_kind` | 2026-10-11 | `prepared/018` |
+
+- The compact lookup tables from 017 are backfilled, and the preview reads
+  them (`PREVIEW_COMPACT_LOOKUPS=all`).
+
+`docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
+snapshot of production. Its header explains how the two differ.
 
 ## Migration Index
 
@@ -43,9 +81,9 @@ docker exec -i pensieve-clickhouse clickhouse-client --database nostr < docs/mig
 | 013_schema_optimizations.sql | Replace slow AggregateFunction tables with pre-computed values | **Yes** (runs automatically) |
 | 014_relay_distribution.sql | Pre-aggregate NIP-65 relay distribution data | **Yes** (runs automatically) |
 | 015_kinds_stats.sql | Pre-aggregate event kind statistics | **Yes** (runs automatically) |
-| prepared/016_drop_events_by_time_projection.sql | Prepared removal of the full-row time projection; excluded from `ch-migrate-all` | No (background removal mutation) |
-| prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all` | **Yes** (`preview-lookups backfill`, bounded and resumable) |
-| prepared/018_drop_events_by_kind_projection.sql | Prepared removal of the full-row kind projection after 017; excluded from `ch-migrate-all` | No (background removal mutation) |
+| prepared/016_drop_events_by_time_projection.sql | Removal of the full-row time projection; excluded from `ch-migrate-all`. **Applied in production 2026-07-27** | No (background removal mutation) |
+| prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all`. **Applied and backfilled in production** | **Yes** (`preview-lookups backfill`, bounded and resumable) |
+| prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -375,7 +413,7 @@ docker start pensieve-grafana
 **Purpose:** Reclaim the disk and write amplification of the full-row
 `events_by_time` projection while keeping `events_local`, the
 `idx_created_at` minmax skipping index, and the more heavily used
-`events_by_kind` projection.
+`events_by_kind` projection (itself removed later by 018).
 
 **Production evidence captured before preparation:**
 
@@ -388,7 +426,9 @@ docker start pensieve-grafana
   `optimize_use_projections = 0`; the slowest sampled query changed from about
   2.0 seconds to 4.5 seconds and is protected by the API cache.
 
-The migration has been prepared but has not been applied to production.
+**Status:** applied to production. The drop mutation was created 2026-07-27
+and has finished; no `events_by_time` parts remain. The steps below are the
+procedure as it was run, kept for other installations.
 
 #### Before applying
 
@@ -496,6 +536,12 @@ Design and behaviour differences:
 just ch-migrate docs/migrations/rollback/017_drop_preview_compact_lookups.sql
 ```
 
+> **⚠️ Only while `events_by_kind` exists.** Production ran 018 on
+> 2026-10-11. Without the projection, `none` makes the preview's lookups
+> 10–30 s table scans, and the projection cannot practically be restored
+> (rollback/018 needs 1.6 TiB unreserved). On production, fix the compact
+> path forward instead of rolling 017 back.
+
 
 ---
 
@@ -518,6 +564,10 @@ projection on `events_local` in production.
   benchmarked at p95 ≤ 183 ms with projections and query cache off; preview
   switched to `PREVIEW_COMPACT_LOOKUPS=all`.
 
+**Status:** applied to production. The drop mutation was created 2026-10-11
+16:54 (server time) and has finished: no projection parts remain, and `/data`
+went from 93.5% to 57% used.
+
 **Guards in the file:** it flushes the query log, then refuses to run if the
 017 views are missing, if any query outside the `preview-lookups` tool used
 `events_by_kind` in the last 6 hours, or if another `events_local` mutation is
@@ -537,7 +587,11 @@ bring back 10–30 s legacy reads, so the compact path is the way forward.
 
 ---
 
-## Full Deployment Checklist
+## Full Deployment Checklist (historical)
+
+This is the checklist used when the stats endpoints were first added; every
+migration in it is already applied in production. Deploy binaries as described
+in [`ops/RUNBOOK.md` → Routine deploy](../../ops/RUNBOOK.md#routine-deploy).
 
 When deploying new API endpoints that depend on these migrations:
 
@@ -574,10 +628,10 @@ just ch-query "SELECT * FROM zap_amounts_data ORDER BY amount_msats DESC LIMIT 5
 
 ### 4. Rebuild and deploy the API server
 
-```bash
-just build-release
-# Then deploy pensieve-serve via your deployment method (systemd, docker, etc.)
-```
+Build a release of the exact commit and point `pensieve-api` at it, following
+[`ops/RUNBOOK.md` → Routine deploy](../../ops/RUNBOOK.md#routine-deploy).
+`just build-release` in the host's `~/pensieve` checkout does not change what
+the service runs.
 
 ---
 
@@ -651,7 +705,7 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/activity/hourly` | Activity by hour of day | None |
 | `GET /api/v1/stats/zaps` | Zap statistics | 003 |
 | `GET /api/v1/stats/zaps/histogram` | Zap amount distribution histogram | 003 |
-| `GET /api/v1/stats/engagement` | Reply/reaction ratios | None |
+| `GET /api/v1/stats/engagement` | Reply/reaction ratios (503 `metric_unavailable` unless the `engagement` family is served from Postgres) | None |
 | `GET /api/v1/stats/longform` | Long-form content stats | None |
 | `GET /api/v1/stats/publishers` | Top publishers | None |
 

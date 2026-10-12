@@ -4,8 +4,10 @@
 # Pages from these pubkeys get extended CDN cache TTLs.
 # Empty lines and lines starting with # are ignored.
 #
-# Copy to .vip and edit:
-#   cp .vip.example .vip
+# pensieve-preview reads PREVIEW_VIP_FILE (default ".vip", relative to the
+# service WorkingDirectory=/home/pensieve/pensieve). Copy to that location and
+# edit, or point PREVIEW_VIP_FILE at another path:
+#   cp ops/production/.vip.example /home/pensieve/pensieve/.vip
 
 # Example hex pubkey
 # 82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2

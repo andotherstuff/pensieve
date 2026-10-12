@@ -1,7 +1,9 @@
 # Bounded Analytics Migration Plan
 
-*Status: Slices 0-4 implemented; Slice 4 ready for an operator-authorized production canary*
-*Last updated: 2026-08-23*
+*Status: implementation has landed through Slice 9.5 (see the per-slice
+checklists in section 6); the unchecked items there, including the moving
+recurring all-product publication gate, remain open*
+*Last updated: 2026-09-05 (status header revised 2026-10-11)*
 
 This document turns the
 [analytics endpoint migration ledger](analytics_endpoint_migration.md) into an
@@ -1019,7 +1021,6 @@ After publication:
 
 ## 9. Immediate next action
 
-Implement Slice 0 first so the accepted Slice A shadow refresh is independent
-of unfinished B1 work. Then land Slice 1 as infrastructure-only commits before
-reintroducing any identity metric. No further production-scale B1 rebuild
-should run until the bounded-memory scale gate passes.
+The original next action (implement Slice 0, then Slice 1 before
+reintroducing any identity metric) is complete. The remaining work is the
+unchecked items in the per-slice status in section 6.

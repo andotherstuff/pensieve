@@ -1,12 +1,17 @@
 # Pensieve Ops Runbook
 
-How the production box is actually operated. The box runs at `/home/pensieve/pensieve`
-(the repo checkout); default branch `master`.
+How the production box is actually operated (`ssh pensieve`, user `pensieve`).
+The repo checkout is `/home/pensieve/pensieve`; default branch `master`. The
+checkout provides the Compose file and the ops scripts, but **not** the service
+binaries: those are release builds selected by systemd drop-ins (see
+[Routine deploy](#routine-deploy)). Facts marked with a date were observed on the
+host on that date.
 
 ## Layout
 
-- `ops/production/compose.yml` — Docker stack: ClickHouse, Postgres analytics,
-  Prometheus, Grafana, Caddy.
+- `ops/production/compose.yml` — Docker stack: ClickHouse, Prometheus, Grafana, Caddy,
+  plus `postgres-analytics`, which sits in the `manual-postgres` profile with
+  `restart: "no"` and is not started by `pensieve.service` (not running on 2026-10-11).
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
   ClickHouse query settings (profiles) belong in `clickhouse/users.xml` (mounted under
   `users.d`); `<profiles>` in `clickhouse/config.xml` (`config.d`) are silently ignored.
@@ -17,19 +22,37 @@ How the production box is actually operated. The box runs at `/home/pensieve/pen
   (`WHERE changed` lists only overrides, so it is empty for stock settings).
 - `ops/systemd/*.service`, `*.timer` — **source copies** of the installed units. Editing a
   file here does NOT change the running unit; you must install + `daemon-reload` (below).
-- `ops/scripts/sync-archive.sh` — hourly archive → Storage Box sync (run by `archive-sync.service`).
+  Their `ExecStart` lines point at `~/pensieve/target/release/`, but production overrides
+  them with drop-ins; [`ops/systemd/dropins/`](systemd/dropins/README.md) records those.
+- `ops/scripts/sync-archive.sh` — hourly archive → Storage Box sync (run by `archive-sync.service`
+  straight from the checkout, so the checkout's copy is the one that runs).
 - Secrets: **`/etc/pensieve/pensieve.env`** (outside the repo). Read by Docker Compose
-  (`--env-file`) and by the native binaries (systemd `EnvironmentFile`). Template:
-  repo-root [`env.production.example`](../env.production.example).
+  (`--env-file`), `pensieve-api`, `pensieve-preview`, `archive-sync` and
+  `pensieve-analytics-refresh` (systemd `EnvironmentFile`). **Not** read by
+  `pensieve-ingest`, which is configured by its `ExecStart` flags, drop-ins and the optional
+  root-only `/etc/pensieve/parquet-shadow.env`. Other root-only files: `analytics.env`,
+  `analytics-refresh.env`, `negentropy-worker.env`, the Kuma push URLs. Template:
+  repo-root [`env.production.example`](../env.production.example) and `ops/*.env.example`.
 
 ## What runs how
 
-| Component | Runs as |
-|-----------|---------|
-| ClickHouse, Postgres analytics, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` |
-| `pensieve-ingest`, `pensieve-serve`, `pensieve-preview` | native binaries via systemd |
-| archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` |
-| shadow analytics refresh (daily) | `pensieve-analytics-refresh.timer` → `pensieve-analytics-refresh.service` |
+Observed 2026-10-11:
+
+| Component | Runs as | Binary / command actually started |
+|-----------|---------|-----------------------------------|
+| ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
+| Postgres analytics | manual only (`manual-postgres` profile) | not running; start it as in [Shadow analytics Postgres](#shadow-analytics-postgres) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-7ac5121/pensieve-serve`, `PENSIEVE_POSTGRES_API_FAMILIES=none` |
+| `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
+| archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
+| shadow analytics refresh (daily) | `pensieve-analytics-refresh.timer` (**disabled**) → `.service` | `~/pensieve/ops/scripts/run-analytics-refresh.sh` |
+| Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
+| Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
+
+While `zzzz-bounded-canary.conf` is installed, the ingester does **not** restart by itself
+after it exits; check it after any stop or crash.
 
 Grafana datasources/dashboards are configured **on the running instance** (no repo
 provisioning). The ingester exposes Prometheus metrics on `:9091`.
@@ -47,7 +70,9 @@ required. For deployment:
 - Configure Uptime Kuma to monitor `/health/archive-admission` on the private
   ingester metrics port, accepting only HTTP 200, either directly over existing
   private connectivity or through a credential-protected outbound push probe.
-  Pensieve currently uses the latter; do not expose the port publicly. Test
+  Pensieve currently uses the latter (`pensieve-archive-admission-kuma.timer`,
+  [`ops/scripts/archive-admission-kuma.py`](scripts/archive-admission-kuma.py));
+  do not expose the port publicly. Test
   notification firing and resolution. The checked-in Prometheus rules alone
   do not notify anyone.
 - Run a read-only preflight for existing recovery markers/orphan segments and
@@ -67,29 +92,113 @@ replay, the shadow must drain its notification queue. Check catch-up and current
 work-unit duration before choosing a stop deadline, particularly when replacing
 an older binary that still drains the entire historical replay.
 
-1. **Pull:** `cd ~/pensieve && git pull origin master`
-2. **Build (if Rust changed):** `just build-release`
-3. **Install/reload units (only if `ops/systemd/` changed):**
+**Do not stop the ingester during :00–:07 UTC.** Refreshable views rescan all of
+`events_local` at those times: `kinds_stats_mv` and `active_users_daily_mv` every
+hour, and `relay_distribution_mv` (1.3 TiB read) at 00/06/12/18 UTC. They saturate
+the CPU, ingest inserts slow from ~8 s to ~50 s per batch, and shutdown waits for
+the in-flight segment to finish indexing. On 2026-10-12 a stop at 06:04 UTC
+exceeded the then 90 s `TimeoutStopSec` and was killed; `stop-timeout.conf` now
+allows 15 minutes. Check `system.view_refreshes` (`status`, `next_refresh_time`)
+before stopping.
+
+**After a killed shutdown, repair ClickHouse.** The indexer only requeues segments
+whose inserts *failed* (`/archive/segments/.clickhouse_reindex_queue`); a segment
+in flight at SIGKILL, and any sealed-but-not-yet-indexed segment, stays partially
+or entirely missing from `events_local` after restart. Find them from the journal
+(`Indexing segment N` without a matching `Indexed segment N`, plus the final
+sealed segment). Insert only the missing IDs: re-indexing a whole segment
+double-counts the summing views (reactions, replies, reposts, daily user stats).
+The 2026-10-12 repair converted each segment with `notepack-to-parquet`, selected
+the IDs absent from `events_local` through a `clickhouse-client --external` table
+into a Native file, checked its row count, inserted it, and re-counted to zero
+missing.
+
+Production deploys one component at a time from a release build of an exact
+commit. Do **not** deploy with `git pull` + `just build-release` in `~/pensieve`:
+the services do not run `target/release/` (drop-ins override `ExecStart`), and
+the checkout has uncommitted edits that the Compose stack and `archive-sync`
+use (on 2026-10-11: 29 commits behind, local edits to `ops/production/compose.yml`,
+`ops/scripts/sync-archive.sh`, `env.production.example`). Leave the checkout alone
+unless you are deliberately changing those.
+
+Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown):
+
+1. **Build the exact commit in a detached worktree** with its own target dir:
    ```bash
-   sudo install -m 644 ops/systemd/*.service ops/systemd/*.timer /etc/systemd/system/
+   git -C ~/pensieve fetch origin
+   SHA=<7-char commit>
+   git -C ~/pensieve worktree add --detach ~/pensieve-preview-$SHA $SHA
+   cd ~/pensieve-preview-$SHA
+   CARGO_TARGET_DIR=~/pensieve-preview-target cargo build --release --locked -p pensieve-preview
+   ```
+2. **Install into a new release directory** (root-owned, never overwritten):
+   ```bash
+   sudo install -d -m 755 /home/pensieve/pensieve/releases/preview-$SHA
+   sudo install -m 755 ~/pensieve-preview-target/release/pensieve-preview \
+     ~/pensieve-preview-target/release/preview-lookups \
+     /home/pensieve/pensieve/releases/preview-$SHA/
+   ```
+3. **Point the drop-in at it** and restart only that service:
+   ```bash
+   sudoedit /etc/systemd/system/pensieve-preview.service.d/10-release.conf
+   #   [Service]
+   #   ExecStart=
+   #   ExecStart=/home/pensieve/pensieve/releases/preview-<sha>/pensieve-preview
    sudo systemctl daemon-reload
+   sudo systemctl restart pensieve-preview
    ```
-4. **Restart native services as needed** (ingester last to minimize ingest gaps):
+4. **Verify** the running binary, the journal and health:
    ```bash
-   sudo systemctl restart pensieve-api pensieve-preview
-   sudo systemctl restart pensieve-ingest
+   readlink /proc/$(systemctl show -p MainPID --value pensieve-preview)/exe
+   journalctl -u pensieve-preview --since '5 minutes ago' --no-pager
+   curl -fsS localhost:8081/health   # API: localhost:8080/health
    ```
-5. **Restart Docker infra ONLY if `ops/production/` changed:**
-   ```bash
-   sudo systemctl restart pensieve
-   ```
-6. **Run migrations explicitly (if schema changed):**
-   ```bash
-   just ch-migrate docs/migrations/NNN_description.sql
-   ```
+5. **Record it:** update the copy in [`ops/systemd/dropins/`](systemd/dropins/README.md)
+   in the PR, and keep the previous `releases/` directory for rollback.
+
+Drop-ins per service (2026-10-11): `pensieve-api.service.d/90-postgres-cutover.conf`
+(also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_POSTGRES_API_FAMILIES=none` and
+`PENSIEVE_LATEST_EVENT_WATERMARK_PATH` inline), `pensieve-preview.service.d/10-release.conf`,
+and for the ingester `giftwrap-recipient-block.conf`, `nip66-monitor.conf`,
+`override.conf`, `stop-timeout.conf` (`TimeoutStopSec=15min`), `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
+
+**Ingester exception.** The running ingester was built from a plain source copy in
+`~/releases/negentropy-<sha>/` with `CARGO_TARGET_DIR=/data/pensieve-build/negentropy-<sha>`
+and is run from that target dir; the matching `pensieve-negentropy-worker` was installed
+to `/usr/local/libexec/`. Follow the graceful-stop checks above for every ingester stop.
+
+**Units.** Install only the unit files you changed, then `daemon-reload`. Do not glob
+`ops/systemd/*.service`: that also installs gated units (`pensieve-negentropy-worker`,
+the Kuma probes, `pensieve-parquet-campaign`) and the base `ExecStart` lines.
+```bash
+sudo install -m 644 ops/systemd/<changed>.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+**Docker infra:** restart only if `ops/production/` changed, and only after the
+checkout holds the intended files: `sudo systemctl restart pensieve`.
+
+**Migrations:** apply one file explicitly, `just ch-migrate docs/migrations/NNN_description.sql`.
+Never run `just ch-migrate-all` here: it replays every top-level migration,
+including drops, `TRUNCATE` and full backfills (see
+[`docs/migrations/README.md`](../docs/migrations/README.md)).
 
 Verify: `systemctl status pensieve pensieve-api pensieve-ingest pensieve-preview`,
 `curl localhost:8080/health`, `journalctl -u pensieve-ingest -f`.
+
+### Rollback
+
+Point the drop-in back at the previous release directory, `daemon-reload`, restart
+that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
+
+- Removing a drop-in falls back to `~/pensieve/target/release/<binary>`. Those are old
+  builds (2026-10-11: `pensieve-preview` from 2026-07-27, before compact lookups, so it
+  would do 10–30 s scans now that `events_by_kind` is gone; `pensieve-ingest` is the
+  2026-10-05 giftwrap hotfix). The comment inside `10-release.conf` that says "remove
+  this file" predates migration 018; do not follow it.
+- `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (current)
+  and only `preview-3ab1045`.
+- Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
 ## First live Parquet shadow activation
 
@@ -155,6 +264,12 @@ merely to bypass the guard.
 
 ## Bounded historical Parquet catch-up
 
+**Status (2026-10-11):** `pensieve-parquet-campaign.service` is not installed on the
+host and `/etc/pensieve/` has no `parquet-campaign.env` or `parquet-object-storage.env`.
+The steps below build from the `~/pensieve` checkout; if you run them again, build in a
+detached worktree instead (see [Routine deploy](#routine-deploy)) and point
+`SOURCE_MANIFEST_BIN` and the campaign binary at that build.
+
 The historical campaign is finite. Its immutable input universe ends at the
 inclusive historical/live boundary `H = 7702`; later live segments belong to
 the live shadow. Do not restart a healthy campaign merely to deploy the source
@@ -184,13 +299,16 @@ pass has stopped normally.
      --working-directory=/home/pensieve/pensieve \
      --property=EnvironmentFile=/etc/pensieve/parquet-object-storage.env \
      --property=EnvironmentFile=/etc/pensieve/parquet-campaign.env \
-     --setenv=INVENTORY_ONLY=1 \
+     /usr/bin/env INVENTORY_ONLY=1 \
      /home/pensieve/pensieve/ops/scripts/run-parquet-archive-campaign.sh
    sudo -u pensieve /home/pensieve/pensieve/target/release/pensieve-source-manifest \
      verify \
      --manifest /var/lib/pensieve-parquet/state/historical-source-manifest.json \
      --expected-max-segment-number 7702
    ```
+   Set `INVENTORY_ONLY=1` with `/usr/bin/env` as shown, not `--setenv`:
+   systemd lets `EnvironmentFile=` override `Environment=`, and the template
+   sets `INVENTORY_ONLY=0`, which would start the full download/publish run.
    The build is no-clobber. If the file already exists, the wrapper verifies
    and reuses it. Never delete or replace a populated manifest to make a
    boundary mismatch disappear; investigate the configuration instead.
@@ -222,8 +340,12 @@ failed historical inventory row to make the completion report green.
 ## Shadow analytics Postgres
 
 `postgres-analytics` is a localhost-only serving store for the DuckDB-built
-shadow analytics products. Set `POSTGRES_ANALYTICS_PASSWORD` in the private
-`/etc/pensieve/pensieve.env`, then start only this dependency with:
+shadow analytics products. It is in the Compose profile `manual-postgres` with
+`restart: "no"`, so `pensieve.service` never starts it and it stays down after a
+reboot (on 2026-10-11 it was not running, `pensieve-analytics-refresh.timer` was
+disabled, and the API served every family from ClickHouse). Compose still
+requires `POSTGRES_ANALYTICS_PASSWORD` in `/etc/pensieve/pensieve.env` for any
+`docker compose` command, including the normal stack. Start only this dependency with:
 
 ```bash
 sudo docker compose \
@@ -285,9 +407,10 @@ Install a non-secret `/etc/pensieve/analytics-refresh.env` based on
 `PENSIEVE_ANALYTICS_WORK_DATABASE` at the current persistent DuckDB file. Then
 install and activate the units:
 
+The service runs `ops/scripts/run-analytics-refresh.sh` straight from the
+checkout (already mode 0755 in Git), so there is nothing to install for it.
+
 ```bash
-sudo install -m 0755 ops/scripts/run-analytics-refresh.sh \
-  /home/pensieve/pensieve/ops/scripts/run-analytics-refresh.sh
 sudo install -m 0644 ops/systemd/pensieve-analytics-refresh.service \
   ops/systemd/pensieve-analytics-refresh.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -353,6 +476,9 @@ P3 parity gate. Keep `pensieve-serve` and Grafana on ClickHouse.
 
 ## One-time cutover (ops/ move + secrets → /etc)
 
+**Historical: completed.** Compose, the units and the scripts already use
+`ops/` and `/etc/pensieve/`. Kept as a record; do not re-run it.
+
 The move of compose/systemd paths and secrets to `/etc` must happen in lockstep with
 pulling this change, or services break. On the box, after `git pull`:
 
@@ -395,15 +521,21 @@ pulling this change, or services break. On the box, after `git pull`:
 Moves nstr.to's profile, zap and naddr reads off the `events_by_kind`
 projection and onto small lookup tables. Design, correctness model and
 behaviour differences: [`docs/preview_compact_lookups.md`](../docs/preview_compact_lookups.md).
-Every step below can be undone. **Dropping the projection is not one of these
-steps** (see the end of this section).
 
-Run the tool from the checkout as the `pensieve` user, with
-`/etc/pensieve/pensieve.env` loaded (`CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`):
+**Status (2026-10-11):** steps 1–6 are done (017 applied, backfilled, validated,
+preview on `PREVIEW_COMPACT_LOOKUPS=all`) and the projection was then removed by
+migration 018 (see the end of this section). Steps 1–5 below are kept as the
+procedure for a fresh install or a rebuild; on production they now need
+`--allow-full-scan` where noted, and rollback step 7 is no longer cheap.
+
+Run the tool as the `pensieve` user with `/etc/pensieve/pensieve.env` loaded
+(`CLICKHOUSE_URL`; `CLICKHOUSE_DATABASE` defaults to `nostr`). Use the binary
+from the preview release, not a build from the `~/pensieve` checkout (which
+predates #67 on 2026-10-11):
 
 ```bash
-cargo build --release --bin preview-lookups
-PL="target/release/preview-lookups --checkpoint-dir /home/pensieve/preview-lookups"
+# Current preview release on 2026-10-11; use the directory the drop-in points at.
+PL="/home/pensieve/pensieve/releases/preview-3ab1045/preview-lookups --checkpoint-dir /home/pensieve/preview-lookups"
 ```
 
 ### 1. Preflight (read-only)
@@ -479,8 +611,8 @@ $PL status
   backlog). Re-run the same command later.
 - **Error on projection or read amplification:** the tool stops if a shard
   did not use `events_by_kind` or read far more rows than planned.
-  Investigate before continuing, and never re-run with `--allow-full-scan` on
-  production while the projection exists.
+  Investigate before continuing, and never re-plan with `plan --allow-full-scan`
+  on production while the projection exists (`backfill` follows the plan).
 - **Calibrate:** after the first few shards, compare `status` bytes per row
   with the plan's estimate.
 - **Optional:** add `--gap-pass` on the final session to re-read rows indexed
@@ -640,6 +772,25 @@ Provisioning is no longer in the repo. Configure the Prometheus datasource
 installed at container start. See the ingestion/coverage dashboard guide handed off
 separately for the panel set.
 
+## Negentropy reconciliation
+
+The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
+`pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
+`ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
+not covered by the routine deploy above. Since 2026-10-12 08:29 CEST the ingester runs
+build `negentropy-ba0c4a1` (PR #72) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
+the worker is started only for monitored pilots. Expect that drop-in to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
+and [`docs/negentropy_continuous_readiness.md`](../docs/negentropy_continuous_readiness.md).
+Its Kuma probe is `pensieve-negentropy-kuma.timer` (`/health/negentropy`); the
+archive-admission probe is `pensieve-archive-admission-kuma.timer` (`/health/archive-admission`).
+Both were active on 2026-10-11. Their scripts are `ops/scripts/negentropy-kuma.py`
+and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pensieve-*-kuma.py`.
+
 ## Cleanup debt
-- `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; this needs
-  updating when the Parquet archive lands (see [`docs/migration-plan.md`](../docs/migration-plan.md)).
+- `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
+  with Parquet retention now that the live shadow and historical campaign exist (see
+  [`docs/migration-plan.md`](../docs/migration-plan.md)).
+- The `~/pensieve` checkout on the host is behind `master` with uncommitted edits (see
+  [Routine deploy](#routine-deploy)); bring it back to a clean `master` deliberately.
+- `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
+  [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.

@@ -5,6 +5,22 @@
 -- This schema is designed for self-hosted ClickHouse deployments using
 -- standard MergeTree engines. It includes projections for optimized query
 -- performance across different access patterns.
+--
+-- FRESH-INSTALL STARTING POINT, NOT A PRODUCTION SNAPSHOT.
+-- A fresh install is: this file (`just ch-init`, which needs the nostr
+-- database to exist), then `just ch-migrate-all` (001-015), then
+-- docs/migrations/prepared/017_preview_compact_lookups.sql. Migration 013
+-- drops several objects created below (the video/tag/activity views and
+-- event_tags_flat); migrations add the rest (pubkey_first_seen_*,
+-- zap_amounts_*, daily_user_stats, active_users_*, cohort_retention_*,
+-- relay_distribution, kinds_stats_mv, the 017 compact lookups).
+-- Checked on ClickHouse 24.8 on 2026-10-11: that sequence yields exactly the
+-- tables and views production has. The only difference is events_local:
+-- production has NO projections. events_by_author was dropped by hand on
+-- 2026-06-13 (no migration covers it); events_by_time and events_by_kind
+-- were dropped by prepared/016 and prepared/018. events_by_kind stays here on
+-- purpose (see below). Never run `just ch-migrate-all` against an existing
+-- database; see docs/migrations/README.md.
 
 -- =============================================================================
 -- DATABASE SETUP
@@ -67,7 +83,8 @@ USE nostr;
 --   preview-lookups backfill rely on it. An installation removes it only after
 --   applying and backfilling prepared migration 017, switching the preview to
 --   PREVIEW_COMPACT_LOOKUPS=all, and then running prepared migration 018.
--- - events_by_author: Optimized for author queries (e.g., "videos by pubkey X")
+-- - events_by_author: Optimized for author queries (e.g., "videos by pubkey X").
+--   Not present in production (dropped by hand 2026-06-13).
 CREATE TABLE IF NOT EXISTS events_local (
     -- Event fields (NIP-01)
     id String,                    -- 32-byte hex event ID (SHA-256 hash, always 64 chars)

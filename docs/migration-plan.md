@@ -16,6 +16,20 @@ It is a companion to the target-architecture design notes. Where the design doc 
 
 ## 1. Current state (what exists today)
 
+> **Update 2026-10-11** (changes since the 2026-07-28 snapshot below):
+> - The `events_by_time` and `events_by_kind` projections were removed from
+>   `events_local` (prepared migrations 016 and 018); production has no
+>   projections on that table.
+> - `pensieve-preview` gained compact lookup tables (prepared migration 017,
+>   [preview_compact_lookups.md](preview_compact_lookups.md)) and runs with
+>   `PREVIEW_COMPACT_LOOKUPS=all`. The preview is not currently being dropped.
+> - The sealed-notepack Parquet live shadow and the sequential historical
+>   campaign have landed (see P2 in section 9).
+> - Analytics slices beyond Slice A exist in `crates/pensieve-analytics` and
+>   `docs/postgres/002`–`010` (see
+>   [bounded_analytics_plan.md](bounded_analytics_plan.md)); production API
+>   routes still read ClickHouse (`PENSIEVE_POSTGRES_API_FAMILIES=none`).
+
 ```
 relay collectors ─► RocksDB dedup ─► notepack .gz segments (source of truth)
                                           └─► ClickHouse (events_local + ~7 MVs)
@@ -819,6 +833,10 @@ Updated 2026-07-28.
   inventoried. Slice A now has an executable DuckDB builder and transactional
   Postgres serving schema; real-snapshot shadow deployment, old/new comparison,
   later slices, endpoint cutover, and the optimizer remain.
+  *2026-10-11:* later slices have landed through Slice 9.5
+  ([bounded_analytics_plan.md](bounded_analytics_plan.md)); no endpoint family
+  is cut over in production (`PENSIEVE_POSTGRES_API_FAMILIES=none`), and the
+  optimizer remains.
 - **P4 Reader cutover** — not started
 - **P5 Parquet durability authority** — not started
 - **P6 Retire old storage** — not started

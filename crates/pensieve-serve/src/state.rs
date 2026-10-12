@@ -137,7 +137,7 @@ impl AnalyticsBackendSelection {
 /// Application configuration loaded from environment.
 #[derive(Clone)]
 pub struct Config {
-    /// Server bind address (e.g., "0.0.0.0:3000").
+    /// Server bind address (e.g., "0.0.0.0:8080").
     pub bind_addr: String,
 
     /// ClickHouse connection URL.
@@ -178,7 +178,7 @@ impl Config {
     /// - `PENSIEVE_API_TOKENS`: Comma-separated list of valid API tokens
     ///
     /// Optional environment variables:
-    /// - `PENSIEVE_BIND_ADDR`: Server bind address (default: "0.0.0.0:3000")
+    /// - `PENSIEVE_BIND_ADDR`: Server bind address (default: "0.0.0.0:8080")
     /// - `CLICKHOUSE_URL`: ClickHouse URL (default: "http://localhost:8123")
     /// - `CLICKHOUSE_DATABASE`: Database name (default: "nostr")
     /// - `DATABASE_URL`: Postgres URL (required for selected Postgres families)
