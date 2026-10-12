@@ -41,7 +41,7 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-60c4bfe/pensieve-serve` (master with migration 019 rollups, since 2026-10-12 14:52 CEST) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12 16:20 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
@@ -205,7 +205,7 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`, current) and
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, current) and
   only `preview-3ab1045`.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
@@ -691,8 +691,10 @@ publishers 30 d 4.9 s, longform 0.4 s, publishers 366 d **39 s**.
 
 **Known limit:** the API caps `days` at 60 (`400` above that) since 2026-10-12. Since
 mid-2026 20–45 million distinct pubkeys are active per month (mostly single-use keys), so
-cost grows with the window: 30 days ~26M rows / 5–7 s, 60 days ~46M / ~9.5 s, 90 days
-~71M / ~20 s (at the cap), one year ~150M / 39 s. Re-measure if key churn grows.
+cost grows with the window: 30 days ~26M rows / 5–7 s, 60 days ~46M / ~9.5 s for the
+ranking alone and 14.4 s through the API (which also computes kinds and first/last times),
+90 days ~71M / ~20 s (at the cap), one year ~150M / 39 s. Re-measure if key churn grows;
+a precomputed ranking is the fix if 60 days approaches the cap.
 The rollup keeps 400 days, so the cap can be raised once long windows get a precomputed
 path.
 
