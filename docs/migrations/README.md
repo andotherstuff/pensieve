@@ -14,6 +14,7 @@ just ch-migrate docs/migrations/NNN_description.sql
 just ch-init
 just ch-migrate-all
 just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
+just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
 ```
 
 > **⚠️ `just ch-migrate-all` is for empty databases only.** Nothing records
@@ -58,6 +59,9 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 
 - The compact lookup tables from 017 are backfilled, and the preview reads
   them (`PREVIEW_COMPACT_LOOKUPS=all`).
+- Prepared 019 (API rollups for `/stats/publishers` and `/stats/longform`)
+  is **not yet applied**. Until it is applied and backfilled, an API build
+  that reads it answers those two endpoints with `503 metric_unavailable`.
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -84,6 +88,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/016_drop_events_by_time_projection.sql | Removal of the full-row time projection; excluded from `ch-migrate-all`. **Applied in production 2026-07-27** | No (background removal mutation) |
 | prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all`. **Applied and backfilled in production** | **Yes** (`preview-lookups backfill`, bounded and resumable) |
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
+| prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Not yet applied in production** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -584,6 +589,56 @@ only through this migration, after 017 is applied, backfilled and enabled.
 start without 1.6 TiB unreserved, so it is effectively unavailable on the
 current production disk. After removal, `PREVIEW_COMPACT_LOOKUPS=none` would
 bring back 10–30 s legacy reads, so the compact path is the way forward.
+
+---
+
+### prepared/019_api_publishers_longform.sql
+
+**Purpose:** Serve `GET /api/v1/stats/publishers` and
+`GET /api/v1/stats/longform` from two small tables instead of scanning
+`events_local`. Without projections both endpoints hit the API's 20 s query
+cap (ClickHouse error 159): the publisher ranking read ~300M rows in 20 s
+and the longform totals read 270M rows / 60 GiB of content in 20 s.
+
+It creates two tables, each fed by an insert-triggered view on
+`events_local`:
+- `publisher_activity`: `AggregatingMergeTree ORDER BY (grain, kind,
+  period, pubkey)` with event count, kinds and first/last `created_at` per
+  UTC day and per UTC month, per kind and for all kinds (`kind = -1`).
+  Kinds 445 and 1059 (throwaway keys) are excluded. `TTL period + 400 days`.
+  Counts are **sums**: a row counted twice stays counted twice.
+- `longform_latest`: the latest version of every kind 30023 article per
+  (pubkey, d tag), with its id, `created_at` and content length (migration
+  017's `argMin` rule: newest `created_at`, lowest id on ties).
+
+The migration refuses to create the publisher view on a non-empty
+`publisher_activity` (the backfill boundary needs the view to start on an
+empty table). It does **not** backfill.
+
+**Backfill:** `api-rollups plan` fixes the view boundary (the first second
+the view captured) and sizes a sample shard; `api-rollups backfill` then
+reads `events_local` in id-prefix shards. Publisher shards read only rows
+indexed before the boundary and each runs exactly once (one atomic part per
+shard, pending markers resolved from `system.query_log`). Longform shards are
+idempotent. `api-rollups validate` compares sampled keys against a direct
+oracle on `events_local`.
+
+**Behaviour changes** (see [`docs/api_rollups.md`](../api_rollups.md)):
+- longform `articles_count` counts distinct articles (latest version per
+  pubkey and d tag), not every version; content statistics come from that
+  latest version, and `days` filters on its `created_at`;
+- publishers use whole UTC days, accept `days` 1–366, and reject kinds 445
+  and 1059; events dated more than a day after ingestion count on the day
+  after ingestion.
+
+**Apply, backfill, validate and roll out:** follow
+[`ops/RUNBOOK.md` → API rollups](../../ops/RUNBOOK.md#api-rollups-migration-019).
+
+**Rollback:** both endpoints then answer `503 metric_unavailable`:
+
+```bash
+just ch-migrate docs/migrations/rollback/019_drop_api_publishers_longform.sql
+```
 
 ---
 

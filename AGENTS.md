@@ -50,6 +50,7 @@ just test-preview-verbose   # Run with output
 just coverage-preview       # HTML coverage report (requires cargo-llvm-cov)
 just coverage-preview-summary  # Coverage summary
 just run-preview-lookups --help  # Compact lookup plan/backfill/status/validate/bench
+just run-api-rollups --help      # API rollup (migration 019) plan/backfill/status/validate/resolve
 ```
 
 ### Agent Commit Requirement
@@ -101,6 +102,7 @@ pensieve/
 │   │       └── routes/      # HTTP routes (preview, JSON API, llms.txt, health)
 │   │   └── src/bin/         # preview-lookups (compact lookup operator tool)
 │   ├── pensieve-serve/      # HTTP API (/api/v1 stats, kinds, relays) over ClickHouse
+│   │   └── src/bin/         # api-rollups (migration 019 operator tool)
 │   ├── pensieve-parquet/    # Canonical Parquet schema/writer (notepack-to-parquet, validate, compare, salvage)
 │   ├── pensieve-lake/       # Parquet lake work units, inventory, publication
 │   │                        #   (pensieve-parquet-campaign, pensieve-source-manifest, pensieve-lake-catalog)
@@ -203,7 +205,7 @@ just test-verbose
 cargo test -p pensieve-core test_name
 ```
 
-Every crate has unit tests; `pensieve-ingest`, `-preview`, `-lake`, `-parquet` and `-analytics` also have `tests/` integration suites. ClickHouse integration tests are opt-in (`just ch-test-up && just test-clickhouse`), and `just ops-test` covers the Python ops scripts.
+Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-parquet` and `-analytics` also have `tests/` integration suites. ClickHouse integration tests are opt-in (`just ch-test-up && just test-clickhouse`), and `just ops-test` covers the Python ops scripts.
 
 ## Common Tasks
 
@@ -218,9 +220,9 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-lake`, `-parquet` a
 3. Register in the metrics initialization if using labels
 
 ### Modifying ClickHouse schema
-1. Add a migration file in `docs/migrations/` with the next free number (`019_description.sql` at the time of writing; `prepared/` and `rollback/` share the numbering)
+1. Add a migration file in `docs/migrations/` with the next free number (`020_description.sql` at the time of writing; `prepared/` and `rollback/` share the numbering)
 2. Ensure idempotency (use `IF NOT EXISTS`, `CREATE OR REPLACE`, etc.)
-3. Run with `just ch-migrate docs/migrations/019_description.sql`
+3. Run with `just ch-migrate docs/migrations/020_description.sql`
 4. If a fresh install should get the change, update `docs/clickhouse_self_hosted.sql` too, or say in the migration why not
 
 ### Working with the dedupe index
@@ -233,9 +235,9 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-lake`, `-parquet` a
 ## ClickHouse Migrations
 
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
-`docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
+`docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-11):** 001–015 and prepared 016, 017 and 018 are applied. `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state (2026-10-12):** 001–015 and prepared 016, 017 and 018 are applied; prepared 019 is not yet applied. `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -275,6 +277,7 @@ just ch-migrate docs/migrations/NNN_description.sql
 just ch-init                  # needs the nostr database; the production compose creates it
 just ch-migrate-all           # 001–015
 just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
+just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
 
 # Verify current state
 just ch-tables
@@ -286,7 +289,7 @@ just ch-tables
 - **Truncate + backfill**: Some migrations truncate tables and repopulate from `events_local` (2.4 billion rows in production). These take a long time.
 - **Materialized views**: When fixing MV logic, you typically: drop the view, recreate with new logic, truncate the target table, and backfill.
 - **Prepared operations**: Files under `docs/migrations/prepared/` are excluded from `just ch-migrate-all` and require explicit operator preflight and invocation.
-- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017) produces the same tables and views as production, but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
+- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017) produces the same tables and views as production (prepared 019 then adds the API rollups, which production gets when it is rolled out), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
 - **Test locally first**: `just ch-test-up` starts a disposable ClickHouse 24.8 (same line as production).
 
 ---

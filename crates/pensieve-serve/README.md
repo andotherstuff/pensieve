@@ -634,13 +634,20 @@ contract it will serve once a bounded source exists.
 
 #### `GET /api/v1/stats/longform`
 
-Statistics for long-form content (kind 30023).
+Statistics for long-form content (kind 30023). Each article, identified by
+pubkey and `d` tag, counts **once, at its latest version** (newest
+`created_at`, lowest event id on ties); edits are not counted separately.
+
+This reads the `longform_latest` table from prepared migration
+`019_api_publishers_longform` (see [`docs/api_rollups.md`](../../docs/api_rollups.md)).
+Without that table the endpoint returns `503` with
+`{"error": "metric_unavailable"}`.
 
 **Query Parameters**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `days` | integer | - | Days to include (omit for all time) |
+| `days` | integer | - | Only articles whose latest version was created in the last `days` days (omit for all time) |
 
 **Response**
 
@@ -654,21 +661,44 @@ Statistics for long-form content (kind 30023).
 }
 ```
 
+| Field | Description |
+|-------|-------------|
+| `articles_count` | Distinct articles (pubkey, `d` tag) |
+| `unique_authors` | Distinct authors of those articles |
+| `avg_content_length` | Mean content length of the latest versions, in bytes (`0` when there are none) |
+| `total_content_length` | Sum of the latest versions' content lengths, in bytes |
+| `estimated_total_words` | `total_content_length / 5` |
+
+> **Changed with migration 019:** `articles_count` and the content statistics
+> used to include every version of every article.
+
 ---
 
 ### Publishers
 
 #### `GET /api/v1/stats/publishers`
 
-Top publishers by event count.
+Top publishers by event count (ties ordered by pubkey).
+
+This reads the `publisher_activity` table from prepared
+migration `019_api_publishers_longform` (see
+[`docs/api_rollups.md`](../../docs/api_rollups.md)). Without that table the
+endpoint returns `503` with `{"error": "metric_unavailable"}`.
 
 **Query Parameters**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `kind` | integer | - | Filter by event kind |
-| `days` | integer | 30 | Days to include |
+| `kind` | integer | - | Filter by event kind (not 445 or 1059) |
+| `days` | integer | 30 | Days to include, 1–366 |
 | `limit` | integer | 100 | Number of publishers (max: 1000) |
+
+The window covers whole UTC days: from the start of the UTC day containing
+`now - days` onwards, so between `days` and `days + 1` days. It has no upper
+bound, but an event dated more than a day after it was ingested counts on the
+day after ingestion. Kinds 445 and 1059 (throwaway-key gift wraps and group
+messages) are not ranked and return `400`. `first_event`/`last_event` are the
+earliest and latest `created_at` in the window.
 
 **Response**
 
@@ -1002,7 +1032,7 @@ All errors return JSON with the following structure:
 | 500 | `database_error` | Database query failed |
 | 500 | `serialization_error` | Response serialization failed |
 | 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out; retry later |
-| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`) |
+| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied |
 
 ---
 
