@@ -44,7 +44,7 @@ Observed 2026-10-11:
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12 16:20 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
+| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker`, continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
@@ -896,7 +896,7 @@ The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separa
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
 not covered by the routine deploy above. Since 2026-10-12 16:36 CEST the ingester runs
 `releases/ingest-b466b37` (master, incl. #72 and #73) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
-the worker is started only for monitored pilots. Expect that drop-in to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
+the worker runs continuously against Premium Primal only since 2026-10-12 15:22 UTC and is started with the ingester (`negentropy-worker.conf`); see [continuous readiness](../docs/negentropy_continuous_readiness.md#continuous-premium-primal-operation-since-2026-10-12). Expect these drop-ins to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
 and [`docs/negentropy_continuous_readiness.md`](../docs/negentropy_continuous_readiness.md).
 Its Kuma probe is `pensieve-negentropy-kuma.timer` (`/health/negentropy`); the
 archive-admission probe is `pensieve-archive-admission-kuma.timer` (`/health/archive-admission`).

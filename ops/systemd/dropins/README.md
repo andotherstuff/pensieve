@@ -17,6 +17,7 @@ copy here in the same PR as the code it deploys.
 | `pensieve-preview` | `10-release.conf` | Runs `releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
 | `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
+| `pensieve-ingest` | `negentropy-worker.conf` | `Wants=pensieve-negentropy-worker.service`: starts the isolated NIP-77 worker whenever the ingester starts, including at boot (continuous Premium Primal reconciliation since 2026-10-12) |
 | `pensieve-ingest` | `override.conf` | `RUST_BACKTRACE=1` |
 | `pensieve-ingest` | `stop-timeout.conf` | `TimeoutStopSec=15min` (added 2026-10-12): a ClickHouse insert slowed by the hourly refreshable views must finish instead of being killed mid-segment |
 | `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 14:36 UTC; previously the PR #72 build, kept for rollback as `releases/ingest-ba0c4a1/` with its worker) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |

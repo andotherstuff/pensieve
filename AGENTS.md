@@ -321,7 +321,7 @@ summary below is a quick reference.
 | `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12) via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
 | `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
+| `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against Premium Primal since 2026-10-12) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout |
 | Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
 
