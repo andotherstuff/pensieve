@@ -21,14 +21,19 @@ mod admission;
 mod clickhouse;
 mod coverage;
 mod dedupe;
+mod index_queue;
 mod parquet_shadow;
 mod seal_timer;
 mod segment;
 
 pub use admission::validate_archive_event;
-pub use clickhouse::{ClickHouseConfig, ClickHouseIndexer, EventRow, IndexerStats};
+pub use clickhouse::{
+    ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, EventRow, IndexOutcome,
+    IndexerStats,
+};
 pub use coverage::CoverageSampler;
 pub use dedupe::{DedupeIndex, DedupeStats, EventStatus, PendingAdmission};
+pub use index_queue::{IndexProgress, IndexQueue, resolve_segment};
 pub use parquet_shadow::{
     ParquetShadowConfig, ParquetShadowHandle, ParquetShadowPublisher, start_parquet_shadow,
 };

@@ -35,9 +35,10 @@ use pensieve_core::metrics::{init_metrics, start_metrics_server_with_archive_hea
 use pensieve_ingest::pipeline::ArchiveSealTimer;
 use pensieve_ingest::sync::runtime::{IsolatedRuntime, RuntimeConfig};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, NegentropySyncConfig,
-    NegentropySyncer, ParquetShadowConfig, ParquetShadowHandle, ParquetShadowPublisher,
-    RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig, SegmentWriter, SyncStateDb,
+    ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, CoverageSampler, DedupeIndex,
+    IndexQueue, NegentropySyncConfig, NegentropySyncer, ParquetShadowConfig, ParquetShadowHandle,
+    ParquetShadowPublisher, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
+    SegmentWriter, SyncStateDb,
     logging::compact_error,
     pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
@@ -1429,12 +1430,12 @@ async fn main() -> Result<()> {
             handle.request_shutdown();
         }
 
-        // Wait for ClickHouse indexer if running
+        // ClickHouse is derived and every sealed segment is journaled, so its
+        // indexer never holds shutdown hostage: give it a short window to
+        // drain, then stop it at the next batch boundary, then stop waiting.
+        // Anything unfinished resumes from the journal on the next start.
         if let Some(handle) = indexer_handle {
-            tracing::info!("Waiting for ClickHouse indexer to finish...");
-            if let Err(e) = handle.join() {
-                tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
-            }
+            stop_clickhouse_indexer(handle).await;
         }
         if let Some(handle) = parquet_shadow_handle {
             tracing::info!("Waiting for Parquet shadow worker to finish...");
@@ -1494,6 +1495,41 @@ fn continue_live_after_isolated_failure<T>(result: Result<T>) -> Option<T> {
     }
 }
 
+/// How long shutdown lets the ClickHouse indexer drain queued segments.
+const CLICKHOUSE_DRAIN_GRACE: Duration = Duration::from_secs(20);
+/// How long shutdown then waits for the in-flight insert batch to finish.
+const CLICKHOUSE_STOP_GRACE: Duration = Duration::from_secs(60);
+
+/// Stop the ClickHouse indexer within a bounded time.
+async fn stop_clickhouse_indexer(handle: ClickHouseIndexerHandle) {
+    tracing::info!("Waiting for ClickHouse indexer to finish...");
+    if !wait_until_finished(&handle, CLICKHOUSE_DRAIN_GRACE).await {
+        tracing::info!("ClickHouse indexer still busy; stopping it at the next batch boundary");
+        handle.request_shutdown();
+        if !wait_until_finished(&handle, CLICKHOUSE_STOP_GRACE).await {
+            tracing::warn!(
+                "ClickHouse indexer did not stop in time; exiting with an insert in flight \
+                 (the journal resumes it on next start, checking for existing rows)"
+            );
+            return;
+        }
+    }
+    if let Err(e) = handle.join() {
+        tracing::warn!(panic = ?e, "ClickHouse indexer thread panicked");
+    }
+}
+
+async fn wait_until_finished(handle: &ClickHouseIndexerHandle, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
 async fn finish_archive_shutdown(
     isolated_error: Option<anyhow::Error>,
     cleanup: impl std::future::Future<Output = Result<()>>,
@@ -1523,7 +1559,7 @@ async fn wait_for_archive_recovery(shutdown: &AtomicBool, reason: &str) {
 type PipelineComponents = (
     Arc<SegmentWriter>,
     Arc<DedupeIndex>,
-    Option<std::thread::JoinHandle<()>>,
+    Option<ClickHouseIndexerHandle>,
     Option<ParquetShadowHandle>,
 );
 
@@ -1582,10 +1618,30 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
         "segment writer configured"
     );
 
-    let segment_writer = Arc::new(
+    // Journal of segments not yet fully in ClickHouse. Opened before the
+    // writer so entries left by a previous run are distinguishable from new
+    // seals. Keeps the historical file name so queues from older binaries
+    // are picked up.
+    let index_queue = if args.clickhouse_url.is_some() {
+        let path = args.output_dir.join(".clickhouse_reindex_queue");
+        let queue = IndexQueue::open(&path).with_context(|| {
+            format!(
+                "Failed to open ClickHouse index queue at {}",
+                path.display()
+            )
+        })?;
+        Some(Arc::new(queue))
+    } else {
+        None
+    };
+
+    let mut segment_writer =
         SegmentWriter::new_with_senders(segment_config, sealed_senders, Some(Arc::clone(&dedupe)))
-            .with_context(|| "Failed to create segment writer")?,
-    );
+            .with_context(|| "Failed to create segment writer")?;
+    if let Some(queue) = &index_queue {
+        segment_writer = segment_writer.with_index_queue(Arc::clone(queue));
+    }
+    let segment_writer = Arc::new(segment_writer);
 
     // Initialize ClickHouse indexer (optional)
     let indexer_handle =
@@ -1596,7 +1652,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
                 database: args.clickhouse_db.clone(),
                 table: "events_local".to_string(),
                 batch_size: 10000,
-                reindex_queue_path: Some(args.output_dir.join(".clickhouse_reindex_queue")),
+                index_queue,
             };
             let indexer = ClickHouseIndexer::new(ch_config)
                 .with_context(|| "Failed to create ClickHouse indexer")?;

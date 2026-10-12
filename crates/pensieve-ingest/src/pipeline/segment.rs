@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use super::dedupe::DedupeIndex;
+use super::index_queue::IndexQueue;
 pub use pensieve_core::{LatestEventWatermark, read_latest_event_watermark};
 
 /// Configuration for the segment writer.
@@ -202,6 +203,10 @@ pub struct SegmentWriter {
     dedupe: Option<Arc<DedupeIndex>>,
     /// Serializes cumulative watermark read/merge/write publication.
     watermark_publication: Mutex<()>,
+    /// Optional ClickHouse index journal. Each sealed segment is recorded here
+    /// before any downstream notification, so a segment sealed just before a
+    /// kill is still indexed on the next start.
+    index_queue: Option<Arc<IndexQueue>>,
 }
 
 impl SegmentWriter {
@@ -259,7 +264,16 @@ impl SegmentWriter {
             sealed_senders,
             dedupe,
             watermark_publication: Mutex::new(()),
+            index_queue: None,
         })
+    }
+
+    /// Journal every sealed segment in `queue` for the ClickHouse indexer.
+    ///
+    /// Journaling is best-effort: a failure is logged and never blocks sealing.
+    pub fn with_index_queue(mut self, queue: Arc<IndexQueue>) -> Self {
+        self.index_queue = Some(queue);
+        self
     }
 
     /// Inspect recovery evidence before opening databases or starting admission.
@@ -660,6 +674,20 @@ impl SegmentWriter {
         // re-fetchable rather than silently lost.
         if let Some(dedupe) = &self.dedupe {
             dedupe.mark_archived(event_ids.iter())?;
+        }
+
+        // The archive is canonical, so a journal failure costs only ClickHouse
+        // coverage for this segment; never fail the seal over it.
+        if let Some(queue) = &self.index_queue
+            && let Err(error) = queue.record_sealed(&path)
+        {
+            metrics::counter!("clickhouse_index_queue_errors_total").increment(1);
+            tracing::error!(
+                segment_number,
+                path = %path.display(),
+                error = %compact_error(&error),
+                "failed to journal sealed segment for clickhouse indexing"
+            );
         }
 
         let sealed_at = Utc::now();
@@ -1374,6 +1402,43 @@ mod tests {
 
         let stats = writer.stats();
         assert!(stats.segment_number > 0); // Should have sealed at least once
+    }
+
+    #[test]
+    fn sealed_segments_are_journaled_before_notification() {
+        let tmp = TempDir::new().unwrap();
+        let queue_path = tmp.path().join(".clickhouse_reindex_queue");
+        let queue = Arc::new(IndexQueue::open(&queue_path).unwrap());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let config = SegmentConfig {
+            output_dir: tmp.path().to_path_buf(),
+            compress: true,
+            ..Default::default()
+        };
+        let writer = SegmentWriter::new(config, Some(sender), None)
+            .unwrap()
+            .with_index_queue(Arc::clone(&queue));
+
+        writer.write(test_event(1)).unwrap();
+        let sealed = writer.seal().unwrap().unwrap();
+        // Journaled at seal time, under the uncompressed name, before the
+        // background compression thread notifies anyone.
+        assert_eq!(queue.progress(&sealed.path), Some(Default::default()));
+        writer.wait_for_compression().unwrap();
+        let notified = receiver.try_recv().unwrap();
+        assert!(notified.path.to_string_lossy().ends_with(".notepack.gz"));
+        // The compressed path names the same journal entry.
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.progress(&notified.path), Some(Default::default()));
+        // A process that dies now finds the segment on restart.
+        drop(writer);
+        let reopened = IndexQueue::open(&queue_path).unwrap();
+        let pending = reopened.previous_run();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            super::super::index_queue::resolve_segment(&pending[0].0),
+            Some(notified.path)
+        );
     }
 
     #[test]

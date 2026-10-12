@@ -51,8 +51,9 @@ pub use error::{Error, Result};
 
 // Re-export pipeline components for convenience
 pub use pipeline::{
-    ClickHouseConfig, ClickHouseIndexer, CoverageSampler, DedupeIndex, DedupeStats, EventStatus,
-    IndexerStats, LatestEventWatermark, PackedEvent, ParquetShadowConfig, ParquetShadowHandle,
+    ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, CoverageSampler, DedupeIndex,
+    DedupeStats, EventRow, EventStatus, IndexOutcome, IndexProgress, IndexQueue, IndexerStats,
+    LatestEventWatermark, PackedEvent, ParquetShadowConfig, ParquetShadowHandle,
     ParquetShadowPublisher, SealedSegment, SegmentConfig, SegmentStats, SegmentWriter,
     pack_nostr_event, read_latest_event_watermark, start_parquet_shadow,
 };

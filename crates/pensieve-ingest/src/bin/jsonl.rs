@@ -32,7 +32,8 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, DedupeIndex, SealedSegment, SegmentConfig, SegmentWriter,
+    ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, DedupeIndex, SealedSegment,
+    SegmentConfig, SegmentWriter,
     logging::compact_error,
     source::{EventSource, JsonlConfig, JsonlSource},
 };
@@ -290,7 +291,7 @@ async fn index_segments_mode(
         database: clickhouse_db.to_string(),
         table: "events_local".to_string(),
         batch_size: 10000,
-        reindex_queue_path: None,
+        index_queue: None,
     };
     let indexer = ClickHouseIndexer::new(ch_config)?;
 
@@ -681,7 +682,7 @@ fn collect_files(input: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>> {
 type PipelineComponents = (
     Arc<SegmentWriter>,
     Option<Arc<DedupeIndex>>,
-    Option<std::thread::JoinHandle<()>>,
+    Option<ClickHouseIndexerHandle>,
 );
 
 fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
@@ -722,7 +723,7 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
                 database: args.clickhouse_db.clone(),
                 table: "events_local".to_string(),
                 batch_size: 10000,
-                reindex_queue_path: None,
+                index_queue: None,
             };
             let indexer = ClickHouseIndexer::new(ch_config)?;
             Some(indexer.start(receiver))
