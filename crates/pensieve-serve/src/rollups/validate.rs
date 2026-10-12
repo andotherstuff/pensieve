@@ -5,7 +5,7 @@
 //! (so pubkeys missing from the rollup are found), and, when a plan exists,
 //! pubkeys with events indexed within `--boundary-window-secs` of the view
 //! boundary (where a double count or gap would show). For each pubkey every
-//! (grain, kind, period) row from the last [`PUBLISHER_MAX_DAYS`] days is
+//! (grain, kind, period) row from the last [`PUBLISHER_ROLLUP_DAYS`] days is
 //! recomputed from `events_local` and compared:
 //!
 //! - `event_count` must equal the number of distinct event ids. A larger
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use super::plan::{Plan, utc_day};
 use super::{
-    ACTIVITY_AT_EXPR, ALL_KINDS, EXCLUDED_PUBLISHER_KINDS, LONGFORM_TABLE, PUBLISHER_MAX_DAYS,
+    ACTIVITY_AT_EXPR, ALL_KINDS, EXCLUDED_PUBLISHER_KINDS, LONGFORM_TABLE, PUBLISHER_ROLLUP_DAYS,
     PUBLISHER_TABLE, Target, ops,
 };
 
@@ -470,7 +470,7 @@ async fn validate_publishers(ctx: &Ctx<'_>, plan: Option<&Plan>) -> Result<Targe
     let (db, o) = (ctx.db, ctx.options);
     let mut report = TargetReport::new(Target::Publishers);
     let today = utc_day(ops::server_now(ctx.client).await?);
-    let window_start = today - chrono::Days::new(u64::from(PUBLISHER_MAX_DAYS));
+    let window_start = today - chrono::Days::new(u64::from(PUBLISHER_ROLLUP_DAYS));
     let start = window_start.format("%Y-%m-%d").to_string();
     let excluded = excluded_kinds();
     let activity = ACTIVITY_AT_EXPR;

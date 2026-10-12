@@ -689,10 +689,11 @@ around the boundary; longform 108,895 rows; `addressable_latest` cross-check 466
 0 different); API `releases/api-60c4bfe` since 12:52 UTC. Query timings with the cache off:
 publishers 30 d 4.9 s, longform 0.4 s, publishers 366 d **39 s**.
 
-**Known limit:** windows longer than about 90 days still exceed the API's 20 s cap
-(`503 analytics_busy`). Since mid-2026 20–45 million distinct pubkeys are active per month
-(mostly single-use keys), so a one-year ranking aggregates ~150M (month, pubkey) rows
-however they are stored. The default 30-day window and 90 days work.
+**Known limit:** the API caps `days` at 90 (`400` above that) since 2026-10-12. Since
+mid-2026 20–45 million distinct pubkeys are active per month (mostly single-use keys), so a
+one-year ranking aggregates ~150M (month, pubkey) rows and took 39 s, beyond the 20 s cap.
+The rollup keeps 400 days, so the cap can be raised once long windows get a precomputed
+path.
 
 Run the tool as the `pensieve` user with `/etc/pensieve/pensieve.env` loaded
 (`CLICKHOUSE_URL`; `CLICKHOUSE_DATABASE` defaults to `nostr`). Build
@@ -835,7 +836,7 @@ just ch-query "SELECT count(), uniqExact(pubkey), sum(tupleElement(l, 3)) FROM (
 just ch-query "SELECT query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 5 MINUTE AND (query LIKE '%publisher_activity%' OR query LIKE '%longform_latest%') AND query NOT LIKE '%system.query_log%' ORDER BY event_time DESC LIMIT 5"
 ```
 
-Repeat the first query with `toIntervalDay(366)`. Both must finish well
+Repeat the first query with `toIntervalDay(90)` (the API's maximum). Both must finish well
 under the API's 20 s cap; record the numbers in the change log.
 
 ### 6. Deploy the API
@@ -895,8 +896,8 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
-- `/api/v1/stats/publishers` with `days` beyond ~90 times out (20 s cap) even on the 019
-  rollup; see [API rollups](#api-rollups-migration-019) → Known limit.
+- `/api/v1/stats/publishers` is capped at `days=90`; a longer window needs a precomputed
+  ranking (see [API rollups](#api-rollups-migration-019) → Known limit).
 - The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
   ingester keeps writing the WAL database, so relay endpoints can be stale.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
