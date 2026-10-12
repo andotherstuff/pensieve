@@ -12,6 +12,9 @@ use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+mod rollup_reads;
+use rollup_reads::{fetch_clickhouse_longform, fetch_clickhouse_publishers};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Overview
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1599,7 +1602,9 @@ pub struct LongformStats {
 
 /// `GET /api/v1/stats/longform`
 ///
-/// Returns statistics for long-form content (kind 30023).
+/// Returns statistics for long-form content (kind 30023), counting each
+/// article (pubkey, d tag) once at its latest version. It reads the
+/// migration 019 `longform_latest` rollup.
 /// Cached for 10 minutes.
 pub async fn longform(
     State(state): State<AppState>,
@@ -1613,29 +1618,7 @@ pub async fn longform(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        let days_clause = match days {
-            Some(days) => format!("AND created_at >= now() - INTERVAL {} DAY", days),
-            None => String::new(),
-        };
-
-        let stats: LongformStats = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
-                    count() AS articles_count,
-                    uniq(pubkey) AS unique_authors,
-                    avg(length(content)) AS avg_content_length,
-                    sum(length(content)) AS total_content_length,
-                    toUInt64(sum(length(content)) / 5) AS estimated_total_words
-                FROM events_local
-                WHERE kind = 30023
-                {}",
-                days_clause
-            ))
-            .fetch_one()
-            .await?;
-
-        Ok(stats)
+        fetch_clickhouse_longform(&state, days).await
     })
     .await?;
 
@@ -1730,7 +1713,8 @@ pub struct PublisherRow {
 
 /// `GET /api/v1/stats/publishers`
 ///
-/// Returns top publishers by event count.
+/// Returns top publishers by event count. It reads the
+/// migration 019 `publisher_activity` rollup (whole UTC days, `days` 1..=366).
 /// Cached for 5 minutes.
 pub async fn publishers(
     State(state): State<AppState>,
@@ -1749,32 +1733,7 @@ pub async fn publishers(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        let kind_clause = match kind {
-            Some(kind) => format!("AND kind = {}", kind),
-            None => String::new(),
-        };
-
-        let rows: Vec<PublisherRow> = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
-                    pubkey,
-                    count() AS event_count,
-                    uniq(kind) AS kinds_count,
-                    toUInt32(min(created_at)) AS first_event,
-                    toUInt32(max(created_at)) AS last_event
-                FROM events_local
-                WHERE created_at >= now() - INTERVAL {} DAY
-                {}
-                GROUP BY pubkey
-                ORDER BY event_count DESC
-                LIMIT {}",
-                days, kind_clause, limit
-            ))
-            .fetch_all()
-            .await?;
-
-        Ok(rows)
+        fetch_clickhouse_publishers(&state, days, kind, limit).await
     })
     .await?;
 

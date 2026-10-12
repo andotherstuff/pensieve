@@ -14,11 +14,13 @@
 //! - **AppState**: Shared ClickHouse client, relay database, and response cache
 //! - **Auth**: Bearer token middleware for request authentication
 //! - **Routes**: Endpoint handlers grouped by domain
+//! - **Rollups**: SQL and operator tooling for the migration 019 rollup tables
 
 mod auth;
 pub mod bounded_clickhouse;
 pub mod cache;
 mod error;
+pub mod rollups;
 mod routes;
 mod state;
 

@@ -156,6 +156,10 @@ coverage-preview-summary:
 run-preview-lookups *ARGS:
     cargo run --bin preview-lookups -- {{ARGS}}
 
+# Run the API rollup operator tool for migration 019 (plan/backfill/status/validate/resolve)
+run-api-rollups *ARGS:
+    cargo run --bin api-rollups -- {{ARGS}}
+
 # Run the relay cleanup tool
 run-relay-cleanup *ARGS:
     cargo run --bin relay-cleanup -- {{ARGS}}
@@ -291,6 +295,8 @@ test-clickhouse:
         cargo test -p pensieve-preview --test compact_lookups -- --ignored
     PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
         cargo test -p pensieve-ingest --test clickhouse_index_recovery -- --ignored
+    PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
+        cargo test -p pensieve-serve --test api_rollups -- --ignored
 
 # ============================================================================
 # Utilities

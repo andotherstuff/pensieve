@@ -687,6 +687,193 @@ After removal:
   a zap parser correction) uses `plan --allow-full-scan --shard-by id-prefix`:
   full-table reads in 256 bounded shards, so plan the I/O accordingly.
 
+## API rollups (migration 019)
+
+Moves `pensieve-serve`'s `GET /api/v1/stats/publishers` and
+`GET /api/v1/stats/longform` off full scans of `events_local` (both time out
+at the API's 20 s cap since the projections were dropped) and onto two small
+tables fed by insert-triggered views. Design, correctness model and behaviour
+changes: [`docs/api_rollups.md`](../docs/api_rollups.md).
+
+**Status (2026-10-12):** prepared, not applied. The API build that reads the
+tables answers both endpoints with `503 metric_unavailable` until 019 exists,
+so deploy it only after step 5.
+
+Run the tool as the `pensieve` user with `/etc/pensieve/pensieve.env` loaded
+(`CLICKHOUSE_URL`; `CLICKHOUSE_DATABASE` defaults to `nostr`). Build
+`pensieve-serve` and `api-rollups` from the merged commit into a new
+`releases/api-<sha>/` directory, as for any API release (see
+[Routine deploy](#routine-deploy)):
+
+```bash
+AR="/home/pensieve/pensieve/releases/api-<sha>/api-rollups --checkpoint-dir /home/pensieve/api-rollups"
+```
+
+Every tool query is tagged `log_comment = 'api-rollups…'` and carries
+`--max-threads` (default 2), `--max-memory-gib` (default 8) and
+`--max-execution-secs` limits.
+
+### 1. Preflight (read-only)
+
+```bash
+just ch-query "SELECT version()"
+just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks"
+just ch-query "SELECT count() FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND is_done = 0"
+# Ingest inserts: synchronous, no errors (~70/hour):
+just ch-query "SELECT toStartOfHour(event_time) h, count() n, sum(written_rows) rows, any(Settings['async_insert']) async_setting, countIf(exception != '') errors FROM system.query_log WHERE event_time > now() - INTERVAL 3 HOUR AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart' GROUP BY h ORDER BY h"
+just ch-query "SELECT view_name, status, count() FROM system.query_views_log WHERE event_time > now() - INTERVAL 1 HOUR GROUP BY view_name, status ORDER BY view_name"
+# When the refreshable views rescan events_local:
+just ch-query "SELECT view, status, last_refresh_time, next_refresh_time FROM system.view_refreshes"
+```
+
+Record the outputs in the change log.
+
+### 2. Create the tables and views
+
+Apply outside :58–:07 UTC, right **after** an ingest insert burst (step 1's
+query shows when they happen). The plan needs the first insert the views see
+to start at least 5 s after they were created; an insert racing the creation
+makes `plan` refuse (step 3 has the recovery).
+
+```bash
+just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
+```
+
+For the next 30 minutes, watch the two new views next to the existing ones:
+
+```bash
+just ch-query "SELECT view_name, status, count(), any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name LIKE 'nostr.%' GROUP BY view_name, status ORDER BY view_name"
+just ch-query "SELECT count() n, countIf(exception != '') errors, any(exception), quantile(0.95)(query_duration_ms) p95_ms FROM system.query_log WHERE event_time > now() - INTERVAL 30 MINUTE AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
+journalctl -u pensieve-ingest --since "30 min ago" | grep -i clickhouse
+```
+
+**Abort:** if a view reports an exception or `events_local` inserts start
+failing, run the rollback SQL at once (step 7). Inserts are synchronous, so a
+failing view fails the insert and ClickHouse ingest stalls until it is
+dropped.
+
+### 3. Plan
+
+After at least one ingest insert has landed (and 10 minutes after step 2,
+which `backfill` enforces anyway):
+
+```bash
+$AR plan --min-free-gib 100
+```
+
+- **Publishers** fixes the view boundary: the first second the view captured.
+  Backfill shards read only rows indexed before it; the view owns the rest.
+- Each target prints the full-table read (from `system.columns`), a sample
+  shard (shard 0 run as a `SELECT`), and the pre-merge and peak disk estimate.
+  Expected order of magnitude for 2.43B rows, uncompressed: publishers
+  ~320 GiB (id and pubkey at 64 bytes each, plus kind, created_at and
+  indexed_at); longform ~860 GiB (adds ~540 GiB of content, extrapolated from
+  the 60 GiB per 270M rows the old query read). The plan prints the
+  compressed figure. `longform_latest` ends near 466k rows (the plan shows the
+  kind 30023 coordinate count from `addressable_latest`). Stop if the peak
+  does not fit comfortably in `/data` unreserved space.
+- **`Recreate the view`**: an insert raced the view's creation, so the
+  boundary is ambiguous. Nothing has been backfilled yet; recover with
+
+  ```bash
+  just ch-query "DROP VIEW nostr.publisher_activity_mv"
+  just ch-query "TRUNCATE TABLE nostr.publisher_activity"
+  just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
+  ```
+
+  then wait for an insert and `plan --target publishers --discard-progress`.
+  The migration refuses to recreate the view on a non-empty table.
+
+### 4. Backfill (bounded, resumable)
+
+```bash
+$AR --max-threads 2 --max-memory-gib 8 backfill --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
+$AR status
+```
+
+- Shards do not start in the quiet minutes (`--quiet-minutes 58-7` by
+  default): the hourly refreshable views rescan `events_local` at :00–:07.
+- **Exit code 2** means the session stopped early (runtime, disk guard or
+  merge backlog). Re-run the same command later; done shards are skipped.
+- Each publisher shard runs **exactly once**: it is one INSERT written as one
+  part, and its query id is recorded before it is sent. If a session dies
+  mid-shard, the next run settles the shard from `system.query_log` (or
+  `system.part_log`). If it cannot (`cannot tell whether … committed`), look
+  the query id up by hand:
+
+  ```bash
+  just ch-query "SELECT event_time, type, written_rows, exception FROM system.query_log WHERE query_id = '<id>' AND type != 'QueryStart'"
+  just ch-query "SELECT event_time, part_name, rows FROM system.part_log WHERE query_id = '<id>' AND event_type = 'NewPart'"
+  $AR resolve --target publishers --shard <n> --committed      # or --not-committed
+  ```
+
+  Never delete a publisher checkpoint or `pending/` marker by hand: a shard
+  that runs twice is counted twice.
+- A shard over `--max-memory-gib` fails cleanly (nothing is written); re-plan
+  with `--id-prefix-len 3 --discard-progress` only if **no** publisher shard
+  has completed, otherwise raise `--max-memory-gib`.
+- `status` must show `view boundary … ok`. `VIOLATED` means the table no
+  longer matches the plan: stop and investigate.
+- **Calibrate:** compare `status` bytes on disk with the plan after the first
+  shards; merges shrink the table as they catch up.
+
+### 5. Validate and benchmark
+
+```bash
+$AR validate --out /home/pensieve/api-rollups/validate.json
+```
+
+- Must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target.
+  `duplicate_inflation` rows are explained (an event inserted twice whose
+  duplicate is still visible in `events_local`); `missing`, `excess` and
+  `mismatch` are failures.
+- The boundary sample reads the whole `indexed_at` column once (minutes at 2
+  threads); `--boundary-sample 0` skips it.
+- The longform cross-check compares every kind 30023 coordinate's winner with
+  `addressable_latest` and must show no disagreement.
+
+Then time the endpoint queries directly, as the API runs them:
+
+```bash
+just ch-query "WITH toDate(now() - toIntervalDay(30), 'UTC') AS start_day, if(toStartOfMonth(start_day) = start_day, start_day, toStartOfMonth(start_day) + toIntervalMonth(1)) AS split_day SELECT a.pubkey AS pubkey, sum(a.event_count) AS event_count FROM nostr.publisher_activity AS a WHERE a.kind = -1 AND ((a.grain = 'day' AND a.period >= start_day AND a.period < split_day) OR (a.grain = 'month' AND a.period >= split_day)) GROUP BY pubkey ORDER BY event_count DESC LIMIT 100 SETTINGS max_threads = 4, use_query_cache = 0 FORMAT Null"
+just ch-query "SELECT count(), uniqExact(pubkey), sum(tupleElement(l, 3)) FROM (SELECT pubkey, argMinMerge(latest) AS l FROM nostr.longform_latest GROUP BY pubkey, d_tag) SETTINGS max_threads = 4, use_query_cache = 0"
+just ch-query "SELECT query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 5 MINUTE AND (query LIKE '%publisher_activity%' OR query LIKE '%longform_latest%') AND query NOT LIKE '%system.query_log%' ORDER BY event_time DESC LIMIT 5"
+```
+
+Repeat the first query with `toIntervalDay(366)`. Both must finish well
+under the API's 20 s cap; record the numbers in the change log.
+
+### 6. Deploy the API
+
+Point the `pensieve-api` drop-in's `ExecStart` (the file is still named
+`90-postgres-cutover.conf`) at the new
+`releases/api-<sha>/pensieve-serve`, `daemon-reload`, restart
+`pensieve-api`, check `/proc/<pid>/exe`, and update the drop-in record in
+`ops/systemd/dropins/` in the same PR. Then:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/publishers?days=30&limit=5"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/publishers?days=365&kind=1&limit=5"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/longform"
+journalctl -u pensieve-api --since "10 min ago" | grep -i "rollup\|error"
+```
+
+`articles_count` drops from all versions to distinct articles (about 466k
+from 22k authors on 2026-10-12): this is the intended change.
+
+### 7. Rollback
+
+- **API:** point the drop-in back at the previous `releases/api-*` and
+  restart. Those builds scan `events_local` again (and time out, as before).
+- **Tables and views:** with the API rolled back, or accepting `503
+  metric_unavailable` on both endpoints:
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/019_drop_api_publishers_longform.sql
+  ```
+
+  Re-applying 019 later needs `plan --discard-progress` and a full backfill.
+
 ## Grafana
 
 Provisioning is no longer in the repo. Configure the Prometheus datasource
