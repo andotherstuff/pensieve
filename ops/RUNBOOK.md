@@ -211,8 +211,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, current) and
-  only `preview-3ab1045`.
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, current), `ingest-b466b37` (current
+  ingester), `ingest-ba0c4a1` (previous ingester from PR #72, with its worker) and only
+  `preview-3ab1045`. Build target dirs other than the latest `api-*`/`ingest-*` caches in
+  `/data/pensieve-build/` were removed on 2026-10-12.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
 ## First live Parquet shadow activation
