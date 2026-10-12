@@ -1,4 +1,7 @@
-//! Validate the API rollups against a direct (slow) oracle on `events_local`.
+//! Validate the rollups against a direct (slow) oracle on `events_local`.
+//!
+//! The migration 020 targets (user flags, relay lists, kinds) are validated in
+//! `validate_derived`; see its module docs.
 //!
 //! **Publishers.** Pubkeys are sampled three ways: a hashed random subset of
 //! the rollup, the pubkeys of one random id-prefix slice of `events_local`
@@ -39,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use super::plan::{Plan, utc_day};
 use super::{
     ACTIVITY_AT_EXPR, ALL_KINDS, EXCLUDED_PUBLISHER_KINDS, LONGFORM_TABLE, PUBLISHER_ROLLUP_DAYS,
-    PUBLISHER_TABLE, Target, ops,
+    PUBLISHER_TABLE, Target, ops, validate_derived,
 };
 
 /// Validation options.
@@ -65,6 +68,14 @@ pub struct ValidateOptions {
     pub max_key_events: u64,
     /// Differences to keep as examples per target.
     pub max_examples: usize,
+    /// User flags: days of `daily_user_stats` whose stored flags must all
+    /// have a matching `pubkey_flags` entry.
+    pub flag_days: u32,
+    /// User flags: days of `daily_user_stats` compared per sampled pubkey.
+    pub user_days: u32,
+    /// Kinds: largest relative difference (percent) between the approximate
+    /// and the exact (`kinds_stats_mv`) distinct pubkeys of a kind.
+    pub pubkeys_tolerance_pct: f64,
 }
 
 impl Default for ValidateOptions {
@@ -80,6 +91,9 @@ impl Default for ValidateOptions {
             batch: 100,
             max_key_events: 5_000,
             max_examples: 20,
+            flag_days: 7,
+            user_days: 3,
+            pubkeys_tolerance_pct: 2.0,
         }
     }
 }
@@ -145,7 +159,7 @@ impl CrossCheck {
 pub struct TargetReport {
     /// Target.
     pub target: Target,
-    /// Keys sampled (pubkeys).
+    /// Keys sampled (pubkeys; kinds for the kinds target).
     pub sampled: usize,
     /// Keys compared with the oracle.
     pub compared: usize,
@@ -166,7 +180,7 @@ pub struct TargetReport {
 }
 
 impl TargetReport {
-    fn new(target: Target) -> Self {
+    pub(super) fn new(target: Target) -> Self {
         Self {
             target,
             sampled: 0,
@@ -181,7 +195,13 @@ impl TargetReport {
         }
     }
 
-    fn record(&mut self, key: &str, outcome: Outcome, detail: String, max_examples: usize) {
+    pub(super) fn record(
+        &mut self,
+        key: &str,
+        outcome: Outcome,
+        detail: String,
+        max_examples: usize,
+    ) {
         *self.rows.entry(outcome).or_default() += 1;
         if outcome != Outcome::Match && self.examples.len() < max_examples {
             self.examples.push(Difference {
@@ -260,13 +280,38 @@ impl ValidationReport {
     }
 }
 
-/// Run validation. `client` should carry resource limits. `plans` supplies
-/// the publisher view boundary for boundary sampling, when planned.
+/// What validation knows from the checkpoint directory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValidateInputs<'a> {
+    /// Publisher plan: the view boundary for boundary sampling.
+    pub publisher_plan: Option<&'a Plan>,
+    /// Kinds plan: the view boundary splitting backfill and view shares.
+    pub kinds_plan: Option<&'a Plan>,
+    /// Migration 020 cutover time (`finished_at`), when it ran.
+    pub cutover_at: Option<u32>,
+}
+
+/// Run validation. `client` should carry resource limits. `publisher_plan`
+/// supplies the publisher view boundary for boundary sampling, when planned.
 pub async fn run(
     client: &Client,
     database: &str,
     options: &ValidateOptions,
     publisher_plan: Option<&Plan>,
+) -> Result<ValidationReport> {
+    let inputs = ValidateInputs {
+        publisher_plan,
+        ..ValidateInputs::default()
+    };
+    run_with(client, database, options, &inputs).await
+}
+
+/// Run validation with everything known from the checkpoint directory.
+pub async fn run_with(
+    client: &Client,
+    database: &str,
+    options: &ValidateOptions,
+    inputs: &ValidateInputs<'_>,
 ) -> Result<ValidationReport> {
     if options.sample == 0 && options.boundary_sample == 0 {
         bail!("validation needs --sample or --boundary-sample above 0");
@@ -288,8 +333,11 @@ pub async fn run(
     let mut targets = Vec::new();
     for target in &options.targets {
         targets.push(match target {
-            Target::Publishers => validate_publishers(&ctx, publisher_plan).await?,
+            Target::Publishers => validate_publishers(&ctx, inputs.publisher_plan).await?,
             Target::Longform => validate_longform(&ctx).await?,
+            Target::UserFlags => validate_derived::user_flags(&ctx, inputs.cutover_at).await?,
+            Target::RelayLists => validate_derived::relay_lists(&ctx).await?,
+            Target::Kinds => validate_derived::kinds(&ctx, inputs.kinds_plan).await?,
         });
     }
     Ok(ValidationReport {
@@ -299,14 +347,14 @@ pub async fn run(
     })
 }
 
-struct Ctx<'a> {
-    db: &'a str,
-    client: &'a Client,
-    options: &'a ValidateOptions,
-    cutoff: u32,
+pub(super) struct Ctx<'a> {
+    pub(super) db: &'a str,
+    pub(super) client: &'a Client,
+    pub(super) options: &'a ValidateOptions,
+    pub(super) cutoff: u32,
 }
 
-fn placeholders(n: usize) -> String {
+pub(super) fn placeholders(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
 
@@ -319,14 +367,14 @@ fn excluded_kinds() -> String {
 }
 
 /// A random 3-hex-digit id prefix range derived from the seed.
-fn seeded_id_range(seed: u64) -> (String, Option<String>) {
+pub(super) fn seeded_id_range(seed: u64) -> (String, Option<String>) {
     let bucket = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize; // 0..4096
     let start = format!("{bucket:03x}");
     let end = (bucket + 1 < 4096).then(|| format!("{:03x}", bucket + 1));
     (start, end)
 }
 
-fn id_range_predicate(start: &str, end: Option<&str>) -> String {
+pub(super) fn id_range_predicate(start: &str, end: Option<&str>) -> String {
     match end {
         Some(end) => format!("id >= '{start}' AND id < '{end}'"),
         None => format!("id >= '{start}'"),
@@ -398,6 +446,20 @@ fn group_label(key: &GroupKey) -> String {
     format!("{pubkey} {grain} {day} kind={kind}")
 }
 
+/// Classify a summed count against the source's distinct events and raw
+/// rows (unmerged duplicates included).
+pub fn classify_count(counted: u64, events: u64, rows: u64) -> Outcome {
+    if counted == events {
+        Outcome::Match
+    } else if counted < events {
+        Outcome::Missing
+    } else if counted <= rows {
+        Outcome::DuplicateInflation
+    } else {
+        Outcome::Excess
+    }
+}
+
 /// Compare the rollup rows of some pubkeys with their oracle rows.
 pub fn compare_publisher_groups(
     oracle: &[OracleGroup],
@@ -417,15 +479,7 @@ pub fn compare_publisher_groups(
         let label = group_label(key);
         match (expected.get(key), actual.get(key)) {
             (Some(o), Some(r)) => {
-                let outcome = if r.event_count == o.events {
-                    Outcome::Match
-                } else if r.event_count < o.events {
-                    Outcome::Missing
-                } else if r.event_count <= o.rows {
-                    Outcome::DuplicateInflation
-                } else {
-                    Outcome::Excess
-                };
+                let outcome = classify_count(r.event_count, o.events, o.rows);
                 let fields_match = r.kinds == o.kinds && r.first == o.first && r.last == o.last;
                 let outcome = if outcome == Outcome::Match && !fields_match {
                     Outcome::Mismatch

@@ -15,7 +15,14 @@ just ch-init
 just ch-migrate-all
 just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
 just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
+just ch-migrate docs/migrations/prepared/020_incremental_derived_views.sql
+just ch-migrate docs/migrations/prepared/020_incremental_derived_views_cutover.sql
 ```
+
+On an empty database 020's two phases can run back to back: there is no
+history to backfill (`api-rollups plan/backfill --migration 020` still record
+the plans that `cutover` checks; run them before the cutover file, or apply the
+cutover file by hand as above).
 
 > **⚠️ `just ch-migrate-all` is for empty databases only.** Nothing records
 > which migrations have run, so it re-executes every top-level
@@ -62,6 +69,8 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - Prepared 019 (API rollups for `/stats/publishers` and `/stats/longform`)
   was applied at 09:14 UTC on 2026-10-12, backfilled and validated (0 failed
   rows); the API reads it since 12:52 UTC.
+- Prepared 020 (incremental derived views) is **not applied yet**; see its
+  section below.
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -89,6 +98,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all`. **Applied and backfilled in production** | **Yes** (`preview-lookups backfill`, bounded and resumable) |
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
 | prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
+| prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Prepared, not applied** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -638,6 +648,76 @@ oracle on `events_local`.
 
 ```bash
 just ch-migrate docs/migrations/rollback/019_drop_api_publishers_longform.sql
+```
+
+### prepared/020_incremental_derived_views.sql
+
+**Purpose:** Remove the three most expensive derived-view costs on
+`events_local` (~2.45B rows, no projections, ~40M new events a day). Measured
+in production on 2026-10-12 over 24 h (`system.query_views_log`,
+`system.view_refreshes`):
+
+1. `daily_user_stats_mv` (005) took 7.7 s of the ~8.4 s every ingest insert
+   takes (2,833 inserts a day, ~6 h a day): for every event it evaluated
+   `pubkey IN (SELECT pubkey FROM pubkeys_with_profile_data)` and the same for
+   follows, reading ~30.4M lookup rows per insert.
+2. `relay_distribution_mv` (014) rescanned all of `events_local` every 6 h
+   (1.32 TiB read per run) for each pubkey's latest kind 10002 list.
+3. `kinds_stats_mv` (015) rescanned all of `events_local` every hour
+   (180 GiB per run) for per-kind `count()`, `uniqExact(pubkey)`, first/last.
+
+The two rescans saturate 24 cores at :00–:07 and push ingest insert p95 from
+~17 s to ~31 s (69 s at 12:00 UTC when both run).
+
+**Phase 1** (this file) creates, without changing any existing object's
+behaviour:
+- `pubkey_flags` (`AggregatingMergeTree ORDER BY pubkey`): first
+  `indexed_at` of a kind 0 / kind 3 per pubkey (`min`; sentinel 2106 =
+  never), fed by `pubkey_flags_mv`; seeded by the backfill from
+  `pubkeys_with_profile_data` / `pubkeys_with_follows_data` with 1970.
+- `daily_user_stats.last_indexed_at SimpleAggregateFunction(max, DateTime)`
+  (metadata only; SummingMergeTree merges it with `max`).
+- `relay_list_latest` (`ORDER BY pubkey`): `argMin` state of the latest kind
+  10002 per pubkey (newest `created_at`, lowest id on ties), payload id,
+  `created_at` and the 'r' tags exactly as 014 selected them.
+- `kind_totals` (`ORDER BY (kind, origin)`): `event_count` (sum, exactly
+  once via the 019 boundary model), `pubkeys` (`uniqCombined64` sketch,
+  approximate), first/last `created_at`; `origin` keeps backfill and view rows
+  apart so validation is exact.
+
+The migration refuses to create `kind_totals_mv` on a non-empty
+`kind_totals`. It does **not** backfill.
+
+**Phase 2** (`020_incremental_derived_views_cutover.sql`, run by
+`api-rollups cutover`, which refuses unless the 020 backfills are complete and
+nothing still reads `kinds_stats_mv`):
+- active-users refreshes (013, same schedules/windows/columns) compute
+  `has_profile`/`has_follows` as stored flag `> 0`, or
+  `profile_since < last_indexed_at` via one grace-hash join on
+  `sipHash128(pubkey)` with `pubkey_flags`;
+- `ALTER TABLE daily_user_stats_mv MODIFY QUERY` drops the lookups (atomic for
+  inserts: no gap, no double count);
+- `relay_distribution_mv` recomputes 014's output from `relay_list_latest`,
+  hourly at :20;
+- `kinds_stats_mv` is dropped; the API reads `kind_totals`.
+
+**Behaviour changes** (details in [`docs/api_rollups.md`](../api_rollups.md#migration-020-incremental-derived-views)):
+- `has_profile`, `has_follows`, `has_both` of the active-users tables keep
+  their insert-time meaning but stop undercounting: 013's `= 1` dropped every
+  merged (date, pubkey) row whose summed UInt8 flag exceeded 1, so published
+  values rise. `active_users` and `total_events` are unchanged.
+- `/api/v1/kinds` `unique_pubkeys` is approximate (~0.3% standard error);
+  counts and first/last are current instead of up to an hour old.
+- relay distribution: `created_at` ties resolve to the lowest id (014: arbitrary).
+
+**Apply, backfill, validate, cut over and roll back:** follow
+[`ops/RUNBOOK.md` → Incremental derived views](../../ops/RUNBOOK.md#incremental-derived-views-migration-020).
+
+**Rollback:** undo the cutover first, then drop phase 1:
+
+```bash
+just ch-migrate docs/migrations/rollback/020_undo_derived_views_cutover.sql
+just ch-migrate docs/migrations/rollback/020_drop_incremental_derived_views.sql
 ```
 
 ---

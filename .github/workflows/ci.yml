@@ -130,6 +130,9 @@ jobs:
       - run: cargo test -p pensieve-serve --test api_rollups -- --ignored
         env:
           PENSIEVE_TEST_CLICKHOUSE_URL: http://localhost:8123
+      - run: cargo test -p pensieve-serve --test derived_views -- --ignored
+        env:
+          PENSIEVE_TEST_CLICKHOUSE_URL: http://localhost:8123
 
   # Single required status check that aggregates the matrix + other jobs, so branch
   # protection only needs to require "CI success".

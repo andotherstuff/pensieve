@@ -1,27 +1,41 @@
-//! Insert-fed ClickHouse rollups behind `/api/v1/stats/publishers` and
-//! `/api/v1/stats/longform` (prepared migration 019).
+//! Insert-fed ClickHouse rollups and their operator tool (`api-rollups`).
 //!
-//! Both endpoints used to scan `events_local` (~2.4B rows, `ORDER BY id`, no
-//! projections) and hit the API's 20 s query cap. Migration
-//! `docs/migrations/prepared/019_api_publishers_longform.sql` adds two small
-//! tables fed by materialized views:
+//! **Migration 019** (`docs/migrations/prepared/019_api_publishers_longform.sql`)
+//! moved `/api/v1/stats/publishers` and `/api/v1/stats/longform` off full scans
+//! of `events_local` (~2.4B rows, `ORDER BY id`, no projections):
 //!
 //! - `publisher_activity`: event counts per (grain, kind, period, pubkey),
 //!   with a day grain and a month grain and an all-kinds rollup (`kind = -1`).
 //! - `longform_latest`: the latest version of every kind 30023 article per
 //!   (pubkey, d_tag), with its content length.
 //!
+//! **Migration 020** (`docs/migrations/prepared/020_incremental_derived_views.sql`
+//! and its cutover) replaces the three most expensive derived views:
+//!
+//! - `pubkey_flags`: when each pubkey first had a profile / follow list, so
+//!   `daily_user_stats_mv` no longer looks pubkeys up in every ingest insert
+//!   (see [`derived`]).
+//! - `relay_list_latest`: the latest kind 10002 relay list per pubkey, from
+//!   which `relay_distribution` is recomputed instead of rescanning
+//!   `events_local` every 6 hours.
+//! - `kind_totals`: per-kind event counts, approximate distinct pubkeys and
+//!   first/last `created_at`, replacing the hourly `kinds_stats_mv` rescan.
+//!
 //! This module holds the SQL shared by the API reads and the `api-rollups`
-//! operator tool (plan, backfill, status, validate). The backfill `SELECT`
-//! bodies must stay equivalent to the views in migration 019; the integration
-//! tests in `tests/api_rollups.rs` insert the same events through both paths
-//! and compare. See `docs/api_rollups.md`.
+//! operator tool (plan, backfill, status, validate, cutover). The backfill
+//! `SELECT` bodies must stay equivalent to the views in the migrations; the
+//! integration tests in `tests/api_rollups.rs` and `tests/derived_views.rs`
+//! insert the same events through both paths and compare. See
+//! `docs/api_rollups.md`.
 
 pub mod backfill;
+pub mod cutover;
+pub mod derived;
 pub mod ops;
 pub mod plan;
 pub mod status;
 pub mod validate;
+mod validate_derived;
 
 use std::fmt;
 
@@ -105,21 +119,42 @@ const LONGFORM_PAYLOAD_EXPR: &str = "CAST((id, created_at, toUInt64(length(conte
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Target {
-    /// `publisher_activity`: per-day and per-month publisher counts.
+    /// `publisher_activity`: per-day and per-month publisher counts (019).
     Publishers,
-    /// `longform_latest`: latest kind 30023 version per (pubkey, d_tag).
+    /// `longform_latest`: latest kind 30023 version per (pubkey, d_tag) (019).
     Longform,
+    /// `pubkey_flags`: first profile / follow list per pubkey (020).
+    UserFlags,
+    /// `relay_list_latest`: latest kind 10002 relay list per pubkey (020).
+    RelayLists,
+    /// `kind_totals`: per-kind counts, approximate pubkeys, first/last (020).
+    Kinds,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 2] = [Self::Publishers, Self::Longform];
+    pub const ALL: [Self; 5] = [
+        Self::Publishers,
+        Self::Longform,
+        Self::UserFlags,
+        Self::RelayLists,
+        Self::Kinds,
+    ];
+
+    /// Targets created by migration 019.
+    pub const MIGRATION_019: [Self; 2] = [Self::Publishers, Self::Longform];
+
+    /// Targets created by migration 020.
+    pub const MIGRATION_020: [Self; 3] = [Self::UserFlags, Self::RelayLists, Self::Kinds];
 
     /// Short stable name used in paths and logs.
     pub fn name(self) -> &'static str {
         match self {
             Self::Publishers => "publishers",
             Self::Longform => "longform",
+            Self::UserFlags => "user-flags",
+            Self::RelayLists => "relay-lists",
+            Self::Kinds => "kinds",
         }
     }
 
@@ -128,6 +163,9 @@ impl Target {
         match self {
             Self::Publishers => PUBLISHER_TABLE,
             Self::Longform => LONGFORM_TABLE,
+            Self::UserFlags => derived::USER_FLAGS_TABLE,
+            Self::RelayLists => derived::RELAY_LISTS_TABLE,
+            Self::Kinds => derived::KINDS_TABLE,
         }
     }
 
@@ -136,20 +174,51 @@ impl Target {
         match self {
             Self::Publishers => PUBLISHER_VIEW,
             Self::Longform => LONGFORM_VIEW,
+            Self::UserFlags => derived::USER_FLAGS_VIEW,
+            Self::RelayLists => derived::RELAY_LISTS_VIEW,
+            Self::Kinds => derived::KINDS_VIEW,
         }
     }
 
-    /// Whether re-inserting a source row changes the target. Publisher counts
-    /// are sums, so each source row must be written exactly once; longform
-    /// states are `argMin` and idempotent.
+    /// The prepared migration that creates the target.
+    pub fn migration_file(self) -> &'static str {
+        match self {
+            Self::Publishers | Self::Longform => {
+                "docs/migrations/prepared/019_api_publishers_longform.sql"
+            }
+            Self::UserFlags | Self::RelayLists | Self::Kinds => {
+                "docs/migrations/prepared/020_incremental_derived_views.sql"
+            }
+        }
+    }
+
+    /// Whether re-inserting a source row changes the target. Publisher and
+    /// kind counts are sums, so each source row must be written exactly once;
+    /// the other targets hold `argMin`/`min`/`max` states and are idempotent.
     pub fn is_additive(self) -> bool {
-        matches!(self, Self::Publishers)
+        matches!(self, Self::Publishers | Self::Kinds)
+    }
+
+    /// Tables the backfill reads.
+    pub fn source_tables(self) -> &'static [&'static str] {
+        match self {
+            Self::UserFlags => &derived::USER_FLAG_LOOKUPS,
+            _ => &["events_local"],
+        }
+    }
+
+    /// Column the shards split by prefix (the sort key of the sources).
+    pub fn shard_column(self) -> &'static str {
+        match self {
+            Self::UserFlags => "pubkey",
+            _ => "id",
+        }
     }
 
     /// Source columns a backfill shard reads (for read-cost estimates).
     pub fn source_columns(self) -> &'static [&'static str] {
         match self {
-            Self::Publishers => &["id", "pubkey", "kind", "created_at", "indexed_at"],
+            Self::Publishers | Self::Kinds => &["id", "pubkey", "kind", "created_at", "indexed_at"],
             Self::Longform => &[
                 "id",
                 "pubkey",
@@ -159,6 +228,8 @@ impl Target {
                 "content",
                 "d_tag",
             ],
+            Self::UserFlags => &["pubkey"],
+            Self::RelayLists => &["id", "pubkey", "kind", "created_at", "indexed_at", "tags"],
         }
     }
 
@@ -170,17 +241,23 @@ impl Target {
                  last_created_at, live_min_indexed_at, last_indexed_at"
             }
             Self::Longform => "pubkey, d_tag, latest, last_indexed_at",
+            Self::UserFlags => "pubkey, profile_since, follows_since, last_indexed_at",
+            Self::RelayLists => "pubkey, latest, last_indexed_at",
+            Self::Kinds => {
+                "kind, origin, event_count, pubkeys, first_created_at, last_created_at, \
+                 live_min_indexed_at, last_indexed_at"
+            }
         }
     }
 
-    /// `INSERT ... SELECT` that writes the target rows for source events in
+    /// `INSERT ... SELECT` that writes the target rows for source rows in
     /// `range_predicate` (a trusted, internally generated predicate such as an
-    /// id-prefix range). Publisher backfills also need `bounds`.
+    /// id-prefix range). Additive targets also need `bounds.indexed_before`.
     pub fn backfill_sql(
         self,
         database: &str,
         range_predicate: &str,
-        bounds: Option<&PublisherBounds>,
+        bounds: &SourceBounds,
     ) -> String {
         format!(
             "INSERT INTO {database}.{} ({}) {}",
@@ -196,13 +273,19 @@ impl Target {
         self,
         database: &str,
         range_predicate: &str,
-        bounds: Option<&PublisherBounds>,
+        bounds: &SourceBounds,
     ) -> String {
         match self {
-            Self::Publishers => {
-                let bounds = bounds.expect("publisher backfill needs bounds");
-                publisher_backfill_select_sql(database, range_predicate, bounds)
-            }
+            Self::Publishers => publisher_backfill_select_sql(
+                database,
+                range_predicate,
+                bounds
+                    .indexed_before
+                    .expect("publisher backfill needs a view boundary"),
+                bounds
+                    .window_start
+                    .expect("publisher backfill needs a window"),
+            ),
             Self::Longform => format!(
                 "SELECT pubkey, d_tag, \
                  argMinState({LONGFORM_PAYLOAD_EXPR}, {WINNER_KEY_EXPR}) AS latest, \
@@ -211,20 +294,60 @@ impl Target {
                  WHERE kind = 30023 AND ({range_predicate}) \
                  GROUP BY pubkey, d_tag"
             ),
+            Self::UserFlags => derived::user_flags_backfill_select_sql(database, range_predicate),
+            Self::RelayLists => derived::relay_lists_backfill_select_sql(database, range_predicate),
+            Self::Kinds => derived::kinds_backfill_select_sql(
+                database,
+                range_predicate,
+                bounds
+                    .indexed_before
+                    .expect("kinds backfill needs a view boundary"),
+            ),
         }
     }
 
     /// Source rows a shard reads that can produce target rows (for plan
-    /// statistics). Publishers count only rows before the view boundary.
-    pub fn source_filter(self, bounds: Option<&PublisherBounds>) -> String {
-        match (self, bounds) {
-            (Self::Publishers, Some(bounds)) => format!(
-                "kind NOT IN ({}) AND indexed_at < toDateTime({})",
-                excluded_kinds_sql(),
-                bounds.indexed_before
+    /// statistics). Additive targets count only rows before the view boundary.
+    pub fn source_filter(self, bounds: &SourceBounds) -> String {
+        let before = bounds
+            .indexed_before
+            .map(|c| format!("indexed_at < toDateTime({c})"));
+        match self {
+            Self::Publishers => {
+                let kinds = format!("kind NOT IN ({})", excluded_kinds_sql());
+                match before {
+                    Some(before) => format!("{kinds} AND {before}"),
+                    None => kinds,
+                }
+            }
+            Self::Longform => "kind = 30023".to_string(),
+            Self::UserFlags => "1".to_string(),
+            Self::RelayLists => "kind = 10002".to_string(),
+            Self::Kinds => before.unwrap_or_else(|| "1".to_string()),
+        }
+    }
+
+    /// `SELECT (rows, usable rows)` of the sources in `predicate` (a shard
+    /// range), for plan statistics.
+    pub fn sample_count_sql(
+        self,
+        database: &str,
+        predicate: &str,
+        bounds: &SourceBounds,
+    ) -> String {
+        match self {
+            Self::UserFlags => {
+                let sources = derived::USER_FLAG_LOOKUPS
+                    .iter()
+                    .map(|t| format!("SELECT pubkey FROM {database}.{t} WHERE {predicate}"))
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ");
+                format!("SELECT count() AS n, n FROM ({sources})")
+            }
+            _ => format!(
+                "SELECT count(), countIf({}) FROM {database}.events_local WHERE {predicate}",
+                self.source_filter(bounds)
             ),
-            (Self::Publishers, None) => format!("kind NOT IN ({})", excluded_kinds_sql()),
-            (Self::Longform, _) => "kind = 30023".to_string(),
         }
     }
 }
@@ -233,6 +356,18 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// Which source rows a backfill reads, fixed when it is planned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceBounds {
+    /// Additive targets: read only rows with `indexed_at` below this (Unix
+    /// seconds), the first second the view wrote. Rows at or after it are the
+    /// view's.
+    pub indexed_before: Option<u32>,
+    /// Publishers: read only rows whose activity day is on or after this UTC
+    /// day (the TTL window at planning time).
+    pub window_start: Option<NaiveDate>,
 }
 
 /// Source bounds of a publisher backfill, fixed when it is planned.
@@ -266,11 +401,11 @@ fn excluded_kinds_sql() -> String {
 fn publisher_backfill_select_sql(
     database: &str,
     range_predicate: &str,
-    bounds: &PublisherBounds,
+    indexed_before: u32,
+    window_start: NaiveDate,
 ) -> String {
     let excluded = excluded_kinds_sql();
-    let indexed_before = bounds.indexed_before;
-    let window_start = bounds.window_start.format("%Y-%m-%d");
+    let window_start = window_start.format("%Y-%m-%d");
     format!(
         "SELECT \
          CAST(slot.1, '{GRAIN_TYPE}') AS grain, \
@@ -412,32 +547,53 @@ mod tests {
     const MIGRATION: &str =
         include_str!("../../../../docs/migrations/prepared/019_api_publishers_longform.sql");
 
-    fn bounds() -> PublisherBounds {
-        PublisherBounds {
-            indexed_before: 1_700_000_000,
-            window_start: NaiveDate::from_ymd_opt(2025, 9, 9).unwrap(),
+    fn bounds() -> SourceBounds {
+        SourceBounds {
+            indexed_before: Some(1_700_000_000),
+            window_start: Some(NaiveDate::from_ymd_opt(2025, 9, 9).unwrap()),
         }
     }
 
     #[test]
     fn backfill_sql_is_scoped_and_bind_free() {
         for target in Target::ALL {
-            let sql = target.backfill_sql("scratch", "id >= 'a'", Some(&bounds()));
+            let range = format!("{} >= 'a'", target.shard_column());
+            let sql = target.backfill_sql("scratch", &range, &bounds());
             assert!(sql.starts_with(&format!("INSERT INTO scratch.{}", target.table())));
-            assert!(sql.contains("FROM scratch.events_local"));
-            assert!(sql.contains("AND (id >= 'a')"));
+            for source in target.source_tables() {
+                assert!(sql.contains(&format!("FROM scratch.{source}")), "{sql}");
+            }
+            assert!(sql.contains(&format!("({range})")), "{sql}");
             assert!(!sql.contains("nostr."));
             assert!(!sql.contains('?'), "{target} backfill SQL must not bind");
+            let sample = target.sample_count_sql("scratch", &range, &bounds());
+            assert!(!sample.contains('?') && sample.contains(&range), "{sample}");
         }
+        assert_eq!(Target::ALL.len(), 5);
+        assert_eq!(
+            [Target::MIGRATION_019.as_slice(), &Target::MIGRATION_020].concat(),
+            Target::ALL
+        );
     }
 
     #[test]
     fn publisher_backfill_reads_only_rows_before_the_view_boundary() {
-        let sql = Target::Publishers.backfill_sql("db", "1", Some(&bounds()));
+        let sql = Target::Publishers.backfill_sql("db", "1", &bounds());
         assert!(sql.contains("indexed_at < toDateTime(1700000000)"));
         assert!(sql.contains("toDate(activity_at, 'UTC') >= toDate('2025-09-09')"));
         assert!(sql.contains("kind NOT IN (445, 1059)"));
         assert!(sql.contains("toDateTime(4294967295) AS live_min_indexed_at"));
+        let sql = Target::Kinds.backfill_sql("db", "1", &bounds());
+        assert!(sql.contains("indexed_at < toDateTime(1700000000)"));
+        assert!(sql.contains("toDateTime(4294967295) AS live_min_indexed_at"));
+        assert_eq!(
+            Target::Kinds.source_filter(&bounds()),
+            "indexed_at < toDateTime(1700000000)"
+        );
+        assert!(Target::Kinds.is_additive() && Target::Publishers.is_additive());
+        for target in [Target::Longform, Target::UserFlags, Target::RelayLists] {
+            assert!(!target.is_additive());
+        }
     }
 
     #[test]

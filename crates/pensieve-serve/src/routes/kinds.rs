@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
+use crate::rollups::derived::KindsSort;
+use crate::routes::stats::fetch_kind_totals;
 use crate::state::AppState;
 
 /// Query parameters for kinds list.
@@ -33,8 +35,10 @@ pub struct KindSummary {
 /// `GET /api/v1/kinds`
 ///
 /// Returns a list of event kinds with counts.
-/// Reads from pre-aggregated `kinds_stats_mv` (refreshed hourly with exact counts).
-/// Cached for 5 minutes.
+/// Reads the insert-fed `kind_totals` rollup (migration 020): event counts and
+/// first/last seen are exact and current; `unique_pubkeys` is approximate
+/// (`uniqCombined64`, ~0.3% standard error). Ties in `sort=count` are broken
+/// by kind. Cached for 5 minutes.
 pub async fn list_kinds(
     State(state): State<AppState>,
     Query(params): Query<KindsQuery>,
@@ -44,8 +48,8 @@ pub async fn list_kinds(
 
     // Validate sort before caching
     let order_by = match sort.as_deref() {
-        Some("kind") => "kind ASC",
-        Some("count") | None => "event_count DESC",
+        Some("kind") => KindsSort::Kind,
+        Some("count") | None => KindsSort::Count,
         Some(other) => {
             return Err(ApiError::BadRequest(format!(
                 "invalid sort value: '{}'. Valid options: count, kind",
@@ -62,25 +66,7 @@ pub async fn list_kinds(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        // Read from pre-aggregated MV (hourly refresh with uniqExact)
-        let rows: Vec<KindSummary> = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
-                    kind,
-                    event_count,
-                    unique_pubkeys,
-                    first_seen,
-                    last_seen
-                FROM kinds_stats_mv
-                FINAL
-                ORDER BY {}
-                LIMIT {}",
-                order_by, limit
-            ))
-            .fetch_all()
-            .await?;
-
+        let rows = fetch_kind_totals(&state, order_by, limit).await?;
         Ok(rows)
     })
     .await?;

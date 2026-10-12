@@ -632,7 +632,7 @@ async fn backfill_counts_each_row_exactly_once_around_the_view_boundary() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut plans = BTreeMap::new();
-    for target in Target::ALL {
+    for target in Target::MIGRATION_019 {
         let plan = plan::build_plan(&db.client, &db.name, target, &plan_options())
             .await
             .unwrap();
@@ -653,7 +653,7 @@ async fn backfill_counts_each_row_exactly_once_around_the_view_boundary() {
 
     // Before the backfill only the live rows are counted.
     let live_only = total_day_events(&db).await;
-    for target in Target::ALL {
+    for target in Target::MIGRATION_019 {
         let (plan, cp) = &plans[&target];
         let report = backfill::run_backfill(&db.client, plan, cp, &backfill_options())
             .await
@@ -685,6 +685,7 @@ async fn backfill_counts_each_row_exactly_once_around_the_view_boundary() {
     // The validator agrees, including pubkeys active around the boundary.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let options = ValidateOptions {
+        targets: Target::MIGRATION_019.to_vec(),
         sample: 50,
         boundary_sample: 50,
         sample_permyriad: 10_000,
@@ -712,7 +713,7 @@ async fn backfill_counts_each_row_exactly_once_around_the_view_boundary() {
     assert!(cross.matched > 0 && !cross.disagrees(), "{cross:?}");
 
     // Re-running is a no-op.
-    for target in Target::ALL {
+    for target in Target::MIGRATION_019 {
         let (plan, cp) = &plans[&target];
         let report = backfill::run_backfill(&db.client, plan, cp, &backfill_options())
             .await

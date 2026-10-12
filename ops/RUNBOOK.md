@@ -91,8 +91,10 @@ work-unit duration before choosing a stop deadline, particularly when replacing
 an older binary that still drains the entire historical replay.
 
 **Do not stop the ingester during :00–:07 UTC.** Refreshable views rescan all of
-`events_local` at those times: `kinds_stats_mv` and `active_users_daily_mv` every
-hour, and `relay_distribution_mv` (1.3 TiB read) at 00/06/12/18 UTC. They saturate
+`events_local` at those times: `kinds_stats_mv` (180 GiB) every hour and
+`relay_distribution_mv` (1.3 TiB read) at 00/06/12/18 UTC; `active_users_daily_mv` also
+refreshes hourly at :00 (from `daily_user_stats`). The migration 020 cutover removes both
+rescans ([Incremental derived views](#incremental-derived-views-migration-020)). They saturate
 the CPU, ingest inserts slow from ~8 s to ~50 s per batch, and shutdown waits for
 the in-flight segment to finish indexing. On 2026-10-12 a stop at 06:04 UTC
 exceeded the then 90 s `TimeoutStopSec` and was killed; `stop-timeout.conf` now
@@ -765,7 +767,7 @@ After at least one ingest insert has landed (and 10 minutes after step 2,
 which `backfill` enforces anyway):
 
 ```bash
-$AR plan --min-free-gib 100
+$AR plan --migration 019 --min-free-gib 100
 ```
 
 - **Publishers** fixes the view boundary: the first second the view captured.
@@ -794,7 +796,7 @@ $AR plan --min-free-gib 100
 ### 4. Backfill (bounded, resumable)
 
 ```bash
-$AR --max-threads 2 --max-memory-gib 8 backfill --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
+$AR --max-threads 2 --max-memory-gib 8 backfill --migration 019 --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
 $AR status
 ```
 
@@ -827,7 +829,7 @@ $AR status
 ### 5. Validate and benchmark
 
 ```bash
-$AR validate --out /home/pensieve/api-rollups/validate.json
+$AR validate --migration 019 --out /home/pensieve/api-rollups/validate.json
 ```
 
 - Must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target.
@@ -880,6 +882,212 @@ from 22k authors on 2026-10-12): this is the intended change.
   ```
 
   Re-applying 019 later needs `plan --discard-progress` and a full backfill.
+
+## Incremental derived views (migration 020)
+
+Removes the three most expensive derived-view costs on `events_local`. Measured on
+2026-10-12 over 24 h: `daily_user_stats_mv`'s per-insert lookups took 7.7 s of every ~8.4 s
+ingest insert (2,833 inserts, ~6 h a day); `relay_distribution_mv` rescans 1.32 TiB every
+6 h and `kinds_stats_mv` 180 GiB every hour, saturating 24 cores at :00–:07 and pushing
+insert p95 from ~17 s to ~31 s (69 s at 12:00 UTC). Design, semantics and behaviour
+changes: [`docs/api_rollups.md` → Migration 020](../docs/api_rollups.md#migration-020-incremental-derived-views).
+
+**Status:** prepared, not applied.
+
+Two phases. Phase 1 (`prepared/020_incremental_derived_views.sql`) only adds tables, three
+insert-time views and the `daily_user_stats.last_indexed_at` column; nothing that exists
+changes behaviour. Phase 2 (the cutover) switches `daily_user_stats_mv`, the active-users
+refreshes and `relay_distribution_mv`, and drops `kinds_stats_mv`. **Order:** phase 1 →
+backfill → validate → deploy the API that reads `kind_totals` → cutover. The API never
+reads an incomplete table: before its deploy it reads `kinds_stats_mv` as today, after it
+reads the backfilled and validated `kind_totals`; `relay_distribution` and the
+`active_users_*` tables keep their names and are replaced atomically by each refresh.
+
+Use the `api-rollups` binary from the release that contains this migration, as for 019
+(`$AR` below is the 019 alias with the same `--checkpoint-dir`; 020 targets get their own
+subdirectories). Every tool query carries `--max-threads` (default 2),
+`--max-memory-gib` (default 8) and `--max-execution-secs` and is tagged
+`log_comment = 'api-rollups…'`.
+
+### 1. Preflight (read-only)
+
+```bash
+just ch-query "SELECT version()"
+just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks"
+just ch-query "SELECT count() FROM system.mutations WHERE database = 'nostr' AND table IN ('events_local', 'daily_user_stats') AND is_done = 0"
+# Baseline cost per view (expect daily_user_stats_mv ~7.7 s per insert):
+just ch-query "SELECT view_name, count() n, round(avg(view_duration_ms)) avg_ms, max(view_duration_ms) max_ms, round(avg(read_rows)) avg_read FROM system.query_views_log WHERE event_time > now() - INTERVAL 24 HOUR GROUP BY view_name ORDER BY avg_ms DESC"
+# Baseline insert latency and the refresh rescans:
+just ch-query "SELECT toStartOfHour(event_time) h, count() n, quantile(0.95)(query_duration_ms) p95_ms, countIf(exception != '') errors FROM system.query_log WHERE event_time > now() - INTERVAL 24 HOUR AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart' GROUP BY h ORDER BY h"
+just ch-query "SELECT view, status, last_success_time, duration_ms, formatReadableSize(read_bytes) read, next_refresh_time FROM system.view_refreshes WHERE database = 'nostr' ORDER BY view"
+# Who reads kinds_stats_mv (the API; anything else must move to kind_totals before the cutover):
+just ch-query "SELECT user, client_name, http_user_agent, count() FROM system.query_log WHERE event_date >= today() - 1 AND type = 'QueryFinish' AND query_kind = 'Select' AND has(tables, 'nostr.kinds_stats_mv') GROUP BY ALL"
+just ch-query "SELECT count() FROM nostr.pubkeys_with_profile_data"
+just ch-query "SELECT count() FROM nostr.pubkeys_with_follows_data"
+```
+
+Record the outputs in the change log. `relay_distribution_mv`'s `duration_ms` calibrates
+the relay-lists backfill (it reads the same columns, on all cores).
+
+### 2. Apply phase 1
+
+Outside :58–:07 UTC, right **after** an ingest insert burst: the kinds plan needs the first
+insert `kind_totals_mv` sees to start at least 5 s after the view was created.
+
+```bash
+just ch-migrate docs/migrations/prepared/020_incremental_derived_views.sql
+```
+
+For 30 minutes, watch the three new views (expect a few ms each) and insert latency:
+
+```bash
+just ch-query "SELECT view_name, status, count(), round(avg(view_duration_ms)) avg_ms, any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name IN ('nostr.pubkey_flags_mv', 'nostr.relay_list_latest_mv', 'nostr.kind_totals_mv', 'nostr.daily_user_stats_mv') GROUP BY view_name, status ORDER BY view_name"
+just ch-query "SELECT count() n, countIf(exception != '') errors, any(exception), quantile(0.95)(query_duration_ms) p95_ms FROM system.query_log WHERE event_time > now() - INTERVAL 30 MINUTE AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
+journalctl -u pensieve-ingest --since "30 min ago" | grep -i clickhouse
+```
+
+**Abort:** a view exception or failing inserts → run
+`docs/migrations/rollback/020_drop_incremental_derived_views.sql` at once (inserts are
+synchronous; a failing view stalls ClickHouse ingest).
+
+### 3. Plan
+
+After at least one ingest insert and 10 minutes after step 2:
+
+```bash
+$AR plan --target user-flags --id-prefix-len 1 --min-free-gib 100
+$AR plan --target relay-lists --target kinds --min-free-gib 100
+```
+
+- **kinds** fixes the view boundary (first second `kind_totals_mv` captured). On
+  `Recreate the view`, nothing is backfilled yet:
+  `just ch-query "DROP VIEW nostr.kind_totals_mv"`,
+  `just ch-query "TRUNCATE TABLE nostr.kind_totals"`, re-apply phase 1, wait for an
+  insert, `plan --target kinds --discard-progress`.
+- Each target prints the source read, a sample shard (with its duration), the wall-clock
+  estimate and the disk estimate. Expected: user-flags reads ~30M lookup rows (minutes);
+  relay-lists reads tags of nearly every granule, about one 014 rescan (~1.3–1.5 TiB
+  uncompressed, ~2–3 h at 2 threads); kinds ~320 GiB uncompressed (~1.5–2 h, like 019's
+  publishers). Stop if the peak does not fit comfortably in `/data`.
+
+### 4. Backfill (bounded, resumable)
+
+```bash
+$AR --max-threads 2 --max-memory-gib 8 backfill --migration 020 --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
+$AR status
+```
+
+Same rules as 019: no shard starts at :58–:07; exit code 2 means stopped early (re-run);
+**kinds** shards run exactly once (a lost outcome is settled from `system.query_log` /
+`system.part_log`, else `$AR resolve --target kinds --shard <n> --committed|--not-committed`
+after checking by hand); never delete a kinds checkpoint or `pending/` marker.
+user-flags and relay-lists are idempotent. `status` must show `view boundary … ok` for
+kinds. Watch insert p95 and the disk during the relay-lists shards (they read `tags`).
+
+### 5. Validate
+
+```bash
+$AR validate --migration 020 --out /home/pensieve/api-rollups/validate-020.json
+```
+
+- Must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target.
+- **user-flags**: lookups and `pubkey_flags` agree, stored flags of the last 7 days are
+  backed, sampled `daily_user_stats` counts match `events_local`, and the cutover join
+  reproduces the stored flags exactly. The notes print `active_users_daily` for the last
+  days under 013's rule (`= 1`, published today), stored flags (`> 0`) and the join:
+  **record the difference** — after the cutover `has_profile`/`has_follows`/`has_both`
+  move from the first to the last (see docs; active users and events do not change).
+- **relay-lists**: sampled winners match; the note compares the distribution the cutover
+  will publish with the current table (differences = lists since the last 014 refresh,
+  and `created_at` ties).
+- **kinds**: two scans of `kind`/`indexed_at`/`created_at` (a few minutes each at 2
+  threads); backfill share exact; `unique_pubkeys` within 2% of `kinds_stats_mv`, with the
+  largest error in the notes.
+
+### 6. Deploy the API
+
+Build and point the `pensieve-api` drop-in at the release as in
+[API rollups → Deploy the API](#6-deploy-the-api) (update the drop-in record in the same
+PR). Then:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds?limit=5"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/kinds/total"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats"
+journalctl -u pensieve-api --since "10 min ago" | grep -i "rollup\|error"
+```
+
+`/kinds` `unique_pubkeys` is now approximate (~0.3% standard error); counts are current.
+
+### 7. Cut over
+
+At least 15 minutes after the deploy (the API caches `/kinds` for 5 minutes), outside
+:58–:07, right after an ingest burst:
+
+```bash
+$AR cutover --dry-run
+$AR cutover
+```
+
+It refuses unless the three backfills are complete and nothing outside the tool read
+`kinds_stats_mv` in the last 15 minutes (step 1's query shows who). It recreates the three
+active-users refreshes and `relay_distribution_mv` (each runs once immediately), switches
+`daily_user_stats_mv` with `MODIFY QUERY` (no gap, no double count), drops
+`kinds_stats_mv`, and records the time in `cutover-020.json`. A failure names the statement;
+the statements are idempotent, so fix and re-run, or roll back (step 9). Then:
+
+```bash
+just ch-query "SELECT view, status, last_success_time, duration_ms, exception FROM system.view_refreshes WHERE database = 'nostr' ORDER BY view"
+just ch-query "SELECT as_select FROM system.tables WHERE database = 'nostr' AND name = 'daily_user_stats_mv'"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/users/active"
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/relays/distribution?limit=5"
+```
+
+### 8. Validate again and monitor
+
+After an hour (`validate` now also samples pubkeys active around the cutover and checks
+`last_indexed_at` of rows inserted after it):
+
+```bash
+$AR validate --migration 020 --out /home/pensieve/api-rollups/validate-020-after.json
+```
+
+Over the next day, compare with step 1's baseline:
+
+- `system.query_views_log`: `daily_user_stats_mv` from ~7.7 s to milliseconds per insert;
+  the three new views a few ms each.
+- Insert p95 per hour (step 1 query): no :00 spike to ~31 s / 69 s; overall well below
+  the ~17 s baseline.
+- `system.view_refreshes`: no `kinds_stats_mv`; `relay_distribution_mv` hourly at :20,
+  `active_users_*_mv` succeed (`duration_ms` ~seconds, `exception` empty).
+- CPU at :00–:07 (Grafana/Prometheus node metrics): no longer saturated.
+
+### 9. Rollback
+
+- **Cutover** (restores 005's insert-time lookups, 013's refreshes, 014's 6-hourly rescan
+  with `EMPTY` so `relay_distribution` keeps its rows until the next 00/06/12/18 run, and
+  015's `kinds_stats_mv`, which refreshes at once):
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/020_undo_derived_views_cutover.sql
+  ```
+
+  Wait for `kinds_stats_mv`'s first successful refresh (`system.view_refreshes`) before
+  pointing the API back at a pre-020 release. `daily_user_stats` rows inserted between the
+  cutover and the rollback store flags as 0, so `has_*` undercount those days until they
+  leave the refresh windows (active users and events are unaffected).
+- **Phase 1** (after the cutover is undone, and with an API that does not read
+  `kind_totals`, which otherwise answers 503 on `/kinds`, `/stats/kinds/total`,
+  `/stats/events/earliest` and `/stats`; the file refuses while a switched view still
+  reads a 020 object):
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/020_drop_incremental_derived_views.sql
+  ```
+
+  Re-applying 020 later needs `plan --migration 020 --discard-progress` (after
+  `TRUNCATE TABLE nostr.kind_totals`, which the migration's guard requires) and a full
+  backfill.
 
 ## Grafana
 

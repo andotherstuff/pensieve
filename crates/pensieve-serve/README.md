@@ -143,7 +143,9 @@ Returns total unique pubkeys.
 
 #### `GET /api/v1/stats/kinds/total`
 
-Returns distinct event kinds seen in the last 30 days.
+Returns distinct event kinds with at least one event created in the last 30
+days. Read from the `kind_totals` rollup (migration
+`020_incremental_derived_views`); `503 metric_unavailable` without it.
 
 **Response**
 
@@ -159,7 +161,9 @@ Returns distinct event kinds seen in the last 30 days.
 
 #### `GET /api/v1/stats/events/earliest`
 
-Returns earliest event timestamp (Nostr genesis: Nov 7, 2020).
+Returns earliest event timestamp (Nostr genesis: Nov 7, 2020, at the
+earliest). Read from the `kind_totals` rollup (migration 020), like
+`total_kinds` and `earliest_event` in `GET /api/v1/stats`.
 
 **Response**
 
@@ -312,10 +316,20 @@ Current DAU/WAU/MAU summary.
 | Field | Description |
 |-------|-------------|
 | `active_users` | Unique pubkeys with activity in the period |
-| `has_profile` | Users who have published a kind 0 (profile metadata) |
-| `has_follows_list` | Users who have published a kind 3 (follow list) |
+| `has_profile` | Users who had published a kind 0 (profile metadata) before the activity was ingested |
+| `has_follows_list` | Users who had published a kind 3 (follow list) before the activity was ingested |
 | `has_profile_and_follows_list` | Users with both profile and follows (strongest signal of established user) |
 | `total_events` | Total events in the period |
+
+The profile and follows flags are evaluated when the activity is ingested: a
+user who publishes a profile later is not counted retroactively for earlier
+days. Since migration 020's cutover the flags are joined from `pubkey_flags`
+at refresh time instead of being looked up in every ingest insert, and a
+user flagged on several events of one day is no longer dropped from
+`has_profile` / `has_follows_list` / `has_profile_and_follows_list` (013's
+`= 1` test missed rows whose summed flags exceeded 1), so those three fields
+are higher than before the cutover. `active_users` and `total_events` are
+unchanged. See [`docs/api_rollups.md`](../../docs/api_rollups.md#migration-020-incremental-derived-views).
 
 ---
 
@@ -759,8 +773,18 @@ List all event kinds with counts.
 
 | Field | Description |
 |-------|-------------|
+| `event_count` | Events of this kind (exact) |
+| `unique_pubkeys` | **Approximate** distinct authors (`uniqCombined64` sketch, ~0.3% standard error; exact for small kinds) |
 | `first_seen` | Unix timestamp (seconds) of the first event of this kind |
 | `last_seen` | Unix timestamp (seconds) of the most recent event of this kind |
+
+Read from the insert-fed `kind_totals` rollup (migration
+`020_incremental_derived_views`): counts and timestamps are current (the
+hourly `kinds_stats_mv` rescan it replaces was up to an hour old and counted
+`unique_pubkeys` exactly). With `sort=count`, kinds with equal counts are
+ordered by kind. `503 metric_unavailable` if the rollup does not exist.
+`GET /api/v1/kinds/{kind}` below still reads `events_local` directly, so its
+`unique_pubkeys` stays exact.
 
 **Examples**
 
@@ -902,7 +926,11 @@ Returns relay popularity distribution based on NIP-65 relay lists (kind 10002 ev
 
 **Notes**
 
-- Data is pre-computed and refreshed every 6 hours
+- Data is pre-computed: hourly (at :20) from the `relay_list_latest` rollup
+  since migration 020's cutover, every 6 hours by rescanning `events_local`
+  before it
+- When a user's latest relay lists share a `created_at`, the one with the
+  lowest event id counts (before 020: an arbitrary one)
 - Only includes relays with 10+ users (filters noise)
 - Excludes invalid URLs (localhost, malformed, ws://, etc.)
 - Shows current relay preferences (latest event per user, not historical)
