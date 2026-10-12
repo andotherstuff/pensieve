@@ -43,7 +43,7 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12 16:20 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -99,17 +99,23 @@ exceeded the then 90 s `TimeoutStopSec` and was killed; `stop-timeout.conf` now
 allows 15 minutes. Check `system.view_refreshes` (`status`, `next_refresh_time`)
 before stopping.
 
-**After a killed shutdown, repair ClickHouse.** The indexer only requeues segments
-whose inserts *failed* (`/archive/segments/.clickhouse_reindex_queue`); a segment
-in flight at SIGKILL, and any sealed-but-not-yet-indexed segment, stays partially
-or entirely missing from `events_local` after restart. Find them from the journal
-(`Indexing segment N` without a matching `Indexed segment N`, plus the final
-sealed segment). Insert only the missing IDs: re-indexing a whole segment
-double-counts the summing views (reactions, replies, reposts, daily user stats).
-The 2026-10-12 repair converted each segment with `notepack-to-parquet`, selected
-the IDs absent from `events_local` through a `clickhouse-client --external` table
-into a Native file, checked its row count, inserted it, and re-counted to zero
-missing.
+**Killed shutdowns heal themselves (since `ingest-b466b37`, #73).** Every sealed
+segment is journaled in `/archive/segments/.clickhouse_reindex_queue` before it is
+indexed (`v1 <committed> <batch_end> <path>`), progress is recorded before each insert
+batch, and the entry is removed once the segment is fully in `events_local`. On start
+the indexer resumes from the journal, checks only the possibly in-flight batch against
+`events_local`, and inserts only missing IDs, so the summing views are not
+double-counted. Watch `clickhouse_index_queue_segments` (normally 0–2) and
+`clickhouse_index_queue_errors_total`; completion logs `indexed segment segment=…
+inserted=… already_present=…`. Shutdown gives the indexer 20 s to drain, then stops at
+the next batch boundary.
+
+Manual repair is only needed if the journal file itself is lost or a build older than
+#73 was killed. Insert only the missing IDs: re-indexing a whole segment double-counts
+the summing views (reactions, replies, reposts, daily user stats). The 2026-10-12 repair
+converted each segment with `notepack-to-parquet`, selected the IDs absent from
+`events_local` through a `clickhouse-client --external` table into a Native file,
+checked its row count, inserted it, and re-counted to zero missing.
 
 Production deploys one component at a time from a release build of an exact
 commit. Do **not** deploy with `git pull` + `just build-release` in `~/pensieve`:
@@ -886,8 +892,8 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-12 08:29 CEST the ingester runs
-build `negentropy-ba0c4a1` (PR #72) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
+not covered by the routine deploy above. Since 2026-10-12 16:36 CEST the ingester runs
+`releases/ingest-b466b37` (master, incl. #72 and #73) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
 the worker is started only for monitored pilots. Expect that drop-in to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
 and [`docs/negentropy_continuous_readiness.md`](../docs/negentropy_continuous_readiness.md).
 Its Kuma probe is `pensieve-negentropy-kuma.timer` (`/health/negentropy`); the
