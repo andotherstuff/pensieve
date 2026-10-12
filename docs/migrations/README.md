@@ -705,7 +705,7 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/activity/hourly` | Activity by hour of day | None |
 | `GET /api/v1/stats/zaps` | Zap statistics | 003 |
 | `GET /api/v1/stats/zaps/histogram` | Zap amount distribution histogram | 003 |
-| `GET /api/v1/stats/engagement` | Reply/reaction ratios (503 `metric_unavailable` unless the `engagement` family is served from Postgres) | None |
+| `GET /api/v1/stats/engagement` | Reply/reaction ratios (currently always 503 `metric_unavailable`) | None |
 | `GET /api/v1/stats/longform` | Long-form content stats | None |
 | `GET /api/v1/stats/publishers` | Top publishers | None |
 

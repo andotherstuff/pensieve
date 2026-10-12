@@ -1,4 +1,4 @@
-//! Bounded canonical facts required to finish the Postgres serving contract.
+//! Bounded canonical serving facts (hourly counts and per-kind summaries).
 //!
 //! The existing event-fact artifact deliberately omits content. This lane
 //! extends its fixed record with exact UTF-8 content bytes, aligns the initial

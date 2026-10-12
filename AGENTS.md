@@ -4,7 +4,7 @@ This file provides context for AI coding agents working on the Pensieve codebase
 
 ## Project Overview
 
-Pensieve is an **archive-first Nostr indexer** written in Rust. It ingests events from Nostr relays, stores them in a canonical notepack archive (source of truth), and indexes them into ClickHouse for analytics. A Parquet lake (optional live shadow plus a historical campaign) and DuckDB/Postgres analytics products are being built alongside ClickHouse; see `docs/migration-plan.md`.
+Pensieve is an **archive-first Nostr indexer** written in Rust. It ingests events from Nostr relays, stores them in a canonical notepack archive (source of truth), and indexes them into ClickHouse for analytics. A Parquet lake (optional live shadow plus a historical campaign) is being built alongside ClickHouse, with DuckDB batch tools for research over it; see `docs/migration-plan.md`. The Postgres analytics serving store was abandoned on 2026-10-12 and its code removed; the API serves everything from ClickHouse.
 
 **Key architecture decisions:**
 - Archive-first: notepack segments are the source of truth; ClickHouse is a derived index
@@ -100,17 +100,15 @@ pensieve/
 │   │       ├── render/      # HTML renderers (note, profile, article, video, etc.)
 │   │       └── routes/      # HTTP routes (preview, JSON API, llms.txt, health)
 │   │   └── src/bin/         # preview-lookups (compact lookup operator tool)
-│   ├── pensieve-serve/      # HTTP API (/api/v1 stats, kinds, relays) over ClickHouse or Postgres products
-│   │   └── src/bin/         # pensieve-api-cutover-compare
+│   ├── pensieve-serve/      # HTTP API (/api/v1 stats, kinds, relays) over ClickHouse
 │   ├── pensieve-parquet/    # Canonical Parquet schema/writer (notepack-to-parquet, validate, compare, salvage)
 │   ├── pensieve-lake/       # Parquet lake work units, inventory, publication
 │   │                        #   (pensieve-parquet-campaign, pensieve-source-manifest, pensieve-lake-catalog)
-│   └── pensieve-analytics/  # DuckDB-built analytics products published to Postgres
-│                            #   (pensieve-analytics + ~30 pensieve-analytics-* batch/compare tools)
+│   └── pensieve-analytics/  # DuckDB analytics builders over Parquet snapshots (research tooling)
+│                            #   (pensieve-analytics + pensieve-analytics-* builder/ClickHouse-compare tools)
 ├── docs/
 │   ├── clickhouse_self_hosted.sql  # Base ClickHouse schema for fresh installs (not a production snapshot)
 │   ├── migrations/                  # ClickHouse migrations (+ prepared/ and rollback/)
-│   ├── postgres/                    # Postgres analytics schema migrations
 │   └── *.md                         # Design notes, plans and incident write-ups
 ├── ops/                     # Production ops: compose, systemd units + drop-in records, scripts, RUNBOOK
 ├── scripts/                 # Developer scripts (caching baseline, Parquet interop check)
@@ -155,7 +153,7 @@ Review [rust-code-style.mdc](./.cursor/rules/rust-code-style.mdc) for full code 
 | `clap` | CLI argument parsing |
 | `parquet`, `arrow-*` | Canonical Parquet archive writing (pensieve-parquet) |
 | `aws-sdk-s3` | Object storage for the Parquet lake |
-| `duckdb`, `postgres` / `tokio-postgres` | Analytics builds and their Postgres serving store |
+| `duckdb` | Analytics builds over the Parquet lake (pensieve-analytics) |
 | `rusqlite` | Relay stats, negentropy job ledger, Parquet inventories |
 
 ## Domain Knowledge
@@ -306,7 +304,7 @@ summary below is a quick reference.
 > Pensieve services run release builds selected by systemd drop-ins (below), so
 > `git pull` plus `just build-release` in `~/pensieve` deploys nothing. The
 > checkout still matters: `pensieve.service` runs its `ops/production/compose.yml`,
-> and `archive-sync` / `pensieve-analytics-refresh` run its `ops/scripts/`. On
+> and `archive-sync` runs its `ops/scripts/`. On
 > 2026-10-11 it was 29 commits behind `origin/master` with uncommitted edits to
 > `compose.yml`, `ops/scripts/sync-archive.sh` and `env.production.example`
 > (the same content `master` later committed, minus newer additions). A
@@ -318,12 +316,12 @@ summary below is a quick reference.
 
 | Component | Runs as | What actually starts (2026-10-11) |
 |-----------|---------|-----------------------------------|
-| ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` (Postgres analytics is defined there but is not running) |
+| ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` (the drifted checkout still defines the stopped `postgres-analytics` service, removed from `master` on 2026-10-12) |
 | `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-7ac5121/pensieve-serve` via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
 | `pensieve-ingest` | `pensieve-ingest.service` | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72 build, since 2026-10-12 08:29 CEST) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
-| Archive sync, analytics refresh | `archive-sync.timer`, `pensieve-analytics-refresh.timer` (disabled) | scripts in the `~/pensieve/ops/scripts/` checkout |
+| Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout. The disabled `pensieve-analytics-refresh.timer` is still installed but obsolete (its code was removed 2026-10-12) |
 | Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
 
 The `ExecStart` lines in `ops/systemd/*.service` still point at
@@ -376,8 +374,8 @@ docker logs -f pensieve-grafana
 ### Environment Variables
 
 `/etc/pensieve/pensieve.env` is read by Docker Compose (`--env-file`), by
-`pensieve-api` and `pensieve-preview`, and by the `archive-sync` and
-`pensieve-analytics-refresh` scripts (`EnvironmentFile`). The ingester does
+`pensieve-api` and `pensieve-preview`, and by the `archive-sync` script
+(`EnvironmentFile`). The ingester does
 not read it: it takes CLI flags plus the optional root-only
 `/etc/pensieve/parquet-shadow.env`, so ingest settings placed in `pensieve.env`
 are silently ignored. Templates: `env.production.example`,
@@ -391,9 +389,7 @@ are silently ignored. Templates: `env.production.example`,
 | `PENSIEVE_BIND_ADDR` | No | Bind address (default `0.0.0.0:8080`) |
 | `CLICKHOUSE_URL` | No | Default `http://localhost:8123` |
 | `CLICKHOUSE_DATABASE` | No | Default `nostr` |
-| `PENSIEVE_POSTGRES_API_FAMILIES` | No | Route families served from Postgres; production sets `none` |
-| `DATABASE_URL`, `POSTGRES_ANALYTICS_PASSWORD`, `PENSIEVE_POSTGRES_POOL_SIZE` | When a Postgres family is selected | Postgres analytics connection |
-| `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`, `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | For the `overview` family on Postgres | Ingest-written watermark (production: `/var/lib/pensieve/latest-event-watermark.json`) |
+| `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`, `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | No | Ingest-written watermark; when set, `latest_event` is read from it instead of scanning `events_local` (production: `/var/lib/pensieve/latest-event-watermark.json`; max age default 900 s) |
 | `RELAY_DB_PATH` | No | Ingester's relay-stats SQLite for relay endpoints (unset in production) |
 
 `pensieve-preview` (`crates/pensieve-preview/src/config.rs`):
@@ -450,9 +446,8 @@ readlink /proc/$(systemctl show -p MainPID --value pensieve-api)/exe
 ## Local Development
 
 > **Note:** The bundled local Docker stack (`pensieve-local/`) was removed during the
-> lakehouse migration and will be replaced when the new stack (Parquet + DuckDB +
-> Postgres) lands. For now, run the Rust binaries natively against a ClickHouse you
-> provide.
+> lakehouse migration. For now, run the Rust binaries natively against a ClickHouse
+> you provide.
 
 ```bash
 # Copy and edit local env (loaded by pensieve-serve and pensieve-preview only;

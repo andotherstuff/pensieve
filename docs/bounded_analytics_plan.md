@@ -1,5 +1,11 @@
 # Bounded Analytics Migration Plan
 
+> **Postgres analytics abandoned 2026-10-12; kept as history.** The bounded DuckDB
+> builders remain in `crates/pensieve-analytics` for research over the Parquet
+> lake; every `*-publish` binary, the incremental publisher and the Postgres
+> schema (`docs/postgres/`) were removed, so the publication gates below will
+> not be completed.
+
 *Status: implementation has landed through Slice 9.5 (see the per-slice
 checklists in section 6); the unchecked items there, including the moving
 recurring all-product publication gate, remain open*

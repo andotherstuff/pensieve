@@ -21,6 +21,23 @@ copy here in the same PR as the code it deploys.
 | `pensieve-ingest` | `stop-timeout.conf` | `TimeoutStopSec=15min` (added 2026-10-12): a ClickHouse insert slowed by the hourly refreshable views must finish instead of being killed mid-segment |
 | `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
 
+### Obsolete settings in the API drop-in
+
+The Postgres analytics backend was removed from `pensieve-serve` on
+2026-10-12. Once an API build from that date or later is deployed:
+
+- `PENSIEVE_POSTGRES_API_FAMILIES=none` in `90-postgres-cutover.conf` is
+  obsolete. The binary no longer reads it, so leaving it in place is harmless;
+  drop it at the next edit of this drop-in. `DATABASE_URL`,
+  `POSTGRES_ANALYTICS_PASSWORD` and `PENSIEVE_POSTGRES_POOL_SIZE` are also no
+  longer read (production never set them for the API).
+- `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` is **still used**: with it set,
+  `latest_event` in `/api/v1/stats` and `/api/v1/stats/events/latest` comes
+  from the ingester's watermark file instead of a `max(created_at)` scan of
+  `events_local`. Keep it.
+- The file name `90-postgres-cutover.conf` is historical. Renaming it is
+  optional; if you do, record the new name here in the same PR.
+
 The comment inside `10-release.conf` ("Rollback: remove this file") predates
 migration 018. Removing it now would start the 2026-07-27 build in
 `~/pensieve/target/release/`, which has no compact lookups and would scan

@@ -1,35 +1,25 @@
-//! Build bounded fixed-activity state and atomically upgrade one Slice B1 publication.
+//! Build or advance bounded fixed-activity state from Parquet.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use clap::Parser;
 use pensieve_analytics::{
-    AnalyticsBuild, BatchLimits, BuildConfig, CatalogDeltaPlan, FixedActivityConfig,
-    IDENTITY_QUERY_VERSION, PublishOutcome, acquire_publication_lock,
+    BatchLimits, BuildConfig, CatalogDeltaPlan, FixedActivityConfig,
     advance_bounded_fixed_activity, build_bounded_fixed_activity, load_bounded_fixed_activity,
-    load_bounded_pubkey_first_seen, publish_incremental_with_identity_and_activity,
     resolve_delta_locations, resolve_snapshot,
 };
-use postgres::{Config as PostgresConfig, NoTls};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
-#[command(about = "Atomically add bounded exact activity products to a Slice B1 publication")]
+#[command(about = "Build bounded exact fixed-activity state")]
 struct Args {
-    /// Canonical active-file snapshot matching the current Slice B1 run.
+    /// Canonical active-file snapshot.
     #[arg(long)]
     catalog: PathBuf,
     /// Verified local object root; omit to read immutable objects from the catalog store.
     #[arg(long)]
     local_object_root: Option<PathBuf>,
-    /// Existing completed Slice A DuckDB checkpoint.
-    #[arg(long)]
-    work_database: PathBuf,
-    /// Verified first-seen evidence matching the current Slice B1 run.
-    #[arg(long)]
-    identity_evidence: PathBuf,
     /// Dedicated immutable fixed-activity batch and merge workspace.
     #[arg(long)]
     activity_work_root: PathBuf,
@@ -39,33 +29,24 @@ struct Args {
     /// Verified predecessor activity evidence; enables append-only advancement.
     #[arg(long, requires_all = ["delta_plan", "delta_object_root"])]
     activity_baseline_evidence: Option<PathBuf>,
-    /// Persisted historical-run catalog delta plan used to stage successor objects.
+    /// Persisted catalog delta plan used to stage successor objects.
     #[arg(long)]
     delta_plan: Option<PathBuf>,
     /// Root containing only the delta plan's verified added objects.
     #[arg(long)]
     delta_object_root: Option<PathBuf>,
-    /// Fixed as-of from the current Slice B1 run.
+    /// Fixed Unix timestamp bounding eligible events.
     #[arg(long)]
     as_of: u64,
-    /// Build/commit identity stored in analytics run metadata.
+    /// Build/commit identity recorded in the evidence.
     #[arg(long)]
     code_version: String,
-    /// Postgres connection string for atomic publication.
-    #[arg(long, env = "DATABASE_URL")]
-    postgres_url: String,
-    /// Postgres password supplied separately from the connection string.
-    #[arg(long, env = "POSTGRES_ANALYTICS_PASSWORD")]
-    postgres_password: Option<String>,
     /// AWS region used by DuckDB's environment credential chain.
     #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
     s3_region: String,
     /// Use path-style S3 addressing.
     #[arg(long)]
     s3_force_path_style: bool,
-    /// Build and validate immutable activity evidence without changing Postgres.
-    #[arg(long)]
-    dry_run: bool,
     /// DuckDB memory limit for each bounded input scan.
     #[arg(long, default_value = "4GB")]
     memory_limit: String,
@@ -89,10 +70,6 @@ struct Args {
 #[derive(Serialize)]
 struct Output {
     snapshot_id: String,
-    previous_run_id: String,
-    run_id: Option<String>,
-    publication_status: &'static str,
-    dry_run: bool,
     activity_records: u64,
     pubkey_flag_records: u64,
     distinct_period_rows: u64,
@@ -109,16 +86,16 @@ struct Output {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("activity publication failed: {error:#}");
+        eprintln!("activity build failed: {error:#}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    let started_at = Utc::now();
     let snapshot = resolve_snapshot(&args.catalog, args.local_object_root.as_deref())
         .context("resolve immutable snapshot")?;
+    let snapshot_id = snapshot.catalog.snapshot_id.clone();
     let build_config = BuildConfig {
         as_of_epoch: args.as_of,
         code_version: args.code_version,
@@ -127,14 +104,6 @@ fn run() -> Result<()> {
         memory_limit: args.memory_limit,
         threads: args.threads,
     };
-    let build =
-        AnalyticsBuild::open_completed(&args.work_database, snapshot.clone(), build_config.clone())
-            .context("open completed Slice A checkpoint")?;
-    let identity = load_bounded_pubkey_first_seen(&args.identity_evidence)
-        .context("load bounded first-seen evidence")?;
-    identity
-        .validate_for_publication(&snapshot.catalog.snapshot_id, args.as_of)
-        .context("validate first-seen evidence")?;
     let activity_config = FixedActivityConfig {
         work_root: args.activity_work_root,
         batch_limits: BatchLimits {
@@ -180,63 +149,10 @@ fn run() -> Result<()> {
             "activity baseline evidence, delta plan, and delta object root must be supplied together"
         ),
     };
-
-    let mut postgres_config: PostgresConfig = args
-        .postgres_url
-        .parse()
-        .context("parse Postgres connection")?;
-    if let Some(password) = args.postgres_password {
-        postgres_config.password(password);
-    }
-    let mut client = postgres_config
-        .connect(NoTls)
-        .context("connect to Postgres without TLS")?;
-    acquire_publication_lock(&mut client).context("acquire analytics publication lock")?;
-    let current = client
-        .query_one(
-            "SELECT run_id, snapshot_id, query_version, as_of_epoch FROM pensieve_analytics.current_run_metadata",
-            &[],
-        )
-        .context("load current Slice B1 baseline")?;
-    let previous_run_id: String = current.get(0);
-    let current_snapshot: String = current.get(1);
-    let current_query_version: String = current.get(2);
-    let current_as_of: i64 = current.get(3);
-    if current_snapshot != build.snapshot.catalog.snapshot_id
-        || current_query_version != IDENTITY_QUERY_VERSION
-        || current_as_of != i64::try_from(args.as_of).context("as-of exceeds i64")?
-    {
-        bail!(
-            "current Postgres run is not the exact Slice B1 snapshot/as-of selected for activity upgrade"
-        );
-    }
-    let completed_at = Utc::now();
-    let (run_id, publication_status) = if args.dry_run {
-        (None, "not_published")
-    } else {
-        let outcome = publish_incremental_with_identity_and_activity(
-            &mut client,
-            &build,
-            &identity,
-            &activity,
-            &previous_run_id,
-            started_at,
-            completed_at,
-        )
-        .context("atomically publish fixed-activity products")?;
-        match outcome {
-            PublishOutcome::Published { run_id, .. } => (Some(run_id), "published"),
-            PublishOutcome::AlreadyCurrent { run_id } => (Some(run_id), "already_current"),
-        }
-    };
     println!(
         "{}",
         serde_json::to_string_pretty(&Output {
-            snapshot_id: build.snapshot.catalog.snapshot_id.clone(),
-            previous_run_id,
-            run_id,
-            publication_status,
-            dry_run: args.dry_run,
+            snapshot_id,
             activity_records: activity.evidence.activity_artifact.row_count,
             pubkey_flag_records: activity.evidence.flags_artifact.row_count,
             distinct_period_rows: activity.evidence.distinct_period_rows,

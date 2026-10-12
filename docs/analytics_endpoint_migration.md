@@ -1,5 +1,10 @@
 # Analytics Endpoint Migration Ledger
 
+> **Postgres analytics abandoned 2026-10-12; kept as history.** No endpoint will
+> move to a Postgres serving store; the API stays on ClickHouse. The DuckDB
+> computations mapped here survive only as research builders in
+> `crates/pensieve-analytics`.
+
 *Status: draft design / P3 planning*
 *Last updated: 2026-07-28*
 

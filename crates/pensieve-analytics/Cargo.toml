@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 authors.workspace = true
-description = "DuckDB-to-Postgres analytics builder for Pensieve"
+description = "DuckDB analytics builders over the Pensieve Parquet lake"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -23,7 +23,6 @@ hex.workspace = true
 pensieve-core = { path = "../pensieve-core" }
 pensieve-lake = { path = "../pensieve-lake" }
 pensieve-parquet = { path = "../pensieve-parquet" }
-postgres.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true

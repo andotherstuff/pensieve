@@ -12,7 +12,7 @@ use crate::{
     publish_canonical_json,
 };
 
-/// Canonical validation runner identity consumed by Postgres publication.
+/// Canonical validation runner identity recorded in validation evidence.
 pub const FLEXIBLE_DISTINCT_VALIDATION_RUNNER: &str =
     "pensieve-analytics-flexible-distinct-validation-v3";
 /// Production maximum accepted relative error in parts per million.

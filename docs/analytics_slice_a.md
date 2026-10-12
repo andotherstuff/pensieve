@@ -1,5 +1,13 @@
 # Analytics Slice A — Builder and Publication Runbook
 
+> **Postgres analytics abandoned 2026-10-12; kept as history.** The DuckDB build
+> (`pensieve-analytics`, `just analytics-build`) still works and writes only the
+> local DuckDB work database; it no longer accepts `--postgres-url`. Everything
+> about Postgres publication, `pensieve-analytics-plan`/`-incremental`, the
+> recurring refresh (`run-analytics-refresh.sh`, `stage-analytics-delta.sh`,
+> `pensieve-analytics-refresh.timer`) and the Postgres comparison harness
+> (`pensieve-analytics-compare`) describes code that was removed.
+
 *Status: deployed as shadow analytics; not accepted for API cutover*
 *Last updated: 2026-08-04*
 

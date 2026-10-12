@@ -1,5 +1,10 @@
 # Pensieve Migration Plan — Lakehouse Re-Architecture
 
+> **Postgres analytics abandoned 2026-10-12; kept as history.** The Parquet lake and
+> DuckDB batch tooling continue; the Postgres rollup/serving store and the API
+> cutover to it were abandoned, and the API stays on ClickHouse. Sections that
+> plan Postgres serving are history.
+
 *Status: active / executing*
 *Created: 2026-06-14*
 *Last updated: 2026-07-28*
