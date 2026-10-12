@@ -41,6 +41,14 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
 Restart=always
 RestartSec=10
 
+# Stop budget: archive shutdown (final seal, compression, RocksDB flush) runs
+# first, then the ClickHouse indexer gets up to 20 s to drain plus 60 s to
+# reach a batch boundary. systemd's 90 s default can kill the process before
+# that clean stop (2026-10-12). A kill is still safe, because the batch was
+# journaled before it was sent, but a clean stop avoids the existence check
+# on restart.
+TimeoutStopSec=5min
+
 # Open-file limit: the ingester holds many concurrent relay sockets; the systemd
 # default caused "Too many open files" (notably during shutdown).
 LimitNOFILE=524288
