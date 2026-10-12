@@ -60,8 +60,8 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - The compact lookup tables from 017 are backfilled, and the preview reads
   them (`PREVIEW_COMPACT_LOOKUPS=all`).
 - Prepared 019 (API rollups for `/stats/publishers` and `/stats/longform`)
-  is **not yet applied**. Until it is applied and backfilled, an API build
-  that reads it answers those two endpoints with `503 metric_unavailable`.
+  was applied at 09:14 UTC on 2026-10-12, backfilled and validated (0 failed
+  rows); the API reads it since 12:52 UTC.
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -88,7 +88,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/016_drop_events_by_time_projection.sql | Removal of the full-row time projection; excluded from `ch-migrate-all`. **Applied in production 2026-07-27** | No (background removal mutation) |
 | prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all`. **Applied and backfilled in production** | **Yes** (`preview-lookups backfill`, bounded and resumable) |
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
-| prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Not yet applied in production** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
+| prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).

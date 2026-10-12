@@ -237,7 +237,7 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
 `docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-12):** 001–015 and prepared 016, 017 and 018 are applied; prepared 019 is not yet applied. `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state (2026-10-12):** 001–015 and prepared 016, 017, 018 and 019 are applied (019 backfilled and validated 2026-10-12). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -318,7 +318,7 @@ summary below is a quick reference.
 | Component | Runs as | What actually starts (2026-10-11) |
 |-----------|---------|-----------------------------------|
 | ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-f60f003/pensieve-serve` (master, since 2026-10-12) via `pensieve-api.service.d/90-postgres-cutover.conf` |
+| `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-60c4bfe/pensieve-serve` (master with the 019 rollups, since 2026-10-12) via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
 | `pensieve-ingest` | `pensieve-ingest.service` | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72 build, since 2026-10-12 08:29 CEST) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |

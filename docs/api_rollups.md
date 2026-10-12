@@ -1,7 +1,8 @@
 # ClickHouse rollups for `/stats/publishers` and `/stats/longform`
 
-> **Status (2026-10-12):** prepared migration 019, not yet applied in
-> production. Rollout: [`ops/RUNBOOK.md` → API rollups](../ops/RUNBOOK.md#api-rollups-migration-019).
+> **Status (2026-10-12):** applied, backfilled, validated (0 failed rows) and serving in
+> production since 12:52 UTC (`releases/api-60c4bfe`). Publisher windows beyond ~90 days
+> still exceed the 20 s cap; see [`ops/RUNBOOK.md` → API rollups](../ops/RUNBOOK.md#api-rollups-migration-019).
 
 Without projections, `events_local` (~2.43B rows, `ReplacingMergeTree ORDER
 BY id`) can only be scanned, and two `pensieve-serve` endpoints hit the API's
