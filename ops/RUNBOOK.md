@@ -689,9 +689,10 @@ around the boundary; longform 108,895 rows; `addressable_latest` cross-check 466
 0 different); API `releases/api-60c4bfe` since 12:52 UTC. Query timings with the cache off:
 publishers 30 d 4.9 s, longform 0.4 s, publishers 366 d **39 s**.
 
-**Known limit:** the API caps `days` at 90 (`400` above that) since 2026-10-12. Since
-mid-2026 20–45 million distinct pubkeys are active per month (mostly single-use keys), so a
-one-year ranking aggregates ~150M (month, pubkey) rows and took 39 s, beyond the 20 s cap.
+**Known limit:** the API caps `days` at 60 (`400` above that) since 2026-10-12. Since
+mid-2026 20–45 million distinct pubkeys are active per month (mostly single-use keys), so
+cost grows with the window: 30 days ~26M rows / 5–7 s, 60 days ~46M / ~9.5 s, 90 days
+~71M / ~20 s (at the cap), one year ~150M / 39 s. Re-measure if key churn grows.
 The rollup keeps 400 days, so the cap can be raised once long windows get a precomputed
 path.
 
@@ -836,7 +837,7 @@ just ch-query "SELECT count(), uniqExact(pubkey), sum(tupleElement(l, 3)) FROM (
 just ch-query "SELECT query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 5 MINUTE AND (query LIKE '%publisher_activity%' OR query LIKE '%longform_latest%') AND query NOT LIKE '%system.query_log%' ORDER BY event_time DESC LIMIT 5"
 ```
 
-Repeat the first query with `toIntervalDay(90)` (the API's maximum). Both must finish well
+Repeat the first query with `toIntervalDay(60)` (the API's maximum). Both must finish well
 under the API's 20 s cap; record the numbers in the change log.
 
 ### 6. Deploy the API
@@ -896,7 +897,7 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
-- `/api/v1/stats/publishers` is capped at `days=90`; a longer window needs a precomputed
+- `/api/v1/stats/publishers` is capped at `days=60`; a longer window needs a precomputed
   ranking (see [API rollups](#api-rollups-migration-019) → Known limit).
 - The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
   ingester keeps writing the WAL database, so relay endpoints can be stale.

@@ -690,7 +690,7 @@ endpoint returns `503` with `{"error": "metric_unavailable"}`.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `kind` | integer | - | Filter by event kind (not 445 or 1059) |
-| `days` | integer | 30 | Days to include, 1–90 (longer windows exceed the 20 s query cap) |
+| `days` | integer | 30 | Days to include, 1–60 (longer windows exceed the 20 s query cap) |
 | `limit` | integer | 100 | Number of publishers (max: 1000) |
 
 The window covers whole UTC days: from the start of the UTC day containing

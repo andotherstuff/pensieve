@@ -72,7 +72,7 @@ the ingest insert. Unpartitioned, every backfill shard is exactly one part,
 committed atomically (see below). TTL deletes run at most once a day
 (`merge_with_ttl_timeout = 86400`).
 
-**TTL 400 days.** The API accepted `days` 1–366 when this was designed; it now caps at 90 (one-year windows took 39 s in production), and the 400-day history is kept so the cap can be raised again. Because month rows only start
+**TTL 400 days.** The API accepted `days` 1–366 when this was designed; it now caps at 60 (one year took 39 s and 90 days ~20 s in production; 60 days ~9.5 s), and the 400-day history is kept so the cap can be raised again. Because month rows only start
 at the first month boundary inside the window, no read needs a period older
 than today − 366. A month row is complete only if the data behind it starts
 before the month: the view keeps activity days newer than today − 400, and the
@@ -187,7 +187,7 @@ as `duplicate_inflation` while the duplicate is still visible.
 | Longform `unique_authors` | `uniq` (approximate) | `uniqExact` |
 | Longform empty result | `avg_content_length` NaN (`null`) | `0.0` |
 | Publishers window | `created_at >= now() - N days` (rolling) | Whole UTC days from the day containing `now() - N days` (N to N+1 days) |
-| Publishers `days` | Any value | 1–90, else `400` (1–366 until 2026-10-12) |
+| Publishers `days` | Any value | 1–60, else `400` (1–366 until 2026-10-12) |
 | Publishers kinds 445/1059 | Ranked | `400` (not stored) |
 | Publishers future-dated events | Counted forever | Count on the day after ingestion |
 | Publishers `kinds_count` | `uniq` (approximate) | Exact |
