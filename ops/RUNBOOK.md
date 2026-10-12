@@ -42,7 +42,7 @@ Observed 2026-10-11:
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | Postgres analytics | manual only (`manual-postgres` profile) | not running; start it as in [Shadow analytics Postgres](#shadow-analytics-postgres) |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-7ac5121/pensieve-serve`, `PENSIEVE_POSTGRES_API_FAMILIES=none` |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-8bdac94/pensieve-serve` (master, since 2026-10-12), `PENSIEVE_POSTGRES_API_FAMILIES=none` |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `/data/pensieve-build/negentropy-ba0c4a1/release/pensieve-ingest` (PR #72, since 2026-10-12 08:29 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static) | `/usr/local/libexec/pensieve-negentropy-worker` |
@@ -115,13 +115,18 @@ missing.
 
 Production deploys one component at a time from a release build of an exact
 commit. Do **not** deploy with `git pull` + `just build-release` in `~/pensieve`:
-the services do not run `target/release/` (drop-ins override `ExecStart`), and
-the checkout has uncommitted edits that the Compose stack and `archive-sync`
-use (on 2026-10-11: 29 commits behind, local edits to `ops/production/compose.yml`,
-`ops/scripts/sync-archive.sh`, `env.production.example`). Leave the checkout alone
-unless you are deliberately changing those.
+the services do not run `target/release/` (drop-ins override `ExecStart`). The
+checkout is what the Compose stack and `archive-sync` use; keep it a clean
+`master` (synced 2026-10-12) and update it with
+`git -C ~/pensieve merge --ff-only origin/master` when `ops/` changes, never with
+hand edits. Mounted configs and `compose.yml` take effect only when the affected
+container is recreated.
 
-Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown):
+Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown). Copying a
+warm target dir (`cp -a --reflink=auto /data/pensieve-build/<previous> <new>`) and building in a
+resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --property=MemoryMax=8G
+--property=IOSchedulingClass=idle --setenv=CARGO_TARGET_DIR=…`) keeps ingestion unaffected; the
+2026-10-12 API build took 57 s that way.
 
 1. **Build the exact commit in a detached worktree** with its own target dir:
    ```bash
@@ -196,8 +201,9 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   would do 10–30 s scans now that `events_by_kind` is gone; `pensieve-ingest` is the
   2026-10-05 giftwrap hotfix). The comment inside `10-release.conf` that says "remove
   this file" predates migration 018; do not follow it.
-- `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (current)
-  and only `preview-3ab1045`.
+- `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
+  unmerged `codex/negentropy-hardening` branch; previous), `api-8bdac94` (master, current) and
+  only `preview-3ab1045`.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
 ## First live Parquet shadow activation
@@ -790,7 +796,8 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
-- The `~/pensieve` checkout on the host is behind `master` with uncommitted edits (see
-  [Routine deploy](#routine-deploy)); bring it back to a clean `master` deliberately.
+- Since the 2026-10-12 sync, `compose.yml` mounts `prometheus/archive-alerts.yml`, but the
+  running Prometheus container predates it; the archive alert rules load only after
+  `docker compose --env-file /etc/pensieve/pensieve.env up -d prometheus`.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
   [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.
