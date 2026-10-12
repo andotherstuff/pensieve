@@ -392,7 +392,7 @@ are silently ignored. Templates: `env.production.example`,
 | `PENSIEVE_POSTGRES_API_FAMILIES` | No | Route families served from Postgres; production sets `none` |
 | `DATABASE_URL`, `POSTGRES_ANALYTICS_PASSWORD`, `PENSIEVE_POSTGRES_POOL_SIZE` | When a Postgres family is selected | Postgres analytics connection |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`, `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | For the `overview` family on Postgres | Ingest-written watermark (production: `/var/lib/pensieve/latest-event-watermark.json`) |
-| `RELAY_DB_PATH` | No | Ingester's relay-stats SQLite for relay endpoints (unset in production) |
+| `RELAY_DB_PATH` | No | Ingester's relay-stats SQLite for relay endpoints (production: `/data/relay-stats.db`, set in the API drop-in since 2026-10-12; opened once with `immutable=1`) |
 
 `pensieve-preview` (`crates/pensieve-preview/src/config.rs`):
 

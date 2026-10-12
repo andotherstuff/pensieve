@@ -122,6 +122,10 @@ checkout is what the Compose stack and `archive-sync` use; keep it a clean
 hand edits. Mounted configs and `compose.yml` take effect only when the affected
 container is recreated.
 
+Compose changes apply per container: after the 2026-10-12 sync, Prometheus was recreated alone
+(`docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus`
+from `ops/production/`, after `promtool check config`) to load `archive-alerts.yml`.
+
 Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown). Copying a
 warm target dir (`cp -a --reflink=auto /data/pensieve-build/<previous> <new>`) and building in a
 resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --property=MemoryMax=8G
@@ -796,8 +800,12 @@ and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pe
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
-- Since the 2026-10-12 sync, `compose.yml` mounts `prometheus/archive-alerts.yml`, but the
-  running Prometheus container predates it; the archive alert rules load only after
-  `docker compose --env-file /etc/pensieve/pensieve.env up -d prometheus`.
+- `/api/v1/stats/longform` and `/api/v1/stats/publishers` time out (20 s cap) on ClickHouse:
+  longform scans `events_local` for kind 30023 (fast only with the dropped `events_by_kind`
+  projection) and publishers scans 30 days by `created_at` (fast only with the dropped
+  `events_by_time` projection). Their Postgres families exist but Postgres analytics is not
+  running.
+- The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
+  ingester keeps writing the WAL database, so relay endpoints can be stale.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
   [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.
