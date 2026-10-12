@@ -62,7 +62,15 @@ maintenance but pauses replay, new planning and leases, exposing
 
 The listener authenticates the accepted Unix peer against the dedicated systemd
 unit, retains a pidfd, and rechecks identity and remaining service lifetime
-immediately before assignment. It never infers a verified OOM from EOF. Local
+immediately before assignment. Archive replay and idle waiting consume the
+worker's ten-minute service lifetime, not a new full nine-minute reservation.
+The final recheck caps the parent session at the smaller of nine minutes and
+the remaining service lifetime minus a ten-second safety margin (also capped
+by the fixed-canary intake budget when applicable). At least two minutes must
+remain after that margin to admit a session; otherwise no work is assigned to
+that process. The ten-minute systemd backstop and all identity checks remain
+unchanged. Session-budget logs expose the actual admitted duration.
+It never infers a verified OOM from EOF. Local
 inventory density is checked before leasing and split atomically without an
 attempt; a one-second dense interval is blocked and logged. A concurrent append
 between preflight and session can still cause a later TooDense outcome, which

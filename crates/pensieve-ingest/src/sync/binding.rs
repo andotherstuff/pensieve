@@ -1,7 +1,6 @@
 //! Fail-closed Linux worker identity inspection. Never launches a worker or
 //! grants a lease. A snapshot is not a cached admission permission.
 
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", test))]
@@ -25,6 +24,8 @@ const PARENT_CGROUP: &str = "/system.slice/pensieve-ingest.service";
 #[cfg(any(target_os = "linux", test))]
 const JOB_US: u64 = 540_000_000;
 #[cfg(any(target_os = "linux", test))]
+const MIN_JOB_US: u64 = 120_000_000;
+#[cfg(any(target_os = "linux", test))]
 const MARGIN_US: u64 = 10_000_000;
 #[cfg(any(target_os = "linux", test))]
 const OUTPUT_LIMIT: usize = 16 * 1024;
@@ -46,7 +47,7 @@ pub enum BindingError {
     /// Untrusted/inconsistent identity or malformed manager response.
     #[error("worker identity mismatch")]
     Identity,
-    /// Full job plus safety margin no longer fits.
+    /// Minimum useful session plus safety margin no longer fits.
     #[error("worker service lifetime insufficient")]
     Lifetime,
     /// Bounded output limit was exceeded.
@@ -84,10 +85,10 @@ impl WorkerCandidate {
     }
 
     /// Always fails closed on this platform.
-    pub async fn recheck(&self) -> Result<(), BindingError> {
+    pub async fn recheck(&self) -> Result<Duration, BindingError> {
         #[cfg(test)]
         {
-            Ok(())
+            Ok(Duration::from_secs(540))
         }
         #[cfg(not(test))]
         {
@@ -181,7 +182,7 @@ fn parse(unit: &[u8], service: &[u8]) -> Result<Snapshot, BindingError> {
 
 #[cfg(any(target_os = "linux", test))]
 impl Snapshot {
-    fn check(&self, expected: &Self, pid: u32, now_us: u64) -> Result<(), BindingError> {
+    fn check(&self, expected: &Self, pid: u32, now_us: u64) -> Result<Duration, BindingError> {
         if self != expected || self.pid != pid || now_us < self.active_us {
             return Err(BindingError::Identity);
         }
@@ -189,13 +190,14 @@ impl Snapshot {
             .active_us
             .checked_add(self.runtime_us)
             .ok_or(BindingError::Lifetime)?;
-        if now_us
-            .checked_add(JOB_US + MARGIN_US)
-            .is_none_or(|end| end > deadline)
-        {
+        let remaining = deadline
+            .checked_sub(now_us)
+            .and_then(|remaining| remaining.checked_sub(MARGIN_US))
+            .ok_or(BindingError::Lifetime)?;
+        if remaining < MIN_JOB_US {
             return Err(BindingError::Lifetime);
         }
-        Ok(())
+        Ok(Duration::from_micros(remaining.min(JOB_US)))
     }
 }
 
@@ -241,7 +243,7 @@ mod tests {
         let snapshot = parse(&unit, &service).unwrap();
         assert!(snapshot.check(&snapshot, 123, 51_000_000).is_ok());
         assert!(matches!(
-            snapshot.check(&snapshot, 123, 51_000_001),
+            snapshot.check(&snapshot, 123, 471_000_001),
             Err(BindingError::Lifetime)
         ));
         assert!(snapshot.check(&snapshot, 124, 1_000_000).is_err());
@@ -252,5 +254,27 @@ mod tests {
         replacement = snapshot.clone();
         replacement.active_us = u64::MAX;
         assert!(replacement.check(&replacement, 123, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn replay_time_reduces_session_budget_without_rejecting_healthy_worker() {
+        let (unit, service) = outputs();
+        let snapshot = parse(&unit, &service).unwrap();
+        for (age_seconds, budget_seconds) in
+            [(0, 540), (50, 540), (82, 508), (300, 290), (470, 120)]
+        {
+            assert_eq!(
+                snapshot
+                    .check(&snapshot, 123, snapshot.active_us + age_seconds * 1_000_000)
+                    .unwrap(),
+                Duration::from_secs(budget_seconds)
+            );
+        }
+        for age_seconds in [471, 590, 600, 601] {
+            assert!(matches!(
+                snapshot.check(&snapshot, 123, snapshot.active_us + age_seconds * 1_000_000),
+                Err(BindingError::Lifetime)
+            ));
+        }
     }
 }

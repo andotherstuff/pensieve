@@ -277,7 +277,7 @@ async fn drive(
                     // Revalidate the same pidfd, invocation and remaining service
                     // lifetime immediately before exporting a lease capability.
                     match candidate.recheck().await {
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(error) => {
                             counter!("negentropy_worker_binding_rejections_total").increment(1);
                             tracing::warn!(error = %error, "worker changed while idle");
@@ -298,11 +298,15 @@ async fn drive(
                     if config.canary_until.is_some() {
                         canary_attempts += 1;
                     }
-                    if let Err(error) = candidate.recheck().await {
-                        tracing::warn!(error = %error, job = lease.job().id, "worker changed before assignment");
-                        parent.retry(lease, 60, RetryReason::WorkerLost).await?;
-                        continue;
-                    }
+                    let session_time = match candidate.recheck().await {
+                        Ok(remaining) => session_time.min(remaining),
+                        Err(error) => {
+                            tracing::warn!(error = %error, job = lease.job().id, "worker changed before assignment");
+                            parent.retry(lease, 60, RetryReason::WorkerLost).await?;
+                            continue;
+                        }
+                    };
+                    tracing::info!(job = lease.job().id, session_seconds = session_time.as_secs(), "isolated worker session budget");
                     let job = lease.job().id;
                     let attempt = lease.job().attempt;
                     let outcome = tokio::select! {

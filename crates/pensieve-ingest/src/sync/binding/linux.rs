@@ -62,9 +62,9 @@ impl WorkerCandidate {
         Ok(candidate)
     }
 
-    /// Recheck immediately before assignment, and again as needed while the
-    /// parent owns the socket. A changed invocation or exhausted runtime fails.
-    pub async fn recheck(&self) -> Result<(), BindingError> {
+    /// Recheck immediately before assignment and return the usable session time.
+    /// A changed invocation or less than two minutes plus margin fails closed.
+    pub async fn recheck(&self) -> Result<std::time::Duration, BindingError> {
         let _permit = INSPECTION.try_acquire().map_err(|_| BindingError::Busy)?;
         self.check_process()?;
         let until = Instant::now() + QUERY_TIME;
@@ -73,7 +73,7 @@ impl WorkerCandidate {
         self.verify(until).await
     }
 
-    async fn verify(&self, until: Instant) -> Result<(), BindingError> {
+    async fn verify(&self, until: Instant) -> Result<std::time::Duration, BindingError> {
         let current = query::snapshot(until).await?;
         self.check_process()?;
         current.check(&self.initial, self.pid, monotonic_us()?)
