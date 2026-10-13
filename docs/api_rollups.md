@@ -7,7 +7,8 @@
 > Migration 020 ([below](#migration-020-incremental-derived-views)) is applied and cut over
 > (2026-10-12 19:18 UTC); results in `ops/RUNBOOK.md` → Incremental derived views.
 > Migration 021 ([below](#migration-021-kind-activity), `/kinds/{kind}` and
-> `/kinds/{kind}/activity`) is prepared, not applied.
+> `/kinds/{kind}/activity`) is applied, backfilled and validated (2026-10-13; the API
+> reads it since 07:36 UTC); results in `ops/RUNBOOK.md` → Kind activity.
 
 This document covers the migrations that move derived data off full scans of
 `events_local` and the shared operator tool `api-rollups`. Migration 019 is
