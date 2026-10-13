@@ -13,7 +13,7 @@ copy here in the same PR as the code it deploys.
 
 | Unit | Drop-in | Effect |
 |------|---------|--------|
-| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-d026d53/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`; since 2026-10-12 19:02 UTC; previously `api-b466b37`, `api-ff8a446`, `api-60c4bfe`, `api-f60f003`, `api-8bdac94`, `api-7ac5121`), plus `RELAY_DB_PATH=/data/relay-stats.db` and the latest-event watermark path |
+| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 07:36 UTC; previously `api-d026d53`, `api-b466b37`, `api-ff8a446`, `api-60c4bfe`, `api-f60f003`, `api-8bdac94`, `api-7ac5121`), plus `RELAY_DB_PATH=/data/relay-stats.db` and the latest-event watermark path |
 | `pensieve-preview` | `10-release.conf` | Runs `releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
 | `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |

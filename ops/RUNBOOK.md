@@ -41,7 +41,7 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-d026d53/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`; since 2026-10-12 21:02 CEST) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker`, continuous against Premium Primal since 2026-10-12 |
@@ -213,7 +213,7 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, current), `ingest-b466b37` (current
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-b466b37` (current
   ingester), `ingest-ba0c4a1` (previous ingester from PR #72, with its worker) and only
   `preview-3ab1045`. Build target dirs other than the latest `api-*`/`ingest-*` caches in
   `/data/pensieve-build/` were removed on 2026-10-12.
@@ -1103,9 +1103,18 @@ its totals from 020's `kind_totals`. Design, time basis and behaviour changes:
 The same release replaces `validate`'s kinds `unique_pubkeys` check (it compared with
 `kinds_stats_mv`, gone since the 020 cutover) with an exact sampled comparison.
 
-**Status:** prepared, not applied. **Order:** apply → plan → backfill → validate → deploy
-the API that reads `kind_activity` (the current API does not read it, so nothing serves an
-incomplete table) → monitor.
+**Status:** Applied 2026-10-13 at 06:14:16 UTC at a quiet moment (view boundary
+`indexed_at < 1791872126`; the view costs ~2 ms per insert). `plan` 06:24 UTC (256 shards,
+~1.36 TiB compressed read, peak disk ~79 GiB estimated); backfill ~06:25–07:30 UTC
+(80,314,740 rows written, 4.8M rows / 1.49 GiB after merges; ingest 0 errors, insert p95
+≤ 8.5 s). `validate --migration 021` and `validate --target kinds` both 0 failed rows
+(kinds: largest `unique_pubkeys` sketch error 0.271%, 2 heavy kinds skipped). The API
+`api-fe54f04` reads it since 07:36 UTC: `/kinds/1` went from `500` after 20.0 s to 200 in
+33 ms; `/kinds/1/activity?group_by=day&limit=365` 0.81 s;
+`/kinds/7/activity?group_by=month&limit=120` 0.43 s.
+
+**Order:** apply → plan → backfill → validate → deploy the API that reads `kind_activity`
+(the previous API did not read it, so nothing served an incomplete table) → monitor.
 
 Use the `api-rollups` binary from the release that contains this migration (`$AR` as for
 019/020, same `--checkpoint-dir`; the target gets its own `kind-activity/` subdirectory).
