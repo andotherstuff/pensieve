@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only, time-bounded ledger measurements; never authorizes pruning or rollout."""
+"""Read-only, time-bounded ledger measurements; never authorizes pruning or rollout.
+
+Aggregate counts only, except the few most recent relay-unavailable exclusions
+(schema 10): their public event IDs, relays and windows are listed because an
+operator needs them to check whether another relay or the archive has the event.
+Lease tokens, policy-exclusion IDs, recipient lists and failure bodies are never
+emitted.
+"""
 
 import argparse
 import json
@@ -20,7 +27,7 @@ def check_owner(path):
 
 
 def inspect(path, timeout=5.0):
-    """Return aggregate counts only, without lease tokens or event identifiers."""
+    """Return aggregate counts plus the latest relay-unavailable exclusions."""
     path = Path(path).resolve(strict=True)
     check_owner(path)
     with path.open("rb") as source:
@@ -43,7 +50,7 @@ def inspect(path, timeout=5.0):
             db.execute("PRAGMA application_id").fetchone()[0],
             db.execute("PRAGMA user_version").fetchone()[0],
         )
-        if identity[0] != 0x504E4A31 or identity[1] not in (8, 9):
+        if identity[0] != 0x504E4A31 or identity[1] not in (8, 9, 10):
             raise Refusal("unsupported_identity")
         states = dict(db.execute("SELECT state,count(*) FROM jobs GROUP BY state"))
         rows = sum(states.values())
@@ -73,13 +80,17 @@ def inspect(path, timeout=5.0):
         failures = db.execute("SELECT count(*) FROM failure_reports").fetchone()[0]
         last_success = None
         coverage = None
-        if identity[1] == 9:
+        if identity[1] >= 9:
             last_success = db.execute("SELECT last_success FROM lifecycle WHERE singleton=1").fetchone()[0]
             coverage = db.execute(
                 "SELECT count(*),coalesce(sum(received),0),coalesce(sum(archived),0),"
-                "coalesce(sum(excluded),0),coalesce(sum(lease_grants),0),coalesce(sum(failures),0) "
-                "FROM completed_coverage"
+                "coalesce(sum(excluded),0),coalesce(sum(lease_grants),0),coalesce(sum(failures),0)"
+                + (",coalesce(sum(relay_unavailable),0)" if identity[1] >= 10 else "")
+                + " FROM completed_coverage"
             ).fetchone()
+        relay_unavailable = None
+        if identity[1] >= 10:
+            relay_unavailable = relay_unavailable_report(db, states.get("complete", 0))
         # No identifiers or lease capabilities are emitted. Event time is not a
         # creation/completion timestamp and cannot measure queue latency.
         logical_bytes = db.execute("PRAGMA page_count").fetchone()[0] * db.execute(
@@ -123,11 +134,52 @@ def inspect(path, timeout=5.0):
         ),
         "last_durable_completion_unix": last_success,
         "retained_coverage_accounting": None if coverage is None else dict(zip(
-            ("rows", "received_frames", "archived_frames", "excluded_frames", "lease_grants", "failure_reports"),
+            ("rows", "received_frames", "archived_frames", "excluded_frames", "lease_grants",
+             "failure_reports", "relay_unavailable_events"),
             coverage,
         )),
+        "relay_unavailable_exclusions": relay_unavailable,
         "safe_to_prune": False,
         "continuous_ready": False,
+    }
+
+
+RECENT_EXCLUSIONS = 5
+EXCLUSION_FIELDS = (
+    "event_id", "job", "relay", "since", "until", "first_attempt", "last_attempt",
+    "attempts", "first_reported_at", "last_reported_at", "span_secs", "excluded_at",
+    "resolved_at",
+)
+
+
+def relay_unavailable_report(db, complete_jobs):
+    """Windows completed without events their relay advertised but never delivered.
+
+    These are not fully reconciled: `complete_states` splits them out of the raw
+    `complete` count, and `unresolved` events have not reached the archive since.
+    """
+    events, jobs, unresolved = db.execute(
+        "SELECT count(*),count(DISTINCT job),coalesce(sum(resolved_at IS NULL),0) "
+        "FROM relay_unavailable_exclusions"
+    ).fetchone()
+    by_exclusion = db.execute(
+        "SELECT count(*) FROM jobs WHERE state='complete' AND reason='relay_unavailable'"
+    ).fetchone()[0]
+    recent = db.execute(
+        "SELECT lower(hex(event_id)),job,relay,since,until,first_attempt,last_attempt,attempts,"
+        "first_reported_at,last_reported_at,span_secs,excluded_at,resolved_at "
+        "FROM relay_unavailable_exclusions ORDER BY excluded_at DESC,id DESC LIMIT ?",
+        (RECENT_EXCLUSIONS,),
+    ).fetchall()
+    return {
+        "events": events,
+        "jobs": jobs,
+        "unresolved_events": unresolved,
+        "complete_states": {
+            "reconciled": complete_jobs - by_exclusion,
+            "relay_unavailable_exclusion": by_exclusion,
+        },
+        "recent": [dict(zip(EXCLUSION_FIELDS, row)) for row in recent],
     }
 
 

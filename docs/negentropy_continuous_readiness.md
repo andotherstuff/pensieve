@@ -84,36 +84,17 @@ authenticated attempt failure is logged with its kind and outstanding-ID count
 errors, budget exhaustion, invalid ledger input and archive recovery still stop the
 runtime.
 
-**Persistently undeliverable IDs (open decision).** Job 768's relay advertises one
-event ID in its negentropy set that it never delivers: attempts 11–15 recorded
-identical `unavailable` reports (`missing_count` 1, same ID) after receiving and
-archiving the other 17 events. The documented policy covers this case and the
-runtime follows it: never split, skip or complete because of `Unavailable` (worker
-exit 2 cannot tell relay withholding from SDK-expired NIP-40 events); retain the
-gap; retry with paced backoff (capped at one hour); keep serving healthy jobs; and
-fail health (`unresolved_failures`) once a job is in retry backoff after three
-failures, which happened at 2026-10-12T19:15Z. Nothing in these docs authorizes a
-retry cap or an exclusion, so none is implemented. Options for the maintainer:
-
-1. *Keep the current policy.* The gap is retried hourly forever and the monitor
-   stays red until an operator acts; the root occupies one of the relay's 32
-   unresolved-root planning slots. No new code, but the red monitor masks any
-   second fault.
-2. *Block after N identical reports.* After, say, five consecutive `unavailable`
-   reports with the same sample, move the job to `blocked` with a new reason such
-   as `relay_withheld` (today `blocked` means only `dense_timestamp`). Retries stop,
-   the gap stays unresolved and visible, and health stays red, so this needs an
-   explicit operator acknowledgement path (and possibly a health class that does not
-   mask other faults) to be useful. It needs a schema/reason addition but no proof.
-3. *Record a relay-unavailable exclusion with proof.* Persist the ID, relay and the
-   attempts/reports showing it was advertised and never delivered, analogous to
-   policy exclusions, and treat it as resolved for that relay's window so the job
-   can complete. This is the only option that lets coverage progress, but it is a
-   skipped-ID success that the worker and failure-diagnostic docs currently forbid,
-   and it needs a rule for when the ID later appears (refetch on a later sweep).
-
-Options 2 and 3 could be combined (block first, then let an operator command turn a
-blocked relay-withheld job into a proven exclusion).
+**Persistently undeliverable IDs.** Job 768's relay advertises one event ID in its
+negentropy set that it never delivers: all 15 attempts recorded identical
+`unavailable` reports (`missing_count` 1, ID `089d1fdc…6b65`) after receiving and
+archiving the other events (20 on attempt 1, 17 on each later one). No relay
+returns that event by ID (Premium Primal, relay.primal.net, Damus, nos.lol,
+nostr.wine, Snort, offchain.pub, nostr.mom) and it is not in ClickHouse. The policy
+at the time forbade skipping it, so the gap was retried hourly and health stayed
+`unresolved_failures` from 2026-10-12T19:15Z. The maintainer chose option 3 of
+the three considered (keep retrying; block after N identical reports; record a
+relay-unavailable exclusion with proof). It is now implemented; see
+[relay-unavailable exclusions](#relay-unavailable-exclusions) below.
 
 ### Unattended operation and monitor 46
 
@@ -132,7 +113,9 @@ overnight. Two mechanisms keep continuous mode from depending on that:
   reconciliation, including healthy fresh windows, until an operator restarts the
   ingester without the flag or resolves the job; the pause does not end on its own
   because nothing is retried while paused. Restarting the ingester also restarts
-  live ingestion.
+  live ingestion. A window whose relay persistently withholds the same advertised
+  IDs no longer reaches the pause: it is completed by a
+  [relay-unavailable exclusion](#relay-unavailable-exclusions) first.
 - **Runbook step.** On monitor 46 red with `unresolved_failures`, stop only the
   worker (`sudo systemctl stop pensieve-negentropy-worker`) and record the
   read-only ledger status. Without the flag, this is what must happen manually; the
@@ -143,14 +126,110 @@ moving part that can misread a transient reason, while the in-process pause uses
 ledger's own durable classification. Leaving the runtime retrying (no flag) is safe
 for data after this fix; it only means the red monitor hides later faults.
 
+## Relay-unavailable exclusions
+
+This is the one case in which a window completes without an event that its relay
+advertised. It replaces, for this case only, the earlier rule that no automatic
+expiry exception or skipped-ID success is authorized. Every other `Unavailable`
+outcome still retains the gap and retries it.
+
+**Rule.** On every runtime tick, before leasing, the parent checks each retry-wait
+job whose latest `K` consecutive reported attempts (default 5) each ended in an
+`unavailable` report naming the *identical* missing-ID set, and excludes those IDs
+when all of the following hold:
+
+- the set is fully enumerated: `missing_count` equals the number of sampled IDs,
+  and the set has at most `--isolated-negentropy-unavailable-exclusion-max-ids`
+  IDs (default 8, at most the 128-ID sample cap);
+- every missing ID was explicitly requested: each attempt's received frames plus
+  its missing count fit in the worker's single 128-ID fetch batch (a larger diff
+  can report later-batch IDs that were never asked for);
+- the reports span at least `T` seconds from first to last (default 3600);
+- every frame the job received is already archive-confirmed (no retained receipt),
+  and none of the IDs carries a durable archive marker (if one does, the event
+  was delivered after all and normal reconciliation finishes the window).
+
+Any other failure kind (relay errors, deadlines and worker-side protocol failures
+all report as `relay`), a different set or a protocol-complete attempt ends the
+run. An attempt that ended with no report at all carries no relay evidence and is
+skipped without counting: a lost worker, an ingester restart mid-session, or a
+lease consumed without a session, like job 768's attempt 16 in the lease race
+above. Skipping it is safe because any event such an attempt did receive is either
+still a retained receipt (which defers the exclusion) or archived (which refuses
+it). An unparseable stored report is corruption and stops the runtime as before. Flags: `--isolated-negentropy-unavailable-exclusion-attempts`
+(3–32), `-span-secs` (1800–86400), `-max-ids` (1–128), and
+`--isolated-negentropy-disable-unavailable-exclusion` to stop new exclusions.
+
+**Report times.** Schema 10 records `failure_reports.reported_at`. Older reports
+have no time. Where a gap touches one, the span uses the runtime's fixed backoff
+floor after that attempt, `min(60 * 2^(n-1), 3600)` seconds after failure `n`,
+which has not changed since the runtime shipped (#60). The only path that can
+shorten such a gap is a release that lost its lease and fell back to expiry's
+60-second retry (`negentropy_isolated_stale_release_total`). Job 768's latest five
+reports (attempts 11–15) have a floor of four hours, so it is excluded at the first
+evaluation after deploy (attempt 16, consumed by the lease race without a report,
+is skipped), with no new attempt and no manual ledger edit.
+
+**Proof and accounting.** Each excluded ID gets a row in
+`relay_unavailable_exclusions`: event ID, job, relay, window, first and last
+attempt of the identical run, attempt count, first and last report times (when
+known), the span lower bound, `excluded_at`, `resolved_at` and reason
+`relay_unavailable`. The rows are self-contained and survive retention of the
+job's detail. The job becomes `complete` with reason `relay_unavailable`;
+receipts, attempt summaries, failure reports, archive markers and job IDs are
+untouched. Retention adds the count to `completed_coverage.relay_unavailable`,
+separate from policy `excluded` frames. This is not a full success: each excluded
+ID logs one WARN line (`negentropy relay-unavailable exclusion: window completed
+without an event the relay advertised but never delivered`, with job, relay,
+count and event ID) and increments `negentropy_relay_unavailable_exclusions_total`;
+`negentropy_relay_unavailable_exclusions_unresolved` gauges events not yet
+archived; the status tool lists the latest exclusions and splits `complete` into
+reconciled and excluded windows.
+
+**Health.** An excluded job is complete, so it no longer counts toward
+`unresolved_failures`, and `/health/negentropy` and Kuma monitor 46 recover. Other
+failures (relay down, protocol errors, blocked dense timestamps, mixed reports)
+count exactly as before.
+
+**Late arrival.** The excluded IDs are not added to the reconciliation inventory.
+If the event later reaches the archive by any path (live ingestion, another relay),
+it is admitted and deduplicated normally and nothing breaks; each tick checks up to
+64 unresolved exclusions against the durable dedupe index and sets `resolved_at`
+(`negentropy_relay_unavailable_resolved_total`). Rolling planning reconciles each
+window once per relay, so nothing asks the relay again. A re-fetch scheduler for
+unresolved exclusions is a follow-up, not part of this change.
+
+**Interaction with the failure pause.** `unresolved_failures` starts when the third
+attempt fails. With the default rule and backoff (4, 8, 16, 32, then 60 minutes
+after attempts 3–7) the exclusion fires at attempt 7 for short sessions: 3,600 s
+of backoff after attempts 3–6, plus four sessions of at most 540 s and about 35 s
+of tick and jitter slack each, is at most 5,900 s after the pause clock starts,
+inside a 7,200 s grace. Nine-minute sessions reach the span one attempt earlier.
+Raising `K` or `T` can push the exclusion past the grace; keep the grace above the
+exclusion time. Any other persistent failure, such as the relay being down for more
+than two hours, still pauses all reconciliation after the grace. With one relay
+that is harmless; revisit it before adding relays, because one bad relay would
+then pause healthy ones too.
+
+**Schema.** Opening a schema-9 ledger adds the column, table, index and coverage
+column in one transaction and sets `user_version` 10. No row is rewritten or
+dropped. A pre-change binary refuses a schema-10 ledger (`unsupported ledger
+identity/version`): the isolated runtime stays off and live ingestion continues.
+Roll back by restarting the new binary with
+`--isolated-negentropy-disable-unavailable-exclusion`, not by downgrading.
+
 ## First increment: measure without deleting
 
 Run `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite`
-against schema 8 or 9. The caller must own the database and existing WAL sidecars;
+against schema 8, 9 or 10. The caller must own the database and existing WAL sidecars;
 running as root against a pensieve-owned ledger is refused before SQLite opens.
 It opens SQL read-only, limits SQL work to five seconds, reports aggregate
 counts and separately sampled DB/WAL/SHM sizes, and refuses unknown identities.
-It never emits lease tokens, event IDs, policy recipient lists or failure bodies.
+It never emits lease tokens, policy-exclusion IDs, policy recipient lists or
+failure bodies. On schema 10 it lists the five most recent relay-unavailable
+exclusions with their event IDs, relays and windows (public data an operator needs
+to look for the event elsewhere) and splits `complete` into reconciled and
+excluded windows.
 SQL read-only does not mean filesystem-write-free: SQLite can touch shared-memory
 reader coordination and recreate sidecars during concurrent writer shutdown.
 The ownership check prevents creation under another UID. A WAL database missing
@@ -201,6 +280,10 @@ Compaction uses exact 15-minute coverage bits per relay/day/policy, together wit
 frame/attempt/failure accounting. Repeated sweeps do not imply novel events.
 Summaries expire 90 days after their last compaction and are capped at 16,384 rows;
 a full summary table preserves detail rather than dropping obligations.
+Schema 10 adds a separate `relay_unavailable` count per summary. Relay-unavailable
+exclusion rows copy their proof (relay, window, attempts, report times), so unlike
+policy exclusions they do not pin their job; they are kept when its tree is
+compacted.
 
 Do not simply delete `state='complete'` rows. Schema 8 has three hazards:
 

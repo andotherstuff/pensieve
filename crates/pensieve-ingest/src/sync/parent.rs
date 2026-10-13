@@ -23,7 +23,7 @@ use super::inventory::{InventoryReplay, MAX_REPLAY_BATCH};
 use super::ipc::{self, Frame, ProtocolError, UploadAction, UploadSession};
 use super::jobs::{
     AttemptProgress, Job, JobLedger, Lease, LedgerError, MaintenanceProgress, PlanningProgress,
-    RetryReason, SplitOutcome,
+    RetryReason, SplitOutcome, UnavailableProgress,
 };
 use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, SyncStateDb};
@@ -274,6 +274,11 @@ impl ParentExecutor {
                         Command::Lifecycle { reply } => {
                             let result = (|| {
                                 let now = clock();
+                                // Archive uncertainty blocks new exclusions; the
+                                // runtime pauses on it at the next tick.
+                                if !writer.recovery_required() {
+                                    record_unavailable(&ledger.exclude_relay_unavailable(now, &dedupe)?);
+                                }
                                 let retention = ledger.retain_completed(now)?;
                                 metrics::counter!("negentropy_retention_removed_jobs_total")
                                     .increment(u64::from(retention.removed_jobs));
@@ -877,6 +882,35 @@ fn exchange(
             UploadAction::ProtocolDone => return Ok(SessionOutcome::ProtocolDone),
             UploadAction::Failed(reason) => return Ok(SessionOutcome::Failed(reason)),
         }
+    }
+}
+
+/// One WARN line and counter increment per excluded event, so an exclusion is
+/// never mistaken for a fully reconciled window.
+fn record_unavailable(progress: &UnavailableProgress) {
+    for exclusion in &progress.excluded {
+        metrics::counter!("negentropy_relay_unavailable_exclusions_total")
+            .increment(exclusion.event_ids.len() as u64);
+        for event_id in &exclusion.event_ids {
+            tracing::warn!(
+                job = exclusion.job,
+                relay = %exclusion.relay,
+                count = exclusion.event_ids.len(),
+                event_id = %hex::encode(event_id),
+                first_attempt = exclusion.first_attempt,
+                last_attempt = exclusion.last_attempt,
+                span_secs = exclusion.span_secs,
+                "negentropy relay-unavailable exclusion: window completed without an event the relay advertised but never delivered"
+            );
+        }
+    }
+    if progress.resolved > 0 {
+        metrics::counter!("negentropy_relay_unavailable_resolved_total")
+            .increment(u64::from(progress.resolved));
+        tracing::info!(
+            resolved = progress.resolved,
+            "relay-unavailable excluded events later reached the archive"
+        );
     }
 }
 

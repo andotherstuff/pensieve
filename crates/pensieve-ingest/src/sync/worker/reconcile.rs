@@ -222,6 +222,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parent_exclusion_rule_matches_the_fetch_batch() {
+        // The parent treats a diff of at most this size as fully requested.
+        assert_eq!(FETCH_BATCH as u64, crate::sync::jobs::WORKER_FETCH_BATCH);
+    }
+
+    #[test]
     fn repeated_and_excessive_replies_fail_closed() {
         let mut replies = HashSet::new();
         record_reply(&mut replies, b"reply").unwrap();

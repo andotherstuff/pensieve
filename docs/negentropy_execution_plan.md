@@ -99,7 +99,9 @@ Worker exit 2 means advertised IDs were unavailable at EOSE, not a proven volume
 failure. SDK expiry filtering and relay withholding can cause this.
 Before 3b activation, persist its distinct outcome, keep the gap, bound/pace retries
 and alert on persistent failure without starving other jobs. Never split or silently
-skip IDs on this outcome. Typed proven-volume classification is required before
+skip IDs on this outcome (the recorded, alerted relay-unavailable exclusion added
+after the 2026-10-13 job 768 incident is the only exception; see
+[continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions)). Typed proven-volume classification is required before
 enabling volume splitting; generic worker loss is insufficient. The worker now
 preserves distinct verified local attempt byte exhaustion as exit 3 and a single
 oversized event as exit 4, ahead of the SDK's resulting missing notification.

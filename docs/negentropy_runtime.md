@@ -112,6 +112,26 @@ text), and increments `negentropy_worker_attempt_failed_total`. The preflighted
 fair candidate is the job that is leased (see [fair leases](negentropy_fair_leases.md));
 a candidate that changed meanwhile is reselected, not treated as a fault.
 
+### Relay-unavailable exclusions
+
+Each owner lifecycle turn (twice per tick, before leasing) first checks retry-wait
+jobs against the relay-unavailable rule: the latest five consecutive reported
+attempts all reported the identical, fully enumerated and explicitly requested set
+of at most eight advertised-but-undelivered IDs, spanning at least an hour; every
+received frame is archived and none of the IDs is. Attempts that ended without
+any report (lost worker, lease without a session) are skipped, not counted. Such a job completes with reason `relay_unavailable`
+and a proof row per ID; the WARN line `negentropy relay-unavailable exclusion`
+names the job, relay, count and event ID, and
+`negentropy_relay_unavailable_exclusions_total` counts them. This replaces the
+former no-skip rule for this one case, after production job 768 (2026-10-13)
+retried one withheld Premium Primal event fifteen times. Other `Unavailable`
+outcomes still retain and retry the gap. The rule, its flags
+(`--isolated-negentropy-unavailable-exclusion-attempts`, `-span-secs`,
+`-max-ids`, `--isolated-negentropy-disable-unavailable-exclusion`), late arrival
+and accounting are described in
+[continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions).
+The worker and IPC are unchanged.
+
 ### Pausing on persistent failure
 
 `--isolated-negentropy-pause-on-failure-secs <SECS>` (unset by default) stops
@@ -126,7 +146,12 @@ recycled by its service lifetime. Leasing resumes only if the failure clears; si
 nothing is retried while paused, in practice that means an operator restart
 without the flag (or after resolving the job). The grace clock is in memory, so a
 restart allows one more grace period of paced retries before pausing again. `0`
-pauses as soon as the failure is observed.
+pauses as soon as the failure is observed. A job that meets the relay-unavailable
+rule is completed before a 7200 s grace ends (at most about 5,900 s after the
+third failure with the defaults), so a single withheld event no longer pauses
+leasing; any other persistent failure, such as the relay being down for more than
+two hours, still does. With one relay that is harmless; revisit it before adding
+relays.
 
 ## Bounded canary
 
@@ -172,7 +197,9 @@ targets, disk preflight and backups, three durable canary jobs with injected
 recovery, and the bounded canary remain operator gates. Successful closed rolling
 sweeps now have bounded detail retention and compact coverage accounting; unresolved
 gaps and exclusion-proof owners remain pinned. Schema 8 migrates transactionally
-to 9, without inventing legacy completion timestamps. Older unsupported prototype
+to 9, without inventing legacy completion timestamps. Schema 9 migrates to 10 by
+adding failure-report times, the relay-unavailable proof table and a separate
+coverage count; no row is rewritten and a pre-change binary refuses the result. Older unsupported prototype
 ledgers remain rejected without deletion. See
 [continuous readiness](negentropy_continuous_readiness.md) for the backup,
 retention, separate progress-alert, and bounded activation requirements.

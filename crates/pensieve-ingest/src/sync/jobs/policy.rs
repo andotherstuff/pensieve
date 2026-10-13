@@ -438,7 +438,7 @@ mod tests {
             db.db
                 .pragma_query_value(None, "user_version", |r| r.get::<_, u64>(0))
                 .unwrap(),
-            9
+            10
         );
         drop(db);
         assert!(JobLedger::open(&path, LedgerLimits::default()).is_err());

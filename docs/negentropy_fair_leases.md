@@ -8,7 +8,11 @@ selector through the parent owner after preflight; see
 The selector considers only enabled planner relay identities, at most 32. Fresh
 work is a queued root with attempt zero. Retained gaps are retry-wait jobs or
 queued children/requeued attempts. Blocked, split parents, complete and awaiting
-jobs cannot be leased. Disabled relay jobs and receipts remain untouched; enabling
+jobs cannot be leased. The owner's lifecycle turn runs before each lease, so a
+retry-wait gap whose relay persistently withholds the same advertised IDs is
+completed by a [relay-unavailable exclusion](negentropy_continuous_readiness.md#relay-unavailable-exclusions)
+(job 768, 2026-10-13) instead of being leased again; it then stops occupying a
+gap slot in the rotation. Disabled relay jobs and receipts remain untouched; enabling
 the identity makes due jobs eligible again.
 
 A singleton persists the preferred next class and independent relay cursors for
