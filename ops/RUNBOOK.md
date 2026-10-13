@@ -43,7 +43,7 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-85a2402/pensieve-ingest` (master incl. #88, #90, #92 and #94, since 2026-10-13 15:24 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-2e07c31/pensieve-ingest` (master incl. #88, #90, #92, #94 and #95 carried exclusions, since 2026-10-13 16:35 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -213,9 +213,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-85a2402` (current
-  ingester, #94; runs with the `ingest-26f2170` worker), `ingest-26f2170` (previous ingester and the
-  installed worker, #92; the rollback target for `85a2402`: same worker, keep the pause flag),
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-2e07c31` (current
+  ingester, #95; runs with the `ingest-26f2170` worker), `ingest-85a2402` (previous ingester, #94;
+  the rollback target for `2e07c31`: same worker, keep the pause flag, no ledger restore),
+  `ingest-26f2170` (older ingester and the installed worker, #92),
   `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
   downgrading leaves isolated reconciliation off unless `jobs.sqlite.pre-schema10` is restored),
@@ -1279,9 +1280,10 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-13 15:24 UTC the ingester runs
-`releases/ingest-85a2402` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
-pause clock and #94 shrinking-set exemption, with `--isolated-negentropy-pause-on-failure-secs 7200`)
+not covered by the routine deploy above. Since 2026-10-13 16:35 UTC the ingester runs
+`releases/ingest-2e07c31` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
+pause clock, #94 shrinking-set exemption and #95 carried exclusions, with
+`--isolated-negentropy-pause-on-failure-secs 7200`)
 with the `ingest-26f2170` worker (installed 14:09 UTC), from
 `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger
 (schema 10 since 2026-10-13 12:48 UTC; the schema-9 backup is `jobs.sqlite.pre-schema10` next to it);
@@ -1332,9 +1334,12 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   exclusion carried forward` with `carried_from` and `original_job`,
   `negentropy_relay_unavailable_carried_total`), so it never reaches three
   failures and the monitor stays green. If 46 is red for a window whose
-  `isolated worker attempt failed` lines show `kind=Unavailable` and whose ID is
-  listed in the status tool's `relay_unavailable_exclusions.recent`, it was not
-  carried because one of the conditions fails: the report names other IDs too,
+  `isolated worker attempt failed` lines show `kind=Unavailable` and whose ID has
+  an unresolved original exclusion for that relay, it was not carried. The status
+  tool's `relay_unavailable_exclusions.recent` lists only the five newest rows, so
+  check the ID directly (read-only):
+  `sudo -u pensieve sqlite3 -readonly "$LEDGER" "SELECT id,job,since,until FROM relay_unavailable_exclusions WHERE relay='<relay>' AND hex(event_id)=upper('<event id hex>') AND carried_from IS NULL AND resolved_at IS NULL"`.
+  It was not carried because one of the conditions fails: the report names other IDs too,
   is not fully enumerated (`missing_count` above the sample) or exceeds one fetch
   batch or `max-ids`; the window does not overlap the original's; the original
   row is resolved (the event is archived, so the relay is being asked for it
@@ -1538,6 +1543,16 @@ use `ingest-b466b37`: it refuses the schema-10 ledger (see
 
 ### Rolling out carried exclusions
 
+**Done 2026-10-13 16:35 UTC** with `ingest-2e07c31` (ingester only; the `26f2170` worker and the
+pause flag stay). Before: ledger backed up to `jobs.sqlite.pre-carry-2e07c31` (schema 10, integrity
+`ok`); no `retry_wait` job over an excluded window. Job 1984 had already earned its own exclusion
+(16:21:38 UTC), so its row is an original too (`carried_from` NULL) and no `carried forward` line
+was expected at deploy; later passes carry from the lowest matching original row (768's).
+After: column `carried_from` and index `relay_unavailable_withheld` present, `user_version` 10,
+clean archive shutdown (final segment 31065 sealed), `negentropy_isolated_ready 1`,
+`unhealthy 0`, health `progress_within_deadline`; the status tool reports `carried` zeros and two
+original exclusions. `negentropy_relay_unavailable_carried_total` appears only after the first carry.
+
 Ingester only: the worker binary and the IPC version are unchanged, so the
 installed worker stays. Opening the ledger adds the nullable column
 `relay_unavailable_exclusions.carried_from` and the partial index
@@ -1549,8 +1564,10 @@ binary switch with no ledger restore. See
 
 1. Stop the worker (`sudo systemctl stop pensieve-negentropy-worker`) and record
    `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`.
-   Note any `retry_wait` job over an already excluded window (job 1984 if it has
-   not yet earned its own exclusion).
+   Note any `retry_wait` job over an already excluded window (read-only):
+   `sudo -u pensieve sqlite3 -readonly "$LEDGER" "SELECT j.id,j.attempt FROM jobs j WHERE j.state='retry_wait' AND EXISTS(SELECT 1 FROM relay_unavailable_exclusions e WHERE e.relay=j.relay AND e.resolved_at IS NULL AND e.since<=j.until AND e.until>=j.since)"`.
+   A revisit that already earned its own exclusion before the deploy is an
+   original row itself and is not carried; no `carried forward` line appears for it.
 2. Build the merged master commit as in Routine deploy (ingester only):
    `CARGO_TARGET_DIR=/data/pensieve-build/ingest-<sha> cargo build --release --locked -p pensieve-ingest --bin pensieve-ingest`
    in a detached worktree of `<sha>`, then
