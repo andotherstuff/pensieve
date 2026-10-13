@@ -32,3 +32,21 @@ future-due gap. Clock jumps and storage latency are not monotonic-clock guarante
 
 Fresh prototype schema 7 is required; older versions fail closed without migration
 or deletion. Preserve real older obligations for an explicit recovery decision.
+
+## Leasing the preflighted candidate
+
+The runtime does not call `lease_next_fair` directly. The parent owner first takes
+`fair_candidate(now)`, checks that candidate's archived inventory (which can take
+minutes under live load), and then leases **that same job** with
+`lease_fair_candidate`. Fair selection is decided when the candidate is chosen; the
+lease commits the same attempt increment, capability and class-cursor rotation as
+`lease_next_fair` would have for it. If the durable row no longer matches the
+candidate snapshot (state, attempt, eligibility or relay), its relay was disabled,
+it is not due at the execution-time clock, or the one-lease/two-awaiting gates now
+block leasing, nothing is consumed and selection runs again on a later tick.
+
+Before this, the parent re-ran fair selection after the scan and treated a
+different result as `InvalidRequest`, after the different job's lease had already
+committed. A retry-wait gap that became due during the scan therefore stopped the
+whole runtime (production, 2026-10-13; see
+[continuous readiness](negentropy_continuous_readiness.md#incident-2026-10-13-runtime-stopped-on-a-lease-race)).

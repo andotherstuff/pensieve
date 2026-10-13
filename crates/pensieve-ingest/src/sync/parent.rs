@@ -403,11 +403,12 @@ impl ParentExecutor {
                                             if writer.recovery_required() {
                                                 return Err(ParentError::RecoveryRequired);
                                             }
-                                            let lease = ledger.lease_next_fair(clock(), ttl)?;
-                                            if lease.as_ref().is_some_and(|lease| lease.job().id != candidate.id) {
-                                                return Err(ParentError::InvalidRequest);
-                                            }
-                                            return Ok(lease);
+                                            // Lease the checked candidate itself. The scan can
+                                            // take minutes; re-running fair selection here could
+                                            // pick a gap that became due meanwhile, whose
+                                            // inventory was never checked (incident 2026-10-13).
+                                            // A changed candidate yields None and is reselected.
+                                            return Ok(ledger.lease_fair_candidate(&candidate, clock(), ttl)?);
                                         }
                                         ArchivedWindow::TooDense => {
                                             let result = ledger.split_unleased(candidate.id)?;
@@ -934,6 +935,20 @@ mod tests {
         where
             F: Fn() -> i64 + Send + 'static,
         {
+            Self::with_ledger(clock, |ledger| {
+                ledger
+                    .enqueue("sweep", "wss://relay.example.com", 100, 110)
+                    .unwrap()
+                    .id
+            })
+        }
+        /// Build the executor around a ledger prepared by `seed`, which returns
+        /// the job ID the test is interested in.
+        fn with_ledger<F, S>(clock: F, seed: S) -> Self
+        where
+            F: Fn() -> i64 + Send + 'static,
+            S: FnOnce(&mut JobLedger) -> i64,
+        {
             let root = tempfile::tempdir().unwrap();
             let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
             let writer = Arc::new(
@@ -951,10 +966,7 @@ mod tests {
             let state = Arc::new(SyncStateDb::open(root.path().join("inventory")).unwrap());
             let mut ledger =
                 JobLedger::open(&root.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
-            let job = ledger
-                .enqueue("sweep", "wss://relay.example.com", 100, 110)
-                .unwrap()
-                .id;
+            let job = seed(&mut ledger);
             let executor = ParentExecutor::with_clock(
                 ledger,
                 state.clone(),
@@ -2020,6 +2032,69 @@ mod tests {
                 .completed,
             1
         );
+        h.executor.shutdown().await.unwrap();
+    }
+
+    /// Production incident 2026-10-13: job 768, a relay-failure gap on its 15th
+    /// failed attempt, became due while the parent was scanning the archived
+    /// inventory of the fresh fair candidate. Re-running fair selection after the
+    /// scan picked the gap instead, committed its lease, and returned
+    /// InvalidRequest, which stopped the isolated runtime. The checked candidate
+    /// must be the job that is leased, whatever became due during the scan.
+    #[tokio::test]
+    async fn gap_due_during_preflight_does_not_replace_the_checked_candidate() {
+        const RELAY: &str = "wss://relay.example.com";
+        const PREFLIGHT_SECS: i64 = 136;
+        // The gap's next eligibility after 15 hourly-backoff failures.
+        let due = 10_000 + 15 * 3_600;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // First owner sample: fair_candidate, one second before the gap is due.
+        // Every later sample: after the slow inventory preflight.
+        let clock = move || {
+            if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                due - 1
+            } else {
+                due + PREFLIGHT_SECS
+            }
+        };
+        let mut fresh = 0;
+        let mut h = Harness::with_ledger(clock, |ledger| {
+            ledger.configure_planner(&[RELAY]).unwrap();
+            let gap = ledger.enqueue("gap", RELAY, 1_000, 1_899).unwrap().id;
+            let mut at = 10_000;
+            for attempt in 1..=15 {
+                let lease = ledger.lease_next_fair(at, 600).unwrap().unwrap();
+                assert_eq!((lease.job().id, lease.job().attempt), (gap, attempt));
+                ledger
+                    .retry(&lease, at, 3_600, RetryReason::RelayFailure)
+                    .unwrap();
+                at += 3_600;
+            }
+            assert_eq!(ledger.get(gap).unwrap().next_eligible, due);
+            // A fresh job leased before the gap is due flips rotation to prefer
+            // gaps next, as in production (next_class=1 before the incident).
+            let done = ledger.enqueue("done", RELAY, 2_000, 2_899).unwrap().id;
+            let lease = ledger.lease_next_fair(due - 120, 600).unwrap().unwrap();
+            assert_eq!(lease.job().id, done);
+            ledger
+                .record_protocol_done(&lease, 1, 0, ipc::initial_digest(), due - 100)
+                .unwrap();
+            fresh = ledger.enqueue("fresh", RELAY, 3_000, 3_899).unwrap().id;
+            gap
+        });
+        let gap = h.job;
+        let lease = h
+            .executor
+            .lease_next_fair(600)
+            .await
+            .expect("a gap becoming due during preflight must not stop the runtime")
+            .expect("the checked candidate remains leasable");
+        assert_eq!(lease.job().id, fresh);
+        assert_eq!(lease.job().attempt, 1);
+        assert_eq!(lease.expires_at(), due + PREFLIGHT_SECS + 600);
+        // The gap was not leased behind the runtime's back; its attempt is unspent.
+        let job = h.executor.job(gap).await.unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::RetryWait, 15));
         h.executor.shutdown().await.unwrap();
     }
 }

@@ -55,6 +55,94 @@ red until an operator decides. To turn reconciliation off deliberately, remove t
 `negentropy-worker.conf` drop-in, `daemon-reload`, stop the worker, and pause monitor 46.
 Expanding beyond Premium Primal is a separate decision.
 
+## Incident 2026-10-13: runtime stopped on a lease race
+
+At 2026-10-13T06:01:22Z the isolated runtime stopped with `isolated reconciliation
+paused; durable gaps retained error=invalid parent session request`, 15 ms after
+the waiting worker logged `worker IPC failed`. `/health/negentropy` latched
+`runtime_failed`; live ingestion was unaffected. Each later worker start failed the
+same way because the stopped runtime had removed its socket.
+
+**Cause.** Leasing is a two-step owner command: `fair_candidate(now1)` picks the
+fair job, the parent scans that job's archived inventory (up to 250,000 dedupe
+lookups, which can take minutes under live load), then it leased with
+`lease_next_fair(now2)`, which re-ran fair selection. Job 768 (Premium Primal, a
+`retry_wait` gap on its 15th relay failure, due at 05:59:06) was not yet due at
+`now1`, so the gap-preferring rotation fell back to a fresh root. When the scan
+finished at 06:01:22 the gap was due, so re-selection leased job 768 instead,
+committed that lease (attempt 16, 600 s TTL, rotation advanced), and the mismatch
+check returned `InvalidRequest`. The runtime treats any error from leasing as fatal.
+No receipt, archive marker or job ID was lost; the only effects were the stopped
+runtime and one consumed attempt number with no session.
+
+**Fix.** The parent now leases exactly the candidate whose inventory it checked
+(`lease_fair_candidate`; see [fair leases](negentropy_fair_leases.md)). A candidate
+that changed meanwhile is reselected later instead of being an error. Releasing an
+attempt whose lease already lapsed now affects only that attempt, and every
+authenticated attempt failure is logged with its kind and outstanding-ID count
+(see [runtime fault scope](negentropy_runtime.md#fault-scope)). Ledger storage
+errors, budget exhaustion, invalid ledger input and archive recovery still stop the
+runtime.
+
+**Persistently undeliverable IDs (open decision).** Job 768's relay advertises one
+event ID in its negentropy set that it never delivers: attempts 11–15 recorded
+identical `unavailable` reports (`missing_count` 1, same ID) after receiving and
+archiving the other 17 events. The documented policy covers this case and the
+runtime follows it: never split, skip or complete because of `Unavailable` (worker
+exit 2 cannot tell relay withholding from SDK-expired NIP-40 events); retain the
+gap; retry with paced backoff (capped at one hour); keep serving healthy jobs; and
+fail health (`unresolved_failures`) once a job is in retry backoff after three
+failures, which happened at 2026-10-12T19:15Z. Nothing in these docs authorizes a
+retry cap or an exclusion, so none is implemented. Options for the maintainer:
+
+1. *Keep the current policy.* The gap is retried hourly forever and the monitor
+   stays red until an operator acts; the root occupies one of the relay's 32
+   unresolved-root planning slots. No new code, but the red monitor masks any
+   second fault.
+2. *Block after N identical reports.* After, say, five consecutive `unavailable`
+   reports with the same sample, move the job to `blocked` with a new reason such
+   as `relay_withheld` (today `blocked` means only `dense_timestamp`). Retries stop,
+   the gap stays unresolved and visible, and health stays red, so this needs an
+   explicit operator acknowledgement path (and possibly a health class that does not
+   mask other faults) to be useful. It needs a schema/reason addition but no proof.
+3. *Record a relay-unavailable exclusion with proof.* Persist the ID, relay and the
+   attempts/reports showing it was advertised and never delivered, analogous to
+   policy exclusions, and treat it as resolved for that relay's window so the job
+   can complete. This is the only option that lets coverage progress, but it is a
+   skipped-ID success that the worker and failure-diagnostic docs currently forbid,
+   and it needs a rule for when the ID later appears (refetch on a later sweep).
+
+Options 2 and 3 could be combined (block first, then let an operator command turn a
+blocked relay-withheld job into a proven exclusion).
+
+### Unattended operation and monitor 46
+
+Monitor 46 went red at 19:15Z and nobody acted for eleven hours, as expected
+overnight. Two mechanisms keep continuous mode from depending on that:
+
+- **In-process pause (recommended).** Start the ingester with
+  `--isolated-negentropy-pause-on-failure-secs <SECS>`. Once `unresolved_failures`
+  has held for that long the runtime stops granting leases, keeps replay, planning,
+  receipt maintenance and health, and logs `isolated reconciliation paused leasing`
+  (`negentropy_isolated_failure_pause=1`). This is exactly the documented fault
+  policy (stop new attempts, keep every gap, leave the monitor red) without root
+  automation or a second process. A grace of 7200 s lets a transient relay outage
+  recover through four more paced retries (backoff 4, 8, 16, 32, then 60 minutes)
+  before pausing. Trade-off: one stubborn job stops all
+  reconciliation, including healthy fresh windows, until an operator restarts the
+  ingester without the flag or resolves the job; the pause does not end on its own
+  because nothing is retried while paused. Restarting the ingester also restarts
+  live ingestion.
+- **Runbook step.** On monitor 46 red with `unresolved_failures`, stop only the
+  worker (`sudo systemctl stop pensieve-negentropy-worker`) and record the
+  read-only ledger status. Without the flag, this is what must happen manually; the
+  worker is started again by the ingester's `Wants=` at the next ingester start.
+
+Not chosen: a root timer that stops the worker on a red probe adds a privileged
+moving part that can misread a transient reason, while the in-process pause uses the
+ledger's own durable classification. Leaving the runtime retrying (no flag) is safe
+for data after this fix; it only means the red monitor hides later faults.
+
 ## First increment: measure without deleting
 
 Run `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py /path/to/jobs.sqlite`

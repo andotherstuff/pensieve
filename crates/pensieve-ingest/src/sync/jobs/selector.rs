@@ -144,24 +144,117 @@ impl JobLedger {
                 let Some(id) = id else {
                     continue;
                 };
-                check_budget(&tx, &self.path, self.limits, 0)?;
-                if read_job(&tx, id)?.attempt == i64::MAX {
-                    return Err(LedgerError::Invalid("attempt counter exhausted"));
-                }
-                let token = Keys::generate().secret_key().to_secret_bytes();
-                tx.execute("UPDATE jobs SET state='leased',attempt=attempt+1,token=?2,expires_at=?3 WHERE id=?1", params![id,token.as_slice(),expiry])?;
-                tx.execute(if class==0 { "UPDATE lease_rotation SET next_class=1,after_fresh_relay=?1 WHERE singleton=1" } else { "UPDATE lease_rotation SET next_class=0,after_gap_relay=?1 WHERE singleton=1" }, [relay_id])?;
-                let job = read_job(&tx, id)?;
-                commit(tx, &self.path, self.limits)?;
-                return Ok(Some(Lease {
-                    job,
-                    token,
-                    expires_at: expiry,
-                }));
+                return lease_selected(tx, &self.path, self.limits, id, class, *relay_id, expiry)
+                    .map(Some);
             }
         }
         Ok(None)
     }
+
+    /// Lease exactly the job a preceding [`Self::fair_candidate`] returned, after
+    /// the owner checked its archived inventory, rotating the cursor of that
+    /// candidate's class exactly as [`Self::lease_next_fair`] would have.
+    ///
+    /// Fair selection is decided when the candidate is chosen. Re-running it
+    /// here would be wrong: the inventory preflight can take minutes, and a
+    /// retry-wait gap that becomes due meanwhile would replace a candidate whose
+    /// inventory was never checked. Returns `None`, without consuming an
+    /// attempt or rotating, when the candidate no longer matches the snapshot
+    /// (state, attempt, eligibility, relay or enablement changed), is not due
+    /// at `now`, or another lease or the durability gate blocks leasing; the
+    /// caller selects again later. Expired active leases are not stolen.
+    pub(in crate::sync) fn lease_fair_candidate(
+        &mut self,
+        candidate: &super::Job,
+        now: i64,
+        ttl_secs: u32,
+    ) -> Result<Option<Lease>, LedgerError> {
+        let expiry = now
+            .checked_add(i64::from(ttl_secs))
+            .filter(|_| now >= 0 && ttl_secs > 0 && ttl_secs <= 600)
+            .ok_or(LedgerError::Invalid("invalid lease deadline"))?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='leased')",
+            [],
+            |r| r.get(0),
+        )?;
+        let awaiting: u32 = tx.query_row(
+            "SELECT count(*) FROM jobs WHERE state='awaiting_durability'",
+            [],
+            |r| r.get(0),
+        )?;
+        if active || awaiting >= MAX_AWAITING_DURABILITY {
+            return Ok(None);
+        }
+        let current = read_job(&tx, candidate.id)?;
+        let class = match current.state {
+            super::JobState::Queued if current.parent.is_none() && current.attempt == 0 => 0,
+            super::JobState::Queued | super::JobState::RetryWait => 1,
+            _ => return Ok(None),
+        };
+        if current != *candidate || current.next_eligible > now {
+            return Ok(None);
+        }
+        let relay_id = tx
+            .query_row(
+                "SELECT id FROM planner_relays WHERE relay=?1 AND enabled=1",
+                [&current.relay],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(relay_id) = relay_id else {
+            return Ok(None);
+        };
+        lease_selected(
+            tx,
+            &self.path,
+            self.limits,
+            current.id,
+            class,
+            relay_id,
+            expiry,
+        )
+        .map(Some)
+    }
+}
+
+/// Lease one selected due job and rotate its class cursor in one transaction.
+fn lease_selected(
+    tx: rusqlite::Transaction<'_>,
+    path: &std::path::Path,
+    limits: super::LedgerLimits,
+    id: i64,
+    class: usize,
+    relay_id: i64,
+    expiry: i64,
+) -> Result<Lease, LedgerError> {
+    check_budget(&tx, path, limits, 0)?;
+    if read_job(&tx, id)?.attempt == i64::MAX {
+        return Err(LedgerError::Invalid("attempt counter exhausted"));
+    }
+    let token = Keys::generate().secret_key().to_secret_bytes();
+    tx.execute(
+        "UPDATE jobs SET state='leased',attempt=attempt+1,token=?2,expires_at=?3 WHERE id=?1",
+        params![id, token.as_slice(), expiry],
+    )?;
+    tx.execute(
+        if class == 0 {
+            "UPDATE lease_rotation SET next_class=1,after_fresh_relay=?1 WHERE singleton=1"
+        } else {
+            "UPDATE lease_rotation SET next_class=0,after_gap_relay=?1 WHERE singleton=1"
+        },
+        [relay_id],
+    )?;
+    let job = read_job(&tx, id)?;
+    commit(tx, path, limits)?;
+    Ok(Lease {
+        job,
+        token,
+        expires_at: expiry,
+    })
 }
 
 #[cfg(test)]
@@ -227,6 +320,110 @@ mod tests {
         let before = rotation(&db);
         assert!(db.lease_next_fair(100, 60).unwrap().is_none());
         assert_eq!(rotation(&db), before);
+    }
+
+    #[test]
+    fn checked_candidate_is_leased_even_if_selection_would_now_differ() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = open(&root);
+        db.configure_planner(&[A]).unwrap();
+        let fresh = job(&mut db, A, 1, false);
+        let gap = job(&mut db, A, 2, true);
+        db.db
+            .execute("UPDATE jobs SET next_eligible=150 WHERE id=?1", [gap])
+            .unwrap();
+        db.db
+            .execute("UPDATE lease_rotation SET next_class=1", [])
+            .unwrap();
+        // At 100 the gap is not due, so the fresh job is the fair candidate.
+        let candidate = db.fair_candidate(100).unwrap().unwrap();
+        assert_eq!(candidate.id, fresh);
+        // By 200 a reselection would prefer the now-due gap; the checked
+        // candidate is leased instead and rotates the fresh-class cursor.
+        assert_eq!(db.fair_candidate(200).unwrap().unwrap().id, gap);
+        let lease = db
+            .lease_fair_candidate(&candidate, 200, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!((lease.job.id, lease.job.attempt), (fresh, 1));
+        assert_eq!(lease.expires_at, 260);
+        assert_eq!(rotation(&db), (1, 1, 0));
+        assert_eq!(db.get(gap).unwrap().attempt, 1);
+        // An active lease blocks even a still-valid gap candidate.
+        let gap_candidate = db.get(gap).unwrap();
+        assert!(
+            db.lease_fair_candidate(&gap_candidate, 200, 60)
+                .unwrap()
+                .is_none()
+        );
+        block(&mut db, lease);
+        let lease = db
+            .lease_fair_candidate(&gap_candidate, 200, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!((lease.job.id, lease.job.attempt), (gap, 2));
+        assert_eq!(rotation(&db), (0, 1, 1));
+    }
+
+    #[test]
+    fn changed_or_ineligible_candidate_consumes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db = open(&root);
+        db.configure_planner(&[A, B]).unwrap();
+        let gap = job(&mut db, B, 1, true);
+        let candidate = db.fair_candidate(100).unwrap().unwrap();
+        assert_eq!(candidate.id, gap);
+        let unchanged = |db: &JobLedger| {
+            assert_eq!(rotation(db), (0, 0, 0));
+            let job = db.get(gap).unwrap();
+            assert_eq!((job.state, job.attempt), (JobState::RetryWait, 1));
+        };
+        // Not due at the lease time (clock moved backwards).
+        db.db
+            .execute("UPDATE jobs SET next_eligible=100 WHERE id=?1", [gap])
+            .unwrap();
+        let candidate = db.get(gap).unwrap();
+        assert!(
+            db.lease_fair_candidate(&candidate, 99, 60)
+                .unwrap()
+                .is_none()
+        );
+        unchanged(&db);
+        // The snapshot no longer matches the durable row.
+        db.db
+            .execute("UPDATE jobs SET next_eligible=90 WHERE id=?1", [gap])
+            .unwrap();
+        assert!(
+            db.lease_fair_candidate(&candidate, 100, 60)
+                .unwrap()
+                .is_none()
+        );
+        unchanged(&db);
+        // Its relay was disabled after selection.
+        let candidate = db.get(gap).unwrap();
+        db.configure_planner(&[A]).unwrap();
+        assert!(
+            db.lease_fair_candidate(&candidate, 100, 60)
+                .unwrap()
+                .is_none()
+        );
+        unchanged(&db);
+        // Terminal states are never leased.
+        db.configure_planner(&[A, B]).unwrap();
+        db.db
+            .execute("UPDATE jobs SET state='blocked' WHERE id=?1", [gap])
+            .unwrap();
+        let blocked = db.get(gap).unwrap();
+        assert!(
+            db.lease_fair_candidate(&blocked, 100, 60)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(rotation(&db), (0, 0, 0));
+        // Invalid deadlines are rejected before any read.
+        for (now, ttl) in [(-1, 60), (100, 0), (100, 601)] {
+            assert!(db.lease_fair_candidate(&candidate, now, ttl).is_err());
+        }
     }
 
     #[test]

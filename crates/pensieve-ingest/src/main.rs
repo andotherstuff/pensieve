@@ -385,6 +385,14 @@ struct Args {
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_replay_floor: Option<u64>,
 
+    /// Stop leasing new isolated attempts once the ledger has reported a
+    /// persistent failure (a blocked job, or a job in retry backoff after at
+    /// least three failed attempts; `/health/negentropy` `unresolved_failures`)
+    /// continuously for this many seconds. Unset keeps retrying with paced
+    /// backoff. Gaps, receipts and archive maintenance are kept; health stays red.
+    #[arg(long, requires = "isolated_negentropy")]
+    isolated_negentropy_pause_on_failure_secs: Option<u64>,
+
     /// Ingester-owned durable SQLite ledger path.
     #[arg(
         long,
@@ -1831,6 +1839,9 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         segment_prefix: "segment".to_owned(),
         replay_floor,
         relays: relays.into_iter().collect(),
+        pause_on_persistent_failure: args
+            .isolated_negentropy_pause_on_failure_secs
+            .map(Duration::from_secs),
     }))
 }
 
