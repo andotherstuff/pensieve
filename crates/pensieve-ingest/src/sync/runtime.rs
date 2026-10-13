@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
 use super::SyncStateDb;
-use super::binding::{BindingError, WorkerCandidate};
+use super::binding::{BindingError, WorkerBinding, WorkerCandidate};
 use super::failure::FailureKind;
 use super::jobs::{
     JobLedger, LedgerError, LedgerLimits, RetryReason, SplitOutcome, UnavailableRule,
@@ -114,6 +114,19 @@ impl IsolatedRuntime {
         dedupe: Arc<DedupeIndex>,
         writer: Arc<SegmentWriter>,
     ) -> Result<Self, RuntimeError> {
+        Self::start_bound::<WorkerCandidate>(config, dedupe, writer, DATA_RESERVE_BYTES).await
+    }
+
+    /// [`Self::start`] with the worker identity proof and the data-volume
+    /// reserve as parameters. Production passes [`WorkerCandidate`] and
+    /// [`DATA_RESERVE_BYTES`]; tests substitute a same-UID binding and a small
+    /// reserve so they run on CI hosts without systemd or 20 GiB free.
+    async fn start_bound<B: WorkerBinding>(
+        config: RuntimeConfig,
+        dedupe: Arc<DedupeIndex>,
+        writer: Arc<SegmentWriter>,
+        reserve_bytes: u64,
+    ) -> Result<Self, RuntimeError> {
         if !cfg!(any(target_os = "linux", test)) {
             return Err(RuntimeError::Config("Linux worker binding required"));
         }
@@ -174,7 +187,8 @@ impl IsolatedRuntime {
         parent.configure(config.relays.clone()).await?;
         let (stop, stopping) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let result = drive(&config, listener, parent, writer, stopping).await;
+            let result =
+                drive::<B>(&config, listener, parent, writer, stopping, reserve_bytes).await;
             gauge!("negentropy_isolated_ready").set(0.0);
             // A stopped runtime is not healthy merely because ingestion remains up.
             pensieve_core::reconciliation_health::reconciliation_health().fail();
@@ -214,12 +228,13 @@ impl Drop for SocketCleanup {
     }
 }
 
-async fn drive(
+async fn drive<B: WorkerBinding>(
     config: &RuntimeConfig,
     listener: UnixListener,
     mut parent: ParentExecutor,
     writer: Arc<SegmentWriter>,
     stopping: oneshot::Receiver<()>,
+    reserve_bytes: u64,
 ) -> Result<(), RuntimeError> {
     let stopping = stop_signal(
         stopping,
@@ -227,13 +242,15 @@ async fn drive(
     );
     tokio::pin!(stopping);
     let mut interval = tokio::time::interval(TICK);
-    let mut peer: Option<(UnixStream, WorkerCandidate)> = None;
+    let mut peer: Option<(UnixStream, B)> = None;
     let mut canary_attempts = 0;
     let mut canary_replays = 0;
     let mut failing_since = HashMap::new();
     let mut paused = false;
     let started = tokio::time::Instant::now();
     gauge!("negentropy_isolated_ready").set(1.0);
+    // Present (as 0) from the start, not only after the first pause change.
+    gauge!("negentropy_isolated_failure_pause").set(0.0);
     let result: Result<(), RuntimeError> = async {
     loop {
         tokio::select! {
@@ -241,7 +258,7 @@ async fn drive(
             _ = &mut stopping => break Ok(()),
             accepted = listener.accept(), if peer.is_none() => {
                 let (socket, _) = accepted?;
-                match WorkerCandidate::inspect(&socket, config.worker_uid).await {
+                match B::inspect(&socket, config.worker_uid).await {
                     Ok(candidate) => peer = Some((socket, candidate)),
                     Err(error) => {
                         counter!("negentropy_worker_binding_rejections_total").increment(1);
@@ -259,14 +276,14 @@ async fn drive(
                 let recovered = parent.maintain_archived(32, 256).await?;
                 gauge!("negentropy_isolated_recovery_checked").set(recovered.checked as f64);
                 let mut observation = parent.lifecycle().await?;
-                observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                observation.capacity_exhausted |= !data_has_headroom(&config.ledger, reserve_bytes)?;
                 pensieve_core::reconciliation_health::reconciliation_health().observe(observation);
                 if config.canary_until.is_some() && canary_session_budget(started.elapsed(), canary_attempts).is_none() {
                     // Drain already-admitted work through sealing/receipt maintenance.
                     // Do not replay, plan, lease or exit merely because intake is over.
                     continue;
                 }
-                if !data_has_headroom(&config.ledger)? {
+                if !data_has_headroom(&config.ledger, reserve_bytes)? {
                     gauge!("negentropy_isolated_ledger_space_pause").set(1.0);
                     continue;
                 }
@@ -291,7 +308,7 @@ async fn drive(
                 // owner facts after replay so their sum cannot age a healthy
                 // observation past the watchdog before the session returns.
                 let mut observation = parent.lifecycle().await?;
-                observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                observation.capacity_exhausted |= !data_has_headroom(&config.ledger, reserve_bytes)?;
                 // Evaluated even without the pause so its gauges stay meaningful.
                 let failing = parent.pause_failures().await?;
                 let pause = failure_pause(
@@ -507,14 +524,14 @@ fn retry_delay(job: i64, attempt: i64) -> u32 {
     base.saturating_add((jitter % 31) as u32).min(3600)
 }
 
-fn data_has_headroom(ledger: &Path) -> Result<bool, RuntimeError> {
+fn data_has_headroom(ledger: &Path, reserve_bytes: u64) -> Result<bool, RuntimeError> {
     let directory = ledger
         .parent()
         .ok_or(RuntimeError::Config("ledger has no parent"))?;
     let stats = nix::sys::statvfs::statvfs(directory)
         .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
     let available = available_bytes(stats.blocks_available(), stats.fragment_size());
-    Ok(available >= DATA_RESERVE_BYTES)
+    Ok(available >= reserve_bytes)
 }
 
 fn available_bytes<B: Into<u64>>(blocks: B, fragment_size: u64) -> u64 {
@@ -790,13 +807,40 @@ mod canary_tests {
     }
 
     #[test]
+    fn a_shrinking_withheld_set_is_excluded_without_pausing() {
+        // The relay withholds {X,Y}, then starts delivering Y at attempt
+        // `shrink`. The {X} run starts there and still completes by attempt 10;
+        // the earlier, larger set must not count the job toward the pause.
+        for shrink in [4, 5, 6] {
+            let sim = simulate(&[0], 30, 24 * 3600, |_, attempt| {
+                withheld(if attempt < shrink { &[X, Y] } else { &[X] })
+            });
+            assert_eq!(sim.paused, None, "shrink at {shrink}: {sim:?}");
+            assert_eq!(sim.excluded.len(), 1, "shrink at {shrink}: {sim:?}");
+            let attempt = sim.excluded[0].1;
+            assert!(
+                (shrink + 4..=exemption_ceiling_for_default()).contains(&attempt),
+                "shrink at {shrink}: {sim:?}"
+            );
+        }
+    }
+
+    fn exemption_ceiling_for_default() -> i64 {
+        2 * i64::from(UnavailableRule::default().attempts)
+    }
+
+    #[test]
     fn exemption_is_bounded_for_runs_that_cannot_qualify() {
-        // A changing set is never on track: paused a grace after the third failure.
+        // A set that keeps changing restarts its run every attempt and never
+        // qualifies: exempt through attempt 10, then counted, so the pause
+        // fires a grace later instead of never.
         let sim = simulate(&[0], 30, 24 * 3600, |_, attempt| {
             withheld(if attempt % 2 == 0 { &[X] } else { &[Y] })
         });
         assert!(sim.excluded.is_empty());
-        assert!((7200..7200 + 600).contains(&sim.paused.unwrap()), "{sim:?}");
+        let paused = sim.paused.unwrap();
+        assert!(paused > 7200 + 600, "{sim:?}");
+        assert!(paused < 12 * 3600, "{sim:?}");
         // One report followed only by lost workers: exempt through attempt 10,
         // then counted, so the pause fires a grace later instead of never.
         let sim = simulate(&[0], 30, 24 * 3600, |_, attempt| {
@@ -865,14 +909,40 @@ mod canary_tests {
     }
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+/// Runtime loop tests. They run on every platform, CI's Linux runners
+/// included, as an unprivileged user: the systemd/cgroup/pidfd worker proof is
+/// replaced by [`SameUidPeer`] and the 20 GiB data reserve by a small one. The
+/// peer-UID check, the parent's own `serve` UID check and everything after
+/// identity are the production code.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::SegmentConfig;
+    use crate::sync::binding::SameUidPeer;
     use crate::sync::ipc::{Frame, Message, initial_digest};
     use crate::sync::jobs::JobState;
     use crate::sync::worker::{Hello, ParentMessage, read_message, write_message};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_RESERVE_BYTES: u64 = 1024 * 1024;
+
+    async fn start(
+        config: RuntimeConfig,
+        dedupe: Arc<DedupeIndex>,
+        writer: Arc<SegmentWriter>,
+    ) -> Result<IsolatedRuntime, RuntimeError> {
+        IsolatedRuntime::start_bound::<SameUidPeer>(config, dedupe, writer, TEST_RESERVE_BYTES)
+            .await
+    }
+
+    /// The test process's UID, used as the worker UID so a same-process peer
+    /// passes the UID checks. The runtime refuses worker UID 0, so these tests
+    /// need an unprivileged user (as on CI).
+    fn worker_uid() -> u32 {
+        let uid = nix::unistd::getuid().as_raw();
+        assert_ne!(uid, 0, "runtime tests need a non-root user");
+        uid
+    }
 
     #[tokio::test]
     async fn occupied_socket_is_preserved_and_reconciliation_stays_closed() {
@@ -908,12 +978,59 @@ mod tests {
             relay_unavailable_rule: Some(UnavailableRule::default()),
         };
         assert!(matches!(
-            IsolatedRuntime::start(config, dedupe, writer).await,
+            start(config, dedupe, writer).await,
             Err(RuntimeError::SocketOccupied(path)) if path == socket
         ));
         let _peer = UnixStream::connect(&socket).await.unwrap();
         let (_accepted, _) = active.accept().await.unwrap();
         assert!(!root.path().join("jobs.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn production_binding_rejects_a_same_uid_peer_outside_the_worker_service() {
+        // The public entry point binds with the real proof. A same-UID peer that
+        // is not the systemd worker (here: the test process itself) is dropped
+        // before any assignment, on Linux and elsewhere.
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..SegmentConfig::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let config = RuntimeConfig {
+            canary_until: None,
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
+            socket: root.path().join("worker.sock"),
+            worker_uid: worker_uid(),
+            ledger: root.path().join("jobs.sqlite"),
+            inventory: root.path().join("inventory"),
+            archive,
+            segment_prefix: "segment".to_owned(),
+            replay_floor: 0,
+            relays: vec!["wss://a.example".to_owned()],
+            pause_on_persistent_failure: None,
+            relay_unavailable_rule: Some(UnavailableRule::default()),
+        };
+        let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
+            .await
+            .unwrap();
+        let mut worker = UnixStream::connect(&config.socket).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(10), worker.read(&mut byte))
+            .await
+            .expect("rejected peer is disconnected");
+        assert!(matches!(read, Ok(0) | Err(_)), "no assignment: {read:?}");
+        drop(worker);
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -947,7 +1064,7 @@ mod tests {
             pause_on_persistent_failure: None,
             relay_unavailable_rule: Some(UnavailableRule::default()),
         };
-        let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
+        let runtime = start(config.clone(), dedupe.clone(), writer.clone())
             .await
             .unwrap();
         // Two real planning ticks would normally seed dozens of rolling jobs.
@@ -966,13 +1083,13 @@ mod tests {
             .unwrap();
         assert_eq!(queued, 3);
         assert!(matches!(
-            IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone()).await,
+            start(config.clone(), dedupe.clone(), writer.clone()).await,
             Err(RuntimeError::Config(_))
         ));
         let mut rolling = config;
         rolling.canary_until = None;
         assert!(matches!(
-            IsolatedRuntime::start(rolling, dedupe, writer).await,
+            start(rolling, dedupe, writer).await,
             Err(RuntimeError::Config(_))
         ));
         let retained: u32 = db
@@ -998,12 +1115,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
-        let uid: u32 = String::from_utf8(uid.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let uid = worker_uid();
         let ledger_path = root.path().join("jobs.sqlite");
         let config = RuntimeConfig {
             canary_until: None,
@@ -1019,9 +1131,7 @@ mod tests {
             pause_on_persistent_failure: None,
             relay_unavailable_rule: Some(UnavailableRule::default()),
         };
-        let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
-            .await
-            .unwrap();
+        let runtime = start(config.clone(), dedupe, writer).await.unwrap();
         let mut worker = UnixStream::connect(&config.socket).await.unwrap();
         write_message(
             &mut worker,
@@ -1112,12 +1222,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
-        let uid: u32 = String::from_utf8(uid.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let uid = worker_uid();
         let ledger_path = root.path().join("jobs.sqlite");
         // A due gap after three relay failures: health reports unresolved_failures.
         let gap = {
@@ -1151,7 +1256,7 @@ mod tests {
         let hello = || Hello {
             version: super::super::ipc::VERSION,
         };
-        let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
+        let runtime = start(config.clone(), dedupe.clone(), writer.clone())
             .await
             .unwrap();
         let mut worker = UnixStream::connect(&config.socket).await.unwrap();
@@ -1185,9 +1290,7 @@ mod tests {
         assert_eq!((attempt_rows, attempts), (0, 3));
         // Without the pause the same ledger resumes paced retries.
         config.pause_on_persistent_failure = None;
-        let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
-            .await
-            .unwrap();
+        let runtime = start(config.clone(), dedupe, writer).await.unwrap();
         let mut worker = UnixStream::connect(&config.socket).await.unwrap();
         write_message(&mut worker, &hello()).await.unwrap();
         let ParentMessage::Job { .. } = tokio::time::timeout(
@@ -1226,12 +1329,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let uid = std::process::Command::new("id").arg("-u").output().unwrap();
-            let uid: u32 = String::from_utf8(uid.stdout)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let uid = worker_uid();
             let ledger_path = root.path().join("jobs.sqlite");
             let gap = {
                 let mut ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
@@ -1276,9 +1374,7 @@ mod tests {
                 pause_on_persistent_failure: Some(Duration::ZERO),
                 relay_unavailable_rule: Some(UnavailableRule::default()),
             };
-            let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
-                .await
-                .unwrap();
+            let runtime = start(config.clone(), dedupe, writer).await.unwrap();
             let mut worker = UnixStream::connect(&config.socket).await.unwrap();
             write_message(
                 &mut worker,

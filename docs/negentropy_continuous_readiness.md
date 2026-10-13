@@ -222,9 +222,13 @@ unresolved exclusions is a follow-up, not part of this change.
 **Interaction with the failure pause.** `unresolved_failures` starts when a
 job's third attempt fails, and an exempt job still counts there. The pause does
 not count it while its reports are on track to an exclusion: the latest reported
-attempt qualifies, every `unavailable` report since the last protocol-complete
-attempt names the same set, the run has not met the rule yet, and the job is at
-most at attempt `2 × K` (10 by default). The pause clock is per job, so failures
+attempt qualifies, its identical run (the one an exclusion would measure) has not
+met the rule yet, and the job is at most at attempt `2 × K` (10 by default).
+Earlier reports do not matter, so a withheld set that shrinks (`{X,Y}` on
+attempts 1–3, then `{X}` once the relay delivers `Y`) is excluded on the `{X}`
+run without pausing; the first version of the exemption required every report
+since the last protocol-complete attempt to name the same set and paused such a
+job about 8,300 s in when the set shrank at attempt 5. The pause clock is per job, so failures
 of different jobs never add up. #90 used one global clock that reset only when
 no job was failing; two counter-examples paused before an exclusion could land,
 and since nothing is leased while paused it then stayed paused until a restart:
@@ -239,11 +243,11 @@ and since nothing is leased while paused it then stayed paused until a restart:
 Both now complete without pausing (`counter_example_a_*` and
 `counter_example_b_*` in `sync/runtime.rs` drive them through the ledger with a
 virtual clock, alongside the #90 clock to show where it paused). The exemption is
-bounded: a changed set, a set larger than `max-ids` or one fetch batch, a run
-that met the rule but is held back by unarchived receipts, a disabled rule and a
-job past attempt `2 × K` all count, so a relay that keeps changing what it
-withholds, or a worker that keeps dying after one report, still pauses a grace
-after it stops being exempt. A relay that stays down still pauses a grace after
+bounded: a set larger than `max-ids` or one fetch batch, a run that met the
+rule but is held back by unarchived receipts, a disabled rule and a job past
+attempt `2 × K` all count, so a relay that keeps changing what it withholds, or a
+worker that keeps dying after one report, still pauses a grace after it stops
+being exempt (about five hours after the third failure, when attempt 11 fails). A relay that stays down still pauses a grace after
 the third failure. With the defaults an uninterrupted run from the first failure
 is excluded at attempt 7 (short sessions) or 6 (nine-minute sessions). Raising
 `K` delays the exclusion and raises the ceiling with it. `T` is measured over the

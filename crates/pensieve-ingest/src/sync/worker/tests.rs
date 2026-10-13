@@ -83,6 +83,20 @@ struct RelayStats {
     cap: Option<usize>,
     /// Number of IDs named by each REQ, in order.
     requested: std::sync::Mutex<Vec<usize>>,
+    /// How the relay answers every REQ after the first (the worker's follow-ups).
+    follow_up: FollowUpFault,
+}
+
+/// A fault in the relay's answer to a follow-up REQ.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum FollowUpFault {
+    /// Answer like the first REQ.
+    #[default]
+    None,
+    /// `CLOSED` on the follow-up's subscription instead of events and EOSE.
+    Closed,
+    /// A valid, in-window event the follow-up did not name, then the usual answer.
+    Unrequested,
 }
 
 async fn relay_events(
@@ -158,11 +172,30 @@ async fn relay_events(
                     serde_json::json!(["NEG-MSG", request[1], hex::encode(reply)])
                 }
                 "REQ" if !hang => {
-                    stats
+                    let follow_up = stats
                         .batches
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        > 0;
                     let ids = request[2]["ids"].as_array().unwrap();
                     stats.requested.lock().unwrap().push(ids.len());
+                    if follow_up && stats.follow_up == FollowUpFault::Closed {
+                        let closed = serde_json::json!(["CLOSED", request[1], "error: test"]);
+                        let _ = socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                closed.to_string().into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    if follow_up && stats.follow_up == FollowUpFault::Unrequested {
+                        let stray = serde_json::json!(["EVENT", request[1], unrequested]);
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                stray.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
                     let mut sent = 0;
                     for event in events
                         .iter()
@@ -486,10 +519,20 @@ async fn capped_download(
     withhold: bool,
     events: Vec<Event>,
 ) -> (Result<DownloadProof, WorkerError>, Vec<usize>, usize) {
-    let stats = Arc::new(RelayStats {
+    let stats = RelayStats {
         cap,
         ..RelayStats::default()
-    });
+    };
+    download_from(stats, withhold, events).await
+}
+
+/// [`capped_download`] against a mock relay configured by `stats`.
+async fn download_from(
+    stats: RelayStats,
+    withhold: bool,
+    events: Vec<Event>,
+) -> (Result<DownloadProof, WorkerError>, Vec<usize>, usize) {
+    let stats = Arc::new(stats);
     let (url, server) = relay_events(withhold, false, events, stats.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
@@ -578,6 +621,57 @@ async fn relay_result_cap_is_followed_up_not_reported_unavailable() {
     };
     assert_eq!(report.sample, vec![withheld.to_bytes()]);
     assert_eq!(requested, vec![10, 1]);
+}
+
+fn signed_events(count: usize) -> Vec<Event> {
+    let keys = Keys::generate();
+    (0..count)
+        .map(|i| {
+            EventBuilder::new(Kind::TextNote, i.to_string())
+                .custom_created_at(Timestamp::from(150))
+                .sign_with_keys(&keys)
+                .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn faulty_follow_up_answers_fail_closed_not_unavailable() {
+    // The first REQ is capped at three results, so a follow-up is sent. A relay
+    // that closes the follow-up, or answers it with an event it did not name,
+    // makes the attempt incomplete: neither is evidence of withholding.
+    for fault in [FollowUpFault::Closed, FollowUpFault::Unrequested] {
+        let stats = RelayStats {
+            cap: Some(3),
+            follow_up: fault,
+            ..RelayStats::default()
+        };
+        let (result, requested, _) = download_from(stats, false, signed_events(10)).await;
+        assert!(
+            matches!(result, Err(WorkerError::Incomplete)),
+            "{:?}",
+            result.map(|proof| proof.received.len())
+        );
+        assert_eq!(requested, vec![10, 7]);
+    }
+}
+
+#[tokio::test]
+async fn result_cap_is_followed_up_within_each_batch_of_a_multi_batch_diff() {
+    // 130 IDs are two fetch batches (128 + 2). A relay capping each REQ at 100
+    // gets one follow-up for the first batch's 28-ID tail, then the second
+    // batch; each batch stays within n + 1 REQs.
+    let (result, requested, captured) = capped_download(Some(100), false, signed_events(130)).await;
+    let proof = result.unwrap();
+    assert_eq!(proof.received.len(), 130);
+    assert_eq!(proof.remote, proof.received);
+    assert_eq!(requested, vec![128, 28, 2]);
+    assert_eq!(captured, 130);
+    // Capped at 50: two follow-ups for the first batch, none crossing into
+    // the second.
+    let (result, requested, _) = capped_download(Some(50), false, signed_events(130)).await;
+    assert_eq!(result.unwrap().received.len(), 130);
+    assert_eq!(requested, vec![128, 78, 28, 2]);
 }
 
 #[tokio::test]
