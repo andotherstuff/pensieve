@@ -66,8 +66,11 @@ pub struct RuntimeConfig {
     /// maintenance turn is kept, and health stays red.
     pub pause_on_persistent_failure: Option<Duration>,
     /// Complete a window, with recorded proof, once its relay has persistently
-    /// advertised the same IDs without delivering them. `None` disables new
-    /// exclusions; recorded ones are kept and still checked for late arrival.
+    /// advertised the same IDs without delivering them, or after a single
+    /// failure when an earlier window's exclusion already proves that relay
+    /// withholds them (carried; see `jobs::unavailable`). `None` disables new
+    /// exclusions, carried ones included; recorded ones are kept and still
+    /// checked for late arrival.
     pub relay_unavailable_rule: Option<UnavailableRule>,
 }
 
@@ -640,6 +643,11 @@ mod canary_tests {
         paused: Option<i64>,
         /// When the global clock of #90 would have paused.
         legacy_paused: Option<i64>,
+        /// `(job, attempt, seconds after start)` of each carried exclusion.
+        carried: Vec<(i64, i64, i64)>,
+        /// Seconds after start of each observation with health red
+        /// (`unresolved_failures`: some job is a persistent failure).
+        red: Vec<i64>,
     }
 
     const GRACE: Duration = Duration::from_secs(7200);
@@ -667,10 +675,23 @@ mod canary_tests {
     /// lease, as in `drive`. A session blocks the loop for `session` seconds and
     /// ends with `report(job_index, attempt)` (or, with `None`, a lost worker),
     /// released at the runtime's backoff. Job `n` is enqueued `enqueue[n]`
-    /// seconds after the start. Stops at the pause, once every job is complete,
-    /// or after `horizon` seconds.
+    /// seconds after the start, for its own 15-minute window. Stops at the
+    /// pause, once every job is complete, or after `horizon` seconds.
     fn simulate(
         enqueue: &[i64],
+        session: i64,
+        horizon: i64,
+        report: impl Fn(usize, i64) -> Option<FailureDiagnostic>,
+    ) -> Simulation {
+        let jobs: Vec<_> = (0..).zip(enqueue).map(|(n, &at)| (at, n)).collect();
+        simulate_windows(&jobs, session, horizon, report)
+    }
+
+    /// [`simulate`] where job `n` is `(enqueued seconds after start, window
+    /// index)`; jobs sharing a window index revisit it, as a later planner
+    /// pass over history does.
+    fn simulate_windows(
+        enqueue: &[(i64, i64)],
         session: i64,
         horizon: i64,
         report: impl Fn(usize, i64) -> Option<FailureDiagnostic>,
@@ -690,18 +711,21 @@ mod canary_tests {
         let mut sim = Simulation::default();
         let mut now = start;
         while now < start + horizon {
-            while jobs.len() < enqueue.len() && now >= start + enqueue[jobs.len()] {
-                let n = jobs.len() as i64;
-                let job = ledger.enqueue("manual", "wss://a.example", n * 900, n * 900 + 899);
+            while jobs.len() < enqueue.len() && now >= start + enqueue[jobs.len()].0 {
+                let (n, window) = (jobs.len(), enqueue[jobs.len()].1);
+                let sweep = format!("pass-{n}");
+                let job =
+                    ledger.enqueue(&sweep, "wss://a.example", window * 900, window * 900 + 899);
                 jobs.push(job.unwrap().id);
             }
-            for excluded in ledger
-                .exclude_relay_unavailable(now, &dedupe)
-                .unwrap()
-                .excluded
-            {
+            let progress = ledger.exclude_relay_unavailable(now, &dedupe).unwrap();
+            for excluded in progress.excluded {
                 let attempt = ledger.get(excluded.job).unwrap().attempt;
                 sim.excluded.push((excluded.job, attempt, now - start));
+            }
+            for carried in progress.carried {
+                let attempt = ledger.get(carried.job).unwrap().attempt;
+                sim.carried.push((carried.job, attempt, now - start));
             }
             if jobs.len() == enqueue.len()
                 && jobs
@@ -712,6 +736,9 @@ mod canary_tests {
             }
             let at = origin + Duration::from_secs((now - start) as u64);
             let observation = ledger.progress_observation(now).unwrap();
+            if observation.persistent_failure {
+                sim.red.push(now - start);
+            }
             if legacy_failure_pause(&mut legacy, observation.persistent_failure, GRACE, at)
                 && sim.legacy_paused.is_none()
             {
@@ -754,6 +781,42 @@ mod canary_tests {
             assert_eq!(sim.excluded.len(), 1);
             assert_eq!(sim.excluded[0].1, attempt, "session {session}");
         }
+    }
+
+    #[test]
+    fn a_revisited_withheld_window_is_carried_without_health_red_or_pause() {
+        // Production 2026-10-13: job 768 was excluded, then a later pass over
+        // history enqueued the same window as job 1984, which withheld the same
+        // ID. Before carry-forward 1984 had to re-earn the exclusion (five
+        // reports over an hour) and held health red from its third failure.
+        const REVISIT: i64 = 12 * 3600;
+        for session in [30, 540] {
+            let sim = simulate_windows(&[(0, 0), (REVISIT, 0)], session, 24 * 3600, |_, _| {
+                withheld(&[X])
+            });
+            assert_eq!(sim.paused, None, "session {session}");
+            assert_eq!(sim.excluded.len(), 1, "{sim:?}");
+            // The revisit completes on the lifecycle turn after its first
+            // failure, long before its 60 s retry is due.
+            assert_eq!(sim.carried.len(), 1, "{sim:?}");
+            let (job, attempt, at) = sim.carried[0];
+            assert_eq!((job, attempt), (2, 1), "{sim:?}");
+            assert!(at < REVISIT + session + 60, "{sim:?}");
+            // Health was red only while the original earned its exclusion.
+            let original_excluded = sim.excluded[0].2;
+            assert!(!sim.red.is_empty(), "{sim:?}");
+            assert!(
+                sim.red.iter().all(|&red| red < original_excluded),
+                "{sim:?}"
+            );
+        }
+        // A different window is not carried: it earns its own exclusion.
+        let sim = simulate_windows(&[(0, 0), (REVISIT, 1)], 30, 24 * 3600, |_, _| {
+            withheld(&[X])
+        });
+        assert!(sim.carried.is_empty(), "{sim:?}");
+        assert_eq!(sim.excluded.len(), 2, "{sim:?}");
+        assert!(sim.red.iter().any(|&red| red > REVISIT), "{sim:?}");
     }
 
     #[test]
@@ -1411,5 +1474,118 @@ mod tests {
                 assert!(exclusions.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_revisited_withheld_window_is_carried_by_the_real_runtime_loop() {
+        use crate::sync::failure::FailureDiagnostic;
+        // Job 768 / 1984 shape: an excluded window, then a later pass's job for
+        // the same window that failed once withholding the same ID. The first
+        // tick's lifecycle turn completes it before any lease, and a zero-grace
+        // pause never fires.
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..SegmentConfig::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let ledger_path = root.path().join("jobs.sqlite");
+        let report = FailureDiagnostic {
+            kind: FailureKind::Unavailable,
+            missing_count: 1,
+            sample: vec![[8; 32]],
+        };
+        let (original, revisit) = {
+            let mut ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+            let original = ledger
+                .enqueue("pass-1", "wss://a.example", 0, 899)
+                .unwrap()
+                .id;
+            let fail = |ledger: &mut JobLedger, at: i64| {
+                let lease = ledger.lease_next(at, 600).unwrap().unwrap();
+                ledger
+                    .record_failure_report(&lease, 1, &report, at + 1)
+                    .unwrap();
+                ledger
+                    .retry(&lease, at + 1, 60, RetryReason::RelayFailure)
+                    .unwrap();
+                lease.job().id
+            };
+            for n in 0..5 {
+                assert_eq!(fail(&mut ledger, 1_000 + n * 3600), original);
+            }
+            let progress = ledger.exclude_relay_unavailable(20_000, &dedupe).unwrap();
+            assert_eq!(progress.excluded[0].job, original);
+            let revisit = ledger
+                .enqueue("pass-2", "wss://a.example", 0, 899)
+                .unwrap()
+                .id;
+            assert_eq!(fail(&mut ledger, 30_000), revisit);
+            (original, revisit)
+        };
+        let config = RuntimeConfig {
+            canary_until: None,
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
+            socket: root.path().join("worker.sock"),
+            worker_uid: worker_uid(),
+            ledger: ledger_path.clone(),
+            inventory: root.path().join("inventory"),
+            archive,
+            segment_prefix: "segment".to_owned(),
+            replay_floor: 0,
+            relays: vec!["wss://a.example".to_owned()],
+            pause_on_persistent_failure: Some(Duration::ZERO),
+            relay_unavailable_rule: Some(UnavailableRule::default()),
+        };
+        let runtime = start(config.clone(), dedupe, writer).await.unwrap();
+        let mut worker = UnixStream::connect(&config.socket).await.unwrap();
+        write_message(
+            &mut worker,
+            &Hello {
+                version: super::super::ipc::VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        let ParentMessage::Job { assignment } = tokio::time::timeout(
+            Duration::from_secs(15),
+            read_message::<_, ParentMessage>(&mut worker),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("expected assignment");
+        };
+        // The revisit was completed, not leased again.
+        assert_ne!(assignment.header(0).job, revisit);
+        drop(worker);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        runtime.shutdown().await.unwrap();
+        let ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+        let job = ledger.get(revisit).unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::Complete, 1));
+        assert_eq!(
+            job.reason.as_deref(),
+            Some(super::super::jobs::RELAY_UNAVAILABLE)
+        );
+        assert_eq!(
+            ledger.relay_unavailable_exclusions(revisit).unwrap(),
+            vec![([8; 32], None)]
+        );
+        let original_row = ledger.relay_unavailable_carried_from(revisit).unwrap()[0];
+        assert!(original_row.is_some());
+        assert_eq!(
+            ledger.relay_unavailable_carried_from(original).unwrap(),
+            vec![None]
+        );
     }
 }

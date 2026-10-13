@@ -139,6 +139,25 @@ retry the gap. The rule, its flags
 with the three tuning flags), late arrival and accounting are described in
 [continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions).
 
+**Carried exclusions.** The same turn also completes a retry-wait job, from its
+first failure, whose latest reported attempt qualifies and names only
+*known-withheld* IDs: each has an unresolved original exclusion row for the
+job's relay whose window overlaps the job's window, and no archive marker. This
+covers a later planner pass over history revisiting an excluded window, as job
+1984 revisited job 768's window on 2026-10-13 and, under per-job proof, held
+health red for about an hour re-earning the exclusion. The job completes with
+reason `relay_unavailable`; its proof rows record its own run and point at the
+original row in `carried_from`; the WARN line `negentropy relay-unavailable
+exclusion carried forward` names job, relay, event ID, `carried_from` and
+`original_job`; and `negentropy_relay_unavailable_carried_total` counts the
+events (not `negentropy_relay_unavailable_exclusions_total`). A set that mixes
+known-withheld and new IDs is not carried. Because the turn runs before every
+lease, a carried job never reaches the three failures behind
+`unresolved_failures` (see
+[carried exclusions](negentropy_continuous_readiness.md#carried-exclusions)).
+Carried exclusions are ingester-only: the IPC version and the worker binary are
+unchanged.
+
 The IPC version is unchanged. The worker changed in one respect: before it
 reports `Unavailable` it re-requests exactly the still-missing IDs, at least once
 and again while each request delivers something new, so a relay that caps the
@@ -235,7 +254,10 @@ sweeps now have bounded detail retention and compact coverage accounting; unreso
 gaps and exclusion-proof owners remain pinned. Schema 8 migrates transactionally
 to 9, without inventing legacy completion timestamps. Schema 9 migrates to 10 by
 adding failure-report times, the relay-unavailable proof table and a separate
-coverage count; no row is rewritten and a pre-change binary refuses the result. Older unsupported prototype
+coverage count; no row is rewritten and a pre-change binary refuses the result.
+Carried exclusions add a nullable column and a partial index within schema 10, at
+open and idempotently; a schema-10 binary without them (ingest-85a2402) still
+opens and serves such a ledger. Older unsupported prototype
 ledgers remain rejected without deletion. See
 [continuous readiness](negentropy_continuous_readiness.md) for the backup,
 retention, separate progress-alert, and bounded activation requirements.

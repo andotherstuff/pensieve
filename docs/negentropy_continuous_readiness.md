@@ -209,15 +209,85 @@ they advance `lifecycle.last_success` (the status tool's
 **Health.** An excluded job is complete, so it no longer counts toward
 `unresolved_failures`, and `/health/negentropy` and Kuma monitor 46 recover. Other
 failures (relay down, protocol errors, blocked dense timestamps, mixed reports)
-count exactly as before.
+count exactly as before. A window that revisits an already excluded event is
+carried (below) after its first failure and never turns health red.
 
 **Late arrival.** The excluded IDs are not added to the reconciliation inventory.
 If the event later reaches the archive by any path (live ingestion, another relay),
 it is admitted and deduplicated normally and nothing breaks; each tick checks up to
 64 unresolved exclusions against the durable dedupe index and sets `resolved_at`
-(`negentropy_relay_unavailable_resolved_total`). Rolling planning reconciles each
-window once per relay, so nothing asks the relay again. A re-fetch scheduler for
-unresolved exclusions is a follow-up, not part of this change.
+(`negentropy_relay_unavailable_resolved_total`), carried rows included. A
+resolved event is no longer known-withheld, so a later pass over its window
+reconciles normally. Rolling planning does revisit history on a later pass (see
+carried exclusions), but that only asks the same relay again; a re-fetch
+scheduler for unresolved exclusions from other relays is a follow-up, not part
+of this change.
+
+### Carried exclusions
+
+**Recurrence (2026-10-13).** Job 768 (`wss://premium.primal.net`, window
+1791222300..1791223199, 2026-10-05 17:45–18:00 UTC) was excluded at 12:48 UTC
+for `089d1fdc…6b65`. At 15:15 UTC the rolling planner started a new pass over
+history and enqueued the same window as job 1984. Every attempt again reported
+`unavailable` with that single ID while receiving the other 17 events. Exclusions
+were proven per job, so 1984 had to re-earn its own (five reports over an hour),
+and from its third failure health was `unresolved_failures` and monitor 46 red
+for about an hour. It was exempt from the pause, but a monitor that goes red on
+every pass over history for an already explained event stops meaning anything.
+
+**Rule.** An event ID is *known-withheld* by a relay when all of the following
+hold:
+
+- an original exclusion row (`carried_from IS NULL`, proven by the full rule
+  above) records it for that relay;
+- that row is unresolved (`resolved_at IS NULL`: the event never reached the
+  archive) and the ID still has no durable archive marker;
+- the row's window overlaps the job's window (`since <= job.until` and
+  `until >= job.since`). An event ID commits to its `created_at`, and the relay
+  advertised it under both windows' filters, so `created_at` lies in their
+  intersection; disjoint windows mean the relay's claims are inconsistent and
+  nothing is carried. Overlap, not equality, lets a revisit whose window contains
+  a split child's (or the reverse) carry it.
+
+Only original rows count as proof. A carried row rests on a single report, and
+chaining carried rows would let the evidence thin out from pass to pass.
+
+When a retry-wait job's latest reported attempt qualifies (an `unavailable`
+report, fully enumerated, within one fetch batch, at most `max-ids` IDs; the same
+test as above) and every ID it names is known-withheld for the job's relay, the
+next lifecycle turn completes the job, after archive confirmation of its received
+frames as for any exclusion. It does not wait for `K` attempts or span `T`,
+because the proof already exists. A set that mixes known-withheld and new IDs is
+never carried; the full rule applies to the whole set. The rule's flags apply:
+`--isolated-negentropy-disable-unavailable-exclusion` stops carried exclusions
+too.
+
+**Proof and accounting.** The job is `complete` with reason `relay_unavailable`,
+like any exclusion, and its rows in `relay_unavailable_exclusions` record this
+job's own identical run honestly (usually one attempt and a span of 0) with
+`carried_from` set to the original row's ID. They count in
+`completed_coverage.relay_unavailable` as before. Each carried ID logs one WARN
+line (`negentropy relay-unavailable exclusion carried forward: window completed
+without an event its relay is already proven to withhold`, with job, relay,
+event ID, `carried_from` and `original_job`) and increments
+`negentropy_relay_unavailable_carried_total`, which is separate from
+`negentropy_relay_unavailable_exclusions_total` (freshly proven events). The
+status tool reports `carried` counts and marks each recent row with
+`carried_from` and `carried_from_job`.
+
+**Health and ordering.** Every 5-second tick runs the lifecycle turn
+(exclusions, carried ones included) twice, and the second run precedes the
+health observation, the pause evaluation and the only place a lease is granted.
+So a carried job is completed before it can be leased again: it stays at attempt
+1, never reaches the three failures behind `unresolved_failures`, and never
+counts toward the pause. Two things can defer it, as for any exclusion: frames
+the failed attempt received that are not yet archive-confirmed (novel events wait
+for their segment to seal; a revisit normally receives events already archived),
+and the turn's bound of 32 candidate jobs (keyset cursor) over any job past `K`
+attempts plus any job, from its first attempt, whose window overlaps an
+unresolved original exclusion of its relay. The first retry is due 60 seconds
+after the failure and the third failure comes minutes later, so only an unusual
+backlog could let health turn red first.
 
 **Interaction with the failure pause.** `unresolved_failures` starts when a
 job's third attempt fails, and an exempt job still counts there. The pause does
@@ -260,7 +330,14 @@ ones too.
 
 **Schema.** Opening a schema-9 ledger adds the column, table, index and coverage
 column in one transaction and sets `user_version` 10. No row is rewritten or
-dropped. A pre-change binary refuses a schema-10 ledger (`unsupported ledger
+dropped. Carried exclusions extend schema 10 without a version change: every open
+adds the nullable `relay_unavailable_exclusions.carried_from` column if it is
+missing and creates the partial index `relay_unavailable_withheld`
+`(relay, event_id) WHERE resolved_at IS NULL` if it does not exist. A schema-10
+binary that predates them (ingest-85a2402) still opens such a ledger: it inserts
+with explicit columns (so its rows have `carried_from` NULL), ignores the index,
+resolves carried rows on late arrival like any other, and simply stops carrying.
+Rolling back to it needs no restore. A pre-change binary refuses a schema-10 ledger (`unsupported ledger
 identity/version`): it leaves the isolated runtime off, so `/health/negentropy`
 reports `runtime_failed`, while live ingestion continues. There are two rollback
 paths (the RUNBOOK has the steps): keep the new build and restart it with
@@ -284,7 +361,9 @@ It never emits lease tokens, policy-exclusion IDs, policy recipient lists or
 failure bodies. On schema 10 it lists the five most recent relay-unavailable
 exclusions with their event IDs, relays and windows (public data an operator needs
 to look for the event elsewhere) and splits `complete` into reconciled and
-excluded windows.
+excluded windows. It counts carried exclusions separately (`carried`) and marks
+each recent row with `carried_from` (the original row) and `carried_from_job`;
+on a ledger without the column both are null and nothing is carried.
 SQL read-only does not mean filesystem-write-free: SQLite can touch shared-memory
 reader coordination and recreate sidecars during concurrent writer shutdown.
 The ownership check prevents creation under another UID. A WAL database missing

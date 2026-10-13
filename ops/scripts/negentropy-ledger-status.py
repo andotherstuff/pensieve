@@ -148,7 +148,7 @@ RECENT_EXCLUSIONS = 5
 EXCLUSION_FIELDS = (
     "event_id", "job", "relay", "since", "until", "first_attempt", "last_attempt",
     "attempts", "first_reported_at", "last_reported_at", "span_secs", "excluded_at",
-    "resolved_at",
+    "resolved_at", "carried_from", "carried_from_job",
 )
 
 
@@ -167,10 +167,28 @@ def relay_unavailable_report(db, complete_jobs):
     - `already_archived`: every ID the relay withheld was already archived
       (reason `already_archived`); nothing is missing;
     - `reconciled`: everything else.
+
+    `carried` counts the exclusion rows (and their jobs) that rest on an earlier
+    window's exclusion of the same relay and event instead of the job's own
+    repeated reports; they are a subset of `events` and `jobs`, and their jobs
+    are among `relay_unavailable_exclusion`. In `recent`, `carried_from` is the
+    original exclusion row's ID (`carried_from_job` its job), or None for a row
+    its job proved itself. A
+    schema-10 ledger last opened by a release before carried exclusions has no
+    such column: nothing is carried there.
     """
     events, jobs, unresolved = db.execute(
         "SELECT count(*),count(DISTINCT job),coalesce(sum(resolved_at IS NULL),0) "
         "FROM relay_unavailable_exclusions"
+    ).fetchone()
+    has_carried = any(
+        row[1] == "carried_from"
+        for row in db.execute("PRAGMA table_info(relay_unavailable_exclusions)")
+    )
+    carried_column = "carried_from" if has_carried else "NULL"
+    carried_events, carried_jobs, carried_unresolved = db.execute(
+        "SELECT count(*),count(DISTINCT job),coalesce(sum(resolved_at IS NULL),0) "
+        "FROM relay_unavailable_exclusions WHERE " + carried_column + " IS NOT NULL"
     ).fetchone()
     by_exclusion = db.execute(
         "SELECT count(*) FROM jobs WHERE state='complete' AND reason='relay_unavailable'"
@@ -188,16 +206,24 @@ def relay_unavailable_report(db, complete_jobs):
         " SELECT count(*) FROM jobs WHERE state='complete' AND reason IS NULL"
         " AND id IN (SELECT id FROM ancestors)"
     ).fetchone()[0]
+    origin = "e.carried_from" if has_carried else "NULL"
     recent = db.execute(
-        "SELECT lower(hex(event_id)),job,relay,since,until,first_attempt,last_attempt,attempts,"
-        "first_reported_at,last_reported_at,span_secs,excluded_at,resolved_at "
-        "FROM relay_unavailable_exclusions ORDER BY excluded_at DESC,id DESC LIMIT ?",
+        "SELECT lower(hex(e.event_id)),e.job,e.relay,e.since,e.until,e.first_attempt,"
+        "e.last_attempt,e.attempts,e.first_reported_at,e.last_reported_at,e.span_secs,"
+        "e.excluded_at,e.resolved_at," + origin + ","
+        " (SELECT o.job FROM relay_unavailable_exclusions o WHERE o.id=" + origin + ")"
+        " FROM relay_unavailable_exclusions e ORDER BY e.excluded_at DESC,e.id DESC LIMIT ?",
         (RECENT_EXCLUSIONS,),
     ).fetchall()
     return {
         "events": events,
         "jobs": jobs,
         "unresolved_events": unresolved,
+        "carried": {
+            "events": carried_events,
+            "jobs": carried_jobs,
+            "unresolved_events": carried_unresolved,
+        },
         "complete_states": {
             "reconciled": complete_jobs - by_exclusion - split_with_exclusion - already_archived,
             "relay_unavailable_exclusion": by_exclusion,

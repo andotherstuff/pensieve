@@ -131,10 +131,58 @@ class LedgerStatusTests(unittest.TestCase):
         self.assertEqual(recent[0]["job"], 4)
         self.assertEqual([r["excluded_at"] for r in recent], [2006, 2005, 2004, 2003, 2002])
         self.assertEqual(recent[0]["relay"], "wss://premium.primal.net")
+        # Written before carried exclusions: no carried_from column at all.
+        self.assertEqual(
+            exclusions["carried"], {"events": 0, "jobs": 0, "unresolved_events": 0}
+        )
+        self.assertEqual(
+            [(r["carried_from"], r["carried_from_job"]) for r in recent], [(None, None)] * 5
+        )
         self.assertEqual(report["retained_coverage_accounting"]["relay_unavailable_events"], 2)
         self.assertEqual(report["retained_coverage_accounting"]["excluded_frames"], 1)
         self.assertNotIn("secret diagnostic", str(report))
         self.assertFalse(report["continuous_ready"])
+
+    def test_carried_exclusions_are_counted_and_marked(self):
+        # Production 2026-10-13: job 768 excluded the withheld ID; job 1984, a
+        # later pass over the same window, carried that exclusion forward.
+        with database(self.path) as db:
+            db.executescript("""
+                PRAGMA user_version=10;
+                ALTER TABLE jobs ADD COLUMN reason TEXT;
+                ALTER TABLE jobs ADD COLUMN parent INTEGER;
+                INSERT INTO jobs VALUES(768,'complete',1791222300,15,'relay_unavailable',NULL),
+                    (1984,'complete',1791222300,1,'relay_unavailable',NULL),
+                    (1985,'complete',1791223200,6,'relay_unavailable',NULL);
+                CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
+                INSERT INTO lifecycle VALUES(1,1234);
+                CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,
+                    lease_grants INTEGER,failures INTEGER,relay_unavailable INTEGER);
+                CREATE TABLE relay_unavailable_exclusions(id INTEGER PRIMARY KEY,event_id BLOB,
+                    job INTEGER,relay TEXT,since INTEGER,until INTEGER,first_attempt INTEGER,
+                    last_attempt INTEGER,attempts INTEGER,first_reported_at INTEGER,
+                    last_reported_at INTEGER,span_secs INTEGER,excluded_at INTEGER,resolved_at INTEGER,
+                    reason TEXT,carried_from INTEGER);
+                INSERT INTO relay_unavailable_exclusions VALUES
+                    (1,zeroblob(32),768,'wss://premium.primal.net',1791222300,1791223199,
+                     1,15,15,NULL,NULL,32580,1791895680,NULL,'relay_unavailable',NULL),
+                    (2,zeroblob(32),1984,'wss://premium.primal.net',1791222300,1791223199,
+                     1,1,1,1791904651,1791904651,0,1791906000,NULL,'relay_unavailable',1),
+                    (3,x'09',1985,'wss://premium.primal.net',1791223200,1791224099,
+                     2,6,5,1791800000,1791814400,14400,1791906100,NULL,'relay_unavailable',NULL);
+            """)
+        report = STATUS.inspect(self.path)
+        exclusions = report["relay_unavailable_exclusions"]
+        self.assertEqual((exclusions["events"], exclusions["jobs"]), (3, 3))
+        self.assertEqual(
+            exclusions["carried"], {"events": 1, "jobs": 1, "unresolved_events": 1}
+        )
+        # Carried jobs are still relay-unavailable completions, not reconciled.
+        self.assertEqual(exclusions["complete_states"]["relay_unavailable_exclusion"], 3)
+        self.assertEqual(
+            [(r["job"], r["carried_from"], r["carried_from_job"]) for r in exclusions["recent"]],
+            [(1985, None, None), (1984, 1, 768), (768, None, None)],
+        )
 
     def test_split_parents_of_excluded_children_are_not_counted_as_reconciled(self):
         # Tree 10 -> (11 reconciled, 12 -> (13 excluded, 14 reconciled)); job 15

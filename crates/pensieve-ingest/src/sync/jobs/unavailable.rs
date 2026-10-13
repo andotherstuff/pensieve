@@ -36,6 +36,39 @@
 //! whose in-progress run is on track to such a completion; see
 //! `exemption_ceiling` for the bound.
 //!
+//! # Carried exclusions
+//!
+//! Exclusions are proven per job, but the rolling planner revisits history: on
+//! 2026-10-13 its 15:15 UTC pass enqueued job 768's window again as job 1984,
+//! which reported the same single withheld ID on its first attempt and would
+//! have had to re-earn the exclusion over another `attempts` reports and
+//! `min_span_secs`, holding health red (`unresolved_failures`) for about an hour
+//! on every pass. So an ID is *known-withheld* by a relay when an original
+//! exclusion row (one proven by the full rule, `carried_from IS NULL`) records it
+//! for that relay, is still unresolved (the event never reached the archive) and
+//! its window overlaps the job's window; the ID must also still lack a durable
+//! archive marker. Overlap is the exact consistency condition: an event ID
+//! commits to its `created_at`, and the relay advertised the ID under both
+//! windows' filters, so `created_at` lies in their intersection. Windows that
+//! do not overlap mean the relay's claims are inconsistent and nothing is
+//! carried. Only original rows are proof: a carried row rests on one report, so
+//! chaining carried rows would let the evidence degrade from pass to pass.
+//!
+//! A retry-wait job whose latest reported attempt qualifies (see
+//! `Reported::qualifies`) and names only known-withheld IDs is completed on the
+//! next turn without waiting for `attempts` reports or `min_span_secs`: the
+//! proof already exists. Its rows reference the original row in `carried_from`
+//! and record this job's own identical run (attempts and span) honestly; the
+//! job's reason is `relay_unavailable` as for any exclusion. A set that mixes
+//! known-withheld and other IDs is never carried; the full rule applies to the
+//! whole set. Late arrival resolves carried rows like any other, and a resolved
+//! (archived) ID is no longer known-withheld, so later passes reconcile normally.
+//!
+//! The `carried_from` column and the `(relay, event_id)` lookup index are an
+//! additive extension of schema 10, applied idempotently at open without a
+//! version change: a schema-10 reader that predates them (ingest-85a2402) opens
+//! the ledger, ignores the column and still resolves every row.
+//!
 //! Report times are recorded from schema 10 on. Older reports have none; for a
 //! gap that touches one, the span uses the runtime's fixed backoff floor after
 //! that attempt (`min(60 * 2^(n-1), 3600)` seconds after failure `n`, unchanged
@@ -86,6 +119,32 @@ CREATE INDEX relay_unavailable_unresolved ON relay_unavailable_exclusions(id)
  WHERE resolved_at IS NULL;
 ALTER TABLE completed_coverage ADD COLUMN relay_unavailable INTEGER NOT NULL DEFAULT 0;
 ";
+
+/// The original exclusion row a carried row rests on; NULL on original rows.
+const CARRIED_COLUMN: &str = "ALTER TABLE relay_unavailable_exclusions
+ ADD COLUMN carried_from INTEGER CHECK(carried_from IS NULL OR carried_from>=1);";
+/// Known-withheld lookup by relay and event ID, over unresolved rows only.
+const WITHHELD_INDEX: &str = "CREATE INDEX IF NOT EXISTS relay_unavailable_withheld
+ ON relay_unavailable_exclusions(relay,event_id) WHERE resolved_at IS NULL;";
+
+/// Add the carried-exclusion column and lookup index to a schema-10 ledger,
+/// idempotently and without changing `user_version`. Both are additive: no
+/// existing row is rewritten, and a reader that predates them still opens the
+/// ledger, inserts with explicit column lists (so `carried_from` is NULL) and
+/// resolves every row.
+pub(super) fn extend_schema(tx: &Transaction<'_>) -> Result<(), LedgerError> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relay_unavailable_exclusions')
+         WHERE name='carried_from')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        tx.execute_batch(CARRIED_COLUMN)?;
+    }
+    tx.execute_batch(WITHHELD_INDEX)?;
+    Ok(())
+}
 
 /// Operator policy for automatic relay-unavailable exclusions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +210,44 @@ pub struct UnavailableExclusion {
     pub span_secs: i64,
 }
 
+/// One event of a carried exclusion and the original proof it rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriedEvent {
+    /// Excluded event ID.
+    pub event_id: [u8; 32],
+    /// Original exclusion row (`relay_unavailable_exclusions.id`) carried forward.
+    pub original_row: i64,
+    /// Job that proved the original exclusion.
+    pub original_job: i64,
+}
+
+/// One window completed because every ID its relay withheld is already known
+/// to be withheld by that relay (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedExclusion {
+    /// Completed job.
+    pub job: i64,
+    /// Relay that advertised and withheld the IDs.
+    pub relay: String,
+    /// Excluded events, sorted by event ID, each with its original proof.
+    pub events: Vec<CarriedEvent>,
+    /// First attempt of this job's identical run.
+    pub first_attempt: i64,
+    /// Last attempt of this job's identical run.
+    pub last_attempt: i64,
+    /// Qualifying reports in this job's run (usually one).
+    pub attempts: i64,
+    /// Lower bound on this job's report span in seconds (zero for one report).
+    pub span_secs: i64,
+}
+
 /// One bounded evaluation turn.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UnavailableProgress {
     /// Windows completed by exclusion this turn.
     pub excluded: Vec<UnavailableExclusion>,
+    /// Windows completed by carrying an earlier exclusion forward this turn.
+    pub carried: Vec<CarriedExclusion>,
     /// Qualifying jobs left in retry because received frames are not yet archived.
     pub awaiting_archive: u32,
     /// Qualifying jobs completed with reason `already_archived`, without an
@@ -323,18 +415,100 @@ fn evidence(
     if !meets(&run, rule) {
         return Ok(None);
     }
+    Ok(measure(ids, &run))
+}
+
+/// The evidence of a non-empty identical run.
+fn measure(ids: Option<Vec<[u8; 32]>>, run: &[(i64, Option<i64>)]) -> Option<Evidence> {
     let (Some(ids), Some(&(first_attempt, first_reported_at))) = (ids, run.last()) else {
-        return Ok(None);
+        return None;
     };
-    Ok(Some(Evidence {
+    Some(Evidence {
         ids,
         first_attempt,
         last_attempt: run[0].0,
         attempts: run.len() as i64,
         first_reported_at,
         last_reported_at: run[0].1,
-        span_secs: span_lower_bound(&run),
-    }))
+        span_secs: span_lower_bound(run),
+    })
+}
+
+/// The original exclusion that makes `event_id` known-withheld by the job's
+/// relay, as `(row, job)`: an unresolved row proven by the full rule
+/// (`carried_from IS NULL`) for the same relay and event ID whose window
+/// overlaps the job's window. The lowest row ID wins, so a job always carries
+/// the earliest surviving proof.
+fn known_withheld(
+    db: &Connection,
+    job: &super::Job,
+    event_id: &[u8; 32],
+) -> Result<Option<(i64, i64)>, LedgerError> {
+    Ok(db
+        .query_row(
+            "SELECT id,job FROM relay_unavailable_exclusions INDEXED BY relay_unavailable_withheld
+             WHERE relay=?1 AND event_id=?2 AND resolved_at IS NULL AND carried_from IS NULL
+             AND job!=?3 AND since<=?5 AND until>=?4 ORDER BY id LIMIT 1",
+            params![job.relay, event_id.as_slice(), job.id, job.since, job.until],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// A retry-wait job whose latest reported attempt qualifies and names only
+/// known-withheld IDs that still lack an archive marker: its own identical run
+/// (for honest accounting) and the original proof of each ID, in set order.
+/// Any other ID in the set, archived or not yet proven, means no carry.
+fn carried(
+    db: &Connection,
+    job: &super::Job,
+    rule: &UnavailableRule,
+    dedupe: &crate::DedupeIndex,
+) -> Result<Option<(Evidence, Vec<CarriedEvent>)>, LedgerError> {
+    if job.state != JobState::RetryWait {
+        return Ok(None);
+    }
+    let (ids, run) = identical_run(db, job.id, job.attempt, MAX_EVIDENCE_ATTEMPTS, rule)?;
+    let Some(evidence) = measure(ids, &run) else {
+        return Ok(None);
+    };
+    let mut events = Vec::with_capacity(evidence.ids.len());
+    for event_id in &evidence.ids {
+        if dedupe.get_status(event_id)? == Some(crate::EventStatus::Archived) {
+            return Ok(None);
+        }
+        let Some((original_row, original_job)) = known_withheld(db, job, event_id)? else {
+            return Ok(None);
+        };
+        events.push(CarriedEvent {
+            event_id: *event_id,
+            original_row,
+            original_job,
+        });
+    }
+    Ok(Some((evidence, events)))
+}
+
+/// How a qualifying job's window is completed.
+enum Completion {
+    /// Its own identical run met the rule.
+    Proven(Evidence),
+    /// Every withheld ID is known-withheld by its relay.
+    Carried(Evidence, Vec<CarriedEvent>),
+}
+
+/// A job's completion, preferring its own proof over a carried one.
+fn completion(
+    db: &Connection,
+    job: &super::Job,
+    rule: &UnavailableRule,
+    dedupe: &crate::DedupeIndex,
+) -> Result<Option<Completion>, LedgerError> {
+    if let Some(evidence) = evidence(db, job, rule)? {
+        return Ok(Some(Completion::Proven(evidence)));
+    }
+    Ok(carried(db, job, rule, dedupe)?
+        .map(|(evidence, events)| Completion::Carried(evidence, events)))
 }
 
 /// Whether a retry-wait job at `attempt` is on track to a relay-unavailable
@@ -448,12 +622,14 @@ impl JobLedger {
     }
 
     /// One bounded turn: complete retry-wait jobs whose history proves the relay
-    /// withholds the same advertised IDs, then mark earlier exclusions resolved
-    /// once their event carries a durable archive marker. Call only when archive
-    /// recovery is not required. A qualifying job with unarchived receipts stays in
-    /// retry; receipt maintenance must confirm them first. Like retry and expiry,
-    /// this resolves an existing obligation and bypasses the admission ceiling;
-    /// real storage errors still roll back.
+    /// withholds the same advertised IDs, or whose latest report names only IDs
+    /// already known to be withheld by that relay (carried exclusions; see the
+    /// module docs), then mark earlier exclusions resolved once their event
+    /// carries a durable archive marker. Call only when archive recovery is not
+    /// required. A qualifying job with unarchived receipts stays in retry;
+    /// receipt maintenance must confirm them first. Like retry and expiry, this
+    /// resolves an existing obligation and bypasses the admission ceiling; real
+    /// storage errors still roll back.
     pub fn exclude_relay_unavailable(
         &mut self,
         now: i64,
@@ -464,9 +640,15 @@ impl JobLedger {
         }
         let mut progress = UnavailableProgress::default();
         if let Some(rule) = self.unavailable_rule {
+            // Jobs past the rule's attempt count, and from its first attempt any
+            // job whose window overlaps an unresolved original exclusion of its
+            // relay (a possible carry; `known_withheld` decides).
             let candidates = {
                 let mut query = self.db.prepare(
-                    "SELECT id FROM jobs WHERE state='retry_wait' AND attempt>=?1 AND id>?2
+                    "SELECT id FROM jobs WHERE state='retry_wait' AND id>?2 AND (attempt>=?1
+                     OR EXISTS(SELECT 1 FROM relay_unavailable_exclusions e
+                      WHERE e.relay=jobs.relay AND e.resolved_at IS NULL AND e.carried_from IS NULL
+                      AND e.since<=jobs.until AND e.until>=jobs.since))
                      ORDER BY id LIMIT ?3",
                 )?;
                 query
@@ -483,14 +665,14 @@ impl JobLedger {
             for id in candidates {
                 // Read-only screen first; only a qualifying job takes the write lock
                 // and is re-checked inside it.
-                if evidence(&self.db, &read_job(&self.db, id)?, &rule)?.is_none() {
+                if completion(&self.db, &read_job(&self.db, id)?, &rule, dedupe)?.is_none() {
                     continue;
                 }
                 let tx = self
                     .db
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let job = read_job(&tx, id)?;
-                let Some(evidence) = evidence(&tx, &job, &rule)? else {
+                let Some(completion) = completion(&tx, &job, &rule, dedupe)? else {
                     continue;
                 };
                 let pending: bool = tx.query_row(
@@ -502,22 +684,37 @@ impl JobLedger {
                     progress.awaiting_archive += 1;
                     continue;
                 }
-                // An ID that already carries a durable archive marker is in the
-                // archive, whichever path brought it in, so it is not missing. An
-                // event archived before the inventory replay floor is never in the
-                // inventory: every attempt's diff names it again, so without this
-                // the window could neither finish normally nor be excluded.
-                let mut withheld = Vec::with_capacity(evidence.ids.len());
-                for event_id in &evidence.ids {
-                    if dedupe.get_status(event_id)? != Some(crate::EventStatus::Archived) {
-                        withheld.push(*event_id);
+                let (evidence, withheld) = match &completion {
+                    Completion::Proven(evidence) => {
+                        // An ID that already carries a durable archive marker is in
+                        // the archive, whichever path brought it in, so it is not
+                        // missing. An event archived before the inventory replay
+                        // floor is never in the inventory: every attempt's diff names
+                        // it again, so without this the window could neither finish
+                        // normally nor be excluded.
+                        let mut withheld = Vec::with_capacity(evidence.ids.len());
+                        for event_id in &evidence.ids {
+                            if dedupe.get_status(event_id)? != Some(crate::EventStatus::Archived) {
+                                withheld.push((*event_id, None));
+                            }
+                        }
+                        (evidence, withheld)
                     }
-                }
-                for event_id in &withheld {
+                    // Every ID was checked unarchived and known-withheld above.
+                    Completion::Carried(evidence, events) => (
+                        evidence,
+                        events
+                            .iter()
+                            .map(|event| (event.event_id, Some(event.original_row)))
+                            .collect(),
+                    ),
+                };
+                for (event_id, carried_from) in &withheld {
                     tx.execute(
                         "INSERT INTO relay_unavailable_exclusions(event_id,job,relay,since,until,
                          first_attempt,last_attempt,attempts,first_reported_at,last_reported_at,
-                         span_secs,excluded_at,reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                         span_secs,excluded_at,reason,carried_from)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                         params![
                             event_id.as_slice(),
                             job.id,
@@ -531,7 +728,8 @@ impl JobLedger {
                             evidence.last_reported_at,
                             evidence.span_secs,
                             now,
-                            RELAY_UNAVAILABLE
+                            RELAY_UNAVAILABLE,
+                            carried_from
                         ],
                     )?;
                 }
@@ -552,19 +750,33 @@ impl JobLedger {
                     complete_if_durable(&tx, parent)?;
                 }
                 tx.commit()?;
-                if withheld.is_empty() {
-                    progress.already_archived.push(job.id);
-                    continue;
+                match completion {
+                    Completion::Proven(_) if withheld.is_empty() => {
+                        progress.already_archived.push(job.id);
+                    }
+                    Completion::Proven(evidence) => {
+                        progress.excluded.push(UnavailableExclusion {
+                            job: job.id,
+                            relay: job.relay,
+                            event_ids: withheld.into_iter().map(|(id, _)| id).collect(),
+                            first_attempt: evidence.first_attempt,
+                            last_attempt: evidence.last_attempt,
+                            attempts: evidence.attempts,
+                            span_secs: evidence.span_secs,
+                        });
+                    }
+                    Completion::Carried(evidence, events) => {
+                        progress.carried.push(CarriedExclusion {
+                            job: job.id,
+                            relay: job.relay,
+                            events,
+                            first_attempt: evidence.first_attempt,
+                            last_attempt: evidence.last_attempt,
+                            attempts: evidence.attempts,
+                            span_secs: evidence.span_secs,
+                        });
+                    }
                 }
-                progress.excluded.push(UnavailableExclusion {
-                    job: job.id,
-                    relay: job.relay,
-                    event_ids: withheld,
-                    first_attempt: evidence.first_attempt,
-                    last_attempt: evidence.last_attempt,
-                    attempts: evidence.attempts,
-                    span_secs: evidence.span_secs,
-                });
             }
         }
         progress.resolved = self.resolve_late_arrivals(now, dedupe)?;
@@ -629,6 +841,21 @@ impl JobLedger {
         )?;
         Ok(query
             .query_map([job], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// For each exclusion record of one job, oldest first, the original
+    /// exclusion row it was carried from; `None` for a record the job proved
+    /// itself.
+    pub fn relay_unavailable_carried_from(
+        &self,
+        job: i64,
+    ) -> Result<Vec<Option<i64>>, LedgerError> {
+        let mut query = self.db.prepare(
+            "SELECT carried_from FROM relay_unavailable_exclusions WHERE job=?1 ORDER BY id",
+        )?;
+        Ok(query
+            .query_map([job], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1405,39 +1632,47 @@ mod tests {
 
     /// Every row of every pre-change table, in key order.
     fn snapshot(db: &Connection) -> Snapshot {
-        [
-            "jobs",
-            "attempts",
-            "receipts",
-            "receipt_totals",
-            "failure_reports",
-            "planner_state",
-            "planner_relays",
-            "lease_rotation",
-            "admission_policy",
-            "policy_exclusions",
-            "exclusion_totals",
-            "lifecycle",
-            "completed_coverage",
-        ]
-        .into_iter()
-        .map(|table| {
-            let mut query = db
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
-                .unwrap();
-            let width = query.column_count();
-            let rows = query
-                .query_map([], |r| {
-                    (0..width)
-                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            (table, width, rows)
-        })
-        .collect()
+        snapshot_of(db, SCHEMA9_TABLES)
+    }
+
+    const SCHEMA9_TABLES: &[&str] = &[
+        "jobs",
+        "attempts",
+        "receipts",
+        "receipt_totals",
+        "failure_reports",
+        "planner_state",
+        "planner_relays",
+        "lease_rotation",
+        "admission_policy",
+        "policy_exclusions",
+        "exclusion_totals",
+        "lifecycle",
+        "completed_coverage",
+    ];
+
+    /// Every row of the given tables, in key order.
+    fn snapshot_of(db: &Connection, tables: &[&'static str]) -> Snapshot {
+        tables
+            .iter()
+            .copied()
+            .map(|table| {
+                let mut query = db
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                    .unwrap();
+                let width = query.column_count();
+                let rows = query
+                    .query_map([], |r| {
+                        (0..width)
+                            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                (table, width, rows)
+            })
+            .collect()
     }
 
     /// Restrict a later snapshot to the columns the earlier one had.
@@ -1556,6 +1791,116 @@ mod tests {
     }
 
     #[test]
+    fn schema10_ledger_with_job_1984_gains_the_carry_extension_and_carries_job_768() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.sqlite");
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(include_str!("testdata/ledger_v10_job1984.sql"))
+            .unwrap();
+        let tables = [SCHEMA9_TABLES, &["relay_unavailable_exclusions"]].concat();
+        let before = snapshot_of(&raw, &tables);
+        let column = |db: &Connection| -> bool {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relay_unavailable_exclusions')
+                 WHERE name='carried_from')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!column(&raw));
+        drop(raw);
+        let dedupe = crate::DedupeIndex::open(dir.path().join("dedupe")).unwrap();
+        let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        // Additive within schema 10: no version change, every earlier row and
+        // column value unchanged, the new column NULL on job 768's row.
+        let version = |db: &Connection| -> i64 {
+            db.pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&db.db), 10);
+        assert!(column(&db.db));
+        let index: i64 = db
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index'
+                 AND name='relay_unavailable_withheld'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(
+            original_columns(&before, snapshot_of(&db.db, &tables)),
+            before
+        );
+        assert_eq!(db.relay_unavailable_carried_from(768).unwrap(), vec![None]);
+        let job = db.get(1984).unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::RetryWait, 1));
+        // 15:20 UTC: one failure, not yet an unresolved failure for health.
+        let now = 1_791_904_800;
+        assert!(!db.progress_observation(now).unwrap().persistent_failure);
+        // The first turn after deploy completes job 1984 from job 768's proof.
+        let mut missing = [0u8; 32];
+        hex::decode_to_slice(
+            "089d1fdc2d1cf0f03be5844014378a3f2bcca0d1092619a70ed6f86b7c286b65",
+            &mut missing,
+        )
+        .unwrap();
+        let progress = db.exclude_relay_unavailable(now, &dedupe).unwrap();
+        assert!(progress.excluded.is_empty());
+        assert_eq!(
+            progress.carried,
+            vec![CarriedExclusion {
+                job: 1984,
+                relay: "wss://premium.primal.net".into(),
+                events: vec![CarriedEvent {
+                    event_id: missing,
+                    original_row: 1,
+                    original_job: 768,
+                }],
+                first_attempt: 1,
+                last_attempt: 1,
+                attempts: 1,
+                span_secs: 0,
+            }]
+        );
+        let job = db.get(1984).unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::Complete, 1));
+        assert_eq!(job.reason.as_deref(), Some(RELAY_UNAVAILABLE));
+        assert_eq!(
+            db.relay_unavailable_exclusions(1984).unwrap(),
+            vec![(missing, None)]
+        );
+        assert_eq!(
+            db.relay_unavailable_carried_from(1984).unwrap(),
+            vec![Some(1)]
+        );
+        let observation = db.progress_observation(now).unwrap();
+        assert!(!observation.persistent_failure);
+        assert!(db.pause_failures().unwrap().is_empty());
+        // Receipts, attempt summaries and failure reports are untouched.
+        let after = snapshot_of(&db.db, &tables);
+        for table in ["attempts", "receipts", "receipt_totals", "failure_reports"] {
+            let old = before.iter().find(|t| t.0 == table).unwrap();
+            let new = after.iter().find(|t| t.0 == table).unwrap();
+            assert_eq!(old, new, "{table}");
+        }
+        // Reopening is idempotent, and job IDs continue after 1984.
+        drop(db);
+        let mut db = JobLedger::open(&path, LedgerLimits::default()).unwrap();
+        assert_eq!(version(&db.db), 10);
+        let progress = db.exclude_relay_unavailable(now + 5, &dedupe).unwrap();
+        assert_eq!(progress, UnavailableProgress::default());
+        assert_eq!(
+            db.enqueue("after", "wss://premium.primal.net", 0, 899)
+                .unwrap()
+                .id,
+            1985
+        );
+    }
+
+    #[test]
     fn job_768_lease_race_attempt_without_a_session_does_not_reset_the_run() {
         // Production: the 2026-10-13 lease race consumed attempt 16 with no
         // session, receipt or report; the lease then expired into retry.
@@ -1631,5 +1976,339 @@ mod tests {
         assert_eq!(span_lower_bound(&[(2, Some(100)), (1, Some(40))]), 60);
         assert_eq!(span_lower_bound(&[(2, Some(10)), (1, Some(40))]), 0);
         assert_eq!(span_lower_bound(&[(16, Some(10)), (15, None)]), 3600);
+    }
+
+    const OTHER: [u8; 32] = [0x09; 32];
+
+    impl Fixture {
+        /// A window on `relay` excluded by the full rule for `ids`: five hourly
+        /// identical reports from `at`. Returns the job and its exclusion row IDs.
+        fn excluded(
+            &mut self,
+            sweep: &str,
+            relay: &str,
+            window: (i64, i64),
+            ids: &[[u8; 32]],
+            at: i64,
+        ) -> (i64, Vec<i64>) {
+            let job = self.db.enqueue(sweep, relay, window.0, window.1).unwrap();
+            for n in 0..5 {
+                let lease = self.attempt(at + n * HOUR, 17, Some(unavailable(ids)));
+                assert_eq!(lease.job().id, job.id);
+            }
+            let progress = self.run(at + 5 * HOUR);
+            assert_eq!(progress.excluded.len(), 1);
+            assert_eq!(progress.excluded[0].job, job.id);
+            (job.id, self.rows(job.id))
+        }
+
+        /// Exclusion row IDs of one job, oldest first.
+        fn rows(&self, job: i64) -> Vec<i64> {
+            let mut query = self
+                .db
+                .db
+                .prepare("SELECT id FROM relay_unavailable_exclusions WHERE job=?1 ORDER BY id")
+                .unwrap();
+            query
+                .query_map([job], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+
+        /// The carry decision for one job, bypassing the turn's candidate screen.
+        fn carry(&self, job: i64) -> Option<Vec<CarriedEvent>> {
+            carried(
+                &self.db.db,
+                &self.db.get(job).unwrap(),
+                &UnavailableRule::default(),
+                &self.dedupe,
+            )
+            .unwrap()
+            .map(|(_, events)| events)
+        }
+
+        /// A new job for `window` on `relay` that fails once at `at`.
+        fn revisit(
+            &mut self,
+            sweep: &str,
+            relay: &str,
+            window: (i64, i64),
+            at: i64,
+            received: u64,
+            report: FailureDiagnostic,
+        ) -> i64 {
+            let job = self.db.enqueue(sweep, relay, window.0, window.1).unwrap();
+            let lease = self.attempt(at, received, Some(report));
+            assert_eq!(lease.job().id, job.id);
+            job.id
+        }
+    }
+
+    #[test]
+    fn a_revisited_window_that_withholds_a_known_withheld_id_is_carried_on_its_first_failure() {
+        // Production 2026-10-13: job 768 excluded at 12:48 UTC; the 15:15 UTC
+        // pass enqueued the same window again as job 1984, which withheld the
+        // same single ID and received the other 17 events on every attempt.
+        let mut f = fixture();
+        let (original, rows) = f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let now = 1000 + 10 * HOUR;
+        let job = f.revisit("pass-2", RELAY, (0, 899), now, 17, unavailable(&[MISSING]));
+        let progress = f.run(now + 5);
+        assert!(progress.excluded.is_empty());
+        assert_eq!(
+            progress.carried,
+            vec![CarriedExclusion {
+                job,
+                relay: RELAY.into(),
+                events: vec![CarriedEvent {
+                    event_id: MISSING,
+                    original_row: rows[0],
+                    original_job: original,
+                }],
+                first_attempt: 1,
+                last_attempt: 1,
+                attempts: 1,
+                span_secs: 0,
+            }]
+        );
+        let done = f.db.get(job).unwrap();
+        assert_eq!((done.state, done.attempt), (JobState::Complete, 1));
+        assert_eq!(done.reason.as_deref(), Some(RELAY_UNAVAILABLE));
+        assert_eq!(
+            f.db.relay_unavailable_exclusions(job).unwrap(),
+            vec![(MISSING, None)]
+        );
+        assert_eq!(
+            f.db.relay_unavailable_carried_from(job).unwrap(),
+            vec![Some(rows[0])]
+        );
+        assert_eq!(
+            f.db.relay_unavailable_carried_from(original).unwrap(),
+            vec![None]
+        );
+        // This job's own evidence, recorded honestly: one report, no span.
+        let row: (i64, i64, i64, i64, i64, i64, i64, String) =
+            f.db.db
+                .query_row(
+                    "SELECT first_attempt,last_attempt,attempts,span_secs,first_reported_at,
+                     last_reported_at,excluded_at,reason FROM relay_unavailable_exclusions
+                     WHERE job=?1",
+                    [job],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(
+            row,
+            (
+                1,
+                1,
+                1,
+                0,
+                now + 1,
+                now + 1,
+                now + 5,
+                RELAY_UNAVAILABLE.into()
+            )
+        );
+        // Never a persistent failure, so neither health nor the pause sees it.
+        let observation = f.db.progress_observation(now + 5).unwrap();
+        assert!(!observation.persistent_failure);
+        assert!(f.db.pause_failures().unwrap().is_empty());
+        // Receipts and the attempt summary are untouched.
+        let summary = f.db.attempt_progress(job, 1).unwrap();
+        assert_eq!(
+            (summary.received, summary.archived, summary.excluded),
+            (17, 17, 0)
+        );
+        // A third pass carries the original row, not the second pass's.
+        let third = f.revisit(
+            "pass-3",
+            RELAY,
+            (0, 899),
+            now + HOUR,
+            17,
+            unavailable(&[MISSING]),
+        );
+        let progress = f.run(now + HOUR + 5);
+        assert_eq!(progress.carried[0].job, third);
+        assert_eq!(progress.carried[0].events[0].original_row, rows[0]);
+    }
+
+    #[test]
+    fn carry_needs_the_same_relay_an_overlapping_original_window_and_an_unarchived_id() {
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let mut now = 1000 + 10 * HOUR;
+        fn stays(f: &mut Fixture, now: &mut i64, sweep: &str, relay: &str, window: (i64, i64)) {
+            let job = f.revisit(sweep, relay, window, *now, 0, unavailable(&[MISSING]));
+            // The lookup itself refuses, not only the turn's candidate screen.
+            assert!(f.carry(job).is_none(), "{sweep}");
+            let progress = f.run(*now + 5);
+            assert!(progress.carried.is_empty(), "{sweep}");
+            assert_eq!(f.db.get(job).unwrap().state, JobState::RetryWait);
+            // Leave it out of later leases.
+            f.db.db
+                .execute(
+                    "UPDATE jobs SET next_eligible=?2 WHERE id=?1",
+                    [job, i64::MAX],
+                )
+                .unwrap();
+            *now += HOUR;
+        }
+        stays(
+            &mut f,
+            &mut now,
+            "relay",
+            "wss://other.example.com",
+            (0, 899),
+        );
+        // The same relay, a window that does not overlap the original's.
+        stays(&mut f, &mut now, "window", RELAY, (900, 1799));
+        // Once the ID carries an archive marker it is no longer known-withheld:
+        // before the late-arrival turn resolves the original row (this turn
+        // checks candidates first) and after it.
+        f.dedupe.mark_archived([&MISSING].into_iter()).unwrap();
+        stays(&mut f, &mut now, "archived", RELAY, (0, 899));
+        assert_eq!(
+            f.db.relay_unavailable_exclusions(1).unwrap(),
+            vec![(MISSING, Some(now - HOUR + 5))]
+        );
+        stays(&mut f, &mut now, "resolved", RELAY, (0, 899));
+    }
+
+    #[test]
+    fn carry_rests_only_on_original_proof() {
+        // The second pass's window contains the original's, so it is carried;
+        // the third overlaps only the second pass's (carried) window. Carried
+        // rows are not proof, so the third is not carried.
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let now = 1000 + 10 * HOUR;
+        let second = f.revisit("pass-2", RELAY, (0, 1799), now, 0, unavailable(&[MISSING]));
+        assert_eq!(f.run(now + 5).carried[0].job, second);
+        let third = f.revisit(
+            "pass-3",
+            RELAY,
+            (900, 1799),
+            now + HOUR,
+            0,
+            unavailable(&[MISSING]),
+        );
+        assert!(f.carry(third).is_none());
+        assert!(f.run(now + HOUR + 5).carried.is_empty());
+        assert_eq!(f.db.get(third).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
+    fn a_mixed_or_unqualifiable_report_is_not_carried() {
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let mut now = 1000 + 10 * HOUR;
+        // {X, Y}: Y is not known-withheld, so the full rule applies to the set.
+        let mixed = f.revisit(
+            "mixed",
+            RELAY,
+            (0, 899),
+            now,
+            0,
+            unavailable(&[MISSING, OTHER]),
+        );
+        assert!(f.carry(mixed).is_none());
+        assert!(f.run(now + 5).carried.is_empty());
+        for n in 1..5 {
+            f.attempt(now + n * HOUR, 0, Some(unavailable(&[MISSING, OTHER])));
+            if n < 4 {
+                assert!(f.run(now + n * HOUR + 5).carried.is_empty());
+            }
+        }
+        let progress = f.run(now + 5 * HOUR);
+        assert!(progress.carried.is_empty());
+        assert_eq!(progress.excluded[0].job, mixed);
+        assert_eq!(progress.excluded[0].event_ids, vec![MISSING, OTHER]);
+        // Its own proof: neither row is carried.
+        assert_eq!(
+            f.db.relay_unavailable_carried_from(mixed).unwrap(),
+            vec![None, None]
+        );
+        now += 10 * HOUR;
+        // Sampled one of two outstanding IDs; a diff larger than one fetch
+        // batch; a latest report of another kind after a known-withheld one.
+        let mut sampled = unavailable(&[MISSING]);
+        sampled.missing_count = 2;
+        for (received, report) in [
+            (0, sampled),
+            (WORKER_FETCH_BATCH, unavailable(&[MISSING])),
+            (0, relay_failure()),
+        ] {
+            let job = f.db.enqueue(&format!("u{now}"), RELAY, 0, 899).unwrap().id;
+            if report.kind != FailureKind::Unavailable {
+                f.attempt(now, 0, Some(unavailable(&[MISSING])));
+                now += HOUR;
+            }
+            f.attempt(now, received, Some(report));
+            assert!(f.carry(job).is_none(), "{received}");
+            assert!(f.run(now + 5).carried.is_empty(), "{received}");
+            assert_eq!(f.db.get(job).unwrap().state, JobState::RetryWait);
+            f.db.db
+                .execute(
+                    "UPDATE jobs SET next_eligible=?2 WHERE id=?1",
+                    [job, i64::MAX],
+                )
+                .unwrap();
+            now += HOUR;
+        }
+    }
+
+    #[test]
+    fn carried_rows_resolve_on_late_arrival_and_respect_rule_and_receipts() {
+        let mut f = fixture();
+        let (original, _) = f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let now = 1000 + 10 * HOUR;
+        let job = f.revisit("pass-2", RELAY, (0, 899), now, 0, unavailable(&[MISSING]));
+        // With the rule disabled nothing new is excluded, carried included.
+        f.db.set_relay_unavailable_rule(None).unwrap();
+        assert!(f.run(now + 5).carried.is_empty());
+        f.db.set_relay_unavailable_rule(Some(UnavailableRule::default()))
+            .unwrap();
+        // A retained (not yet archived) receipt defers the carry.
+        f.db.db
+            .execute(
+                "INSERT INTO attempts(job,attempt,received,bytes,digest) VALUES(?1,99,1,1,zeroblob(32))",
+                [job],
+            )
+            .unwrap();
+        f.db.db
+            .execute(
+                "INSERT INTO receipts VALUES(?1,99,1,zeroblob(32),1,1,zeroblob(32))",
+                [job],
+            )
+            .unwrap();
+        let progress = f.run(now + 6);
+        assert_eq!((progress.carried.len(), progress.awaiting_archive), (0, 1));
+        f.db.db
+            .execute_batch("DELETE FROM receipts; UPDATE receipt_totals SET retained=0")
+            .unwrap();
+        assert_eq!(f.run(now + 7).carried[0].job, job);
+        // The event later reaches the archive: both rows resolve.
+        f.dedupe.mark_archived([&MISSING].into_iter()).unwrap();
+        assert_eq!(f.run(now + 8).resolved, 2);
+        for id in [original, job] {
+            assert_eq!(
+                f.db.relay_unavailable_exclusions(id).unwrap(),
+                vec![(MISSING, Some(now + 8))]
+            );
+        }
     }
 }
