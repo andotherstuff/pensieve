@@ -27,14 +27,25 @@
 //! table (informational: the 014 rescan is up to 6 h old and broke
 //! `created_at` ties arbitrarily).
 //!
-//! **Kinds** (`kind_totals`): one scan of `kind`, `indexed_at` and
-//! `created_at` before reading the rollup and one after. The backfill share
-//! (`origin = 'backfill'`) must equal the rows indexed before the planned
-//! view boundary exactly; the view share must lie between the rows indexed
-//! since the boundary in the first and in the second scan; first/last
-//! `created_at` likewise. The approximate distinct pubkeys are compared with
-//! `kinds_stats_mv`'s exact values while that view exists (before the
-//! cutover), within `--pubkeys-tolerance-pct`.
+//! **Kinds** (`kind_totals`): the rollup is read, then `events_local` is
+//! scanned once (`kind`, `indexed_at`, `created_at`). Rows indexed before the
+//! cutoff were committed, view rows included, before the rollup was read (no
+//! insert that started before the cutoff is running); rows the scan sees are
+//! a superset of what the rollup saw. So the backfill share (`origin =
+//! 'backfill'`) must equal the rows indexed before the planned view boundary
+//! exactly, the view share must lie between the settled rows and all rows
+//! since the boundary, and first/last `created_at` likewise.
+//!
+//! The approximate distinct pubkeys are compared with **exact** counts for a
+//! sample of kinds (the largest by events and a seeded random choice of the
+//! rest, `--pubkeys-kinds`, within `--pubkeys-max-exact`): one bounded scan
+//! (`PREWHERE kind IN (...)`) counts the distinct pubkeys first indexed before
+//! the cutoff, before the boundary, and in total. The estimate must lie in
+//! `[settled, total]` within `max(--pubkeys-sigmas` standard errors`, 2)`, and
+//! the backfill rows' estimate within the same tolerance of the exact count
+//! before the boundary. (Until migration 021 the comparison was with the
+//! hourly `kinds_stats_mv` snapshot, which fast-moving kinds outran, and it
+//! stopped once the 020 cutover dropped that view.)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
@@ -43,13 +54,15 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::derived::{
-    CUTOVER_JOIN_SETTINGS, FlagRule, Grain, KINDS_TABLE, NEVER, OLD_KINDS_VIEW,
-    RELAY_DISTRIBUTION_VIEW, RELAY_LISTS_TABLE, RELAY_TAGS_EXPR, RelaySource, USER_FLAG_LOOKUPS,
-    USER_FLAGS_TABLE, active_users_select_sql, relay_distribution_select_sql,
+    CUTOVER_JOIN_SETTINGS, FlagRule, Grain, KINDS_TABLE, NEVER, RELAY_DISTRIBUTION_VIEW,
+    RELAY_LISTS_TABLE, RELAY_TAGS_EXPR, RelaySource, USER_FLAG_LOOKUPS, USER_FLAGS_TABLE,
+    active_users_select_sql, relay_distribution_select_sql,
 };
 use super::plan::Plan;
 use super::validate::{
-    Ctx, Outcome, TargetReport, classify_count, id_range_predicate, placeholders, seeded_id_range,
+    Ctx, Outcome, SKETCH_EXACT_UP_TO, SKETCH_RELATIVE_ERROR, SKETCH_SLACK, TargetReport,
+    classify_count, classify_shares, id_range_predicate, placeholders, seeded_id_range,
+    sketch_error, sketch_tolerance,
 };
 use super::{EXCLUDED_PUBLISHER_KINDS, Target, ops};
 
@@ -758,12 +771,22 @@ async fn distribution_comparison(ctx: &Ctx<'_>, report: &mut TargetReport) -> Re
 // Kinds
 // ---------------------------------------------------------------------------
 
-/// Per-kind facts from a scan of `events_local`.
+/// Per-kind facts from one scan of `events_local`, run after the rollup was
+/// read.
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
 struct KindScan {
     kind: u16,
+    /// Rows indexed before the view boundary.
     before: u64,
+    /// Rows indexed before the cutoff: committed, with their view rows,
+    /// before the rollup was read.
+    settled: u64,
+    /// Every row at the scan.
     total: u64,
+    /// Earliest / latest `created_at` of the settled rows (0 when none).
+    settled_first: u32,
+    settled_last: u32,
+    /// Earliest / latest `created_at` of every row.
     first: u32,
     last: u32,
 }
@@ -774,73 +797,83 @@ struct KindRollup {
     kind: u16,
     backfill: u64,
     view: u64,
+    /// Approximate distinct pubkeys, both origins.
     pubkeys: u64,
+    /// Approximate distinct pubkeys of the backfill rows.
+    backfill_pubkeys: u64,
     first: u32,
     last: u32,
 }
+
+/// Exact distinct pubkeys of one kind (on 128-bit pubkey hashes), split like
+/// [`KindScan`].
+#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+struct ExactPubkeys {
+    kind: u16,
+    total: u64,
+    settled: u64,
+    before: u64,
+}
+
+/// `log_comment` of the exact distinct-pubkeys scan.
+pub const UNIQUE_PUBKEYS_LOG_COMMENT: &str = "api-rollups:validate:kinds:unique-pubkeys";
 
 async fn kind_scan(ctx: &Ctx<'_>, boundary: u32) -> Result<BTreeMap<u16, KindScan>> {
     let rows: Vec<KindScan> = ctx
         .client
         .query(&format!(
-            "SELECT kind, countIf(indexed_at < toDateTime(?)) AS before, count() AS total, \
+            "SELECT kind, countIf(indexed_at < toDateTime(?)) AS before, \
+             countIf(indexed_at < toDateTime(?)) AS settled, count() AS total, \
+             toUInt32(minIf(created_at, indexed_at < toDateTime(?))) AS settled_first, \
+             toUInt32(maxIf(created_at, indexed_at < toDateTime(?))) AS settled_last, \
              toUInt32(min(created_at)) AS first, toUInt32(max(created_at)) AS last \
              FROM {}.events_local GROUP BY kind",
             ctx.db
         ))
         .bind(boundary)
+        .bind(ctx.cutoff)
+        .bind(ctx.cutoff)
+        .bind(ctx.cutoff)
         .fetch_all()
         .await
         .context("scanning events_local by kind")?;
     Ok(rows.into_iter().map(|r| (r.kind, r)).collect())
 }
 
-/// Compare one kind's rollup with the scans before (`a`) and after (`b`) it.
-fn compare_kind(
-    rollup: &KindRollup,
-    a: &KindScan,
-    b: &KindScan,
-    has_boundary: bool,
-) -> (Outcome, String) {
+/// Compare one kind's rollup with the scan that followed it.
+fn compare_kind(rollup: &KindRollup, scan: &KindScan, has_boundary: bool) -> (Outcome, String) {
     let detail = format!(
         "rollup backfill {} + view {}, first {} last {}; source before boundary {}, \
-         total {}..{}, first {}..{} last {}..{}",
+         settled {}, total {}, first {}..{} last {}..{}",
         rollup.backfill,
         rollup.view,
         rollup.first,
         rollup.last,
-        a.before,
-        a.total,
-        b.total,
-        b.first,
-        a.first,
-        a.last,
-        b.last
+        scan.before,
+        scan.settled,
+        scan.total,
+        scan.first,
+        scan.settled_first,
+        scan.settled_last,
+        scan.last
     );
-    let since_lo = a.total.saturating_sub(a.before);
-    let since_hi = b.total.saturating_sub(a.before);
-    let outcome = if has_boundary && rollup.backfill < a.before {
-        Outcome::Missing
-    } else if has_boundary && rollup.backfill > a.before {
-        Outcome::Excess
-    } else if has_boundary && rollup.view < since_lo {
-        Outcome::Missing
-    } else if has_boundary && rollup.view > since_hi {
-        Outcome::Excess
-    } else if !has_boundary && rollup.backfill + rollup.view < a.total {
-        Outcome::Missing
-    } else if !has_boundary && rollup.backfill + rollup.view > b.total {
-        Outcome::Excess
-    } else if !(b.first <= rollup.first
-        && rollup.first <= a.first
-        && a.last <= rollup.last
-        && rollup.last <= b.last)
-    {
-        Outcome::Mismatch
+    let outcome = classify_shares(
+        rollup.backfill,
+        rollup.view,
+        scan.before,
+        scan.settled,
+        scan.total,
+        has_boundary,
+    );
+    let times = scan.first <= rollup.first
+        && rollup.first <= scan.settled_first
+        && scan.settled_last <= rollup.last
+        && rollup.last <= scan.last;
+    if outcome == Outcome::Match && !times {
+        (Outcome::Mismatch, detail)
     } else {
-        Outcome::Match
-    };
-    (outcome, detail)
+        (outcome, detail)
+    }
 }
 
 pub(super) async fn kinds(ctx: &Ctx<'_>, plan: Option<&Plan>) -> Result<TargetReport> {
@@ -856,123 +889,325 @@ pub(super) async fn kinds(ctx: &Ctx<'_>, plan: Option<&Plan>) -> Result<TargetRe
             .push("no kinds plan found: only totals compared (no backfill/view split)".to_string()),
     }
 
-    // Scan, rollup, scan again: the rollup lies between the two scans.
-    let first = kind_scan(ctx, boundary.unwrap_or(0)).await?;
+    // Rollup, then one scan: rows indexed before the cutoff are certainly in
+    // the rollup, rows the scan sees are a superset of it.
     let rollup: Vec<KindRollup> = ctx
         .client
         .query(&format!(
-            "SELECT kind, sumIf(event_count, origin = 'backfill') AS backfill, \
-             sumIf(event_count, origin = 'view') AS view, \
-             uniqCombined64Merge(pubkeys) AS pubkeys, \
-             toUInt32(min(first_created_at)) AS first, toUInt32(max(last_created_at)) AS last \
-             FROM {db}.{KINDS_TABLE} GROUP BY kind"
+            "SELECT t.kind AS kind, sumIf(t.event_count, t.origin = 'backfill') AS backfill, \
+             sumIf(t.event_count, t.origin = 'view') AS view, \
+             uniqCombined64Merge(t.pubkeys) AS pubkeys, \
+             uniqCombined64MergeIf(t.pubkeys, t.origin = 'backfill') AS backfill_pubkeys, \
+             toUInt32(min(t.first_created_at)) AS first, \
+             toUInt32(max(t.last_created_at)) AS last \
+             FROM {db}.{KINDS_TABLE} AS t GROUP BY t.kind"
         ))
         .fetch_all()
         .await
         .context("reading kind_totals")?;
-    let second = kind_scan(ctx, boundary.unwrap_or(0)).await?;
-    report.source_has_rows = !first.is_empty();
+    let scan = kind_scan(ctx, boundary.unwrap_or(0)).await?;
+    report.source_has_rows = !scan.is_empty();
     let rollup: BTreeMap<u16, KindRollup> = rollup.into_iter().map(|r| (r.kind, r)).collect();
 
-    let kinds: BTreeSet<u16> = first
-        .keys()
-        .chain(second.keys())
-        .chain(rollup.keys())
-        .copied()
-        .collect();
+    let kinds: BTreeSet<u16> = scan.keys().chain(rollup.keys()).copied().collect();
     report.sampled = kinds.len();
     for kind in kinds {
         let label = format!("kind {kind}");
-        let (outcome, detail) = match (rollup.get(&kind), first.get(&kind), second.get(&kind)) {
-            (Some(r), Some(a), Some(b)) => compare_kind(r, a, b, boundary.is_some()),
-            // New in the second scan only: committed after the rollup was read
-            // or with it; it can only be compared once it is in both scans.
-            (_, None, Some(_)) => {
+        let (outcome, detail) = match (rollup.get(&kind), scan.get(&kind)) {
+            // Only rows indexed after the cutoff: they may or may not have
+            // been in the rollup when it was read.
+            (_, Some(s)) if s.settled == 0 => {
                 report.skipped_fresh += 1;
                 continue;
             }
-            (None, Some(a), _) => (
+            (Some(r), Some(s)) => compare_kind(r, s, boundary.is_some()),
+            (None, Some(s)) => (
                 Outcome::Missing,
-                format!("no kind_totals row; source has {} rows", a.total),
+                format!("no kind_totals row; source has {} rows", s.total),
             ),
-            (Some(r), _, None) => (
+            (Some(r), None) => (
                 Outcome::Excess,
                 format!(
                     "kind_totals counts {} events the source does not have",
                     r.backfill + r.view
                 ),
             ),
-            (None, None, None) => continue,
+            (None, None) => continue,
         };
         report.compared += 1;
         report.record(&label, outcome, detail, o.max_examples);
     }
 
-    // Approximate distinct pubkeys against the exact pre-020 values.
-    if ops::table_created_at(ctx.client, db, OLD_KINDS_VIEW)
-        .await?
-        .is_some()
-    {
-        let exact: Vec<(u16, u64)> = ctx
-            .client
-            .query(&format!(
-                "SELECT kind, unique_pubkeys FROM {db}.{OLD_KINDS_VIEW} FINAL"
-            ))
-            .fetch_all()
-            .await
-            .context("reading kinds_stats_mv")?;
-        let mut worst: Option<(f64, u16, u64, u64)> = None;
-        let mut compared = 0;
-        for (kind, exact) in exact {
-            let Some(r) = rollup.get(&kind) else { continue };
-            compared += 1;
-            let diff = r.pubkeys.abs_diff(exact);
-            let allowed = ((exact as f64) * o.pubkeys_tolerance_pct / 100.0).max(10.0);
-            if exact >= 1000 {
-                let rel = diff as f64 / exact as f64 * 100.0;
-                if worst.is_none_or(|(w, ..)| rel > w) {
-                    worst = Some((rel, kind, r.pubkeys, exact));
-                }
-            }
-            if diff as f64 > allowed {
-                report.record(
-                    &format!("kind {kind} pubkeys"),
-                    Outcome::Mismatch,
-                    format!(
-                        "approximate {} vs exact {exact} (kinds_stats_mv, up to an hour old): \
-                         beyond {}%",
-                        r.pubkeys, o.pubkeys_tolerance_pct
-                    ),
-                    o.max_examples,
-                );
-            }
-        }
-        report.notes.push(format!(
-            "unique_pubkeys of {compared} kinds compared with kinds_stats_mv (exact, refreshed \
-             hourly){}",
-            worst.map_or_else(String::new, |(rel, kind, approx, exact)| format!(
-                "; largest error {rel:.3}% at kind {kind} ({approx} vs {exact})"
-            ))
-        ));
-    } else {
-        report.notes.push(
-            "kinds_stats_mv does not exist (cutover done): unique_pubkeys not compared".to_string(),
-        );
-    }
+    unique_pubkeys(ctx, &rollup, boundary, &mut report).await?;
     Ok(report)
+}
+
+/// A kind's size, for choosing the exact distinct-pubkeys sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KindSize {
+    pub(super) kind: u16,
+    pub(super) events: u64,
+    pub(super) pubkeys: u64,
+}
+
+/// Kinds chosen for an exact comparison.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct KindSample {
+    /// Kinds to compare.
+    pub(super) kinds: Vec<u16>,
+    /// Largest kinds left out for exceeding the size cap.
+    pub(super) too_large: Vec<u16>,
+}
+
+/// `n` kinds: the larger half the largest by events, the rest a seeded
+/// random choice of the others, both within `max_pubkeys` approximate
+/// pubkeys; plus `extra` regardless of size.
+pub(super) fn pubkey_sample(
+    sizes: &[KindSize],
+    n: usize,
+    max_pubkeys: u64,
+    seed: u64,
+    extra: &[u16],
+) -> KindSample {
+    let mut by_events: Vec<&KindSize> = sizes.iter().collect();
+    by_events.sort_by(|a, b| b.events.cmp(&a.events).then(a.kind.cmp(&b.kind)));
+    let mut sample = KindSample::default();
+    for k in &by_events {
+        if sample.kinds.len() >= n.div_ceil(2) {
+            break;
+        }
+        if k.pubkeys > max_pubkeys {
+            sample.too_large.push(k.kind);
+        } else {
+            sample.kinds.push(k.kind);
+        }
+    }
+    let mut rest: Vec<&KindSize> = by_events
+        .into_iter()
+        .filter(|k| k.pubkeys <= max_pubkeys && !sample.kinds.contains(&k.kind))
+        .collect();
+    rest.sort_by_key(|k| (seeded_order(seed, k.kind), k.kind));
+    let wanted = n.saturating_sub(sample.kinds.len());
+    sample
+        .kinds
+        .extend(rest.into_iter().take(wanted).map(|k| k.kind));
+    for kind in extra {
+        if !sample.kinds.contains(kind) {
+            sample.kinds.push(*kind);
+        }
+    }
+    sample
+}
+
+/// A deterministic pseudo-random order of kinds for a seed (splitmix64).
+pub(super) fn seeded_order(seed: u64, kind: u16) -> u64 {
+    let mut x = (seed ^ u64::from(kind)).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// The largest relative sketch error seen: (error / exact, key, estimate,
+/// exact lower bound, exact upper bound).
+pub(super) type Worst = Option<(f64, String, u64, u64, u64)>;
+
+/// Remember the comparison if its relative error is the largest so far.
+pub(super) fn track_worst(worst: &mut Worst, key: String, approx: u64, lo: u64, hi: u64) {
+    let rel = sketch_error(approx, lo, hi) as f64 / hi.max(1) as f64;
+    if worst.as_ref().is_none_or(|(w, ..)| rel > *w) {
+        *worst = Some((rel, key, approx, lo, hi));
+    }
+}
+
+/// Text for the largest error.
+pub(super) fn describe_worst(worst: &Worst) -> String {
+    worst.as_ref().map_or_else(
+        || "none".to_string(),
+        |(rel, key, approx, lo, hi)| {
+            let exact = if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}..{hi}")
+            };
+            format!(
+                "{:.3}% at {key} (approximate {approx}, exact {exact})",
+                rel * 100.0
+            )
+        },
+    )
+}
+
+/// Compare `kind_totals`' approximate distinct pubkeys with exact counts for
+/// a sample of kinds. One bounded scan: `PREWHERE kind IN (sample)` reads the
+/// `kind` column of the whole table, then `pubkey` and `indexed_at` of the
+/// granules holding a sampled kind (nearly every granule once a large kind is
+/// sampled), keeping one 128-bit hash and the first `indexed_at` per (kind,
+/// pubkey). The rollup was read before the scan, so its sketch lies between
+/// the pubkeys first indexed before the cutoff and all pubkeys at the scan;
+/// the backfill rows' sketch is compared with the pubkeys indexed before the
+/// boundary exactly.
+async fn unique_pubkeys(
+    ctx: &Ctx<'_>,
+    rollup: &BTreeMap<u16, KindRollup>,
+    boundary: Option<u32>,
+    report: &mut TargetReport,
+) -> Result<()> {
+    let (db, o) = (ctx.db, ctx.options);
+    let sizes: Vec<KindSize> = rollup
+        .values()
+        .map(|r| KindSize {
+            kind: r.kind,
+            events: r.backfill + r.view,
+            pubkeys: r.pubkeys,
+        })
+        .collect();
+    let sample = pubkey_sample(
+        &sizes,
+        o.pubkeys_kinds,
+        o.pubkeys_max_exact,
+        o.seed,
+        &o.pubkeys_extra_kinds,
+    );
+    report.skipped_heavy += sample.too_large.len();
+    if sample.kinds.is_empty() {
+        report
+            .notes
+            .push("unique_pubkeys not compared (no kinds sampled)".to_string());
+        return Ok(());
+    }
+    let list = sample
+        .kinds
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let exact: Vec<ExactPubkeys> = ctx
+        .client
+        .query(&format!(
+            "SELECT kind, count() AS total, countIf(first_indexed < toDateTime(?)) AS settled, \
+             countIf(first_indexed < toDateTime(?)) AS before \
+             FROM ( \
+             SELECT kind, sipHash128(pubkey) AS key, min(indexed_at) AS first_indexed \
+             FROM {db}.events_local PREWHERE kind IN ({list}) \
+             GROUP BY kind, key \
+             ) \
+             GROUP BY kind"
+        ))
+        .bind(ctx.cutoff)
+        .bind(boundary.unwrap_or(0))
+        .with_option("log_comment", UNIQUE_PUBKEYS_LOG_COMMENT)
+        .fetch_all()
+        .await
+        .context("counting exact distinct pubkeys of the sampled kinds")?;
+    let exact: BTreeMap<u16, &ExactPubkeys> = exact.iter().map(|e| (e.kind, e)).collect();
+
+    let (mut worst, mut worst_backfill): (Worst, Worst) = (None, None);
+    for kind in &sample.kinds {
+        let Some(r) = rollup.get(kind) else {
+            // A requested kind without rollup rows: the count check above
+            // already reports it if the source has rows.
+            continue;
+        };
+        let (total, settled, before) = exact
+            .get(kind)
+            .map_or((0, 0, 0), |e| (e.total, e.settled, e.before));
+        let error = sketch_error(r.pubkeys, settled, total);
+        let allowed = sketch_tolerance(total, o.pubkeys_sigmas);
+        track_worst(
+            &mut worst,
+            format!("kind {kind}"),
+            r.pubkeys,
+            settled,
+            total,
+        );
+        report.record(
+            &format!("kind {kind} unique_pubkeys"),
+            if error > allowed {
+                Outcome::Mismatch
+            } else {
+                Outcome::Match
+            },
+            format!(
+                "approximate {} vs exact {settled} (first indexed before the cutoff) .. {total} \
+                 (after the rollup read): error {error}, allowed {allowed}",
+                r.pubkeys
+            ),
+            o.max_examples,
+        );
+        if boundary.is_some() {
+            let error = r.backfill_pubkeys.abs_diff(before);
+            let allowed = sketch_tolerance(before, o.pubkeys_sigmas);
+            track_worst(
+                &mut worst_backfill,
+                format!("kind {kind}"),
+                r.backfill_pubkeys,
+                before,
+                before,
+            );
+            report.record(
+                &format!("kind {kind} unique_pubkeys (backfill share)"),
+                if error > allowed {
+                    Outcome::Mismatch
+                } else {
+                    Outcome::Match
+                },
+                format!(
+                    "approximate {} vs exact {before} (indexed before the boundary): error \
+                     {error}, allowed {allowed}",
+                    r.backfill_pubkeys
+                ),
+                o.max_examples,
+            );
+        }
+    }
+    report.notes.push(format!(
+        "unique_pubkeys of {} kinds ({list}) compared with exact counts (first indexed before \
+         the cutoff .. after the rollup read), allowed max({} x {:.4}%, {SKETCH_SLACK}) above \
+         {SKETCH_EXACT_UP_TO} values, else {SKETCH_SLACK}: largest error {}{}{}",
+        sample.kinds.len(),
+        o.pubkeys_sigmas,
+        SKETCH_RELATIVE_ERROR * 100.0,
+        describe_worst(&worst),
+        if boundary.is_some() {
+            format!(
+                "; backfill share largest error {}",
+                describe_worst(&worst_backfill)
+            )
+        } else {
+            String::new()
+        },
+        if sample.too_large.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; kinds above --pubkeys-max-exact {} left out: {:?}",
+                o.pubkeys_max_exact, sample.too_large
+            )
+        }
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scan(before: u64, total: u64, first: u32, last: u32) -> KindScan {
+    fn scan(
+        before: u64,
+        settled: u64,
+        total: u64,
+        first: (u32, u32),
+        last: (u32, u32),
+    ) -> KindScan {
         KindScan {
             kind: 1,
             before,
+            settled,
             total,
-            first,
-            last,
+            first: first.0,
+            settled_first: first.1,
+            settled_last: last.0,
+            last: last.1,
         }
     }
 
@@ -982,16 +1217,18 @@ mod tests {
             backfill,
             view,
             pubkeys: 0,
+            backfill_pubkeys: 0,
             first,
             last,
         }
     }
 
     #[test]
-    fn kind_shares_are_bounded_by_the_two_scans() {
-        let a = scan(100, 150, 10, 90);
-        let b = scan(100, 160, 5, 95);
-        let check = |r: KindRollup| compare_kind(&r, &a, &b, true).0;
+    fn kind_shares_are_bounded_by_the_cutoff_and_the_scan() {
+        // 100 rows before the boundary, 150 settled, 160 at the scan; first
+        // created_at 10 among the settled rows, 5 overall; last 90 / 95.
+        let s = scan(100, 150, 160, (5, 10), (90, 95));
+        let check = |r: KindRollup| compare_kind(&r, &s, true).0;
         assert_eq!(check(rollup(100, 50, 10, 90)), Outcome::Match);
         assert_eq!(check(rollup(100, 60, 5, 95)), Outcome::Match);
         assert_eq!(check(rollup(99, 50, 10, 90)), Outcome::Missing);
@@ -1002,13 +1239,51 @@ mod tests {
         assert_eq!(check(rollup(100, 50, 10, 96)), Outcome::Mismatch);
         // Without a plan only the total is bounded.
         assert_eq!(
-            compare_kind(&rollup(0, 155, 10, 90), &a, &b, false).0,
+            compare_kind(&rollup(0, 155, 10, 90), &s, false).0,
             Outcome::Match
         );
         assert_eq!(
-            compare_kind(&rollup(0, 149, 10, 90), &a, &b, false).0,
+            compare_kind(&rollup(0, 149, 10, 90), &s, false).0,
             Outcome::Missing
         );
+    }
+
+    fn size(kind: u16, events: u64, pubkeys: u64) -> KindSize {
+        KindSize {
+            kind,
+            events,
+            pubkeys,
+        }
+    }
+
+    #[test]
+    fn pubkey_sample_takes_large_and_random_kinds_within_the_cap() {
+        let sizes = [
+            size(1059, 900, 900),
+            size(1, 800, 50),
+            size(7, 700, 40),
+            size(3, 600, 30),
+            size(20001, 10, 5),
+            size(30023, 9, 3),
+            size(4, 8, 2),
+            size(5, 7, 1),
+        ];
+        let sample = pubkey_sample(&sizes, 4, 100, 19, &[]);
+        assert_eq!(sample.too_large, vec![1059]);
+        assert_eq!(&sample.kinds[..2], &[1, 7]);
+        assert_eq!(sample.kinds.len(), 4);
+        assert!(!sample.kinds.contains(&1059));
+        // Deterministic for a seed; extras are added even above the cap.
+        assert_eq!(pubkey_sample(&sizes, 4, 100, 19, &[]), sample);
+        let with_extra = pubkey_sample(&sizes, 4, 100, 19, &[1059, 1]);
+        assert_eq!(with_extra.kinds.len(), 5);
+        assert_eq!(with_extra.kinds.last(), Some(&1059));
+        assert!(pubkey_sample(&sizes, 0, 100, 19, &[]).kinds.is_empty());
+        assert_eq!(pubkey_sample(&sizes, 100, 100, 19, &[]).kinds.len(), 7);
+        let mut worst = None;
+        track_worst(&mut worst, "kind 1".into(), 105, 90, 100);
+        track_worst(&mut worst, "kind 7".into(), 95, 90, 100);
+        assert!(describe_worst(&worst).starts_with("5.000% at kind 1"));
     }
 
     fn version(pubkey: &str, id: &str, created_at: u32) -> ListVersion {

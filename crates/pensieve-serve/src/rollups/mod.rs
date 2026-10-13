@@ -21,21 +21,31 @@
 //! - `kind_totals`: per-kind event counts, approximate distinct pubkeys and
 //!   first/last `created_at`, replacing the hourly `kinds_stats_mv` rescan.
 //!
+//! **Migration 021** (`docs/migrations/prepared/021_kind_activity.sql`) moves
+//! `/api/v1/kinds/{kind}` and `/api/v1/kinds/{kind}/activity` off scans of
+//! `events_local` by kind:
+//!
+//! - `kind_activity`: per kind and UTC hour (last 35 days), day and month of
+//!   `created_at`, the event count and content bytes (sums, exactly once) and
+//!   a `uniqCombined64` sketch of the authors (see [`kind_activity`]).
+//!
 //! This module holds the SQL shared by the API reads and the `api-rollups`
 //! operator tool (plan, backfill, status, validate, cutover). The backfill
 //! `SELECT` bodies must stay equivalent to the views in the migrations; the
-//! integration tests in `tests/api_rollups.rs` and `tests/derived_views.rs`
-//! insert the same events through both paths and compare. See
-//! `docs/api_rollups.md`.
+//! integration tests in `tests/api_rollups.rs`, `tests/derived_views.rs` and
+//! `tests/kind_activity.rs` insert the same events through both paths and
+//! compare. See `docs/api_rollups.md`.
 
 pub mod backfill;
 pub mod cutover;
 pub mod derived;
+pub mod kind_activity;
 pub mod ops;
 pub mod plan;
 pub mod status;
 pub mod validate;
 mod validate_derived;
+mod validate_kind_activity;
 
 use std::fmt;
 
@@ -129,16 +139,20 @@ pub enum Target {
     RelayLists,
     /// `kind_totals`: per-kind counts, approximate pubkeys, first/last (020).
     Kinds,
+    /// `kind_activity`: per kind and hour/day/month counts, content bytes and
+    /// approximate pubkeys (021).
+    KindActivity,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Publishers,
         Self::Longform,
         Self::UserFlags,
         Self::RelayLists,
         Self::Kinds,
+        Self::KindActivity,
     ];
 
     /// Targets created by migration 019.
@@ -146,6 +160,9 @@ impl Target {
 
     /// Targets created by migration 020.
     pub const MIGRATION_020: [Self; 3] = [Self::UserFlags, Self::RelayLists, Self::Kinds];
+
+    /// Targets created by migration 021.
+    pub const MIGRATION_021: [Self; 1] = [Self::KindActivity];
 
     /// Short stable name used in paths and logs.
     pub fn name(self) -> &'static str {
@@ -155,6 +172,7 @@ impl Target {
             Self::UserFlags => "user-flags",
             Self::RelayLists => "relay-lists",
             Self::Kinds => "kinds",
+            Self::KindActivity => "kind-activity",
         }
     }
 
@@ -166,6 +184,7 @@ impl Target {
             Self::UserFlags => derived::USER_FLAGS_TABLE,
             Self::RelayLists => derived::RELAY_LISTS_TABLE,
             Self::Kinds => derived::KINDS_TABLE,
+            Self::KindActivity => kind_activity::KIND_ACTIVITY_TABLE,
         }
     }
 
@@ -177,6 +196,7 @@ impl Target {
             Self::UserFlags => derived::USER_FLAGS_VIEW,
             Self::RelayLists => derived::RELAY_LISTS_VIEW,
             Self::Kinds => derived::KINDS_VIEW,
+            Self::KindActivity => kind_activity::KIND_ACTIVITY_VIEW,
         }
     }
 
@@ -189,14 +209,16 @@ impl Target {
             Self::UserFlags | Self::RelayLists | Self::Kinds => {
                 "docs/migrations/prepared/020_incremental_derived_views.sql"
             }
+            Self::KindActivity => "docs/migrations/prepared/021_kind_activity.sql",
         }
     }
 
-    /// Whether re-inserting a source row changes the target. Publisher and
-    /// kind counts are sums, so each source row must be written exactly once;
-    /// the other targets hold `argMin`/`min`/`max` states and are idempotent.
+    /// Whether re-inserting a source row changes the target. Publisher, kind
+    /// and kind activity counts are sums, so each source row must be written
+    /// exactly once; the other targets hold `argMin`/`min`/`max` states and
+    /// are idempotent.
     pub fn is_additive(self) -> bool {
-        matches!(self, Self::Publishers | Self::Kinds)
+        matches!(self, Self::Publishers | Self::Kinds | Self::KindActivity)
     }
 
     /// Tables the backfill reads.
@@ -230,6 +252,14 @@ impl Target {
             ],
             Self::UserFlags => &["pubkey"],
             Self::RelayLists => &["id", "pubkey", "kind", "created_at", "indexed_at", "tags"],
+            Self::KindActivity => &[
+                "id",
+                "pubkey",
+                "kind",
+                "created_at",
+                "indexed_at",
+                "content",
+            ],
         }
     }
 
@@ -245,6 +275,10 @@ impl Target {
             Self::RelayLists => "pubkey, latest, last_indexed_at",
             Self::Kinds => {
                 "kind, origin, event_count, pubkeys, first_created_at, last_created_at, \
+                 live_min_indexed_at, last_indexed_at"
+            }
+            Self::KindActivity => {
+                "kind, grain, period, origin, event_count, content_bytes, pubkeys, \
                  live_min_indexed_at, last_indexed_at"
             }
         }
@@ -303,6 +337,13 @@ impl Target {
                     .indexed_before
                     .expect("kinds backfill needs a view boundary"),
             ),
+            Self::KindActivity => kind_activity::backfill_select_sql(
+                database,
+                range_predicate,
+                bounds
+                    .indexed_before
+                    .expect("kind activity backfill needs a view boundary"),
+            ),
         }
     }
 
@@ -323,7 +364,7 @@ impl Target {
             Self::Longform => "kind = 30023".to_string(),
             Self::UserFlags => "1".to_string(),
             Self::RelayLists => "kind = 10002".to_string(),
-            Self::Kinds => before.unwrap_or_else(|| "1".to_string()),
+            Self::Kinds | Self::KindActivity => before.unwrap_or_else(|| "1".to_string()),
         }
     }
 
@@ -569,9 +610,14 @@ mod tests {
             let sample = target.sample_count_sql("scratch", &range, &bounds());
             assert!(!sample.contains('?') && sample.contains(&range), "{sample}");
         }
-        assert_eq!(Target::ALL.len(), 5);
+        assert_eq!(Target::ALL.len(), 6);
         assert_eq!(
-            [Target::MIGRATION_019.as_slice(), &Target::MIGRATION_020].concat(),
+            [
+                Target::MIGRATION_019.as_slice(),
+                &Target::MIGRATION_020,
+                &Target::MIGRATION_021
+            ]
+            .concat(),
             Target::ALL
         );
     }
@@ -591,6 +637,14 @@ mod tests {
             "indexed_at < toDateTime(1700000000)"
         );
         assert!(Target::Kinds.is_additive() && Target::Publishers.is_additive());
+        assert!(Target::KindActivity.is_additive());
+        let sql = Target::KindActivity.backfill_sql("db", "1", &bounds());
+        assert!(sql.contains("indexed_at < toDateTime(1700000000)"));
+        assert!(sql.contains("content_bytes"));
+        assert_eq!(
+            Target::KindActivity.source_filter(&bounds()),
+            "indexed_at < toDateTime(1700000000)"
+        );
         for target in [Target::Longform, Target::UserFlags, Target::RelayLists] {
             assert!(!target.is_additive());
         }

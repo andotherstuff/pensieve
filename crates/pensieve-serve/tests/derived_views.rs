@@ -1073,11 +1073,7 @@ async fn kinds_backfill_counts_each_row_exactly_once_around_the_view_boundary() 
         expected_kinds(&rows)
     );
 
-    // validate: exact shares, and unique pubkeys against kinds_stats_mv.
-    let since = db.now().await;
-    db.exec(&format!("SYSTEM REFRESH VIEW {}.kinds_stats_mv", db.name))
-        .await;
-    db.wait_refreshed("kinds_stats_mv", since).await;
+    // validate: exact shares, and unique pubkeys against exact counts.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let report = validate::run_with(
         &db.client,

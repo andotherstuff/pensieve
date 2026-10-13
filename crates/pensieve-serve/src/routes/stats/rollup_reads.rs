@@ -3,7 +3,9 @@
 //! - `/stats/publishers` and `/stats/longform` from migration 019's
 //!   `publisher_activity` and `longform_latest`;
 //! - `/kinds`, `/stats/kinds/total` and `/stats/events/earliest` (and the
-//!   overview) from migration 020's `kind_totals`.
+//!   overview) from migration 020's `kind_totals`;
+//! - `/kinds/{kind}` from `kind_totals` and migration 021's `kind_activity`,
+//!   and `/kinds/{kind}/activity` from `kind_activity`.
 //!
 //! These endpoints used to scan `events_local` (or read the hourly
 //! `kinds_stats_mv` rescan). When a rollup table does not exist (migration not
@@ -17,10 +19,13 @@ use serde::Deserialize;
 use super::{LongformStats, PublisherRow};
 use crate::error::ApiError;
 use crate::rollups::derived::{KindsSort, earliest_event_sql, kinds_list_sql, total_kinds_sql};
+use crate::rollups::kind_activity::{
+    SeriesGrain, average_content_length, kind_detail_sql, kind_series_sql,
+};
 use crate::rollups::{
     PublisherParamError, is_unknown_table, longform_sql, publisher_params, publishers_sql,
 };
-use crate::routes::kinds::KindSummary;
+use crate::routes::kinds::{KindDetail, KindSummary, KindTimeSeriesRow};
 use crate::state::AppState;
 
 /// Map a missing rollup table to `503 metric_unavailable`.
@@ -30,7 +35,8 @@ fn missing_rollup_is_unavailable(error: ApiError) -> ApiError {
             tracing::warn!(
                 error = %inner,
                 "rollup table missing; apply docs/migrations/prepared/019_api_publishers_longform.sql \
-                 (publishers, longform) or 020_incremental_derived_views.sql (kinds)"
+                 (publishers, longform), 020_incremental_derived_views.sql (kinds) or \
+                 021_kind_activity.sql (kind detail and activity)"
             );
             ApiError::MetricUnavailable
         }
@@ -126,6 +132,64 @@ pub(super) async fn fetch_rollup_earliest_event(state: &AppState) -> Result<u32,
         .clickhouse
         .query(&earliest_event_sql())
         .fetch_one::<u32>()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+#[derive(Debug, Deserialize, Row)]
+struct KindDetailRow {
+    kind: u16,
+    event_count: u64,
+    unique_pubkeys: u64,
+    first_seen: u32,
+    last_seen: u32,
+    events_all: u64,
+    content_bytes: u64,
+    events_24h: u64,
+    events_7d: u64,
+    events_30d: u64,
+}
+
+/// One kind's detail: totals, first/last and approximate pubkeys from
+/// `kind_totals`; average content length and the 24 h / 7 d / 30 d counts
+/// from `kind_activity`. `None` when the kind has no events.
+pub(crate) async fn fetch_kind_detail(
+    state: &AppState,
+    kind: u16,
+) -> Result<Option<KindDetail>, ApiError> {
+    let row: Option<KindDetailRow> = state
+        .clickhouse
+        .query(&kind_detail_sql())
+        .bind(kind)
+        .bind(kind)
+        .fetch_optional()
+        .await
+        .map_err(missing_rollup_is_unavailable)?;
+    Ok(row.map(|r| KindDetail {
+        kind: r.kind,
+        event_count: r.event_count,
+        unique_pubkeys: r.unique_pubkeys,
+        first_seen: r.first_seen,
+        last_seen: r.last_seen,
+        avg_content_length: average_content_length(r.content_bytes, r.events_all),
+        events_24h: r.events_24h,
+        events_7d: r.events_7d,
+        events_30d: r.events_30d,
+    }))
+}
+
+/// One kind's activity series from `kind_activity`, newest period first.
+pub(crate) async fn fetch_kind_series(
+    state: &AppState,
+    kind: u16,
+    grain: SeriesGrain,
+    limit: u32,
+) -> Result<Vec<KindTimeSeriesRow>, ApiError> {
+    state
+        .clickhouse
+        .query(&kind_series_sql(grain, limit))
+        .bind(kind)
+        .fetch_all()
         .await
         .map_err(missing_rollup_is_unavailable)
 }

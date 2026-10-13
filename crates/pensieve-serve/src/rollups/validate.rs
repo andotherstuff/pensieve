@@ -1,7 +1,8 @@
 //! Validate the rollups against a direct (slow) oracle on `events_local`.
 //!
 //! The migration 020 targets (user flags, relay lists, kinds) are validated in
-//! `validate_derived`; see its module docs.
+//! `validate_derived` and migration 021's kind activity in
+//! `validate_kind_activity`; see their module docs.
 //!
 //! **Publishers.** Pubkeys are sampled three ways: a hashed random subset of
 //! the rollup, the pubkeys of one random id-prefix slice of `events_local`
@@ -42,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use super::plan::{Plan, utc_day};
 use super::{
     ACTIVITY_AT_EXPR, ALL_KINDS, EXCLUDED_PUBLISHER_KINDS, LONGFORM_TABLE, PUBLISHER_ROLLUP_DAYS,
-    PUBLISHER_TABLE, Target, ops, validate_derived,
+    PUBLISHER_TABLE, Target, ops, validate_derived, validate_kind_activity,
 };
 
 /// Validation options.
@@ -73,9 +74,24 @@ pub struct ValidateOptions {
     pub flag_days: u32,
     /// User flags: days of `daily_user_stats` compared per sampled pubkey.
     pub user_days: u32,
-    /// Kinds: largest relative difference (percent) between the approximate
-    /// and the exact (`kinds_stats_mv`) distinct pubkeys of a kind.
-    pub pubkeys_tolerance_pct: f64,
+    /// Kinds: kinds whose approximate distinct pubkeys are compared with an
+    /// exact count from `events_local` (half the largest by events, half a
+    /// seeded random choice of the rest); 0 skips the comparison.
+    pub pubkeys_kinds: usize,
+    /// Kinds that are always compared exactly, on top of the sample (even
+    /// above `pubkeys_max_exact`).
+    pub pubkeys_extra_kinds: Vec<u16>,
+    /// Kinds: leave kinds with more approximate distinct pubkeys than this
+    /// out of the sample (the exact count holds one ~40-byte entry per
+    /// pubkey in memory, spilling to disk beyond half of `max_memory_usage`).
+    pub pubkeys_max_exact: u64,
+    /// Allowed sketch error in standard errors of `uniqCombined64` (~0.29%
+    /// of the exact count above ~4k values; exact below, with a slack of 2).
+    pub pubkeys_sigmas: f64,
+    /// Kind activity: content bytes and day sketches are recomputed for
+    /// seeded random kinds with at most this many events in total (each event
+    /// can pull one granule of `content` into the scan).
+    pub content_budget_events: u64,
 }
 
 impl Default for ValidateOptions {
@@ -93,7 +109,11 @@ impl Default for ValidateOptions {
             max_examples: 20,
             flag_days: 7,
             user_days: 3,
-            pubkeys_tolerance_pct: 2.0,
+            pubkeys_kinds: 12,
+            pubkeys_extra_kinds: Vec::new(),
+            pubkeys_max_exact: 20_000_000,
+            pubkeys_sigmas: 4.0,
+            content_budget_events: 5_000,
         }
     }
 }
@@ -287,6 +307,9 @@ pub struct ValidateInputs<'a> {
     pub publisher_plan: Option<&'a Plan>,
     /// Kinds plan: the view boundary splitting backfill and view shares.
     pub kinds_plan: Option<&'a Plan>,
+    /// Kind activity plan: the view boundary splitting backfill and view
+    /// shares.
+    pub kind_activity_plan: Option<&'a Plan>,
     /// Migration 020 cutover time (`finished_at`), when it ran.
     pub cutover_at: Option<u32>,
 }
@@ -338,6 +361,9 @@ pub async fn run_with(
             Target::UserFlags => validate_derived::user_flags(&ctx, inputs.cutover_at).await?,
             Target::RelayLists => validate_derived::relay_lists(&ctx).await?,
             Target::Kinds => validate_derived::kinds(&ctx, inputs.kinds_plan).await?,
+            Target::KindActivity => {
+                validate_kind_activity::kind_activity(&ctx, inputs.kind_activity_plan).await?
+            }
         });
     }
     Ok(ValidationReport {
@@ -457,6 +483,74 @@ pub fn classify_count(counted: u64, events: u64, rows: u64) -> Outcome {
         Outcome::DuplicateInflation
     } else {
         Outcome::Excess
+    }
+}
+
+/// Relative standard error of `uniqCombined64` at its default 2^17 registers
+/// (HyperLogLog: 1.04 / sqrt(2^17)).
+pub const SKETCH_RELATIVE_ERROR: f64 = 0.002_873;
+
+/// Distinct values up to which `uniqCombined64` keeps exact 64-bit hashes
+/// (its hash set holds up to 2^12 before switching to HyperLogLog).
+pub const SKETCH_EXACT_UP_TO: u64 = 4_096;
+
+/// Absolute slack allowed for any sketch comparison.
+pub const SKETCH_SLACK: u64 = 2;
+
+/// Largest allowed difference between a `uniqCombined64` estimate and the
+/// exact count `exact`: `max(sigmas` standard errors`, SKETCH_SLACK)`, and only
+/// the slack while the sketch is still exact.
+pub fn sketch_tolerance(exact: u64, sigmas: f64) -> u64 {
+    if exact <= SKETCH_EXACT_UP_TO {
+        SKETCH_SLACK
+    } else {
+        ((exact as f64 * SKETCH_RELATIVE_ERROR * sigmas).ceil() as u64).max(SKETCH_SLACK)
+    }
+}
+
+/// Distance of an estimate from the exact interval `[lo, hi]` (0 inside it).
+/// `lo` counts what was certainly in the rollup when it was read (indexed
+/// before the cutoff), `hi` what was certainly not added after it (counted
+/// after reading the rollup).
+pub fn sketch_error(approx: u64, lo: u64, hi: u64) -> u64 {
+    if approx < lo {
+        lo - approx
+    } else {
+        approx.saturating_sub(hi)
+    }
+}
+
+/// Classify a summed share split by the view boundary. The backfill share
+/// must equal the rows (or bytes) indexed before the boundary (`before`); the
+/// view share lies between what was settled (indexed before the cutoff,
+/// committed before the rollup was read) and everything counted after the
+/// rollup was read (`total`). Without a boundary only the sum is bounded.
+pub fn classify_shares(
+    backfill: u64,
+    view: u64,
+    before: u64,
+    settled: u64,
+    total: u64,
+    has_boundary: bool,
+) -> Outcome {
+    if has_boundary {
+        if backfill < before {
+            Outcome::Missing
+        } else if backfill > before {
+            Outcome::Excess
+        } else if view < settled.saturating_sub(before) {
+            Outcome::Missing
+        } else if view > total.saturating_sub(before) {
+            Outcome::Excess
+        } else {
+            Outcome::Match
+        }
+    } else if backfill + view < settled {
+        Outcome::Missing
+    } else if backfill + view > total {
+        Outcome::Excess
+    } else {
+        Outcome::Match
     }
 }
 
@@ -1041,6 +1135,41 @@ mod tests {
         let winners = latest_versions(&versions);
         assert_eq!(winners[&("p".into(), "a".into())].id, "b1");
         assert_eq!(winners[&("p".into(), "b".into())].id, "z");
+    }
+
+    #[test]
+    fn sketch_tolerance_is_exact_when_small_and_sigma_based_when_large() {
+        assert_eq!(sketch_tolerance(0, 4.0), SKETCH_SLACK);
+        assert_eq!(sketch_tolerance(4_096, 4.0), SKETCH_SLACK);
+        // 1M: 4 x 0.2873% = 11,492.
+        assert_eq!(sketch_tolerance(1_000_000, 4.0), 11_492);
+        assert_eq!(sketch_tolerance(10_000, 4.0), 115);
+        assert_eq!(sketch_error(100, 90, 110), 0);
+        assert_eq!(sketch_error(80, 90, 110), 10);
+        assert_eq!(sketch_error(115, 90, 110), 5);
+        // A fast-moving kind: the exact count grows while validation runs;
+        // the estimate read in between is inside the interval.
+        assert_eq!(sketch_error(1_050, 1_000, 1_100), 0);
+    }
+
+    #[test]
+    fn shares_are_split_by_the_boundary_and_bracketed_by_the_cutoff() {
+        // 100 rows before the boundary, 150 settled, 160 counted after.
+        let check = |b, v| classify_shares(b, v, 100, 150, 160, true);
+        assert_eq!(check(100, 50), Outcome::Match);
+        assert_eq!(check(100, 60), Outcome::Match);
+        assert_eq!(check(99, 50), Outcome::Missing);
+        assert_eq!(check(101, 50), Outcome::Excess);
+        assert_eq!(check(100, 49), Outcome::Missing);
+        assert_eq!(check(100, 61), Outcome::Excess);
+        assert_eq!(classify_shares(0, 155, 0, 150, 160, false), Outcome::Match);
+        assert_eq!(
+            classify_shares(0, 149, 0, 150, 160, false),
+            Outcome::Missing
+        );
+        assert_eq!(classify_shares(0, 161, 0, 150, 160, false), Outcome::Excess);
+        // A cutoff before the boundary: no lower bound on the view share.
+        assert_eq!(classify_shares(100, 0, 100, 90, 120, true), Outcome::Match);
     }
 
     #[test]

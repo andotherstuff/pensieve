@@ -93,11 +93,11 @@ pub async fn collect(
 /// Render statuses as a text table.
 pub fn render(statuses: &[TargetStatus]) -> String {
     let mut out = String::from(
-        "target       view  shards        pending  parts  rows          on disk       lag\n",
+        "target         view  shards        pending  parts  rows          on disk       lag\n",
     );
     for s in statuses {
         out.push_str(&format!(
-            "{:<12} {:<5} {:<13} {:<8} {:<6} {:<13} {:<13} {}\n",
+            "{:<14} {:<5} {:<13} {:<8} {:<6} {:<13} {:<13} {}\n",
             s.target.name(),
             if s.view_exists { "yes" } else { "no" },
             format!("{}/{}", s.shards_done, s.shards_total),

@@ -11,7 +11,8 @@
 //!   id) but whose outcome is not yet recorded;
 //! - `shards/<shard>.json`: completed shards.
 //!
-//! For additive targets (publishers, kinds) the plan also fixes the view
+//! For additive targets (publishers, kinds, kind activity) the plan also fixes
+//! the view
 //! boundary (see [`capture_boundary`]): the first second the materialized view
 //! captured.
 
@@ -52,6 +53,11 @@ const DEFAULT_RELAY_LISTS_ROW_BYTES: u64 = 300;
 /// Assumed compressed bytes per `kind_totals` row: dominated by the
 /// `uniqCombined64` sketch (up to ~96 KiB dense, tiny for rare kinds).
 const DEFAULT_KINDS_ROW_BYTES: u64 = 16 * 1024;
+
+/// Assumed compressed bytes per pre-merge `kind_activity` row: a shard sees
+/// 1/256 of each period's authors, so most sketches are small hash sets (a
+/// few hundred bytes); merged day rows of large kinds grow to ~96 KiB.
+const DEFAULT_KIND_ACTIVITY_ROW_BYTES: u64 = 512;
 
 /// Seconds a shard pauses after it by default (`backfill --delay-secs`).
 const DEFAULT_DELAY_SECS: u64 = 5;
@@ -480,6 +486,8 @@ async fn measured_bytes_per_row(client: &Client, database: &str, target: Target)
         Target::RelayLists => DEFAULT_RELAY_LISTS_ROW_BYTES,
         // Few rows, each a sketch: the view's rows say little about a shard's.
         Target::Kinds => return Ok(DEFAULT_KINDS_ROW_BYTES),
+        // Per-insert sketches say little about a shard's rows either.
+        Target::KindActivity => return Ok(DEFAULT_KIND_ACTIVITY_ROW_BYTES),
     };
     // Tiny parts are dominated by per-part overhead; only trust real volume.
     if parts.rows >= 100_000 {
@@ -565,8 +573,8 @@ impl CheckpointDir {
             if !discard_progress {
                 bail!(
                     "{} already has {done} completed and {pending} pending shard(s); pass \
-                     --discard-progress to replan (for publishers, only after truncating the \
-                     table and recreating its view)",
+                     --discard-progress to replan (for additive targets: publishers, kinds, \
+                     kind-activity, only after truncating the table and recreating its view)",
                     self.root.display()
                 );
             }
@@ -670,6 +678,12 @@ pub fn describe_plan(plan: &Plan, min_free_bytes: u64) -> String {
             "  view boundary:        indexed_at < {} (view created at {})\n\
              \x20 activity window:      day >= {} (TTL window at planning)\n",
             b.indexed_before, plan.view_created_at, b.window_start
+        ),
+        (None, Some(c), Target::KindActivity) => format!(
+            "  view boundary:        indexed_at < {c} (view created at {})\n\
+             \x20 hour rows:            hours newer than the boundary - {} days\n",
+            plan.view_created_at,
+            super::kind_activity::HOUR_ROWS_DAYS
         ),
         (None, Some(c), _) => format!(
             "  view boundary:        indexed_at < {c} (view created at {})\n",
@@ -813,6 +827,8 @@ mod tests {
         plan.target = Target::UserFlags;
         assert_eq!(plan.shard_predicate(&plan.shards[15]), "pubkey >= 'f'");
         assert!(describe_plan(&plan, 0).contains("by pubkey prefix"));
+        plan.target = Target::KindActivity;
+        assert!(describe_plan(&plan, 0).contains("hour rows:            hours newer"));
     }
 
     #[test]
