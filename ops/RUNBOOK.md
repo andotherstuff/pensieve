@@ -43,7 +43,7 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-26f2170/pensieve-ingest` (master incl. #88, #90 and #92, since 2026-10-13 14:09 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-85a2402/pensieve-ingest` (master incl. #88, #90, #92 and #94, since 2026-10-13 15:24 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -213,8 +213,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-26f2170` (current
-  ingester and worker, #92), `ingest-e73bebb` (previous ingester, #88 and #90; reads schema 10; run it
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-85a2402` (current
+  ingester, #94; runs with the `ingest-26f2170` worker), `ingest-26f2170` (previous ingester and the
+  installed worker, #92; the rollback target for `85a2402`: same worker, keep the pause flag),
+  `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
   downgrading leaves isolated reconciliation off unless `jobs.sqlite.pre-schema10` is restored),
   `ingest-ba0c4a1` (PR #72 build, with the previously installed worker) and only
@@ -1277,9 +1279,10 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-13 14:09 UTC the ingester runs
-`releases/ingest-26f2170` (master, incl. #88 lease fix, #90 relay-unavailable exclusions and #92 per-job
-pause clock, with `--isolated-negentropy-pause-on-failure-secs 7200`) and the matching worker, from
+not covered by the routine deploy above. Since 2026-10-13 15:24 UTC the ingester runs
+`releases/ingest-85a2402` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
+pause clock and #94 shrinking-set exemption, with `--isolated-negentropy-pause-on-failure-secs 7200`)
+with the `ingest-26f2170` worker (installed 14:09 UTC), from
 `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger
 (schema 10 since 2026-10-13 12:48 UTC; the schema-9 backup is `jobs.sqlite.pre-schema10` next to it);
 the worker runs continuously against Premium Primal only since 2026-10-12 15:22 UTC and is started with the ingester (`negentropy-worker.conf`); see [continuous readiness](../docs/negentropy_continuous_readiness.md#continuous-premium-primal-operation-since-2026-10-12). Expect these drop-ins to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
@@ -1431,8 +1434,8 @@ installed worker matched `releases/ingest-ba0c4a1/pensieve-negentropy-worker` (s
 saved as `pensieve-negentropy-worker.ba0c4a1`. Clean archive shutdown (final segment sealed,
 checkpoint saved). After: worker sha256 `69f4347b…`, worker `isolated fetch progress` lines show
 `requested` equal to `delivered`, `negentropy_isolated_ready 1`, `unhealthy 0`,
-`failure_pause_counted_jobs 0`, `exempt_jobs 0`. `negentropy_isolated_failure_pause` is absent
-until the first pause (it is set only on a change). Each worker process serves one job and exits,
+`failure_pause_counted_jobs 0`, `exempt_jobs 0`. `negentropy_isolated_failure_pause` was absent
+until the first pause on this build (it was set only on a change; 0 from startup since `ingest-85a2402`). Each worker process serves one job and exits,
 so on small recent windows the unit restarts every ~10 s (`RestartSec=5s`); that is normal.
 
 The release after #90 changes both binaries; the IPC version and ledger schema
@@ -1473,6 +1476,21 @@ The release after #90 changes both binaries; the IPC version and ledger schema
    the flag, `negentropy_isolated_failure_pause` is 0. Worker journal lines
    `isolated fetch progress` now carry `requested` and `delivered`.
 6. Record the release in `ops/systemd/dropins/` and the table above.
+
+**#94 deploy (2026-10-13 15:24 UTC, `ingest-85a2402`, ingester only).** Clean archive shutdown
+(final segment 31049 sealed, checkpoint saved); the `26f2170` worker and the pause flag stay;
+`negentropy_isolated_failure_pause` reads 0 from startup. A new pass over history had already
+re-enqueued job 768's window as job 1984 (first failure 15:15:39), which reported the same
+withheld `089d1fdc…6b65` and had to earn its own exclusion: `unresolved_failures` (monitor 46 red)
+from its third failure at 15:19:38 until the exclusion at attempt 7, 16:21:38 UTC; exempt from the
+pause throughout (`failure_pause_exempt_jobs 1`, `counted_jobs 0`). Every later pass would repeat
+this for each withheld event until exclusions carry forward across passes.
+
+**Rolling back `ingest-85a2402`:** point the second `ExecStart=` of `zzzz-bounded-canary.conf` back
+at `releases/ingest-26f2170/pensieve-ingest`, keep every argument including
+`--isolated-negentropy-pause-on-failure-secs 7200`, leave the installed worker alone,
+`daemon-reload` and restart with the graceful-stop checks. The recipe below goes back further
+(to the #90 build and the `ba0c4a1` worker) and is only for undoing #92.
 
 **Rollback.** Go back to `releases/ingest-e73bebb` (#88 and #90; it reads ledger
 schema 10, so the ledger stays as it is) and the saved `ba0c4a1` worker. Do not
