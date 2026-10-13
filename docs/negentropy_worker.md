@@ -67,7 +67,8 @@ exit nonzero without ProtocolDone; parent retains receipts and applies retry pol
 Exit 2 specifically means EOSE arrived without all advertised IDs (`Unavailable`).
 Before reporting it, the worker re-requests exactly the IDs of the batch that are
 still missing: always once, and again while each request delivers at least one of
-them (so at most one request per ID). A relay that caps or defaults the results of
+them. Every request but the first and the last delivers a new ID, so a batch of
+`n` IDs takes at most `n + 1` requests (129 for a full batch). A relay that caps or defaults the results of
 one REQ below the 128-ID batch therefore delivers the tail to the follow-ups, and
 only IDs that a REQ naming exactly them did not return are reported. Follow-ups use
 the same subscription verification, capture and upload path; an unrequested event

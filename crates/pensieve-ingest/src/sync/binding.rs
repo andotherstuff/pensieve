@@ -74,30 +74,69 @@ impl WorkerCandidate {
         socket: &tokio::net::UnixStream,
         worker_uid: u32,
     ) -> Result<Self, BindingError> {
-        #[cfg(test)]
-        {
-            if socket.peer_cred()?.uid() == worker_uid {
-                return Ok(Self);
-            }
-            Err(BindingError::Identity)
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (socket, worker_uid);
-            Err(BindingError::Unavailable)
-        }
+        let _ = (socket, worker_uid);
+        Err(BindingError::Unavailable)
     }
 
     /// Always fails closed on this platform.
     pub async fn recheck(&self) -> Result<Duration, BindingError> {
-        #[cfg(test)]
-        {
-            Ok(Duration::from_secs(540))
+        Err(BindingError::Unavailable)
+    }
+}
+
+/// How the isolated runtime proves an accepted socket is the dedicated worker
+/// and how long it may still serve. Production always uses [`WorkerCandidate`];
+/// the trait exists so runtime tests can bind a same-UID peer on every
+/// platform without systemd, while production checks stay unconditional.
+#[cfg(unix)]
+pub(crate) trait WorkerBinding: Sized + Send + Sync + 'static {
+    /// Authenticate the accepted socket before exporting any inventory or lease.
+    fn inspect(
+        socket: &tokio::net::UnixStream,
+        worker_uid: u32,
+    ) -> impl Future<Output = Result<Self, BindingError>> + Send;
+
+    /// Revalidate immediately before assignment; returns the usable session time.
+    fn recheck(&self) -> impl Future<Output = Result<Duration, BindingError>> + Send;
+}
+
+#[cfg(unix)]
+impl WorkerBinding for WorkerCandidate {
+    fn inspect(
+        socket: &tokio::net::UnixStream,
+        worker_uid: u32,
+    ) -> impl Future<Output = Result<Self, BindingError>> + Send {
+        WorkerCandidate::inspect(socket, worker_uid)
+    }
+
+    fn recheck(&self) -> impl Future<Output = Result<Duration, BindingError>> + Send {
+        WorkerCandidate::recheck(self)
+    }
+}
+
+/// Test-only binding: the peer's UID must equal the configured worker UID (as
+/// the real check requires first), and the service lifetime is a fixed full
+/// session. It replaces only the systemd unit, cgroup and pidfd proof, which a
+/// CI runner cannot provide; it is never compiled into a release binary.
+#[cfg(all(unix, test))]
+#[derive(Debug)]
+pub(crate) struct SameUidPeer;
+
+#[cfg(all(unix, test))]
+impl WorkerBinding for SameUidPeer {
+    async fn inspect(
+        socket: &tokio::net::UnixStream,
+        worker_uid: u32,
+    ) -> Result<Self, BindingError> {
+        if socket.peer_cred()?.uid() == worker_uid {
+            Ok(Self)
+        } else {
+            Err(BindingError::Identity)
         }
-        #[cfg(not(test))]
-        {
-            Err(BindingError::Unavailable)
-        }
+    }
+
+    async fn recheck(&self) -> Result<Duration, BindingError> {
+        Ok(Duration::from_micros(JOB_US))
     }
 }
 

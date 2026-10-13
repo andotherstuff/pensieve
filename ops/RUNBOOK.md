@@ -1303,13 +1303,19 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   completed automatically (`negentropy relay-unavailable exclusion` WARN lines; see
   [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions))
   at attempt 6 or 7 if its reports are uninterrupted (about an hour after its
-  third failure). It stays exempt through attempt 10 at most (about four hours
-  after its third failure); after that it counts like any other failure, although
-  a later exclusion can still complete it. With
-  `counted_jobs` above 0 it is a different fault. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
+  third failure). It stays exempt through attempt 10 at most (about five hours
+  after its third failure, when attempt 11 fails); after that it counts like any
+  other failure, although a later exclusion can still complete it. With
+  `counted_jobs` above 0, find out what the counted jobs are before acting. Most
+  are a different fault, but a withheld window is counted too once it is past
+  attempt 10 (its run was interrupted, or its withheld set kept changing), or
+  while it meets the rule but is held back because events it received are not yet
+  archive-confirmed (it completes once receipt maintenance confirms them). Stop
+  only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
   capture `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`
-  and the `isolated worker attempt failed` journal lines, and leave the monitor red
-  for a decision. If the ingester runs with
+  and the `isolated worker attempt failed` journal lines (a withheld window logs
+  `kind=Unavailable` with the same `missing_count` on every attempt), and leave the
+  monitor red for a decision. If the ingester runs with
   `--isolated-negentropy-pause-on-failure-secs`, the runtime stops leasing once one
   counted job has failed continuously for the grace (`isolated reconciliation
   paused leasing` in the journal); stopping the worker is then optional.
@@ -1363,6 +1369,9 @@ preflight scan.
 7. Record the new release in `ops/systemd/dropins/` and the table above.
 
 ### Rolling out relay-unavailable exclusions (ledger schema 10)
+
+**Done 2026-10-13 12:48 UTC** with `ingest-e73bebb` (#90); the steps below are kept
+as the record.
 
 The maintainer decision for job 768 (2026-10-13): a window completes, with a
 recorded proof, once its relay has reported the same fully enumerated set of
@@ -1465,9 +1474,30 @@ The release after #90 changes both binaries; the IPC version and ledger schema
    `isolated fetch progress` now carry `requested` and `delivered`.
 6. Record the release in `ops/systemd/dropins/` and the table above.
 
-Roll back by reinstalling the saved worker and pointing the drop-in at the
-previous `releases/ingest-*`; both read schema 10, so no ledger change is needed.
-Remove the pause flag when going back to a #90 build.
+**Rollback.** Go back to `releases/ingest-e73bebb` (#88 and #90; it reads ledger
+schema 10, so the ledger stays as it is) and the saved `ba0c4a1` worker. Do not
+use `ingest-b466b37`: it refuses the schema-10 ledger (see
+[rolling back](#rolling-back-relay-unavailable-exclusions)).
+
+1. Stop the worker: `sudo systemctl stop pensieve-negentropy-worker`.
+2. Reinstall the saved worker:
+   `sudo install -m 755 /usr/local/libexec/pensieve-negentropy-worker.ba0c4a1 /usr/local/libexec/pensieve-negentropy-worker`.
+3. `sudoedit /etc/systemd/system/pensieve-ingest.service.d/zzzz-bounded-canary.conf`:
+   change the second `ExecStart=` line's binary back to
+   `"/home/pensieve/pensieve/releases/ingest-e73bebb/pensieve-ingest"`, keep every
+   other argument, and remove `"--isolated-negentropy-pause-on-failure-secs"` and its
+   value: `e73bebb`'s global pause clock can pause before an exclusion lands.
+4. `sudo systemctl daemon-reload`.
+5. Restart the ingester with the graceful-stop checks above
+   (`sudo systemctl restart pensieve-ingest`, `TimeoutStopSec=15min`);
+   `negentropy-worker.conf` starts the worker with it.
+6. Verify: `readlink /proc/$(systemctl show -p MainPID --value pensieve-ingest)/exe`
+   ends in `releases/ingest-e73bebb/pensieve-ingest`; `sha256sum
+   /usr/local/libexec/pensieve-negentropy-worker
+   /usr/local/libexec/pensieve-negentropy-worker.ba0c4a1` prints the same hash
+   twice; `systemctl show -p ExecStart pensieve-ingest` has no
+   `--isolated-negentropy-pause-on-failure-secs`; `isolated worker session budget`
+   lines continue.
 
 ### Rolling back relay-unavailable exclusions
 

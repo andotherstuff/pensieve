@@ -170,14 +170,15 @@ job). `0` pauses as soon as a counted failure is observed.
 **Exemption for windows on track to an exclusion.** A retry-wait job does not
 count while its reports show it heading for a relay-unavailable completion: its
 latest reported attempt is a qualifying `unavailable` report (fully enumerated,
-within one 128-ID fetch, at most `max-ids` IDs), every `unavailable` report since
-its last protocol-complete attempt names that same set, the current identical run
-has not met the rule yet, and the job is at most at attempt `2 × attempts` (10 by
-default). Other failure kinds and attempts without a report may interrupt the run
-(the exclusion then needs five new identical reports), but past the attempt
-ceiling the job counts whatever it reports. A changed or unqualifiable set, a run
-that met the rule but is held back by unarchived receipts, a disabled rule and
-blocked jobs all count. The exempt job still holds `/health/negentropy` at
+within one 128-ID fetch, at most `max-ids` IDs), that report's identical run (the
+one an exclusion would measure) has not met the rule yet, and the job is at most
+at attempt `2 × attempts` (10 by default). Reports before the current run do not
+matter: another failure kind, an attempt without a report or a changed set (a
+relay that starts delivering one of two withheld IDs) starts a new run, which
+then needs five identical reports of its own, and past the attempt ceiling the
+job counts whatever it reports. An unqualifiable latest report, a run that met
+the rule but is held back by unarchived receipts, a disabled rule and blocked
+jobs all count. The exempt job still holds `/health/negentropy` at
 `unresolved_failures`. Every tick, whether or not the pause is enabled,
 `negentropy_isolated_failure_pause_exempt_jobs` gauges the exempt jobs and
 `negentropy_isolated_failure_pause_counted_jobs` the ones the pause counts. With this, a withheld window is completed instead of pausing

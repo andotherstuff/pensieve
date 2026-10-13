@@ -159,8 +159,9 @@ pub(super) async fn download_with_progress(
         // tail would be missing on every attempt and could be excluded although
         // the relay would deliver it to a smaller REQ. Re-request exactly the
         // still-missing IDs, at least once and again while each REQ delivers
-        // something new (at most one REQ per ID, so bounded by the batch). Only
-        // IDs that a REQ naming exactly them did not return are unavailable.
+        // something new. Every REQ but the first and the last delivers at least
+        // one new ID, so a batch of n IDs takes at most n + 1 REQs. Only IDs
+        // that a REQ naming exactly them did not return are unavailable.
         let mut request = batch.to_vec();
         let mut follow_up = false;
         loop {
