@@ -1274,6 +1274,59 @@ archive-admission probe is `pensieve-archive-admission-kuma.timer` (`/health/arc
 Both were active on 2026-10-11. Their scripts are `ops/scripts/negentropy-kuma.py`
 and `ops/scripts/archive-admission-kuma.py`, installed to `/usr/local/libexec/pensieve-*-kuma.py`.
 
+### Monitor 46 red
+
+Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
+`LEDGER=/data/negentropy/production-premium-20261011T180545Z/jobs.sqlite`.
+
+- `unresolved_failures`: a job is blocked or in retry backoff after three failed
+  attempts. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
+  capture `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`
+  and the `isolated worker attempt failed` journal lines, and leave the monitor red
+  for a decision. If the ingester runs with
+  `--isolated-negentropy-pause-on-failure-secs`, the runtime has already stopped
+  leasing after its grace (`isolated reconciliation paused leasing` in the journal);
+  stopping the worker is then optional.
+- `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
+  it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
+  because the runtime removed its socket), find the cause in
+  `journalctl -u pensieve-ingest | grep 'isolated reconciliation paused'`, and do not
+  restart until the cause is understood or fixed. Never edit, reset or delete the
+  ledger.
+
+### Recovery from the 2026-10-13 lease race
+
+`invalid parent session request` at 06:01:22Z was the lease race described in
+[continuous readiness](../docs/negentropy_continuous_readiness.md#incident-2026-10-13-runtime-stopped-on-a-lease-race).
+The ledger is consistent: job 768 is `leased` (attempt 16, expiry 06:11:22Z) with
+no session and no receipts. Any runtime start after that expiry runs `expire` on
+its first tick, which moves job 768 to `retry_wait` (`worker_lost`, due 60 s later)
+without touching receipts; before expiry the live lease only blocks new leases.
+Only the ingester changes; the worker binary and IPC version are unchanged, so the
+installed `ba0c4a1` worker stays. Restarting the old `ingest-b466b37` build would
+resume safely but can hit the same race again whenever a gap becomes due during a
+preflight scan.
+
+1. Stop the worker: `sudo systemctl stop pensieve-negentropy-worker`.
+2. Keep the ledger copy taken after the stop as incident evidence, and record
+   `negentropy-ledger-status.py "$LEDGER"` once more. Do not modify the live ledger.
+3. Build the fixed master commit as a release (see Routine deploy; ingester only):
+   `releases/ingest-<sha>/pensieve-ingest`.
+4. Edit `zzzz-bounded-canary.conf`: point `ExecStart` at the new release, keep every
+   existing argument, and decide on the pause flag. Job 768 is still unresolved, so
+   with `--isolated-negentropy-pause-on-failure-secs` leasing stops again after the
+   grace; omit it until the job is decided if reconciliation should keep running.
+5. `sudo systemctl daemon-reload`, then restart the ingester with the graceful-stop
+   checks above (`TimeoutStopSec=15min`). `negentropy-worker.conf` starts the worker
+   with it; otherwise `sudo systemctl start pensieve-negentropy-worker`.
+6. Verify: the journal shows `isolated worker session budget` lines and no new
+   `isolated reconciliation paused`; `negentropy_isolated_ready` is 1 and
+   `negentropy_isolated_unhealthy` 0; the status tool shows `states.leased` 0 or 1,
+   job 768 back in `retry_wait`, and `last_success` advancing. `/health/negentropy`
+   will report `unresolved_failures` (not `runtime_failed`) while job 768 remains
+   unresolved; that is the open decision, not a recovery failure.
+7. Record the new release in `ops/systemd/dropins/` and the table above.
+
 ## Cleanup debt
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
   with Parquet retention now that the live shadow and historical campaign exist (see

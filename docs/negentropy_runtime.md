@@ -97,6 +97,37 @@ archive seal timer, final seal, dedupe flush and checkpoint cleanup have run.
 Replay checks cancellation between bounded decoder batches and services receipt
 maintenance during a long sealed segment.
 
+### Fault scope
+
+Only faults that genuinely affect every job stop the runtime and latch
+`runtime_failed`: archive recovery, ledger storage/budget errors, invalid or
+corrupt ledger input, and an owner-thread failure. Per-attempt outcomes do not:
+a worker failure report, EOF, a protocol or deadline error, or a release whose
+lease already lapsed (`negentropy_isolated_stale_release_total`; `expire`
+recovers the lease on a later tick) each retain the same window as durable
+unresolved work and the runtime continues. Each authenticated failure logs
+`isolated worker attempt failed; gap retained for retry` with the job, attempt,
+relay, failure kind, outstanding-ID count and retry delay (never event IDs or relay
+text), and increments `negentropy_worker_attempt_failed_total`. The preflighted
+fair candidate is the job that is leased (see [fair leases](negentropy_fair_leases.md));
+a candidate that changed meanwhile is reselected, not treated as a fault.
+
+### Pausing on persistent failure
+
+`--isolated-negentropy-pause-on-failure-secs <SECS>` (unset by default) stops
+leasing once the ledger has reported a persistent failure (the condition behind
+`/health/negentropy` `unresolved_failures`: a blocked job, or a retry-wait job
+after at least three failed attempts) continuously for `SECS`. It logs
+`isolated reconciliation paused leasing` once and sets
+`negentropy_isolated_failure_pause=1`. Replay, planning, archive maintenance and
+health observation continue; no lease is granted, so no attempt is consumed and
+every gap and receipt is kept. Health stays red. The connected worker idles and is
+recycled by its service lifetime. Leasing resumes only if the failure clears; since
+nothing is retried while paused, in practice that means an operator restart
+without the flag (or after resolving the job). The grace clock is in memory, so a
+restart allows one more grace period of paced retries before pausing again. `0`
+pauses as soon as the failure is observed.
+
 ## Bounded canary
 
 `--isolated-negentropy-canary-until <UNIX_SECONDS>` replaces rolling planning

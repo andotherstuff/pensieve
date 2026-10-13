@@ -52,6 +52,12 @@ pub struct RuntimeConfig {
     /// Exclusive upper timestamp for three fixed 15-minute canary windows.
     /// Requires a fresh ledger and exactly one relay; never runs rolling planning.
     pub canary_until: Option<i64>,
+    /// Stop leasing once the durable ledger has reported a persistent failure
+    /// (a blocked job, or a retry-wait job after at least three failed attempts)
+    /// continuously for this long. `None` keeps retrying with paced backoff.
+    /// The pause holds until the failure clears or the runtime restarts; every
+    /// gap, receipt and archive maintenance turn is kept, and health stays red.
+    pub pause_on_persistent_failure: Option<Duration>,
 }
 
 /// A local failure pauses isolated work without changing live archive ownership.
@@ -212,6 +218,8 @@ async fn drive(
     let mut peer: Option<(UnixStream, WorkerCandidate)> = None;
     let mut canary_attempts = 0;
     let mut canary_replays = 0;
+    let mut failing_since = None;
+    let mut paused = false;
     let started = tokio::time::Instant::now();
     gauge!("negentropy_isolated_ready").set(1.0);
     let result: Result<(), RuntimeError> = async {
@@ -272,7 +280,22 @@ async fn drive(
                 // observation past the watchdog before the session returns.
                 let mut observation = parent.lifecycle().await?;
                 observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                let pause = failure_pause(
+                    &mut failing_since,
+                    observation.persistent_failure,
+                    config.pause_on_persistent_failure,
+                    tokio::time::Instant::now(),
+                );
                 pensieve_core::reconciliation_health::reconciliation_health().observe(observation);
+                if pause != paused {
+                    paused = pause;
+                    gauge!("negentropy_isolated_failure_pause").set(f64::from(u8::from(paused)));
+                    if paused {
+                        tracing::error!("isolated reconciliation paused leasing: persistent failure outlasted the configured grace; gaps retained for operator decision");
+                    } else {
+                        tracing::info!("isolated reconciliation resumed leasing: persistent failure cleared");
+                    }
+                }
                 if let Some((socket, candidate)) = peer.take() {
                     // Revalidate the same pidfd, invocation and remaining service
                     // lifetime immediately before exporting a lease capability.
@@ -291,6 +314,10 @@ async fn drive(
                         },
                         None => SESSION_TIME,
                     };
+                    if paused {
+                        peer = Some((socket, candidate));
+                        continue;
+                    }
                     let Some(lease) = parent.lease_next_fair(LEASE_SECS).await? else {
                         peer = Some((socket, candidate));
                         continue;
@@ -301,8 +328,9 @@ async fn drive(
                     let session_time = match candidate.recheck().await {
                         Ok(remaining) => session_time.min(remaining),
                         Err(error) => {
-                            tracing::warn!(error = %error, job = lease.job().id, "worker changed before assignment");
-                            parent.retry(lease, 60, RetryReason::WorkerLost).await?;
+                            let (job, attempt) = (lease.job().id, lease.job().attempt);
+                            tracing::warn!(error = %error, job, "worker changed before assignment");
+                            attempt_local(parent.retry(lease, 60, RetryReason::WorkerLost).await, job, attempt, "retry")?;
                             continue;
                         }
                     };
@@ -323,18 +351,23 @@ async fn drive(
                             parent.maintain_archived(32, 256).await?;
                         }
                         Ok(SessionOutcome::Failed(FailureKind::Volume)) => {
-                            let split = parent.split(lease).await?;
-                            if split == SplitOutcome::Blocked {
+                            let split = attempt_local(parent.split(lease).await, job, attempt, "split")?;
+                            if split == Some(SplitOutcome::Blocked) {
                                 counter!("negentropy_dense_timestamp_blocked_total").increment(1);
                                 tracing::error!(job, attempt, "isolated worker volume failure at one second");
                             }
                         }
-                        Ok(SessionOutcome::Failed(_)) => {
-                            parent.retry(lease, retry_delay(job, attempt), RetryReason::RelayFailure).await?;
+                        Ok(SessionOutcome::Failed(kind)) => {
+                            let delay = retry_delay(job, attempt);
+                            // Bounded, sanitized diagnostic: never event IDs or relay text.
+                            let missing = parent.failure_report(job, attempt).await.ok().flatten().map(|report| report.missing_count);
+                            counter!("negentropy_worker_attempt_failed_total").increment(1);
+                            tracing::warn!(job, attempt, relay = %lease.job().relay, kind = ?kind, missing_count = ?missing, retry_in_secs = delay, "isolated worker attempt failed; gap retained for retry");
+                            attempt_local(parent.retry(lease, delay, RetryReason::RelayFailure).await, job, attempt, "retry")?;
                         }
                         Err(ParentError::TooDense) => {
-                            let split = parent.split(lease).await?;
-                            if split == SplitOutcome::Blocked {
+                            let split = attempt_local(parent.split(lease).await, job, attempt, "split")?;
+                            if split == Some(SplitOutcome::Blocked) {
                                 counter!("negentropy_dense_timestamp_blocked_total").increment(1);
                                 tracing::error!(job, attempt, "isolated inventory became too dense at one second");
                             }
@@ -348,7 +381,7 @@ async fn drive(
                             // Reread the durable job before choosing any retry.
                             let current = parent.job(job).await?;
                             if current.attempt == attempt && current.state == super::jobs::JobState::Leased {
-                                parent.retry(lease, retry_delay(job, attempt), RetryReason::WorkerLost).await?;
+                                attempt_local(parent.retry(lease, retry_delay(job, attempt), RetryReason::WorkerLost).await, job, attempt, "retry")?;
                             }
                         }
                     }
@@ -359,6 +392,49 @@ async fn drive(
     }.await;
     let shutdown = parent.shutdown().await;
     result.and(shutdown.map(|_| ()).map_err(Into::into))
+}
+
+/// Releasing an attempt whose lease is no longer active (it lapsed during an
+/// uninterruptible disk operation, or the attempt already ended) concerns only
+/// that attempt. The job, its receipts and its window stay durable; `expire`
+/// recovers a lapsed lease on a later tick. Any other error stops the runtime.
+fn attempt_local<T>(
+    result: Result<T, ParentError>,
+    job: i64,
+    attempt: i64,
+    action: &'static str,
+) -> Result<Option<T>, RuntimeError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(ParentError::Ledger(LedgerError::StaleLease)) => {
+            counter!("negentropy_isolated_stale_release_total").increment(1);
+            tracing::warn!(
+                job,
+                attempt,
+                action,
+                "isolated attempt lease no longer active; job retained for expiry recovery"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether leasing should pause: the ledger has reported a persistent failure
+/// continuously for at least `grace`. The start time is in memory only, so a
+/// restart grants one more grace period of paced retries before pausing again.
+fn failure_pause(
+    since: &mut Option<tokio::time::Instant>,
+    failing: bool,
+    grace: Option<Duration>,
+    now: tokio::time::Instant,
+) -> bool {
+    if !failing {
+        *since = None;
+        return false;
+    }
+    let started = *since.get_or_insert(now);
+    grace.is_some_and(|grace| now.saturating_duration_since(started) >= grace)
 }
 
 fn canary_session_budget(elapsed: Duration, attempts: u32) -> Option<Duration> {
@@ -461,6 +537,70 @@ mod canary_tests {
     }
 
     #[test]
+    fn persistent_failure_pauses_only_after_continuous_grace() {
+        let start = tokio::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut since = None;
+        // Disabled: never pauses, however long the failure lasts.
+        assert!(!failure_pause(&mut since, true, None, start));
+        assert!(!failure_pause(&mut since, true, None, start + 10 * hour));
+        let mut since = None;
+        assert!(!failure_pause(&mut since, true, Some(hour), start));
+        assert!(!failure_pause(
+            &mut since,
+            true,
+            Some(hour),
+            start + hour / 2
+        ));
+        assert!(failure_pause(&mut since, true, Some(hour), start + hour));
+        // A cleared failure resets the grace; a new failure starts it again.
+        assert!(!failure_pause(
+            &mut since,
+            false,
+            Some(hour),
+            start + 2 * hour
+        ));
+        assert!(!failure_pause(
+            &mut since,
+            true,
+            Some(hour),
+            start + 3 * hour
+        ));
+        assert!(failure_pause(
+            &mut since,
+            true,
+            Some(hour),
+            start + 4 * hour
+        ));
+        // Zero grace pauses as soon as the ledger reports the failure.
+        let mut since = None;
+        assert!(failure_pause(&mut since, true, Some(Duration::ZERO), start));
+    }
+
+    #[test]
+    fn only_a_lapsed_lease_release_is_attempt_local() {
+        assert_eq!(attempt_local(Ok(7), 1, 1, "retry").unwrap(), Some(7));
+        assert_eq!(
+            attempt_local::<()>(
+                Err(ParentError::Ledger(LedgerError::StaleLease)),
+                1,
+                1,
+                "retry"
+            )
+            .unwrap(),
+            None
+        );
+        for error in [
+            ParentError::InvalidRequest,
+            ParentError::Ledger(LedgerError::Budget),
+            ParentError::Ledger(LedgerError::Invalid("corrupt")),
+            ParentError::Stopped,
+        ] {
+            assert!(attempt_local::<()>(Err(error), 1, 1, "retry").is_err());
+        }
+    }
+
+    #[test]
     fn exhausted_intake_budget_leaves_time_for_durability_drain() {
         assert_eq!(canary_session_budget(Duration::ZERO, 0), Some(SESSION_TIME));
         assert_eq!(
@@ -533,6 +673,7 @@ mod tests {
             segment_prefix: "segment".to_owned(),
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
+            pause_on_persistent_failure: None,
         };
         assert!(matches!(
             IsolatedRuntime::start(config, dedupe, writer).await,
@@ -571,6 +712,7 @@ mod tests {
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
             canary_until: Some(3600),
+            pause_on_persistent_failure: None,
         };
         let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
             .await
@@ -641,6 +783,7 @@ mod tests {
             segment_prefix: "segment".to_owned(),
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
+            pause_on_persistent_failure: None,
         };
         let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
             .await
@@ -716,5 +859,113 @@ mod tests {
             ledger.get(lost.header(0).job).unwrap().state,
             JobState::RetryWait
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_failure_pause_withholds_leases_until_restarted_without_it() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+        let writer = Arc::new(
+            SegmentWriter::new(
+                SegmentConfig {
+                    output_dir: archive.clone(),
+                    compress: false,
+                    ..SegmentConfig::default()
+                },
+                None,
+                Some(dedupe.clone()),
+            )
+            .unwrap(),
+        );
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        let uid: u32 = String::from_utf8(uid.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let ledger_path = root.path().join("jobs.sqlite");
+        // A due gap after three relay failures: health reports unresolved_failures.
+        let gap = {
+            let mut ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+            let id = ledger
+                .enqueue("manual", "wss://a.example", 0, 899)
+                .unwrap()
+                .id;
+            for at in [1_000, 2_000, 3_000] {
+                let lease = ledger.lease_next(at, 60).unwrap().unwrap();
+                ledger
+                    .retry(&lease, at, 60, RetryReason::RelayFailure)
+                    .unwrap();
+            }
+            id
+        };
+        let mut config = RuntimeConfig {
+            canary_until: None,
+            admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
+            socket: root.path().join("worker.sock"),
+            worker_uid: uid,
+            ledger: ledger_path.clone(),
+            inventory: root.path().join("inventory"),
+            archive,
+            segment_prefix: "segment".to_owned(),
+            replay_floor: 0,
+            relays: vec!["wss://a.example".to_owned()],
+            pause_on_persistent_failure: Some(Duration::ZERO),
+        };
+        let hello = || Hello {
+            version: super::super::ipc::VERSION,
+        };
+        let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
+            .await
+            .unwrap();
+        let mut worker = UnixStream::connect(&config.socket).await.unwrap();
+        write_message(&mut worker, &hello()).await.unwrap();
+        // Two ticks pass without an assignment; the runtime keeps running.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(11),
+                read_message::<_, ParentMessage>(&mut worker)
+            )
+            .await
+            .is_err()
+        );
+        drop(worker);
+        runtime.shutdown().await.unwrap();
+        let ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+        let job = ledger.get(gap).unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::RetryWait, 3));
+        drop(ledger);
+        let attempt_rows: u32 = rusqlite::Connection::open(&ledger_path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))
+            .unwrap();
+        let attempts: i64 = rusqlite::Connection::open(&ledger_path)
+            .unwrap()
+            .query_row("SELECT coalesce(sum(attempt),0) FROM jobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // No planned fresh root or the gap consumed an attempt while paused.
+        assert_eq!((attempt_rows, attempts), (0, 3));
+        // Without the pause the same ledger resumes paced retries.
+        config.pause_on_persistent_failure = None;
+        let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
+            .await
+            .unwrap();
+        let mut worker = UnixStream::connect(&config.socket).await.unwrap();
+        write_message(&mut worker, &hello()).await.unwrap();
+        let ParentMessage::Job { .. } = tokio::time::timeout(
+            Duration::from_secs(15),
+            read_message::<_, ParentMessage>(&mut worker),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("expected assignment");
+        };
+        drop(worker);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        runtime.shutdown().await.unwrap();
     }
 }
