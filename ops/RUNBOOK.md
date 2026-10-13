@@ -43,7 +43,7 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-e73bebb/pensieve-ingest` (master incl. #88 and #90, since 2026-10-13 12:48 UTC) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker`, continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -213,8 +213,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-b466b37` (current
-  ingester), `ingest-ba0c4a1` (previous ingester from PR #72, with its worker) and only
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-e73bebb` (current
+  ingester, #88 and #90), `ingest-b466b37` (previous; it refuses the schema-10 negentropy ledger, so
+  downgrading leaves isolated reconciliation off unless `jobs.sqlite.pre-schema10` is restored),
+  `ingest-ba0c4a1` (PR #72 build, with the installed worker) and only
   `preview-3ab1045`. Build target dirs other than the latest `api-*`/`ingest-*` caches in
   `/data/pensieve-build/` were removed on 2026-10-12.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
@@ -1274,8 +1276,10 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-12 16:36 CEST the ingester runs
-`releases/ingest-b466b37` (master, incl. #72 and #73) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger;
+not covered by the routine deploy above. Since 2026-10-13 12:48 UTC the ingester runs
+`releases/ingest-e73bebb` (master, incl. #88 lease fix and #90 relay-unavailable exclusions, without
+`--isolated-negentropy-pause-on-failure-secs`) from `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger
+(schema 10 since that start; the schema-9 backup is `jobs.sqlite.pre-schema10` next to it);
 the worker runs continuously against Premium Primal only since 2026-10-12 15:22 UTC and is started with the ingester (`negentropy-worker.conf`); see [continuous readiness](../docs/negentropy_continuous_readiness.md#continuous-premium-primal-operation-since-2026-10-12). Expect these drop-ins to change. See [`docs/negentropy_runtime.md`](../docs/negentropy_runtime.md)
 and [`docs/negentropy_continuous_readiness.md`](../docs/negentropy_continuous_readiness.md).
 Its Kuma probe is `pensieve-negentropy-kuma.timer` (`/health/negentropy`); the
@@ -1308,6 +1312,15 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   ledger.
 
 ### Recovery from the 2026-10-13 lease race
+
+**Done 2026-10-13 12:48 UTC** with `ingest-e73bebb` (#88 and #90). The stop logged
+`Failed to stop isolated reconciliation cleanly` (the runtime was already failed) after a
+clean archive shutdown (final segment sealed, checkpoint saved, no `.open` files). On start the
+ledger moved to schema 10, job 768 was completed by a relay-unavailable exclusion of
+`089d1fdc2d1cf0f03be5844014378a3f2bcca0d1092619a70ed6f86b7c286b65` (attempts 1–15; no relay
+returns that event by ID), `/health/negentropy` returned `progress_within_deadline` with
+`negentropy_isolated_ready 1`, and worker sessions resumed (job 1351). The steps below are
+kept as the record.
 
 `invalid parent session request` at 06:01:22Z was the lease race described in
 [continuous readiness](../docs/negentropy_continuous_readiness.md#incident-2026-10-13-runtime-stopped-on-a-lease-race).
