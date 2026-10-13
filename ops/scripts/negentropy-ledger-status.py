@@ -157,6 +157,16 @@ def relay_unavailable_report(db, complete_jobs):
 
     These are not fully reconciled: `complete_states` splits them out of the raw
     `complete` count, and `unresolved` events have not reached the archive since.
+    `complete_states` labels every complete job exactly once:
+
+    - `relay_unavailable_exclusion`: completed by an exclusion (reason
+      `relay_unavailable`);
+    - `split_with_relay_unavailable_descendant`: a split parent (reason NULL)
+      completed because its children did, at least one of them (at any depth)
+      by an exclusion, so its window is not fully reconciled either;
+    - `already_archived`: every ID the relay withheld was already archived
+      (reason `already_archived`); nothing is missing;
+    - `reconciled`: everything else.
     """
     events, jobs, unresolved = db.execute(
         "SELECT count(*),count(DISTINCT job),coalesce(sum(resolved_at IS NULL),0) "
@@ -164,6 +174,19 @@ def relay_unavailable_report(db, complete_jobs):
     ).fetchone()
     by_exclusion = db.execute(
         "SELECT count(*) FROM jobs WHERE state='complete' AND reason='relay_unavailable'"
+    ).fetchone()[0]
+    already_archived = db.execute(
+        "SELECT count(*) FROM jobs WHERE state='complete' AND reason='already_archived'"
+    ).fetchone()[0]
+    # Ancestors of excluded jobs. UNION deduplicates, so this terminates even on
+    # a corrupt parent cycle; a split tree is retained or compacted as a whole.
+    split_with_exclusion = db.execute(
+        "WITH RECURSIVE ancestors(id) AS ("
+        " SELECT parent FROM jobs WHERE reason='relay_unavailable' AND parent IS NOT NULL"
+        " UNION SELECT j.parent FROM jobs j JOIN ancestors a ON j.id=a.id"
+        " WHERE j.parent IS NOT NULL)"
+        " SELECT count(*) FROM jobs WHERE state='complete' AND reason IS NULL"
+        " AND id IN (SELECT id FROM ancestors)"
     ).fetchone()[0]
     recent = db.execute(
         "SELECT lower(hex(event_id)),job,relay,since,until,first_attempt,last_attempt,attempts,"
@@ -176,8 +199,10 @@ def relay_unavailable_report(db, complete_jobs):
         "jobs": jobs,
         "unresolved_events": unresolved,
         "complete_states": {
-            "reconciled": complete_jobs - by_exclusion,
+            "reconciled": complete_jobs - by_exclusion - split_with_exclusion - already_archived,
             "relay_unavailable_exclusion": by_exclusion,
+            "split_with_relay_unavailable_descendant": split_with_exclusion,
+            "already_archived": already_archived,
         },
         "recent": [dict(zip(EXCLUSION_FIELDS, row)) for row in recent],
     }

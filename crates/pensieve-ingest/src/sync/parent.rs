@@ -90,6 +90,9 @@ enum Command {
     Lifecycle {
         reply: Reply<pensieve_core::reconciliation_health::ProgressObservation>,
     },
+    PauseFailures {
+        reply: Reply<Vec<i64>>,
+    },
     Configure {
         relays: Vec<String>,
         reply: Reply<()>,
@@ -183,6 +186,15 @@ impl ParentExecutor {
         let (reply, response) = oneshot::channel();
         self.request(Command::Lifecycle { reply }, response).await
     }
+    /// Persistently failing jobs that count toward the leasing pause: the
+    /// `unresolved_failures` jobs minus those on track to a relay-unavailable
+    /// completion. Call after [`Self::lifecycle`] so its exclusions apply first.
+    pub async fn pause_failures(&mut self) -> Result<Vec<i64>, ParentError> {
+        let (reply, response) = oneshot::channel();
+        self.request(Command::PauseFailures { reply }, response)
+            .await
+    }
+
     /// Replace the explicit isolated-worker relay allowlist on the owner.
     pub async fn configure(&mut self, relays: Vec<String>) -> Result<(), ParentError> {
         let (reply, response) = oneshot::channel();
@@ -287,6 +299,9 @@ impl ParentExecutor {
                                 ledger.progress_observation(now)
                             })();
                             let _ = reply.send(result.map_err(Into::into));
+                        }
+                        Command::PauseFailures { reply } => {
+                            let _ = reply.send(ledger.pause_failures().map_err(Into::into));
                         }
                         Command::Configure { relays, reply } => {
                             let refs = relays.iter().map(String::as_str).collect::<Vec<_>>();
@@ -903,6 +918,13 @@ fn record_unavailable(progress: &UnavailableProgress) {
                 "negentropy relay-unavailable exclusion: window completed without an event the relay advertised but never delivered"
             );
         }
+    }
+    for job in &progress.already_archived {
+        metrics::counter!("negentropy_relay_unavailable_already_archived_total").increment(1);
+        tracing::info!(
+            job,
+            "negentropy window completed: every ID the relay withheld was already archived"
+        );
     }
     if progress.resolved > 0 {
         metrics::counter!("negentropy_relay_unavailable_resolved_total")
@@ -2130,5 +2152,193 @@ mod tests {
         let job = h.executor.job(gap).await.unwrap();
         assert_eq!((job.state, job.attempt), (JobState::RetryWait, 15));
         h.executor.shutdown().await.unwrap();
+    }
+
+    /// A window whose relay withheld the same ID on `attempts` hourly attempts.
+    fn withheld_history(ledger: &mut JobLedger, attempts: i64) -> i64 {
+        let job = ledger
+            .enqueue("sweep", "wss://relay.example.com", 100, 110)
+            .unwrap()
+            .id;
+        for n in 0..attempts {
+            let at = 1_000 + n * 3600;
+            let lease = ledger.lease_next(at, 600).unwrap().unwrap();
+            let report = FailureDiagnostic {
+                kind: FailureKind::Unavailable,
+                missing_count: 1,
+                sample: vec![[8; 32]],
+            };
+            ledger
+                .record_failure_report(&lease, 1, &report, at + 1)
+                .unwrap();
+            ledger
+                .retry(&lease, at + 1, 60, RetryReason::RelayFailure)
+                .unwrap();
+        }
+        job
+    }
+
+    #[tokio::test]
+    async fn lifecycle_turn_excludes_withheld_windows_only_without_archive_recovery() {
+        for latched in [false, true] {
+            let mut h = Harness::with_ledger(|| 20_000, |ledger| withheld_history(ledger, 5));
+            if latched {
+                std::fs::create_dir(
+                    h._root
+                        .path()
+                        .join("archive/segment-000000000.notepack.open"),
+                )
+                .unwrap();
+                let event = EventBuilder::text_note("live archive fault")
+                    .custom_created_at(Timestamp::from(105))
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap();
+                assert!(
+                    h.writer
+                        .write_reserved(
+                            crate::pack_nostr_event(&event).unwrap(),
+                            h.dedupe.reserve(event.id.as_bytes()).unwrap().unwrap(),
+                        )
+                        .is_err()
+                );
+                assert!(h.writer.recovery_required());
+            }
+            // The runtime's health observation: the exclusion turn runs first.
+            let observation = h.executor.lifecycle().await.unwrap();
+            let job = h.executor.job(h.job).await.unwrap();
+            if latched {
+                // Archive uncertainty blocks new exclusions; the runtime then
+                // stops on the latch at its next tick.
+                assert_eq!(job.state, JobState::RetryWait);
+                assert!(observation.persistent_failure);
+                assert_eq!(h.executor.pause_failures().await.unwrap(), vec![h.job]);
+            } else {
+                assert_eq!(job.state, JobState::Complete);
+                assert_eq!(
+                    job.reason.as_deref(),
+                    Some(super::super::jobs::RELAY_UNAVAILABLE)
+                );
+                assert!(!observation.persistent_failure);
+                // The exclusion is a durable completion for the stall watchdog.
+                assert!(observation.last_success.is_some());
+                assert!(h.executor.pause_failures().await.unwrap().is_empty());
+            }
+            let ledger = h.executor.shutdown().await.unwrap();
+            assert_eq!(
+                ledger.relay_unavailable_exclusions(h.job).unwrap().len(),
+                usize::from(!latched)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_failures_exempt_an_in_progress_withheld_run_through_the_owner() {
+        let mut h = Harness::with_ledger(|| 20_000, |ledger| withheld_history(ledger, 3));
+        let observation = h.executor.lifecycle().await.unwrap();
+        // Health still reports it; the pause does not count it yet.
+        assert!(observation.persistent_failure);
+        assert!(h.executor.pause_failures().await.unwrap().is_empty());
+        assert_eq!(
+            h.executor.job(h.job).await.unwrap().state,
+            JobState::RetryWait
+        );
+        h.executor.shutdown().await.unwrap();
+    }
+
+    /// Counts counter increments by name; every other metric is discarded.
+    #[derive(Clone, Default)]
+    struct CounterLog(Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>);
+
+    struct LoggedCounter(CounterLog, String);
+
+    impl metrics::CounterFn for LoggedCounter {
+        fn increment(&self, value: u64) {
+            *self.0.0.lock().unwrap().entry(self.1.clone()).or_default() += value;
+        }
+        fn absolute(&self, value: u64) {
+            self.0.0.lock().unwrap().insert(self.1.clone(), value);
+        }
+    }
+
+    impl metrics::Recorder for CounterLog {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(LoggedCounter(self.clone(), key.name().to_owned())))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn record_unavailable_counts_every_excluded_event_and_completion() {
+        let log = CounterLog::default();
+        let progress = UnavailableProgress {
+            excluded: vec![
+                super::super::jobs::UnavailableExclusion {
+                    job: 1,
+                    relay: "wss://relay.example.com".into(),
+                    event_ids: vec![[1; 32], [2; 32]],
+                    first_attempt: 1,
+                    last_attempt: 5,
+                    attempts: 5,
+                    span_secs: 3600,
+                },
+                super::super::jobs::UnavailableExclusion {
+                    job: 2,
+                    relay: "wss://relay.example.com".into(),
+                    event_ids: vec![[3; 32]],
+                    first_attempt: 2,
+                    last_attempt: 7,
+                    attempts: 5,
+                    span_secs: 7200,
+                },
+            ],
+            awaiting_archive: 1,
+            already_archived: vec![3],
+            resolved: 4,
+        };
+        metrics::with_local_recorder(&log, || record_unavailable(&progress));
+        let counts = log.0.lock().unwrap().clone();
+        assert_eq!(counts["negentropy_relay_unavailable_exclusions_total"], 3);
+        assert_eq!(
+            counts["negentropy_relay_unavailable_already_archived_total"],
+            1
+        );
+        assert_eq!(counts["negentropy_relay_unavailable_resolved_total"], 4);
+        let log = CounterLog::default();
+        metrics::with_local_recorder(&log, || record_unavailable(&UnavailableProgress::default()));
+        assert!(log.0.lock().unwrap().is_empty());
     }
 }

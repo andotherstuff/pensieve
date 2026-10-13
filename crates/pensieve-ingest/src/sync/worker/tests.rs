@@ -1,5 +1,6 @@
 use super::super::ipc::{self, UploadAction, UploadSession};
 use super::super::jobs::{JobLedger, JobState, LedgerLimits};
+use super::reconcile::DownloadProof;
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,6 +79,10 @@ struct RelayStats {
     continuations: std::sync::atomic::AtomicUsize,
     batches: std::sync::atomic::AtomicUsize,
     max_reply: std::sync::atomic::AtomicUsize,
+    /// Results per REQ before EOSE, like a relay's per-subscription limit.
+    cap: Option<usize>,
+    /// Number of IDs named by each REQ, in order.
+    requested: std::sync::Mutex<Vec<usize>>,
 }
 
 async fn relay_events(
@@ -156,6 +161,9 @@ async fn relay_events(
                     stats
                         .batches
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let ids = request[2]["ids"].as_array().unwrap();
+                    stats.requested.lock().unwrap().push(ids.len());
+                    let mut sent = 0;
                     for event in events
                         .iter()
                         .take(events.len().saturating_sub(usize::from(partial)))
@@ -168,6 +176,10 @@ async fn relay_events(
                         {
                             continue;
                         }
+                        if stats.cap.is_some_and(|cap| sent == cap) {
+                            break;
+                        }
+                        sent += 1;
                         let response = serde_json::json!(["EVENT", request[1], event]);
                         socket
                             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -464,6 +476,108 @@ async fn overlapping_multiround_and_large_reply_multibatch_downloads() {
             assert!(stats.max_reply.load(Ordering::Relaxed) > 120_000);
         }
     }
+}
+
+/// Run one download against a mock relay that caps each REQ at `cap` results
+/// and, with `withhold`, never delivers the last event. Returns the outcome,
+/// the IDs named by each REQ and the frames captured for upload.
+async fn capped_download(
+    cap: Option<usize>,
+    withhold: bool,
+    events: Vec<Event>,
+) -> (Result<DownloadProof, WorkerError>, Vec<usize>, usize) {
+    let stats = Arc::new(RelayStats {
+        cap,
+        ..RelayStats::default()
+    });
+    let (url, server) = relay_events(withhold, false, events, stats.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_ledger, lease) = job(dir.path(), "wss://relay.example.com");
+    let assignment = Assignment::for_lease(&lease);
+    let (capture, mut receiver) = Capture::new(&assignment);
+    let capture = Arc::new(capture);
+    let client = Client::builder()
+        .opts(ClientOptions::default().relay_limits(relay_limits()))
+        .database(capture.clone())
+        .build();
+    client.add_relay(&url).await.unwrap();
+    let relay = client.relay(&url).await.unwrap();
+    relay.try_connect(Duration::from_secs(2)).await.unwrap();
+    let drain = tokio::spawn(async move {
+        let mut count = 0;
+        while receiver.recv().await.is_some() {
+            count += 1;
+        }
+        count
+    });
+    let result = timeout(
+        Duration::from_secs(10),
+        reconcile::download(&relay, &assignment, vec![]),
+    )
+    .await
+    .unwrap();
+    client.disconnect().await;
+    let result = match result {
+        Ok(proof) => {
+            let remote = proof.remote.clone();
+            let received = proof.received.clone();
+            capture.finish_download(Ok(proof)).await.unwrap();
+            Ok(DownloadProof { remote, received })
+        }
+        Err(error) => {
+            assert!(
+                capture
+                    .finish_download(Err(WorkerError::Incomplete))
+                    .await
+                    .is_err()
+            );
+            Err(error)
+        }
+    };
+    let captured = drain.await.unwrap();
+    server.abort();
+    let _ = server.await;
+    let requested = stats.requested.lock().unwrap().clone();
+    (result, requested, captured)
+}
+
+#[tokio::test]
+async fn relay_result_cap_is_followed_up_not_reported_unavailable() {
+    let keys = Keys::generate();
+    let events: Vec<_> = (0..10)
+        .map(|i| {
+            EventBuilder::new(Kind::TextNote, i.to_string())
+                .custom_created_at(Timestamp::from(150))
+                .sign_with_keys(&keys)
+                .unwrap()
+        })
+        .collect();
+    // A relay that answers at most three events per REQ, then EOSE: each
+    // follow-up names only the still-missing IDs until all ten arrive.
+    let (result, requested, captured) = capped_download(Some(3), false, events.clone()).await;
+    let proof = result.unwrap();
+    assert_eq!(proof.received.len(), 10);
+    assert_eq!(proof.remote, proof.received);
+    assert_eq!(requested, vec![10, 7, 4, 1]);
+    assert_eq!(captured, 10);
+    // The same capped relay also withholding one event: only a REQ naming
+    // exactly the remaining ID, which returns nothing, makes it unavailable.
+    let withheld = events.last().unwrap().id;
+    let (result, requested, captured) = capped_download(Some(3), true, events.clone()).await;
+    let Err(WorkerError::Unavailable(report)) = result else {
+        panic!("expected unavailable");
+    };
+    assert_eq!(report.missing_count, 1);
+    assert_eq!(report.sample, vec![withheld.to_bytes()]);
+    assert_eq!(requested, vec![10, 7, 4, 1]);
+    assert_eq!(captured, 9);
+    // Uncapped withholding: one follow-up for the missing ID, then unavailable.
+    let (result, requested, _) = capped_download(None, true, events).await;
+    let Err(WorkerError::Unavailable(report)) = result else {
+        panic!("expected unavailable");
+    };
+    assert_eq!(report.sample, vec![withheld.to_bytes()]);
+    assert_eq!(requested, vec![10, 1]);
 }
 
 #[tokio::test]

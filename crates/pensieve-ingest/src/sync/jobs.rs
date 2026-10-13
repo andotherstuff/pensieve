@@ -39,7 +39,7 @@ pub use retention::RetentionProgress;
 #[cfg(test)]
 pub(crate) use unavailable::WORKER_FETCH_BATCH;
 pub use unavailable::{
-    RELAY_UNAVAILABLE, UnavailableExclusion, UnavailableProgress, UnavailableRule,
+    ALREADY_ARCHIVED, RELAY_UNAVAILABLE, UnavailableExclusion, UnavailableProgress, UnavailableRule,
 };
 
 /// A rejected operation leaves the prior durable obligation intact.

@@ -386,11 +386,13 @@ struct Args {
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_replay_floor: Option<u64>,
 
-    /// Stop leasing new isolated attempts once the ledger has reported a
-    /// persistent failure (a blocked job, or a job in retry backoff after at
-    /// least three failed attempts; `/health/negentropy` `unresolved_failures`)
-    /// continuously for this many seconds. Unset keeps retrying with paced
-    /// backoff. Gaps, receipts and archive maintenance are kept; health stays red.
+    /// Stop leasing new isolated attempts once one job has been a persistent
+    /// failure (blocked, or in retry backoff after at least three failed
+    /// attempts; `/health/negentropy` `unresolved_failures`) continuously for
+    /// this many seconds. A job whose identical unavailable reports are on track
+    /// to a relay-unavailable exclusion does not count (bounded to 2x the
+    /// exclusion attempts). Unset keeps retrying with paced backoff. Gaps,
+    /// receipts and archive maintenance are kept; health stays red.
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_pause_on_failure_secs: Option<u64>,
 
@@ -426,8 +428,16 @@ struct Args {
     isolated_negentropy_unavailable_exclusion_max_ids: u32,
 
     /// Never complete a window by relay-unavailable exclusion; such jobs stay in
-    /// paced retry. Existing exclusions are kept.
-    #[arg(long, requires = "isolated_negentropy")]
+    /// paced retry. Existing exclusions are kept. Conflicts with the tuning flags.
+    #[arg(
+        long,
+        requires = "isolated_negentropy",
+        conflicts_with_all = [
+            "isolated_negentropy_unavailable_exclusion_attempts",
+            "isolated_negentropy_unavailable_exclusion_span_secs",
+            "isolated_negentropy_unavailable_exclusion_max_ids",
+        ]
+    )]
     isolated_negentropy_disable_unavailable_exclusion: bool,
 
     /// Ingester-owned durable SQLite ledger path.
@@ -2079,6 +2089,27 @@ mod tests {
             ("--isolated-negentropy-unavailable-exclusion-max-ids", "129"),
         ] {
             assert!(parse(&[flag, value]).is_err(), "{flag} {value}");
+        }
+        // Disabling the rule while tuning it is contradictory, not silently ignored.
+        for flag in [
+            "--isolated-negentropy-unavailable-exclusion-attempts",
+            "--isolated-negentropy-unavailable-exclusion-span-secs",
+            "--isolated-negentropy-unavailable-exclusion-max-ids",
+        ] {
+            let value = if flag.ends_with("span-secs") {
+                "3600"
+            } else {
+                "5"
+            };
+            assert!(
+                parse(&[
+                    "--isolated-negentropy-disable-unavailable-exclusion",
+                    flag,
+                    value
+                ])
+                .is_err(),
+                "{flag}"
+            );
         }
         // Tuning flags are meaningless without the isolated runtime.
         assert!(

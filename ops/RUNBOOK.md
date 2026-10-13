@@ -1293,17 +1293,24 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
 `LEDGER=/data/negentropy/production-premium-20261011T180545Z/jobs.sqlite`.
 
 - `unresolved_failures`: a job is blocked or in retry backoff after three failed
-  attempts. A job whose relay keeps advertising the same events without delivering
-  them is completed automatically by a relay-unavailable exclusion within about two
-  hours of its third failure (`negentropy relay-unavailable exclusion` WARN lines;
-  see [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions)),
-  so a red monitor that persists is a different fault. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
+  attempts. First read two gauges on `curl -s localhost:9091/metrics`:
+  `negentropy_isolated_failure_pause_exempt_jobs` counts jobs whose relay keeps
+  reporting the same advertised-but-undelivered IDs and that are on track to a
+  relay-unavailable exclusion; `negentropy_isolated_failure_pause_counted_jobs`
+  counts every other unresolved job. With `counted_jobs` 0, wait: an exempt job is
+  completed automatically (`negentropy relay-unavailable exclusion` WARN lines; see
+  [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions))
+  at attempt 6 or 7 if its reports are uninterrupted (about an hour after its
+  third failure). It stays exempt through attempt 10 at most (about four hours
+  after its third failure); after that it counts like any other failure, although
+  a later exclusion can still complete it. With
+  `counted_jobs` above 0 it is a different fault. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
   capture `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`
   and the `isolated worker attempt failed` journal lines, and leave the monitor red
   for a decision. If the ingester runs with
-  `--isolated-negentropy-pause-on-failure-secs`, the runtime has already stopped
-  leasing after its grace (`isolated reconciliation paused leasing` in the journal);
-  stopping the worker is then optional.
+  `--isolated-negentropy-pause-on-failure-secs`, the runtime stops leasing once one
+  counted job has failed continuously for the grace (`isolated reconciliation
+  paused leasing` in the journal); stopping the worker is then optional.
 - `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
   it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
   because the runtime removed its socket), find the cause in
@@ -1361,22 +1368,22 @@ advertised-but-undelivered IDs on five consecutive attempts over at least an hou
 (see [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions)).
 Only the ingester changes; the worker binary and IPC version are unchanged, so the
 installed worker stays. Opening the ledger migrates it from schema 9 to 10. A
-pre-change ingester refuses a schema-10 ledger (the isolated runtime stays off,
-live ingestion continues), so roll back with
-`--isolated-negentropy-disable-unavailable-exclusion` on the new build, not by
-downgrading.
+pre-change ingester refuses a schema-10 ledger (see
+[rolling back](#rolling-back-relay-unavailable-exclusions)).
 
 1. Stop the worker, then take a consistent ledger backup with the ingester still
    running: `sudo -u pensieve sqlite3 "$LEDGER" ".backup '$LEDGER.pre-schema10'"`.
    Record `negentropy-ledger-status.py "$LEDGER"` (it shows `ledger_schema` 9 and
-   job 768 in `retry_wait`).
+   job 768 in `retry_wait`). The backup is only for the downgrade path under
+   [rolling back](#rolling-back-relay-unavailable-exclusions); keep it until the
+   new build has run for a few days.
 2. Build the merged master commit as `releases/ingest-<sha>/pensieve-ingest` (see
    Routine deploy; ingester only).
 3. Edit `zzzz-bounded-canary.conf`: point `ExecStart` at the new release and keep
-   every existing argument. The defaults need no new flags. Add
-   `--isolated-negentropy-pause-on-failure-secs 7200` only if unattended pausing
-   on other persistent failures is wanted; with the defaults an exclusion lands
-   before that grace ends. Spell out the defaults
+   every existing argument. The defaults need no new flags. Do not add
+   `--isolated-negentropy-pause-on-failure-secs` with this build: its global pause
+   clock can pause before an exclusion lands (fixed by the follow-up release
+   below). Spell out the defaults
    (`--isolated-negentropy-unavailable-exclusion-attempts 5`,
    `--isolated-negentropy-unavailable-exclusion-span-secs 3600`,
    `--isolated-negentropy-unavailable-exclusion-max-ids 8`) only if the drop-in
@@ -1402,10 +1409,82 @@ downgrading.
 6. Record the release in `ops/systemd/dropins/` and the table above.
 
 Every later exclusion logs the same WARN line; check the listed event ID against
-other relays. If one ever looks wrong, restart with
-`--isolated-negentropy-disable-unavailable-exclusion` (recorded exclusions stay;
-new matching jobs keep retrying) and keep the ledger for review. Never delete
-exclusion rows or edit jobs by hand.
+other relays. If one ever looks wrong, roll back as below and keep the ledger for
+review. Never delete exclusion rows or edit jobs by hand.
+
+### Exclusion follow-ups: worker re-request and per-job pause clock
+
+The release after #90 changes both binaries; the IPC version and ledger schema
+(10) stay, so either binary can be upgraded alone, but deploy both:
+
+- **Worker.** Before reporting `Unavailable` the worker re-requests exactly the
+  still-missing IDs (at least once, and again while each request delivers
+  something), so a relay that caps one REQ's results below the 128-ID batch is no
+  longer reported as withholding the tail. The installed worker (`ba0c4a1`) lacks
+  this, and the parent cannot tell the difference: until it is replaced, a capped
+  relay could still get a window wrongly excluded.
+- **Ingester.** The failure pause uses a per-job clock and exempts jobs on track to
+  an exclusion; IDs already archived (for example before the replay floor) count
+  as delivered, and a window whose withheld IDs are all archived completes as
+  `already_archived`. `--isolated-negentropy-pause-on-failure-secs 7200` is safe to
+  enable from this build on.
+
+1. Stop the worker: `sudo systemctl stop pensieve-negentropy-worker`. Record
+   `negentropy-ledger-status.py "$LEDGER"`.
+2. Build the merged master commit as in Routine deploy, both binaries:
+   `cargo build --release --locked -p pensieve-ingest --bin pensieve-ingest --bin pensieve-negentropy-worker`.
+   Install the ingester as `releases/ingest-<sha>/pensieve-ingest`. Keep the old
+   worker (`sudo cp -p /usr/local/libexec/pensieve-negentropy-worker
+   /usr/local/libexec/pensieve-negentropy-worker.ba0c4a1`), then
+   `sudo install -m 755 <target>/release/pensieve-negentropy-worker /usr/local/libexec/`.
+3. Edit `zzzz-bounded-canary.conf`: point `ExecStart` at the new release, keep every
+   existing argument, and add `--isolated-negentropy-pause-on-failure-secs 7200` if
+   unattended pausing on persistent failures is wanted. No other flag is needed.
+4. `sudo systemctl daemon-reload`, then restart the ingester with the graceful-stop
+   checks above; the worker starts with it.
+5. Verify: `readlink /proc/$(systemctl show -p MainPID --value pensieve-ingest)/exe`
+   is the new release; `sha256sum /usr/local/libexec/pensieve-negentropy-worker`
+   matches the build output and the worker's `ActiveEnterTimestamp`
+   (`systemctl show -p ActiveEnterTimestamp pensieve-negentropy-worker`) is after
+   the install; `isolated worker session budget` lines continue;
+   `negentropy_isolated_failure_pause_exempt_jobs` and
+   `negentropy_isolated_failure_pause_counted_jobs` appear on `:9091/metrics`; with
+   the flag, `negentropy_isolated_failure_pause` is 0. Worker journal lines
+   `isolated fetch progress` now carry `requested` and `delivered`.
+6. Record the release in `ops/systemd/dropins/` and the table above.
+
+Roll back by reinstalling the saved worker and pointing the drop-in at the
+previous `releases/ingest-*`; both read schema 10, so no ledger change is needed.
+Remove the pause flag when going back to a #90 build.
+
+### Rolling back relay-unavailable exclusions
+
+A pre-#90 ingester (for example `ingest-b466b37`) refuses a schema-10 ledger with
+`unsupported ledger identity/version`: it leaves the isolated runtime off
+(`/health/negentropy` `runtime_failed`, Kuma monitor 46 red) while live ingestion
+continues. So there are two paths:
+
+1. **Keep the new build, stop new exclusions (preferred).** Add
+   `--isolated-negentropy-disable-unavailable-exclusion` to `zzzz-bounded-canary.conf`
+   (it conflicts with the three `-unavailable-exclusion-*` tuning flags; remove
+   those), `daemon-reload` and restart the ingester with the graceful-stop checks.
+   Recorded exclusions and `already_archived` completions stay complete; new
+   matching jobs keep retrying. Without exclusions a withheld window holds
+   `unresolved_failures` again, so drop `--isolated-negentropy-pause-on-failure-secs`
+   too unless a pause on it is wanted.
+2. **Downgrade the binary and restore the backup.** Only if the new build itself
+   must go. Stop the worker, then stop the ingester with the graceful-stop checks
+   (both must stay stopped until step 4). Check
+   `negentropy-ledger-status.py "$LEDGER"` shows `unresolved_receipts` 0; if not, do
+   not restore (receipts not yet archive-confirmed would be lost): use path 1.
+   Then, as `pensieve`: `mv "$LEDGER" "$LEDGER.schema10"` (also `-wal`/`-shm` if
+   present) and `cp -p "$LEDGER.pre-schema10" "$LEDGER"`. Point the drop-in at the
+   pre-#90 release, remove every flag that build does not know (all
+   `-unavailable-exclusion` flags), `daemon-reload` and start the ingester. This
+   discards every exclusion and all reconciliation progress since the upgrade:
+   job 768 is back in `retry_wait` and holds `unresolved_failures` again, windows
+   planned since then are planned again, and job IDs issued since the upgrade are
+   issued again for other windows. Keep `$LEDGER.schema10` for reference.
 
 ## Cleanup debt
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it

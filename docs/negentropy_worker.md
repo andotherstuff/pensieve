@@ -65,9 +65,18 @@ qualify. Unsolicited frames, cancellation, EOF and wrong ACKs fail closed. Failu
 exit nonzero without ProtocolDone; parent retains receipts and applies retry policy.
 
 Exit 2 specifically means EOSE arrived without all advertised IDs (`Unavailable`).
-It does not distinguish relay withholding from SDK-expired NIP-40 events; it is
-neither proof of permanent absence nor proof of a volume limit. Never split/skip/
-complete solely from exit 2. Distinct verified local byte exhaustion exits 3; a verified
+Before reporting it, the worker re-requests exactly the IDs of the batch that are
+still missing: always once, and again while each request delivers at least one of
+them (so at most one request per ID). A relay that caps or defaults the results of
+one REQ below the 128-ID batch therefore delivers the tail to the follow-ups, and
+only IDs that a REQ naming exactly them did not return are reported. Follow-ups use
+the same subscription verification, capture and upload path; an unrequested event
+still fails closed. Exit 2 still does not distinguish relay withholding from events
+the pinned SDK drops before capture (NIP-40-expired events, an invalid signature, a
+relay message over the 5 MiB limit); it is neither proof of permanent absence nor
+proof of a volume limit. Never split/skip/complete solely from exit 2 (the parent's
+one exception, a repeated identical set, is described below and in
+[continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions)). Distinct verified local byte exhaustion exits 3; a verified
 individual event exceeding the IPC cap exits 4. Capture preserves its first local
 rejection even if the SDK suppresses Event notification and EOSE later reports
 Unavailable. Signature/window checks precede classification; a single oversized
@@ -94,7 +103,8 @@ authorized here, with one parent-side exception: after production job 768
 exclusion once the same fully enumerated set has been reported unavailable by
 five consecutive attempts over at least an hour (see
 [continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions)).
-The worker itself is unchanged; any other window containing an undeliverable event
+IDs of that set already in the archive count as delivered. The worker's only part
+is the follow-up request above; any other window containing an undeliverable event
 can remain unfinished.
 
 ## Deadlines and limitations

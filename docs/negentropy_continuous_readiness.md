@@ -102,8 +102,9 @@ Monitor 46 went red at 19:15Z and nobody acted for eleven hours, as expected
 overnight. Two mechanisms keep continuous mode from depending on that:
 
 - **In-process pause (recommended).** Start the ingester with
-  `--isolated-negentropy-pause-on-failure-secs <SECS>`. Once `unresolved_failures`
-  has held for that long the runtime stops granting leases, keeps replay, planning,
+  `--isolated-negentropy-pause-on-failure-secs <SECS>`. Once one job behind
+  `unresolved_failures` has failed continuously for that long (exempt jobs aside,
+  below) the runtime stops granting leases, keeps replay, planning,
   receipt maintenance and health, and logs `isolated reconciliation paused leasing`
   (`negentropy_isolated_failure_pause=1`). This is exactly the documented fault
   policy (stop new attempts, keep every gap, leave the monitor red) without root
@@ -113,9 +114,10 @@ overnight. Two mechanisms keep continuous mode from depending on that:
   reconciliation, including healthy fresh windows, until an operator restarts the
   ingester without the flag or resolves the job; the pause does not end on its own
   because nothing is retried while paused. Restarting the ingester also restarts
-  live ingestion. A window whose relay persistently withholds the same advertised
-  IDs no longer reaches the pause: it is completed by a
-  [relay-unavailable exclusion](#relay-unavailable-exclusions) first.
+  live ingestion. The grace clock is per job, and a window whose relay
+  persistently withholds the same advertised IDs is exempt while its reports are
+  on track to a [relay-unavailable exclusion](#relay-unavailable-exclusions), so
+  it is completed instead of pausing (see the interaction below).
 - **Runbook step.** On monitor 46 red with `unresolved_failures`, stop only the
   worker (`sudo systemctl stop pensieve-negentropy-worker`) and record the
   read-only ledger status. Without the flag, this is what must happen manually; the
@@ -143,11 +145,24 @@ when all of the following hold:
   IDs (default 8, at most the 128-ID sample cap);
 - every missing ID was explicitly requested: each attempt's received frames plus
   its missing count fit in the worker's single 128-ID fetch batch (a larger diff
-  can report later-batch IDs that were never asked for);
+  can report later-batch IDs that were never asked for). Exactly 128 qualifies. A
+  relay that caps one REQ's results below the batch answers EOSE early; the worker
+  therefore re-requests exactly the still-missing IDs (at least once, and again
+  while each request delivers something) and reports only IDs that a REQ naming
+  exactly them did not return. Workers older than this change lack that
+  follow-up;
 - the reports span at least `T` seconds from first to last (default 3600);
-- every frame the job received is already archive-confirmed (no retained receipt),
-  and none of the IDs carries a durable archive marker (if one does, the event
-  was delivered after all and normal reconciliation finishes the window).
+- every frame the job received is already archive-confirmed (no retained receipt).
+
+IDs of the set that already carry a durable archive marker count as delivered:
+the archive holds them, whichever path brought them in. This matters for events
+archived before the inventory replay floor. The inventory never lists them, so
+every attempt's diff names them again, and normal reconciliation could never
+finish such a window (the previous rule left it retrying forever). Only the
+remaining IDs are excluded; if none remains the job completes with reason
+`already_archived` and no exclusion row (INFO `negentropy window completed: every
+ID the relay withheld was already archived`,
+`negentropy_relay_unavailable_already_archived_total`).
 
 Any other failure kind (relay errors, deadlines and worker-side protocol failures
 all report as `relay`), a different set or a protocol-complete attempt ends the
@@ -155,8 +170,8 @@ run. An attempt that ended with no report at all carries no relay evidence and i
 skipped without counting: a lost worker, an ingester restart mid-session, or a
 lease consumed without a session, like job 768's attempt 16 in the lease race
 above. Skipping it is safe because any event such an attempt did receive is either
-still a retained receipt (which defers the exclusion) or archived (which refuses
-it). An unparseable stored report is corruption and stops the runtime as before. Flags: `--isolated-negentropy-unavailable-exclusion-attempts`
+still a retained receipt (which defers the exclusion) or archived (and then
+counts as delivered). An unparseable stored report is corruption and stops the runtime as before. Flags: `--isolated-negentropy-unavailable-exclusion-attempts`
 (3–32), `-span-secs` (1800–86400), `-max-ids` (1–128), and
 `--isolated-negentropy-disable-unavailable-exclusion` to stop new exclusions.
 
@@ -184,7 +199,12 @@ without an event the relay advertised but never delivered`, with job, relay,
 count and event ID) and increments `negentropy_relay_unavailable_exclusions_total`;
 `negentropy_relay_unavailable_exclusions_unresolved` gauges events not yet
 archived; the status tool lists the latest exclusions and splits `complete` into
-reconciled and excluded windows.
+`reconciled`, `relay_unavailable_exclusion`, `split_with_relay_unavailable_descendant`
+(a split parent completed because its children did, one of them by an exclusion)
+and `already_archived`. Both completions fire the ledger's completion trigger, so
+they advance `lifecycle.last_success` (the status tool's
+`last_durable_completion_unix`) and count as durable progress for the
+`durable_progress_stalled` watchdog, like any other completion.
 
 **Health.** An excluded job is complete, so it no longer counts toward
 `unresolved_failures`, and `/health/negentropy` and Kuma monitor 46 recover. Other
@@ -199,24 +219,55 @@ it is admitted and deduplicated normally and nothing breaks; each tick checks up
 window once per relay, so nothing asks the relay again. A re-fetch scheduler for
 unresolved exclusions is a follow-up, not part of this change.
 
-**Interaction with the failure pause.** `unresolved_failures` starts when the third
-attempt fails. With the default rule and backoff (4, 8, 16, 32, then 60 minutes
-after attempts 3–7) the exclusion fires at attempt 7 for short sessions: 3,600 s
-of backoff after attempts 3–6, plus four sessions of at most 540 s and about 35 s
-of tick and jitter slack each, is at most 5,900 s after the pause clock starts,
-inside a 7,200 s grace. Nine-minute sessions reach the span one attempt earlier.
-Raising `K` or `T` can push the exclusion past the grace; keep the grace above the
-exclusion time. Any other persistent failure, such as the relay being down for more
-than two hours, still pauses all reconciliation after the grace. With one relay
-that is harmless; revisit it before adding relays, because one bad relay would
-then pause healthy ones too.
+**Interaction with the failure pause.** `unresolved_failures` starts when a
+job's third attempt fails, and an exempt job still counts there. The pause does
+not count it while its reports are on track to an exclusion: the latest reported
+attempt qualifies, every `unavailable` report since the last protocol-complete
+attempt names the same set, the run has not met the rule yet, and the job is at
+most at attempt `2 × K` (10 by default). The pause clock is per job, so failures
+of different jobs never add up. #90 used one global clock that reset only when
+no job was failing; two counter-examples paused before an exclusion could land,
+and since nothing is leased while paused it then stayed paused until a restart:
+
+- a `relay` or deadline report on attempt 3, then the same withheld ID again: the
+  identical run restarts at attempt 4, so the fifth identical report is attempt
+  8, after the 7,200 s grace had run out at attempt 7;
+- two withheld windows about an hour apart: the second became a persistent
+  failure before the first was excluded, so the global clock never reset and
+  paused before the second exclusion.
+
+Both now complete without pausing (`counter_example_a_*` and
+`counter_example_b_*` in `sync/runtime.rs` drive them through the ledger with a
+virtual clock, alongside the #90 clock to show where it paused). The exemption is
+bounded: a changed set, a set larger than `max-ids` or one fetch batch, a run
+that met the rule but is held back by unarchived receipts, a disabled rule and a
+job past attempt `2 × K` all count, so a relay that keeps changing what it
+withholds, or a worker that keeps dying after one report, still pauses a grace
+after it stops being exempt. A relay that stays down still pauses a grace after
+the third failure. With the defaults an uninterrupted run from the first failure
+is excluded at attempt 7 (short sessions) or 6 (nine-minute sessions). Raising
+`K` delays the exclusion and raises the ceiling with it. `T` is measured over the
+latest `K` reports, which the 60-minute backoff spaces about an hour apart, so a
+`T` above roughly `K − 1` hours can never be met: such a window is never
+excluded, and it counts toward the pause once past the ceiling. With one
+relay a genuine persistent failure pausing everything is the intended policy;
+revisit it before adding relays, because one bad relay would then pause healthy
+ones too.
 
 **Schema.** Opening a schema-9 ledger adds the column, table, index and coverage
 column in one transaction and sets `user_version` 10. No row is rewritten or
 dropped. A pre-change binary refuses a schema-10 ledger (`unsupported ledger
-identity/version`): the isolated runtime stays off and live ingestion continues.
-Roll back by restarting the new binary with
-`--isolated-negentropy-disable-unavailable-exclusion`, not by downgrading.
+identity/version`): it leaves the isolated runtime off, so `/health/negentropy`
+reports `runtime_failed`, while live ingestion continues. There are two rollback
+paths (the RUNBOOK has the steps): keep the new build and restart it with
+`--isolated-negentropy-disable-unavailable-exclusion` (recorded exclusions stay,
+no new ones are made); or, only if the new build itself must go, stop the
+ingester and the worker, restore the schema-9 backup taken before the upgrade and
+start the old binary. The restore discards every exclusion and all
+reconciliation progress since the upgrade (those windows are planned or retried
+again) and re-issues the job IDs used since then, so keep the schema-10 file for
+reference. As for any pre-upgrade backup, never restore it over receipts that are
+not yet archive-confirmed: the current ledger must show `unresolved_receipts` 0.
 
 ## First increment: measure without deleting
 
