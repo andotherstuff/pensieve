@@ -237,7 +237,7 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
 `docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`; 020 replaces the `daily_user_stats_mv` lookups and the `kinds_stats_mv` / `relay_distribution_mv` rescans in two phases, the second run by `api-rollups cutover`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-12):** 001–015 and prepared 016, 017, 018 and 019 are applied (019 backfilled and validated 2026-10-12); prepared 020 is not applied yet. `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state (2026-10-12):** 001–015 and prepared 016, 017, 018 019 and 020 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -320,7 +320,7 @@ summary below is a quick reference.
 | Component | Runs as | What actually starts (2026-10-11) |
 |-----------|---------|-----------------------------------|
 | ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12) via `pensieve-api.service.d/90-postgres-cutover.conf` |
+| `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-d026d53/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`; since 2026-10-12) via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
 | `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against Premium Primal since 2026-10-12) | `/usr/local/libexec/pensieve-negentropy-worker` |

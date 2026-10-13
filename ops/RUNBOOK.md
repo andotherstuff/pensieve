@@ -41,7 +41,7 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-b466b37/pensieve-serve` (master: 019 rollups, publishers capped at 60 days; since 2026-10-12 16:20 CEST) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-d026d53/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`; since 2026-10-12 21:02 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
 | `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-b466b37/pensieve-ingest` (master incl. #72 and #73, since 2026-10-12 16:36 CEST) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker`, continuous against Premium Primal since 2026-10-12 |
@@ -213,7 +213,7 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, current), `ingest-b466b37` (current
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, current), `ingest-b466b37` (current
   ingester), `ingest-ba0c4a1` (previous ingester from PR #72, with its worker) and only
   `preview-3ab1045`. Build target dirs other than the latest `api-*`/`ingest-*` caches in
   `/data/pensieve-build/` were removed on 2026-10-12.
@@ -892,7 +892,9 @@ ingest insert (2,833 inserts, ~6 h a day); `relay_distribution_mv` rescans 1.32 
 insert p95 from ~17 s to ~31 s (69 s at 12:00 UTC). Design, semantics and behaviour
 changes: [`docs/api_rollups.md` → Migration 020](../docs/api_rollups.md#migration-020-incremental-derived-views).
 
-**Status:** prepared, not applied.
+**Status:** Applied 2026-10-12: phase 1 at 17:12 UTC (the kinds view recreated at 17:23:20 because the first insert raced it by 4 s; `plan` refused as designed); backfill 17:34–18:50 UTC (user-flags 16 shards, relay-lists and kinds 256 each; ingest 0 errors, p95 ≤ 14.6 s); `validate` 0 failed rows (kinds re-checked after `kinds_stats_mv`'s 19:00 refresh: its first run flagged 6 ephemeral kinds against the hour-old reference, while `kind_totals` matched the exact current counts); API `releases/api-d026d53` at 19:02 UTC; cutover at 19:18:03 UTC (10 statements); post-cutover `validate` 0 failed rows. Effect: `daily_user_stats_mv` 7,698 ms → 2 ms per insert (30.4M → 9k rows read), ingest insert ~8.4 s → 0.23 s average (p95 0.29 s); `relay_distribution` refresh 408 s / 1.32 TiB every 6 h → 5.6 s hourly at :20; `kinds_stats_mv` dropped; active users' `has_*` corrected (2026-10-11: `has_profile` 14,318 → 26,788, `has_follows` 5,103 → 10,410).
+
+Known follow-ups: `/api/v1/kinds/{kind}` still scans `events_local` and times out for large kinds (e.g. kind 1); `validate` compares `kind_totals` with `kinds_stats_mv`, which is up to an hour old, so fast-moving ephemeral kinds can fail falsely before the cutover — re-check after a refresh.
 
 Two phases. Phase 1 (`prepared/020_incremental_derived_views.sql`) only adds tables, three
 insert-time views and the `daily_user_stats.last_indexed_at` column; nothing that exists

@@ -69,8 +69,9 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - Prepared 019 (API rollups for `/stats/publishers` and `/stats/longform`)
   was applied at 09:14 UTC on 2026-10-12, backfilled and validated (0 failed
   rows); the API reads it since 12:52 UTC.
-- Prepared 020 (incremental derived views) is **not applied yet**; see its
-  section below.
+- Prepared 020 (incremental derived views) was applied, backfilled and
+  validated on 2026-10-12 and cut over at 19:18 UTC (`kinds_stats_mv` dropped;
+  post-cutover `validate` 0 failed rows); see its section below and the RUNBOOK.
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -98,7 +99,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/017_preview_compact_lookups.sql | Compact profile, zap and naddr lookup tables for `pensieve-preview`; excluded from `ch-migrate-all`. **Applied and backfilled in production** | **Yes** (`preview-lookups backfill`, bounded and resumable) |
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
 | prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
-| prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Prepared, not applied** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
+| prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Prepared, not applied** **Applied and cut over in production 2026-10-12** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).

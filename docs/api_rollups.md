@@ -4,7 +4,8 @@
 > and serving in production since 12:52 UTC (`releases/api-60c4bfe`). Publisher windows
 > beyond ~90 days still exceed the 20 s cap; see
 > [`ops/RUNBOOK.md` → API rollups](../ops/RUNBOOK.md#api-rollups-migration-019).
-> Migration 020 ([below](#migration-020-incremental-derived-views)) is prepared, not applied.
+> Migration 020 ([below](#migration-020-incremental-derived-views)) is applied and cut over
+> (2026-10-12 19:18 UTC); results in `ops/RUNBOOK.md` → Incremental derived views.
 
 This document covers both migrations that move derived data off full scans of
 `events_local` and the shared operator tool `api-rollups`. Migration 019 is
