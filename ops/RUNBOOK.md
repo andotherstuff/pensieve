@@ -1319,6 +1319,25 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   `--isolated-negentropy-pause-on-failure-secs`, the runtime stops leasing once one
   counted job has failed continuously for the grace (`isolated reconciliation
   paused leasing` in the journal); stopping the worker is then optional.
+
+  **A revisited excluded window.** A later rolling pass over history enqueues
+  windows again. On 2026-10-13 the 15:15 UTC pass enqueued job 768's excluded
+  window as job 1984, which withheld the same ID on every attempt and, before
+  carried exclusions, held monitor 46 red for about an hour while it re-earned
+  its own exclusion. With carried exclusions such a job is completed on the
+  lifecycle turn after its first failure (WARN `negentropy relay-unavailable
+  exclusion carried forward` with `carried_from` and `original_job`,
+  `negentropy_relay_unavailable_carried_total`), so it never reaches three
+  failures and the monitor stays green. If 46 is red for a window whose
+  `isolated worker attempt failed` lines show `kind=Unavailable` and whose ID is
+  listed in the status tool's `relay_unavailable_exclusions.recent`, it was not
+  carried because one of the conditions fails: the report names other IDs too,
+  is not fully enumerated (`missing_count` above the sample) or exceeds one fetch
+  batch or `max-ids`; the window does not overlap the original's; the original
+  row is resolved (the event is archived, so the relay is being asked for it
+  again); the job's received frames are not yet archive-confirmed; or
+  `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
+  like any other `unresolved_failures` job above; the full rule still applies.
 - `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
   it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
   because the runtime removed its socket), find the cause in
@@ -1498,6 +1517,58 @@ use `ingest-b466b37`: it refuses the schema-10 ledger (see
    twice; `systemctl show -p ExecStart pensieve-ingest` has no
    `--isolated-negentropy-pause-on-failure-secs`; `isolated worker session budget`
    lines continue.
+
+### Rolling out carried exclusions
+
+Ingester only: the worker binary and the IPC version are unchanged, so the
+installed worker stays. Opening the ledger adds the nullable column
+`relay_unavailable_exclusions.carried_from` and the partial index
+`relay_unavailable_withheld` within schema 10 (`user_version` stays 10; no row is
+rewritten). `ingest-85a2402` (and the earlier schema-10 builds `ingest-26f2170`
+and `ingest-e73bebb`) still open and serve the extended ledger, so rollback is a
+binary switch with no ledger restore. See
+[continuous readiness](../docs/negentropy_continuous_readiness.md#carried-exclusions).
+
+1. Stop the worker (`sudo systemctl stop pensieve-negentropy-worker`) and record
+   `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`.
+   Note any `retry_wait` job over an already excluded window (job 1984 if it has
+   not yet earned its own exclusion).
+2. Build the merged master commit as in Routine deploy (ingester only):
+   `CARGO_TARGET_DIR=/data/pensieve-build/ingest-<sha> cargo build --release --locked -p pensieve-ingest --bin pensieve-ingest`
+   in a detached worktree of `<sha>`, then
+   `sudo install -d -m 755 /home/pensieve/pensieve/releases/ingest-<sha>` and
+   `sudo install -m 755 /data/pensieve-build/ingest-<sha>/release/pensieve-ingest /home/pensieve/pensieve/releases/ingest-<sha>/`.
+3. `sudoedit /etc/systemd/system/pensieve-ingest.service.d/zzzz-bounded-canary.conf`:
+   point the second `ExecStart=` at `releases/ingest-<sha>/pensieve-ingest` and keep
+   every existing argument, including `--isolated-negentropy-pause-on-failure-secs 7200`.
+   No new flag is needed.
+4. Outside :00–:07 UTC, `sudo systemctl daemon-reload`, then restart the ingester
+   with the graceful-stop checks above (`TimeoutStopSec=15min`); the worker starts
+   with it.
+5. Verify: `readlink /proc/$(systemctl show -p MainPID --value pensieve-ingest)/exe`
+   is the new release; `isolated worker session budget` lines continue;
+   `negentropy_isolated_ready` 1 and `negentropy_isolated_unhealthy` 0;
+   the status tool still shows `ledger_schema` 10 and now a
+   `relay_unavailable_exclusions.carried` object. If step 1 found a revisit job,
+   the first tick logs `negentropy relay-unavailable exclusion carried forward`
+   for it (for job 1984: `original_job=768`, `carried_from` job 768's exclusion
+   row ID, 1 if it was the first exclusion,
+   `event_id=089d1fdc2d1cf0f03be5844014378a3f2bcca0d1092619a70ed6f86b7c286b65`),
+   `negentropy_relay_unavailable_carried_total` counts it, the job is `complete`
+   with reason `relay_unavailable`, and `/health/negentropy` leaves
+   `unresolved_failures`. Otherwise the next pass over an excluded window shows the
+   same lines after its first failure.
+6. Record the release in `ops/systemd/dropins/` and the table above.
+
+**Rollback.** Point the second `ExecStart=` back at the release it replaced,
+`releases/ingest-85a2402/pensieve-ingest` (`ingest-26f2170` behaves the same;
+keep every argument), `daemon-reload`
+and restart the ingester with the graceful-stop checks; the worker stays. Leave the
+ledger alone: `ingest-85a2402` opens it (schema 10), writes new rows with
+`carried_from` NULL, ignores the index, keeps carried rows as exclusions (counted,
+resolved on late arrival) and simply stops carrying, so a revisited window again
+re-earns its exclusion and holds monitor 46 red for about an hour. Do not drop the
+column or index by hand.
 
 ### Rolling back relay-unavailable exclusions
 

@@ -399,6 +399,9 @@ struct Args {
     /// Relay-unavailable exclusion: consecutive latest attempts of one job that
     /// must each report the identical, fully enumerated set of advertised but
     /// undelivered event IDs before the window completes without them (3-32).
+    /// A window whose relay is already proven (by an unresolved exclusion of an
+    /// overlapping window) to withhold every reported ID completes after one
+    /// such report instead: a carried exclusion.
     #[arg(
         long,
         requires = "isolated_negentropy",
@@ -427,8 +430,9 @@ struct Args {
     )]
     isolated_negentropy_unavailable_exclusion_max_ids: u32,
 
-    /// Never complete a window by relay-unavailable exclusion; such jobs stay in
-    /// paced retry. Existing exclusions are kept. Conflicts with the tuning flags.
+    /// Never complete a window by relay-unavailable exclusion, carried ones
+    /// included; such jobs stay in paced retry. Existing exclusions are kept.
+    /// Conflicts with the tuning flags.
     #[arg(
         long,
         requires = "isolated_negentropy",

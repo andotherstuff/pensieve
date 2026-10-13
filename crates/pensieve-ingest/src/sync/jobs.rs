@@ -39,7 +39,8 @@ pub use retention::RetentionProgress;
 #[cfg(test)]
 pub(crate) use unavailable::WORKER_FETCH_BATCH;
 pub use unavailable::{
-    ALREADY_ARCHIVED, RELAY_UNAVAILABLE, UnavailableExclusion, UnavailableProgress, UnavailableRule,
+    ALREADY_ARCHIVED, CarriedEvent, CarriedExclusion, RELAY_UNAVAILABLE, UnavailableExclusion,
+    UnavailableProgress, UnavailableRule,
 };
 
 /// A rejected operation leaves the prior durable obligation intact.
@@ -316,6 +317,9 @@ impl JobLedger {
                 tx.execute_batch(unavailable::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 10)?;
             }
+            // Additive and idempotent within schema 10, so a schema-10 reader
+            // that predates carried exclusions still opens the ledger.
+            unavailable::extend_schema(&tx)?;
             tx.commit()?;
         }
         let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;

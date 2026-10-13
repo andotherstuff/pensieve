@@ -919,6 +919,26 @@ fn record_unavailable(progress: &UnavailableProgress) {
             );
         }
     }
+    // Counted apart from fresh exclusions: the proof is the original row's.
+    for carried in &progress.carried {
+        metrics::counter!("negentropy_relay_unavailable_carried_total")
+            .increment(carried.events.len() as u64);
+        for event in &carried.events {
+            tracing::warn!(
+                job = carried.job,
+                relay = %carried.relay,
+                count = carried.events.len(),
+                event_id = %hex::encode(event.event_id),
+                carried_from = event.original_row,
+                original_job = event.original_job,
+                first_attempt = carried.first_attempt,
+                last_attempt = carried.last_attempt,
+                attempts = carried.attempts,
+                span_secs = carried.span_secs,
+                "negentropy relay-unavailable exclusion carried forward: window completed without an event its relay is already proven to withhold"
+            );
+        }
+    }
     for job in &progress.already_archived {
         metrics::counter!("negentropy_relay_unavailable_already_archived_total").increment(1);
         tracing::info!(
@@ -2245,6 +2265,62 @@ mod tests {
         h.executor.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn lifecycle_turn_carries_a_known_withheld_id_to_a_revisited_window() {
+        // Job 768 / 1984 shape: the original window is excluded, then a new pass
+        // over the same window fails once withholding the same ID.
+        let mut original = 0;
+        let mut h = Harness::with_ledger(
+            || 30_000,
+            |ledger| {
+                original = withheld_history(ledger, 5);
+                let scratch = tempfile::tempdir().unwrap();
+                let dedupe = DedupeIndex::open(scratch.path().join("dedupe")).unwrap();
+                let progress = ledger.exclude_relay_unavailable(20_000, &dedupe).unwrap();
+                assert_eq!(progress.excluded[0].job, original);
+                let job = ledger
+                    .enqueue("pass-2", "wss://relay.example.com", 100, 110)
+                    .unwrap()
+                    .id;
+                let lease = ledger.lease_next(25_000, 600).unwrap().unwrap();
+                assert_eq!(lease.job().id, job);
+                let report = FailureDiagnostic {
+                    kind: FailureKind::Unavailable,
+                    missing_count: 1,
+                    sample: vec![[8; 32]],
+                };
+                ledger
+                    .record_failure_report(&lease, 1, &report, 25_001)
+                    .unwrap();
+                ledger
+                    .retry(&lease, 25_001, 60, RetryReason::RelayFailure)
+                    .unwrap();
+                job
+            },
+        );
+        let observation = h.executor.lifecycle().await.unwrap();
+        let job = h.executor.job(h.job).await.unwrap();
+        assert_eq!((job.state, job.attempt), (JobState::Complete, 1));
+        assert_eq!(
+            job.reason.as_deref(),
+            Some(super::super::jobs::RELAY_UNAVAILABLE)
+        );
+        assert!(!observation.persistent_failure);
+        assert!(h.executor.pause_failures().await.unwrap().is_empty());
+        let ledger = h.executor.shutdown().await.unwrap();
+        assert_eq!(
+            ledger.relay_unavailable_exclusions(h.job).unwrap(),
+            vec![([8; 32], None)]
+        );
+        let row = ledger.relay_unavailable_carried_from(h.job).unwrap();
+        assert_eq!(row.len(), 1);
+        assert!(row[0].is_some());
+        assert_eq!(
+            ledger.relay_unavailable_carried_from(original).unwrap(),
+            vec![None]
+        );
+    }
+
     /// Counts counter increments by name; every other metric is discarded.
     #[derive(Clone, Default)]
     struct CounterLog(Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>);
@@ -2325,13 +2401,32 @@ mod tests {
                     span_secs: 7200,
                 },
             ],
+            carried: vec![super::super::jobs::CarriedExclusion {
+                job: 4,
+                relay: "wss://relay.example.com".into(),
+                events: [[1; 32], [4; 32]]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, event_id)| super::super::jobs::CarriedEvent {
+                        event_id,
+                        original_row: n as i64 + 1,
+                        original_job: 1,
+                    })
+                    .collect(),
+                first_attempt: 1,
+                last_attempt: 1,
+                attempts: 1,
+                span_secs: 0,
+            }],
             awaiting_archive: 1,
             already_archived: vec![3],
             resolved: 4,
         };
         metrics::with_local_recorder(&log, || record_unavailable(&progress));
         let counts = log.0.lock().unwrap().clone();
+        // Carried events are counted apart from freshly proven ones.
         assert_eq!(counts["negentropy_relay_unavailable_exclusions_total"], 3);
+        assert_eq!(counts["negentropy_relay_unavailable_carried_total"], 2);
         assert_eq!(
             counts["negentropy_relay_unavailable_already_archived_total"],
             1
