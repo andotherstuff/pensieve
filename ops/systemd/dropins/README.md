@@ -20,7 +20,7 @@ copy here in the same PR as the code it deploys.
 | `pensieve-ingest` | `negentropy-worker.conf` | `Wants=pensieve-negentropy-worker.service`: starts the isolated NIP-77 worker whenever the ingester starts, including at boot (continuous Premium Primal reconciliation since 2026-10-12) |
 | `pensieve-ingest` | `override.conf` | `RUST_BACKTRACE=1` |
 | `pensieve-ingest` | `stop-timeout.conf` | `TimeoutStopSec=15min` (added 2026-10-12): a ClickHouse insert slowed by the hourly refreshable views must finish instead of being killed mid-segment |
-| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `releases/ingest-e73bebb/pensieve-ingest` (master incl. #88 and #90, since 2026-10-13 12:48 UTC; previously `releases/ingest-b466b37/` (#72 and #73), which cannot open the schema-10 ledger, and before that the PR #72 build `releases/ingest-ba0c4a1/` with its worker) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
+| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `releases/ingest-26f2170/pensieve-ingest` (master incl. #88, #90 and #92, since 2026-10-13 14:09 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`; previously `releases/ingest-e73bebb/` (#88 and #90, schema 10, no pause flag), before that `releases/ingest-b466b37/` (#72 and #73), which cannot open the schema-10 ledger, and before that the PR #72 build `releases/ingest-ba0c4a1/` with its worker) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
 
 ### Obsolete settings in the API drop-in
 
