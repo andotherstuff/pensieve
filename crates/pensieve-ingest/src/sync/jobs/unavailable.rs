@@ -2189,6 +2189,18 @@ mod tests {
     }
 
     #[test]
+    fn carry_refuses_a_window_wholly_before_the_original() {
+        // The other non-overlap case: the revisit ends before the original starts.
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (900, 1799), &[MISSING], 1000);
+        let now = 1000 + 10 * HOUR;
+        let job = f.revisit("before", RELAY, (0, 899), now, 0, unavailable(&[MISSING]));
+        assert!(f.carry(job).is_none());
+        assert!(f.run(now + 5).carried.is_empty());
+        assert_eq!(f.db.get(job).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
     fn carry_rests_only_on_original_proof() {
         // The second pass's window contains the original's, so it is carried;
         // the third overlaps only the second pass's (carried) window. Carried
