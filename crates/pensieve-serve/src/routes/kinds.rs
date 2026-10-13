@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
 use crate::rollups::derived::KindsSort;
-use crate::routes::stats::fetch_kind_totals;
+use crate::rollups::kind_activity::SeriesGrain;
+use crate::routes::stats::{fetch_kind_detail, fetch_kind_series, fetch_kind_totals};
 use crate::state::AppState;
 
 /// Query parameters for kinds list.
@@ -93,26 +94,15 @@ pub struct KindDetail {
     pub events_30d: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Row)]
-struct KindBasicStats {
-    kind: u16,
-    event_count: u64,
-    unique_pubkeys: u64,
-    first_seen: u32,
-    last_seen: u32,
-    avg_content_length: f64,
-}
-
-#[derive(Debug, Clone, Deserialize, Row)]
-struct KindRecentStats {
-    events_24h: u64,
-    events_7d: u64,
-    events_30d: u64,
-}
-
 /// `GET /api/v1/kinds/{kind}`
 ///
-/// Returns detailed statistics for a specific event kind.
+/// Returns detailed statistics for a specific event kind, from the
+/// insert-fed rollups (no scan of `events_local`): `event_count`,
+/// `first_seen`, `last_seen` and the approximate `unique_pubkeys` from
+/// `kind_totals` (migration 020); `avg_content_length` and the 24 h / 7 d /
+/// 30 d counts from `kind_activity` (migration 021). The windows start at the
+/// UTC hour containing `now() - N days` and have no upper bound. `404` when
+/// the kind has no events, `503 metric_unavailable` when a rollup is missing.
 /// Cached for 5 minutes.
 pub async fn get_kind(
     State(state): State<AppState>,
@@ -122,52 +112,9 @@ pub async fn get_kind(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        // Get basic stats
-        let basic: KindBasicStats = state
-            .clickhouse
-            .query(
-                "SELECT
-                    kind,
-                    count() AS event_count,
-                    uniqExact(pubkey) AS unique_pubkeys,
-                    toUInt32(min(created_at)) AS first_seen,
-                    toUInt32(max(created_at)) AS last_seen,
-                    avg(length(content)) AS avg_content_length
-                FROM events_local
-                WHERE kind = ?
-                GROUP BY kind",
-            )
-            .bind(kind)
-            .fetch_optional()
+        fetch_kind_detail(&state, kind)
             .await?
-            .ok_or_else(|| ApiError::NotFound(format!("kind {} not found", kind)))?;
-
-        // Get recent activity
-        let recent: KindRecentStats = state
-            .clickhouse
-            .query(
-                "SELECT
-                    countIf(created_at >= now() - INTERVAL 1 DAY) AS events_24h,
-                    countIf(created_at >= now() - INTERVAL 7 DAY) AS events_7d,
-                    countIf(created_at >= now() - INTERVAL 30 DAY) AS events_30d
-                FROM events_local
-                WHERE kind = ?",
-            )
-            .bind(kind)
-            .fetch_one()
-            .await?;
-
-        Ok(KindDetail {
-            kind: basic.kind,
-            event_count: basic.event_count,
-            unique_pubkeys: basic.unique_pubkeys,
-            first_seen: basic.first_seen,
-            last_seen: basic.last_seen,
-            avg_content_length: basic.avg_content_length,
-            events_24h: recent.events_24h,
-            events_7d: recent.events_7d,
-            events_30d: recent.events_30d,
-        })
+            .ok_or_else(|| ApiError::NotFound(format!("kind {} not found", kind)))
     })
     .await?;
 
@@ -194,97 +141,40 @@ pub struct KindTimeSeriesRow {
 
 /// `GET /api/v1/kinds/{kind}/activity`
 ///
-/// Returns activity time series for a specific kind.
-/// Cached for 10 minutes.
+/// Returns activity time series for a specific kind from the `kind_activity`
+/// rollup (migration 021): UTC days, Monday weeks or UTC months of
+/// `created_at`, the current period included, future periods excluded.
+/// `unique_pubkeys` is approximate (`uniqCombined64`). `503
+/// metric_unavailable` when the rollup is missing. Cached for 10 minutes.
 pub async fn kind_activity(
     State(state): State<AppState>,
     Path(kind): Path<u16>,
     Query(params): Query<KindTimeSeriesQuery>,
 ) -> Result<Json<Vec<KindTimeSeriesRow>>, ApiError> {
     let limit = params.limit.unwrap_or(30).min(365);
-    let group_by = params.group_by.clone();
 
     // Validate group_by before caching
-    let (group_expr, max_limit) = match group_by.as_deref() {
-        Some("week") => ("toString(toMonday(created_at))", 52u32),
-        Some("month") => ("toString(toStartOfMonth(created_at))", 120u32),
-        Some("day") | None => ("toString(toDate(created_at))", 365u32),
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "invalid group_by value: '{}'. Valid options: day, week, month",
-                other
-            )));
-        }
+    let Some(grain) = SeriesGrain::parse(params.group_by.as_deref()) else {
+        return Err(ApiError::BadRequest(format!(
+            "invalid group_by value: '{}'. Valid options: day, week, month",
+            params.group_by.as_deref().unwrap_or_default()
+        )));
     };
-
-    let limit = limit.min(max_limit);
-    let window_start = activity_window_start(group_by.as_deref().unwrap_or("day"), limit);
+    let limit = limit.min(grain.max_limit());
 
     let cache_key = format!(
         "kind_activity:kind={}&group_by={}&limit={}",
         kind,
-        group_by.as_deref().unwrap_or("day"),
+        grain.name(),
         limit
     );
 
     let cache = state.cache.clone();
     let result =
         get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            let rows: Vec<KindTimeSeriesRow> = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                    {} AS period,
-                    count() AS event_count,
-                    uniqExact(pubkey) AS unique_pubkeys
-                FROM events_local
-                WHERE kind = ? AND created_at >= {} AND created_at <= now()
-                GROUP BY period
-                ORDER BY period DESC
-                LIMIT {}",
-                    group_expr, window_start, limit
-                ))
-                .bind(kind)
-                .fetch_all()
-                .await?;
-
-            Ok(rows)
+            fetch_kind_series(&state, kind, grain, limit).await
         })
         .await?;
 
     Ok(Json(result))
-}
-
-fn activity_window_start(grain: &str, limit: u32) -> String {
-    let (start, unit) = match grain {
-        "week" => ("toMonday(now())", "WEEK"),
-        "month" => ("toStartOfMonth(now())", "MONTH"),
-        _ => ("toStartOfDay(now())", "DAY"),
-    };
-    format!("{start} - INTERVAL {} {unit}", limit.saturating_sub(1))
-}
-
-#[cfg(test)]
-mod window_tests {
-    use super::activity_window_start;
-
-    #[test]
-    fn recent_calendar_windows_include_current_period() {
-        assert_eq!(
-            activity_window_start("day", 30),
-            "toStartOfDay(now()) - INTERVAL 29 DAY"
-        );
-        assert_eq!(
-            activity_window_start("week", 1),
-            "toMonday(now()) - INTERVAL 0 WEEK"
-        );
-        assert_eq!(
-            activity_window_start("month", 24),
-            "toStartOfMonth(now()) - INTERVAL 23 MONTH"
-        );
-        assert_eq!(
-            activity_window_start("day", 0),
-            "toStartOfDay(now()) - INTERVAL 0 DAY"
-        );
-    }
 }

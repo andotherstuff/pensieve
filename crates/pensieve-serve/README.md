@@ -783,8 +783,7 @@ Read from the insert-fed `kind_totals` rollup (migration
 hourly `kinds_stats_mv` rescan it replaces was up to an hour old and counted
 `unique_pubkeys` exactly). With `sort=count`, kinds with equal counts are
 ordered by kind. `503 metric_unavailable` if the rollup does not exist.
-`GET /api/v1/kinds/{kind}` below still reads `events_local` directly, so its
-`unique_pubkeys` stays exact.
+`GET /api/v1/kinds/{kind}` below reports the same `unique_pubkeys`.
 
 **Examples**
 
@@ -826,14 +825,26 @@ Detailed statistics for a specific event kind.
 
 | Field | Description |
 |-------|-------------|
+| `event_count` | Events of this kind (exact) |
+| `unique_pubkeys` | **Approximate** distinct authors (`uniqCombined64`, ~0.3% standard error; exact for small kinds), the same figure as `GET /api/v1/kinds` |
 | `first_seen` | Unix timestamp (seconds) of the first event of this kind |
 | `last_seen` | Unix timestamp (seconds) of the most recent event of this kind |
+| `avg_content_length` | Average `content` length in bytes |
+| `events_24h`, `events_7d`, `events_30d` | Events whose `created_at` is at or after the start of the UTC hour containing `now() - 1/7/30 days` (so up to one hour more than a rolling window), with no upper bound: future-dated events count, as before |
+
+Read from the insert-fed rollups (no scan of `events_local`): `event_count`,
+`unique_pubkeys`, `first_seen` and `last_seen` from `kind_totals` (migration
+020), the average content length and the window counts from `kind_activity`
+(migration `021_kind_activity`). Until 021 this endpoint scanned
+`events_local` (exact `unique_pubkeys`, rolling windows to the second) and
+timed out for large kinds such as kind 1.
 
 **Errors**
 
 | Status | Description |
 |--------|-------------|
 | 404 | Kind not found (no events of this kind exist) |
+| 503 | `metric_unavailable`: `kind_totals` or `kind_activity` does not exist |
 
 ---
 
@@ -870,6 +881,19 @@ Activity time series for a specific kind.
   }
 ]
 ```
+
+| Field | Description |
+|-------|-------------|
+| `period` | First day of the UTC day, Monday week or month (`YYYY-MM-DD`) |
+| `event_count` | Events whose `created_at` falls in the period (exact) |
+| `unique_pubkeys` | **Approximate** distinct authors in the period (merged `uniqCombined64` sketches, ~0.3% standard error; exact below ~4k authors) |
+
+Read from `kind_activity` (migration `021_kind_activity`): the `limit` most
+recent periods up to the current one, newest first. Periods are UTC (before
+021: the ClickHouse server time zone), and every event of
+the current period counts, including any dated later in it (before 021:
+`created_at <= now()`). `503 metric_unavailable` if the rollup does not
+exist; `400` for another `group_by`.
 
 **Examples**
 

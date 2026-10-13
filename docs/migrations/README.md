@@ -17,10 +17,11 @@ just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
 just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views_cutover.sql
+just ch-migrate docs/migrations/prepared/021_kind_activity.sql
 ```
 
-On an empty database 020's two phases can run back to back: there is no
-history to backfill (`api-rollups plan/backfill --migration 020` still record
+On an empty database 020's two phases can run back to back, and 021 after
+them: there is no history to backfill (`api-rollups plan/backfill --migration 020` still record
 the plans that `cutover` checks; run them before the cutover file, or apply the
 cutover file by hand as above).
 
@@ -72,6 +73,8 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - Prepared 020 (incremental derived views) was applied, backfilled and
   validated on 2026-10-12 and cut over at 19:18 UTC (`kinds_stats_mv` dropped;
   post-cutover `validate` 0 failed rows); see its section below and the RUNBOOK.
+- Prepared 021 (`kind_activity` for `/kinds/{kind}` and
+  `/kinds/{kind}/activity`) is prepared, not applied.
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -100,6 +103,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
 | prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
 | prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Prepared, not applied** **Applied and cut over in production 2026-10-12** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
+| prepared/021_kind_activity.sql | Insert-fed `kind_activity` (per kind and UTC hour (35 days), day and month of `created_at`: event count, content bytes, `uniqCombined64` author sketch) for `pensieve-serve` `/kinds/{kind}` (with `kind_totals`) and `/kinds/{kind}/activity`. Excluded from `ch-migrate-all`. **Prepared, not applied** | **Yes** (`api-rollups backfill --migration 021`, exactly once) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -719,6 +723,55 @@ nothing still reads `kinds_stats_mv`):
 ```bash
 just ch-migrate docs/migrations/rollback/020_undo_derived_views_cutover.sql
 just ch-migrate docs/migrations/rollback/020_drop_incremental_derived_views.sql
+```
+
+### prepared/021_kind_activity.sql
+
+**Purpose:** Serve `GET /api/v1/kinds/{kind}` and
+`GET /api/v1/kinds/{kind}/activity` without scanning `events_local`. Both
+filtered `events_local` by kind; without projections that reads the `kind`
+column of all ~2.46B rows and `pubkey`/`content` of every granule holding the
+kind (every granule for a large kind): kind 1 answered `500 database_error`
+after the API's 20 s cap on 2026-10-12.
+
+It creates `kind_activity` (`AggregatingMergeTree ORDER BY (kind, grain,
+period, origin)`, unpartitioned), fed by `kind_activity_mv`: per kind and UTC
+hour (only hours newer than now − 35 days; `TTL` deletes older hour rows), day
+and month of the event's own `created_at` (unclamped), `event_count` and
+`content_bytes` (`sum(length(content))`) — **sums**, written exactly once via
+the 019 boundary model, `origin` keeping backfill and view rows apart — and a
+`uniqCombined64` sketch of the authors on day and month rows. The migration
+refuses to create the view on a non-empty table. It does **not** backfill.
+
+**Backfill:** `api-rollups plan --migration 021` fixes the view boundary;
+`backfill --migration 021` reads `events_local` in 256 id-prefix shards
+(id, pubkey, kind, created_at, indexed_at and content: ~860 GiB uncompressed,
+~1–2 h at 2 threads), each exactly once; hour rows only for hours newer than
+the boundary − 35 days. `validate --migration 021` checks every (kind, period)
+count and sampled kinds' content bytes and sketches.
+
+**Behaviour changes** (details in [`docs/api_rollups.md`](../api_rollups.md#migration-021-kind-activity)):
+- `/kinds/{kind}`: `event_count`, `first_seen`, `last_seen` from
+  `kind_totals` (same values); `unique_pubkeys` approximate (~0.3%, the
+  `/kinds` figure); `events_24h/7d/30d` start at the UTC hour containing
+  `now() - N days` (up to an hour more than before), still without an upper
+  bound, so future-dated events stay counted as before.
+- `/kinds/{kind}/activity`: UTC periods; `unique_pubkeys` approximate; events
+  dated later in the current period count.
+- Both answer `503 metric_unavailable` when the table is missing.
+
+The same release changes `api-rollups validate --target kinds`: approximate
+`unique_pubkeys` are compared with exact counts for sampled kinds (one bounded
+`PREWHERE kind IN (...)` scan) instead of the hourly `kinds_stats_mv`
+snapshot, which the 020 cutover dropped.
+
+**Apply, backfill, validate and roll out:** follow
+[`ops/RUNBOOK.md` → Kind activity](../../ops/RUNBOOK.md#kind-activity-migration-021).
+
+**Rollback:** both endpoints then answer `503 metric_unavailable`:
+
+```bash
+just ch-migrate docs/migrations/rollback/021_drop_kind_activity.sql
 ```
 
 ---

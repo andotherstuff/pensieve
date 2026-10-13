@@ -19,15 +19,20 @@
 -- cutover makes daily_user_stats_mv lookup-free, recomputes
 -- relay_distribution from relay_list_latest and drops kinds_stats_mv, which
 -- pensieve-serve no longer reads; rows inserted before 020 need
--- `api-rollups backfill --migration 020`). Migration 013 drops several
+-- `api-rollups backfill --migration 020`), then
+-- docs/migrations/prepared/021_kind_activity.sql, applied after 017, 019 and
+-- 020 (kind_activity, which pensieve-serve's /kinds/{kind} and
+-- /kinds/{kind}/activity read together with 020's kind_totals; rows inserted
+-- before 021 need `api-rollups backfill --migration 021`). Migration 013 drops several
 -- objects created below (the video/tag/activity views and event_tags_flat);
 -- migrations add the rest
 -- (pubkey_first_seen_*, zap_amounts_*, daily_user_stats, active_users_*,
 -- cohort_retention_*, relay_distribution, kinds_stats_mv, the 017 compact
--- lookups, the 019 API rollups, the 020 derived views).
+-- lookups, the 019 API rollups, the 020 derived views, the 021 kind activity).
 -- Checked on ClickHouse 24.8 on 2026-10-11: the sequence up to 017 yields
 -- exactly the tables and views production had then (019 was applied in
--- production on 2026-10-12; 020 is prepared, not yet applied). The only difference is events_local:
+-- production on 2026-10-12 and 020 cut over the same day; 021 is prepared, not
+-- yet applied). The only difference is events_local:
 -- production has NO projections. events_by_author was dropped by hand on
 -- 2026-06-13 (no migration covers it); events_by_time and events_by_kind
 -- were dropped by prepared/016 and prepared/018. events_by_kind stays here on

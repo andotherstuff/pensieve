@@ -13,11 +13,11 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 mod rollup_reads;
-pub(crate) use rollup_reads::fetch_kind_totals;
 use rollup_reads::{
     fetch_clickhouse_longform, fetch_clickhouse_publishers, fetch_rollup_earliest_event,
     fetch_rollup_total_kinds,
 };
+pub(crate) use rollup_reads::{fetch_kind_detail, fetch_kind_series, fetch_kind_totals};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Overview

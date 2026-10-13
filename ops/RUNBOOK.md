@@ -894,7 +894,7 @@ changes: [`docs/api_rollups.md` → Migration 020](../docs/api_rollups.md#migrat
 
 **Status:** Applied 2026-10-12: phase 1 at 17:12 UTC (the kinds view recreated at 17:23:20 because the first insert raced it by 4 s; `plan` refused as designed); backfill 17:34–18:50 UTC (user-flags 16 shards, relay-lists and kinds 256 each; ingest 0 errors, p95 ≤ 14.6 s); `validate` 0 failed rows (kinds re-checked after `kinds_stats_mv`'s 19:00 refresh: its first run flagged 6 ephemeral kinds against the hour-old reference, while `kind_totals` matched the exact current counts); API `releases/api-d026d53` at 19:02 UTC; cutover at 19:18:03 UTC (10 statements); post-cutover `validate` 0 failed rows. Effect: `daily_user_stats_mv` 7,698 ms → 2 ms per insert (30.4M → 9k rows read), ingest insert ~8.4 s → 0.23 s average (p95 0.29 s); `relay_distribution` refresh 408 s / 1.32 TiB every 6 h → 5.6 s hourly at :20; `kinds_stats_mv` dropped; active users' `has_*` corrected (2026-10-11: `has_profile` 14,318 → 26,788, `has_follows` 5,103 → 10,410).
 
-Known follow-ups: `/api/v1/kinds/{kind}` still scans `events_local` and times out for large kinds (e.g. kind 1); `validate` compares `kind_totals` with `kinds_stats_mv`, which is up to an hour old, so fast-moving ephemeral kinds can fail falsely before the cutover — re-check after a refresh.
+Known follow-ups (both addressed by [migration 021](#kind-activity-migration-021)): `/api/v1/kinds/{kind}` still scans `events_local` and times out for large kinds (e.g. kind 1); `validate` compared `kind_totals` with `kinds_stats_mv`, which is up to an hour old, so fast-moving ephemeral kinds failed falsely before the cutover, and after it `unique_pubkeys` was not compared at all — the 021 release compares it with exact counts.
 
 Two phases. Phase 1 (`prepared/020_incremental_derived_views.sql`) only adds tables, three
 insert-time views and the `daily_user_stats.last_indexed_at` column; nothing that exists
@@ -1002,9 +1002,10 @@ $AR validate --migration 020 --out /home/pensieve/api-rollups/validate-020.json
 - **relay-lists**: sampled winners match; the note compares the distribution the cutover
   will publish with the current table (differences = lists since the last 014 refresh,
   and `created_at` ties).
-- **kinds**: two scans of `kind`/`indexed_at`/`created_at` (a few minutes each at 2
-  threads); backfill share exact; `unique_pubkeys` within 2% of `kinds_stats_mv`, with the
-  largest error in the notes.
+- **kinds**: one scan of `kind`/`indexed_at`/`created_at` (a few minutes at 2 threads);
+  backfill share exact. Until the 021 release `unique_pubkeys` was compared within 2% of
+  `kinds_stats_mv`; it is now compared with exact counts for sampled kinds (see
+  [Kind activity → Validate](#kind-activity-migration-021)).
 
 ### 6. Deploy the API
 
@@ -1090,6 +1091,166 @@ Over the next day, compare with step 1's baseline:
   Re-applying 020 later needs `plan --migration 020 --discard-progress` (after
   `TRUNCATE TABLE nostr.kind_totals`, which the migration's guard requires) and a full
   backfill.
+
+## Kind activity (migration 021)
+
+Moves `GET /api/v1/kinds/{kind}` and `GET /api/v1/kinds/{kind}/activity` off scans of
+`events_local` by kind (kind 1 answered `500 database_error` after the 20 s cap on
+2026-10-12) onto `kind_activity`, a small insert-fed table of per kind and UTC hour (last
+35 days), day and month counts, content bytes and author sketches; `/kinds/{kind}` takes
+its totals from 020's `kind_totals`. Design, time basis and behaviour changes:
+[`docs/api_rollups.md` → Migration 021](../docs/api_rollups.md#migration-021-kind-activity).
+The same release replaces `validate`'s kinds `unique_pubkeys` check (it compared with
+`kinds_stats_mv`, gone since the 020 cutover) with an exact sampled comparison.
+
+**Status:** prepared, not applied. **Order:** apply → plan → backfill → validate → deploy
+the API that reads `kind_activity` (the current API does not read it, so nothing serves an
+incomplete table) → monitor.
+
+Use the `api-rollups` binary from the release that contains this migration (`$AR` as for
+019/020, same `--checkpoint-dir`; the target gets its own `kind-activity/` subdirectory).
+Every tool query carries `--max-threads` (default 2), `--max-memory-gib` (default 8) and
+`--max-execution-secs` and is tagged `log_comment = 'api-rollups…'`.
+
+### 1. Preflight (read-only)
+
+```bash
+just ch-query "SELECT version(), timezone()"
+just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved, formatReadableSize(total_space) total FROM system.disks"
+just ch-query "SELECT count() FROM system.mutations WHERE database = 'nostr' AND table = 'events_local' AND is_done = 0"
+# Baseline per-view cost (kind_totals_mv is the closest analogue: expect a few ms):
+just ch-query "SELECT view_name, count() n, round(avg(view_duration_ms)) avg_ms, max(view_duration_ms) max_ms FROM system.query_views_log WHERE event_time > now() - INTERVAL 24 HOUR GROUP BY view_name ORDER BY avg_ms DESC"
+# Baseline insert latency (~0.23 s average since the 020 cutover); note when bursts land:
+just ch-query "SELECT toStartOfHour(event_time) h, count() n, quantile(0.95)(query_duration_ms) p95_ms, countIf(exception != '') errors FROM system.query_log WHERE event_time > now() - INTERVAL 3 HOUR AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart' GROUP BY h ORDER BY h"
+# The endpoint today (expect a timeout for kind 1):
+curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds/1"
+```
+
+`timezone()` should be `UTC`: the old activity periods used the server time zone, the new
+ones UTC. Record the outputs in the change log.
+
+### 2. Apply
+
+Outside :58–:07 UTC, right **after** an ingest insert burst: `plan` needs the first insert
+`kind_activity_mv` sees to start at least 5 s after the view was created.
+
+```bash
+just ch-migrate docs/migrations/prepared/021_kind_activity.sql
+```
+
+For 30 minutes, watch the new view (expect a few ms per insert, like `kind_totals_mv`) and
+insert latency:
+
+```bash
+just ch-query "SELECT view_name, status, count(), round(avg(view_duration_ms)) avg_ms, max(view_duration_ms) max_ms, any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name IN ('nostr.kind_activity_mv', 'nostr.kind_totals_mv') GROUP BY view_name, status ORDER BY view_name"
+just ch-query "SELECT count() n, countIf(exception != '') errors, any(exception), quantile(0.95)(query_duration_ms) p95_ms FROM system.query_log WHERE event_time > now() - INTERVAL 30 MINUTE AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
+journalctl -u pensieve-ingest --since "30 min ago" | grep -i clickhouse
+```
+
+**Abort:** a view exception or failing inserts → run
+`docs/migrations/rollback/021_drop_kind_activity.sql` at once (inserts are synchronous; a
+failing view stalls ClickHouse ingest).
+
+### 3. Plan
+
+After at least one ingest insert and 10 minutes after step 2:
+
+```bash
+$AR plan --migration 021 --min-free-gib 100
+```
+
+- Fixes the view boundary (first second `kind_activity_mv` captured) and prints the hour
+  window (hours newer than the boundary − 35 days). On `Recreate the view`, nothing is
+  backfilled yet: `just ch-query "DROP VIEW nostr.kind_activity_mv"`,
+  `just ch-query "TRUNCATE TABLE nostr.kind_activity"`, re-apply step 2, wait for an
+  insert, `plan --migration 021 --discard-progress`.
+- Expected: id, pubkey, kind, created_at, indexed_at **and content** of the whole table,
+  ~860 GiB uncompressed (the longform read of 019, ~50 min there) plus a
+  `GROUP BY kind, grain, period` with sketches; wall-clock ~1–2 h at 2 threads (sample shard
+  × 256 plus pauses and quiet minutes, printed). The disk estimate assumes 512 B per
+  pre-merge row (conservative; ≤ ~0.5M rows per shard). Stop if the peak does not fit
+  comfortably in `/data`.
+
+### 4. Backfill (bounded, resumable)
+
+```bash
+$AR --max-threads 2 --max-memory-gib 8 backfill --migration 021 --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
+$AR status
+```
+
+Same rules as 019/020: no shard starts at :58–:07; exit code 2 means stopped early
+(re-run); every shard runs **exactly once** (a lost outcome is settled from
+`system.query_log` / `system.part_log`, else
+`$AR resolve --target kind-activity --shard <n> --committed|--not-committed` after checking
+by hand); never delete a `kind-activity` checkpoint or `pending/` marker. `status` must show
+`view boundary … ok`. Watch insert p95 during the shards (they read `content`).
+
+### 5. Validate
+
+```bash
+$AR validate --migration 021 --out /home/pensieve/api-rollups/validate-021.json
+$AR validate --target kinds --out /home/pensieve/api-rollups/validate-kinds-021.json
+```
+
+- Both must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target.
+- **kind-activity**: every (kind, day), (kind, month) and recent (kind, hour) count — backfill
+  share exact, view share bracketed by the cutoff — from one scan of
+  `kind`/`created_at`/`indexed_at` (~25 GiB, minutes; ~1–3M groups returned); content bytes
+  and day sketches of seeded random kinds within `--content-budget-events` (5,000 events,
+  ≤ 5,000 granules of `content`). Record the notes (group counts, largest sketch error).
+- **kinds** (the new exact `unique_pubkeys` check, plus the counts): one scan of
+  `kind`/`indexed_at`/`created_at`, then one `PREWHERE kind IN (…)` scan over 12 sampled
+  kinds that reads `pubkey` of every granule once kind 1 is sampled (~150 GiB uncompressed,
+  ~10–30 min at 2 threads, ~40 B memory per (kind, pubkey), spilling beyond 4 GiB).
+  Kinds above `--pubkeys-max-exact` (20M approximate pubkeys, e.g. 1059/445) are left out
+  and listed; `--pubkeys-kind K` adds one, `--pubkeys-kinds 0` skips the scan. The note
+  prints the largest relative error (expect ≤ ~0.5%; fast-moving kinds are bracketed
+  between the cutoff and the scan, so they no longer fail falsely).
+
+### 6. Deploy the API
+
+Build and point the `pensieve-api` drop-in at the release as in
+[API rollups → Deploy the API](#6-deploy-the-api) (update the drop-in record in the same
+PR). Then:
+
+```bash
+curl -s -w '\n%{http_code} %{time_total}s\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds/1"
+curl -s -w '\n%{http_code} %{time_total}s\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds/1/activity?group_by=day&limit=365"
+curl -s -w '\n%{http_code} %{time_total}s\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds/7/activity?group_by=month&limit=120"
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/kinds/65535"   # 404 unless kind 65535 exists
+journalctl -u pensieve-api --since "10 min ago" | grep -i "rollup\|error"
+just ch-query "SELECT query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 10 MINUTE AND has(tables, 'nostr.kind_activity') AND query NOT LIKE '%system.query_log%' ORDER BY event_time DESC LIMIT 10"
+```
+
+Expect `/kinds/1` in tens of milliseconds (thousands of rows read) and the activity series
+well under a second. `unique_pubkeys` is now approximate (the `/kinds` figure); the 24 h /
+7 d / 30 d windows start at the UTC hour containing `now() - N days`.
+
+### 7. Monitor
+
+Over the next day: `kind_activity_mv` a few ms per insert in `system.query_views_log`, no
+view exceptions, insert p95 unchanged against step 1; `$AR status` lag small and the
+boundary `ok`; no `database_error` for `/kinds/*` in the API log. The hour rows' TTL runs at
+most once a day (`merge_with_ttl_timeout`); `kind_activity` stays at a few GiB:
+
+```bash
+just ch-query "SELECT grain, count(), min(period), max(period) FROM nostr.kind_activity GROUP BY grain"
+just ch-query "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows), count() FROM system.parts WHERE database = 'nostr' AND table = 'kind_activity' AND active"
+```
+
+### 8. Rollback
+
+- **API:** point the drop-in back at the previous `releases/api-*` and restart; those builds
+  scan `events_local` again (and time out for large kinds, as before).
+- **Table and view:** with the API rolled back, or accepting `503 metric_unavailable` on
+  `/kinds/{kind}` and `/kinds/{kind}/activity`:
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/021_drop_kind_activity.sql
+  ```
+
+  Re-applying 021 later needs `plan --migration 021 --discard-progress` and a full backfill
+  (the migration's guard refuses a non-empty table without its view).
 
 ## Grafana
 

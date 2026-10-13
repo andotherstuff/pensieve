@@ -1,4 +1,5 @@
-//! Operator tool for the insert-fed rollup tables (migrations 019 and 020).
+//! Operator tool for the insert-fed rollup tables (migrations 019, 020 and
+//! 021).
 //!
 //! Subcommands:
 //! - `plan`: fix the view boundary, size a sample shard, write a shard plan
@@ -8,7 +9,7 @@
 //! - `resolve`: settle a pending shard by hand when the tool cannot
 //! - `cutover`: migration 020 phase 2, guarded (switch the old views over)
 //!
-//! `plan`, `backfill` and `validate` take `--migration 019|020` or explicit
+//! `plan`, `backfill` and `validate` take `--migration 019|020|021` or explicit
 //! `--target`s. See `docs/api_rollups.md` and `ops/RUNBOOK.md`.
 
 use std::path::PathBuf;
@@ -28,7 +29,8 @@ use pensieve_serve::rollups::status;
 use pensieve_serve::rollups::validate::{self, ValidateInputs, ValidateOptions};
 
 /// Manage the ClickHouse rollups of migrations 019 (/stats/publishers,
-/// /stats/longform) and 020 (user flags, relay lists, kind totals).
+/// /stats/longform), 020 (user flags, relay lists, kind totals) and 021
+/// (kind activity for /kinds/{kind} and /kinds/{kind}/activity).
 #[derive(Parser, Debug)]
 #[command(name = "api-rollups", version)]
 struct Args {
@@ -57,16 +59,16 @@ enum Command {
         /// part: use 3 if a shard exceeds --max-memory-gib.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
         id_prefix_len: u8,
-        /// Additive targets (publishers, kinds): required gap between the
-        /// view's creation and the first second it captured.
+        /// Additive targets (publishers, kinds, kind-activity): required gap
+        /// between the view's creation and the first second it captured.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(2..))]
         boundary_margin_secs: u32,
         /// Free-space reserve shown in the estimate, in GiB.
         #[arg(long, default_value_t = 100)]
         min_free_gib: u64,
         /// Replace an existing plan and delete its checkpoints. For additive
-        /// targets (publishers, kinds) only after truncating the table and
-        /// recreating its view.
+        /// targets (publishers, kinds, kind-activity) only after truncating
+        /// the table and recreating its view.
         #[arg(long)]
         discard_progress: bool,
     },
@@ -138,10 +140,30 @@ enum Command {
         /// User flags: days of daily_user_stats compared per sampled pubkey.
         #[arg(long, default_value_t = 3)]
         user_days: u32,
-        /// Kinds: largest allowed difference (percent) between the approximate
-        /// and exact (kinds_stats_mv) distinct pubkeys.
-        #[arg(long, default_value_t = 2.0)]
-        pubkeys_tolerance_pct: f64,
+        /// Kinds: kinds whose approximate distinct pubkeys are compared with
+        /// an exact count (half the largest by events, half seeded random);
+        /// 0 skips that scan.
+        #[arg(long, default_value_t = 12)]
+        pubkeys_kinds: usize,
+        /// Kinds: also compare these kinds exactly (repeatable; ignores
+        /// --pubkeys-max-exact).
+        #[arg(long = "pubkeys-kind")]
+        pubkeys_extra_kinds: Vec<u16>,
+        /// Kinds: leave kinds with more approximate distinct pubkeys than this
+        /// out of the exact sample (memory: ~40 bytes per pubkey, spilling
+        /// to disk beyond half of --max-memory-gib).
+        #[arg(long, default_value_t = 20_000_000)]
+        pubkeys_max_exact: u64,
+        /// Kinds and kind-activity: allowed sketch error in standard errors
+        /// of uniqCombined64 (0.29%); below ~4k values the sketch must be
+        /// exact (slack 2).
+        #[arg(long, default_value_t = 4.0)]
+        pubkeys_sigmas: f64,
+        /// Kind-activity: recompute content bytes and author sketches of
+        /// seeded random kinds with at most this many events in total (each
+        /// event can pull one granule of content into the scan).
+        #[arg(long, default_value_t = 5_000)]
+        content_budget_events: u64,
         /// Write the JSON report here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -204,6 +226,9 @@ enum Migration {
     /// user-flags, relay-lists, kinds
     #[value(name = "020")]
     M020,
+    /// kind-activity
+    #[value(name = "021")]
+    M021,
 }
 
 impl Selection {
@@ -212,13 +237,14 @@ impl Selection {
         let mut all: Vec<Target> = match self.migration {
             Some(Migration::M019) => Target::MIGRATION_019.to_vec(),
             Some(Migration::M020) => Target::MIGRATION_020.to_vec(),
+            Some(Migration::M021) => Target::MIGRATION_021.to_vec(),
             None => Vec::new(),
         };
         all.extend(self.targets.iter().copied());
         if all.is_empty() {
             bail!(
-                "choose targets with --migration 019|020 or --target \
-                 publishers|longform|user-flags|relay-lists|kinds"
+                "choose targets with --migration 019|020|021 or --target \
+                 publishers|longform|user-flags|relay-lists|kinds|kind-activity"
             );
         }
         let mut seen = Vec::new();
@@ -374,7 +400,11 @@ async fn run(args: Args) -> Result<ExitCode> {
             max_key_events,
             flag_days,
             user_days,
-            pubkeys_tolerance_pct,
+            pubkeys_kinds,
+            pubkeys_extra_kinds,
+            pubkeys_max_exact,
+            pubkeys_sigmas,
+            content_budget_events,
             out,
         } => {
             let targets = select.targets()?;
@@ -390,6 +420,8 @@ async fn run(args: Args) -> Result<ExitCode> {
             let publisher_plan =
                 CheckpointDir::new(&args.checkpoint_dir, Target::Publishers).load_plan()?;
             let kinds_plan = CheckpointDir::new(&args.checkpoint_dir, Target::Kinds).load_plan()?;
+            let kind_activity_plan =
+                CheckpointDir::new(&args.checkpoint_dir, Target::KindActivity).load_plan()?;
             let cutover_at = cutover::load_record(&args.checkpoint_dir)?.map(|r| r.finished_at);
             let options = ValidateOptions {
                 targets,
@@ -404,11 +436,16 @@ async fn run(args: Args) -> Result<ExitCode> {
                 max_examples: 20,
                 flag_days,
                 user_days,
-                pubkeys_tolerance_pct,
+                pubkeys_kinds,
+                pubkeys_extra_kinds,
+                pubkeys_max_exact,
+                pubkeys_sigmas,
+                content_budget_events,
             };
             let inputs = ValidateInputs {
                 publisher_plan: publisher_plan.as_ref(),
                 kinds_plan: kinds_plan.as_ref(),
+                kind_activity_plan: kind_activity_plan.as_ref(),
                 cutover_at,
             };
             let report = validate::run_with(&client, &database, &options, &inputs).await?;
