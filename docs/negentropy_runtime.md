@@ -173,8 +173,9 @@ latest reported attempt is a qualifying `unavailable` report (fully enumerated,
 within one 128-ID fetch, at most `max-ids` IDs), that report's identical run (the
 one an exclusion would measure) has not met the rule yet, and the job is at most
 at attempt `2 × attempts` (10 by default). Reports before the current run do not
-matter: another failure kind, an attempt without a report or a changed set (a
-relay that starts delivering one of two withheld IDs) starts a new run, which
+matter: another failure kind or a changed set (a relay that starts delivering one
+of two withheld IDs) starts a new run (an attempt without a report is skipped and
+does not break the run), which
 then needs five identical reports of its own, and past the attempt ceiling the
 job counts whatever it reports. An unqualifiable latest report, a run that met
 the rule but is held back by unarchived receipts, a disabled rule and blocked
