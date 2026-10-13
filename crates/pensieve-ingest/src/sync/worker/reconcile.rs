@@ -153,68 +153,98 @@ pub(super) async fn download_with_progress(
     progress.phase(Phase::Fetch);
     tracing::info!(relay = %job.relay, phase = "fetch", missing = ids.len(), batches = ids.len().div_ceil(FETCH_BATCH), "isolated fetch started");
     for batch in ids.chunks(FETCH_BATCH) {
-        let fetch = SubscriptionId::generate();
-        relay
-            .subscribe_with_id(
-                fetch.clone(),
-                Filter::new().ids(batch.iter().copied()),
-                SubscribeOptions::default(),
-            )
-            .await
-            .map_err(|_| WorkerError::Incomplete)?;
+        // A relay may cap (or default) the number of results per REQ below the
+        // batch and send EOSE early. On a window whose delivered events were
+        // archived before the replay floor the diff never shrinks, so the same
+        // tail would be missing on every attempt and could be excluded although
+        // the relay would deliver it to a smaller REQ. Re-request exactly the
+        // still-missing IDs, at least once and again while each REQ delivers
+        // something new (at most one REQ per ID, so bounded by the batch). Only
+        // IDs that a REQ naming exactly them did not return are unavailable.
+        let mut request = batch.to_vec();
+        let mut follow_up = false;
         loop {
-            match notification(&mut notifications).await? {
-                RelayNotification::Message {
-                    message:
-                        RelayMessage::Event {
-                            subscription_id,
-                            event,
-                        },
-                } if subscription_id.as_ref() == &fetch => {
-                    if batch.binary_search(&event.id).is_err() {
-                        return Err(WorkerError::Incomplete);
-                    }
-                    received.insert(event.id);
-                }
-                RelayNotification::Message {
-                    message: RelayMessage::EndOfStoredEvents(subscription_id),
-                } if subscription_id.as_ref() == &fetch => {
-                    if !batch.iter().all(|id| received.contains(id)) {
-                        let remaining: Vec<_> =
-                            ids.iter().filter(|id| !received.contains(id)).collect();
-                        return Err(WorkerError::Unavailable(super::FailureDiagnostic {
-                            kind: super::FailureKind::Unavailable,
-                            missing_count: remaining.len() as u64,
-                            sample: remaining
-                                .into_iter()
-                                .take(crate::sync::failure::MAX_FAILURE_SAMPLE)
-                                .map(|id| id.to_bytes())
-                                .collect(),
-                        }));
-                    }
-                    relay
-                        .unsubscribe(&fetch)
-                        .await
-                        .map_err(|_| WorkerError::Incomplete)?;
-                    progress.batch();
-                    tracing::info!(relay = %job.relay, phase = "fetch", batches = progress.state().batches, received = received.len(), missing = ids.len(), "isolated fetch progress");
-                    break;
-                }
-                RelayNotification::Message {
-                    message:
-                        RelayMessage::Closed {
-                            subscription_id, ..
-                        },
-                } if subscription_id.as_ref() == &fetch => return Err(WorkerError::Incomplete),
-                RelayNotification::RelayStatus { status } if status != RelayStatus::Connected => {
-                    return Err(WorkerError::Incomplete);
-                }
-                RelayNotification::Shutdown => return Err(WorkerError::Incomplete),
-                _ => (),
+            let delivered = fetch(relay, &mut notifications, &request, &mut received).await?;
+            progress.batch();
+            tracing::info!(relay = %job.relay, phase = "fetch", batches = progress.state().batches, requested = request.len(), delivered, received = received.len(), missing = ids.len(), "isolated fetch progress");
+            request.retain(|id| !received.contains(id));
+            if request.is_empty() {
+                break;
             }
+            if follow_up && delivered == 0 {
+                let remaining: Vec<_> = ids.iter().filter(|id| !received.contains(id)).collect();
+                return Err(WorkerError::Unavailable(super::FailureDiagnostic {
+                    kind: super::FailureKind::Unavailable,
+                    missing_count: remaining.len() as u64,
+                    sample: remaining
+                        .into_iter()
+                        .take(crate::sync::failure::MAX_FAILURE_SAMPLE)
+                        .map(|id| id.to_bytes())
+                        .collect(),
+                }));
+            }
+            follow_up = true;
         }
     }
     Ok(DownloadProof { remote, received })
+}
+
+/// One REQ for exactly `request` (sorted), until its EOSE. Every event must be
+/// one of the requested IDs; it is recorded in `received` (capture has already
+/// verified and queued it through the SDK database callback). Returns how many
+/// requested IDs arrived that had not been received before.
+async fn fetch(
+    relay: &Relay,
+    notifications: &mut broadcast::Receiver<RelayNotification>,
+    request: &[EventId],
+    received: &mut HashSet<EventId>,
+) -> Result<usize, WorkerError> {
+    let fetch = SubscriptionId::generate();
+    relay
+        .subscribe_with_id(
+            fetch.clone(),
+            Filter::new().ids(request.iter().copied()),
+            SubscribeOptions::default(),
+        )
+        .await
+        .map_err(|_| WorkerError::Incomplete)?;
+    let mut delivered = 0;
+    loop {
+        match notification(notifications).await? {
+            RelayNotification::Message {
+                message:
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    },
+            } if subscription_id.as_ref() == &fetch => {
+                if request.binary_search(&event.id).is_err() {
+                    return Err(WorkerError::Incomplete);
+                }
+                delivered += usize::from(received.insert(event.id));
+            }
+            RelayNotification::Message {
+                message: RelayMessage::EndOfStoredEvents(subscription_id),
+            } if subscription_id.as_ref() == &fetch => {
+                relay
+                    .unsubscribe(&fetch)
+                    .await
+                    .map_err(|_| WorkerError::Incomplete)?;
+                return Ok(delivered);
+            }
+            RelayNotification::Message {
+                message:
+                    RelayMessage::Closed {
+                        subscription_id, ..
+                    },
+            } if subscription_id.as_ref() == &fetch => return Err(WorkerError::Incomplete),
+            RelayNotification::RelayStatus { status } if status != RelayStatus::Connected => {
+                return Err(WorkerError::Incomplete);
+            }
+            RelayNotification::Shutdown => return Err(WorkerError::Incomplete),
+            _ => (),
+        }
+    }
 }
 
 #[cfg(test)]

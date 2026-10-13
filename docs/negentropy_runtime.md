@@ -117,41 +117,75 @@ a candidate that changed meanwhile is reselected, not treated as a fault.
 Each owner lifecycle turn (twice per tick, before leasing) first checks retry-wait
 jobs against the relay-unavailable rule: the latest five consecutive reported
 attempts all reported the identical, fully enumerated and explicitly requested set
-of at most eight advertised-but-undelivered IDs, spanning at least an hour; every
-received frame is archived and none of the IDs is. Attempts that ended without
-any report (lost worker, lease without a session) are skipped, not counted. Such a job completes with reason `relay_unavailable`
-and a proof row per ID; the WARN line `negentropy relay-unavailable exclusion`
-names the job, relay, count and event ID, and
-`negentropy_relay_unavailable_exclusions_total` counts them. This replaces the
-former no-skip rule for this one case, after production job 768 (2026-10-13)
-retried one withheld Premium Primal event fifteen times. Other `Unavailable`
-outcomes still retain and retry the gap. The rule, its flags
+of at most eight advertised-but-undelivered IDs, spanning at least an hour, and
+every received frame is archived. Attempts that ended without any report (lost
+worker, lease without a session) are skipped, not counted. IDs of the set that
+already carry a durable archive marker count as delivered. The remaining IDs are
+excluded: the job completes with reason `relay_unavailable` and a proof row per
+ID; the WARN line `negentropy relay-unavailable exclusion` names the job, relay,
+count and event ID, and `negentropy_relay_unavailable_exclusions_total` counts
+them. When no ID remains (all were archived, for example before the replay floor,
+which the inventory never lists), the job completes with reason
+`already_archived`, no exclusion row, the INFO line `negentropy window completed:
+every ID the relay withheld was already archived` and
+`negentropy_relay_unavailable_already_archived_total`. Both completions advance
+the ledger's `last_success` (`last_durable_completion_unix`), so they count as
+durable progress for the stall watchdog. This replaces the former no-skip rule
+for this one case, after production job 768 (2026-10-13) retried one withheld
+Premium Primal event fifteen times. Other `Unavailable` outcomes still retain and
+retry the gap. The rule, its flags
 (`--isolated-negentropy-unavailable-exclusion-attempts`, `-span-secs`,
-`-max-ids`, `--isolated-negentropy-disable-unavailable-exclusion`), late arrival
-and accounting are described in
+`-max-ids`, `--isolated-negentropy-disable-unavailable-exclusion`, which conflicts
+with the three tuning flags), late arrival and accounting are described in
 [continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions).
-The worker and IPC are unchanged.
+
+The IPC version is unchanged. The worker changed in one respect: before it
+reports `Unavailable` it re-requests exactly the still-missing IDs, at least once
+and again while each request delivers something new, so a relay that caps the
+results of one REQ below the 128-ID batch is not mistaken for one that withholds
+(see [worker](negentropy_worker.md)). An older worker still interoperates, but
+its reports do not carry that protection; deploy the worker before relying on
+exclusions against relays with result limits.
 
 ### Pausing on persistent failure
 
 `--isolated-negentropy-pause-on-failure-secs <SECS>` (unset by default) stops
-leasing once the ledger has reported a persistent failure (the condition behind
-`/health/negentropy` `unresolved_failures`: a blocked job, or a retry-wait job
-after at least three failed attempts) continuously for `SECS`. It logs
-`isolated reconciliation paused leasing` once and sets
-`negentropy_isolated_failure_pause=1`. Replay, planning, archive maintenance and
-health observation continue; no lease is granted, so no attempt is consumed and
-every gap and receipt is kept. Health stays red. The connected worker idles and is
-recycled by its service lifetime. Leasing resumes only if the failure clears; since
-nothing is retried while paused, in practice that means an operator restart
-without the flag (or after resolving the job). The grace clock is in memory, so a
-restart allows one more grace period of paced retries before pausing again. `0`
-pauses as soon as the failure is observed. A job that meets the relay-unavailable
-rule is completed before a 7200 s grace ends (at most about 5,900 s after the
-third failure with the defaults), so a single withheld event no longer pauses
-leasing; any other persistent failure, such as the relay being down for more than
-two hours, still does. With one relay that is harmless; revisit it before adding
-relays.
+leasing once one job has been a persistent failure continuously for `SECS`. The
+candidates are the jobs behind `/health/negentropy` `unresolved_failures` (a
+blocked job, or a retry-wait job after at least three failed attempts), with one
+exemption below. The clock is per job and in memory: it starts at the first tick
+that observes the job counted and is dropped as soon as a tick does not, so
+failures of different jobs never add up to one grace, and a restart allows one
+more grace period of paced retries before pausing again. Ticks observe between
+worker sessions, so a job that is retried and fails again stays continuously
+counted. The pause logs `isolated reconciliation paused leasing` once and sets
+`negentropy_isolated_failure_pause=1`. Replay, planning, archive maintenance,
+exclusions and health observation continue; no lease is granted, so no attempt
+is consumed and every gap and receipt is kept. Health stays red. The connected
+worker idles and is recycled by its service lifetime. Leasing resumes only once
+no counted job is past the grace; since nothing is retried while paused, in
+practice that means an operator restart without the flag (or after resolving the
+job). `0` pauses as soon as a counted failure is observed.
+
+**Exemption for windows on track to an exclusion.** A retry-wait job does not
+count while its reports show it heading for a relay-unavailable completion: its
+latest reported attempt is a qualifying `unavailable` report (fully enumerated,
+within one 128-ID fetch, at most `max-ids` IDs), every `unavailable` report since
+its last protocol-complete attempt names that same set, the current identical run
+has not met the rule yet, and the job is at most at attempt `2 × attempts` (10 by
+default). Other failure kinds and attempts without a report may interrupt the run
+(the exclusion then needs five new identical reports), but past the attempt
+ceiling the job counts whatever it reports. A changed or unqualifiable set, a run
+that met the rule but is held back by unarchived receipts, a disabled rule and
+blocked jobs all count. The exempt job still holds `/health/negentropy` at
+`unresolved_failures`. Every tick, whether or not the pause is enabled,
+`negentropy_isolated_failure_pause_exempt_jobs` gauges the exempt jobs and
+`negentropy_isolated_failure_pause_counted_jobs` the ones the pause counts. With this, a withheld window is completed instead of pausing
+reconciliation, including when a `relay` or deadline report interrupts its run or
+when several withheld windows overlap; a genuine persistent failure, such as the
+relay being down for more than the grace, still pauses all leasing. With one
+relay that is the intended behaviour; revisit it before adding relays, because
+one bad relay would then pause healthy ones too.
 
 ## Bounded canary
 

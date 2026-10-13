@@ -93,7 +93,8 @@ class LedgerStatusTests(unittest.TestCase):
             db.executescript("""
                 PRAGMA user_version=10;
                 ALTER TABLE jobs ADD COLUMN reason TEXT;
-                INSERT INTO jobs VALUES(4,'complete',40,15,'relay_unavailable');
+                ALTER TABLE jobs ADD COLUMN parent INTEGER;
+                INSERT INTO jobs VALUES(4,'complete',40,15,'relay_unavailable',NULL);
                 CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
                 INSERT INTO lifecycle VALUES(1,1234);
                 CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,
@@ -116,7 +117,13 @@ class LedgerStatusTests(unittest.TestCase):
         self.assertEqual(exclusions["unresolved_events"], 6)
         self.assertEqual(report["states"]["complete"], 2)
         self.assertEqual(
-            exclusions["complete_states"], {"reconciled": 1, "relay_unavailable_exclusion": 1}
+            exclusions["complete_states"],
+            {
+                "reconciled": 1,
+                "relay_unavailable_exclusion": 1,
+                "split_with_relay_unavailable_descendant": 0,
+                "already_archived": 0,
+            },
         )
         recent = exclusions["recent"]
         self.assertEqual(len(recent), 5)
@@ -128,6 +135,44 @@ class LedgerStatusTests(unittest.TestCase):
         self.assertEqual(report["retained_coverage_accounting"]["excluded_frames"], 1)
         self.assertNotIn("secret diagnostic", str(report))
         self.assertFalse(report["continuous_ready"])
+
+    def test_split_parents_of_excluded_children_are_not_counted_as_reconciled(self):
+        # Tree 10 -> (11 reconciled, 12 -> (13 excluded, 14 reconciled)); job 15
+        # completed already_archived; job 16 is an unrelated split parent.
+        with database(self.path) as db:
+            db.executescript("""
+                PRAGMA user_version=10;
+                ALTER TABLE jobs ADD COLUMN reason TEXT;
+                ALTER TABLE jobs ADD COLUMN parent INTEGER;
+                INSERT INTO jobs VALUES
+                    (10,'complete',0,1,NULL,NULL),(11,'complete',0,1,NULL,10),
+                    (12,'complete',450,1,NULL,10),(13,'complete',450,5,'relay_unavailable',12),
+                    (14,'complete',675,1,NULL,12),(15,'complete',900,5,'already_archived',NULL),
+                    (16,'complete',1800,1,NULL,NULL),(17,'complete',1800,1,NULL,16),
+                    (18,'complete',2250,1,NULL,16);
+                CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
+                INSERT INTO lifecycle VALUES(1,1234);
+                CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,
+                    lease_grants INTEGER,failures INTEGER,relay_unavailable INTEGER);
+                CREATE TABLE relay_unavailable_exclusions(id INTEGER PRIMARY KEY,event_id BLOB,
+                    job INTEGER,relay TEXT,since INTEGER,until INTEGER,first_attempt INTEGER,
+                    last_attempt INTEGER,attempts INTEGER,first_reported_at INTEGER,
+                    last_reported_at INTEGER,span_secs INTEGER,excluded_at INTEGER,resolved_at INTEGER);
+                INSERT INTO relay_unavailable_exclusions VALUES(1,zeroblob(32),13,'wss://r',450,674,
+                    1,5,5,NULL,NULL,14400,5000,NULL);
+            """)
+        report = STATUS.inspect(self.path)
+        # Job 1 from setUp plus nine here.
+        self.assertEqual(report["states"]["complete"], 10)
+        self.assertEqual(
+            report["relay_unavailable_exclusions"]["complete_states"],
+            {
+                "reconciled": 6,
+                "relay_unavailable_exclusion": 1,
+                "split_with_relay_unavailable_descendant": 2,
+                "already_archived": 1,
+            },
+        )
 
     def test_schema9_has_no_relay_unavailable_section(self):
         with database(self.path) as db:

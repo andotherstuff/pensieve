@@ -4,6 +4,7 @@
 //! launches or restarts the static systemd worker. All unfinished jobs survive
 //! worker loss, shutdown and local faults; a socket exchange is not completion.
 
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -54,13 +55,15 @@ pub struct RuntimeConfig {
     /// Exclusive upper timestamp for three fixed 15-minute canary windows.
     /// Requires a fresh ledger and exactly one relay; never runs rolling planning.
     pub canary_until: Option<i64>,
-    /// Stop leasing once the durable ledger has reported a persistent failure
-    /// (a blocked job, or a retry-wait job after at least three failed attempts)
-    /// continuously for this long. `None` keeps retrying with paced backoff.
-    /// The pause holds until the failure clears or the runtime restarts; every
-    /// gap, receipt and archive maintenance turn is kept, and health stays red.
-    /// A job that meets `relay_unavailable_rule` is completed before a 7200 s
-    /// grace runs out; any other persistent failure still pauses all leasing.
+    /// Stop leasing once one job has been a persistent failure (blocked, or in
+    /// retry wait after at least three failed attempts) continuously for this
+    /// long. The clock is per job, so failures of different jobs never add up,
+    /// and a job whose latest reports form an identical unavailable run on track
+    /// to a `relay_unavailable_rule` completion is exempt (bounded; see
+    /// [`JobLedger::pause_failures`]). Exempt jobs still hold health red. `None`
+    /// keeps retrying with paced backoff. The pause holds until no job is past
+    /// the grace or the runtime restarts; every gap, receipt and archive
+    /// maintenance turn is kept, and health stays red.
     pub pause_on_persistent_failure: Option<Duration>,
     /// Complete a window, with recorded proof, once its relay has persistently
     /// advertised the same IDs without delivering them. `None` disables new
@@ -227,7 +230,7 @@ async fn drive(
     let mut peer: Option<(UnixStream, WorkerCandidate)> = None;
     let mut canary_attempts = 0;
     let mut canary_replays = 0;
-    let mut failing_since = None;
+    let mut failing_since = HashMap::new();
     let mut paused = false;
     let started = tokio::time::Instant::now();
     gauge!("negentropy_isolated_ready").set(1.0);
@@ -289,9 +292,11 @@ async fn drive(
                 // observation past the watchdog before the session returns.
                 let mut observation = parent.lifecycle().await?;
                 observation.capacity_exhausted |= !data_has_headroom(&config.ledger)?;
+                // Evaluated even without the pause so its gauges stay meaningful.
+                let failing = parent.pause_failures().await?;
                 let pause = failure_pause(
                     &mut failing_since,
-                    observation.persistent_failure,
+                    &failing,
                     config.pause_on_persistent_failure,
                     tokio::time::Instant::now(),
                 );
@@ -429,21 +434,28 @@ fn attempt_local<T>(
     }
 }
 
-/// Whether leasing should pause: the ledger has reported a persistent failure
-/// continuously for at least `grace`. The start time is in memory only, so a
+/// Whether leasing should pause: some single job in `failing` (the ledger's
+/// non-exempt persistent failures, sorted by ID) has been in it at every
+/// observation for at least `grace`. A job that leaves the set loses its clock,
+/// so separate failures never add up to one grace. Observations are taken
+/// between sessions, never while the single worker holds a lease, so a retried
+/// job is observed continuously. The start times are in memory only, so a
 /// restart grants one more grace period of paced retries before pausing again.
 fn failure_pause(
-    since: &mut Option<tokio::time::Instant>,
-    failing: bool,
+    since: &mut HashMap<i64, tokio::time::Instant>,
+    failing: &[i64],
     grace: Option<Duration>,
     now: tokio::time::Instant,
 ) -> bool {
-    if !failing {
-        *since = None;
-        return false;
+    since.retain(|job, _| failing.binary_search(job).is_ok());
+    for &job in failing {
+        since.entry(job).or_insert(now);
     }
-    let started = *since.get_or_insert(now);
-    grace.is_some_and(|grace| now.saturating_duration_since(started) >= grace)
+    grace.is_some_and(|grace| {
+        since
+            .values()
+            .any(|&started| now.saturating_duration_since(started) >= grace)
+    })
 }
 
 fn canary_session_budget(elapsed: Duration, attempts: u32) -> Option<Duration> {
@@ -512,6 +524,8 @@ fn available_bytes<B: Into<u64>>(blocks: B, fragment_size: u64) -> u64 {
 #[cfg(test)]
 mod canary_tests {
     use super::*;
+    use crate::sync::failure::FailureDiagnostic;
+    use crate::sync::jobs::JobState;
 
     #[test]
     fn canary_rejects_unsafe_boundaries_and_multiple_relays() {
@@ -546,52 +560,104 @@ mod canary_tests {
     }
 
     #[test]
-    fn persistent_failure_pauses_only_after_continuous_grace() {
+    fn persistent_failure_pauses_only_after_one_jobs_continuous_grace() {
         let start = tokio::time::Instant::now();
         let hour = Duration::from_secs(3600);
-        let mut since = None;
+        let minutes = |m: u64| start + Duration::from_secs(60 * m);
         // Disabled: never pauses, however long the failure lasts.
-        assert!(!failure_pause(&mut since, true, None, start));
-        assert!(!failure_pause(&mut since, true, None, start + 10 * hour));
-        let mut since = None;
-        assert!(!failure_pause(&mut since, true, Some(hour), start));
-        assert!(!failure_pause(
-            &mut since,
-            true,
-            Some(hour),
-            start + hour / 2
-        ));
-        assert!(failure_pause(&mut since, true, Some(hour), start + hour));
-        // A cleared failure resets the grace; a new failure starts it again.
-        assert!(!failure_pause(
-            &mut since,
-            false,
-            Some(hour),
-            start + 2 * hour
-        ));
-        assert!(!failure_pause(
-            &mut since,
-            true,
-            Some(hour),
-            start + 3 * hour
-        ));
-        assert!(failure_pause(
-            &mut since,
-            true,
-            Some(hour),
-            start + 4 * hour
-        ));
-        // Zero grace pauses as soon as the ledger reports the failure.
-        let mut since = None;
-        assert!(failure_pause(&mut since, true, Some(Duration::ZERO), start));
+        let mut since = HashMap::new();
+        assert!(!failure_pause(&mut since, &[1], None, start));
+        assert!(!failure_pause(&mut since, &[1], None, start + 10 * hour));
+        let mut since = HashMap::new();
+        assert!(!failure_pause(&mut since, &[1], Some(hour), start));
+        assert!(!failure_pause(&mut since, &[1], Some(hour), minutes(30)));
+        assert!(failure_pause(&mut since, &[1], Some(hour), minutes(60)));
+        // A cleared failure resets that job's grace; a new failure starts it again.
+        assert!(!failure_pause(&mut since, &[], Some(hour), minutes(120)));
+        assert!(!failure_pause(&mut since, &[1], Some(hour), minutes(180)));
+        assert!(failure_pause(&mut since, &[1], Some(hour), minutes(240)));
+        // Overlapping failures of different jobs never add up to one grace:
+        // job 1 fails 0-50 min, job 2 30-80 min, job 3 from 70 min.
+        let mut since = HashMap::new();
+        for (at, failing) in [
+            (0, &[1][..]),
+            (30, &[1, 2]),
+            (50, &[2]),
+            (70, &[2, 3]),
+            (80, &[3]),
+            (129, &[3]),
+        ] {
+            assert!(
+                !failure_pause(&mut since, failing, Some(hour), minutes(at)),
+                "{at}"
+            );
+        }
+        assert!(failure_pause(&mut since, &[3], Some(hour), minutes(130)));
+        // Zero grace pauses as soon as a counted failure is observed.
+        let mut since = HashMap::new();
+        assert!(!failure_pause(&mut since, &[], Some(Duration::ZERO), start));
+        assert!(failure_pause(&mut since, &[7], Some(Duration::ZERO), start));
     }
 
-    /// Drive one job through the runtime's tick order with a virtual clock: the
-    /// exclusion turn and health observation precede the pause check and the
-    /// lease; a session blocks the loop for `session` seconds and ends with an
-    /// authenticated failure released at the runtime's backoff.
-    fn simulate_failing_job(session: i64, withheld: bool) -> (Option<(i64, i64)>, Option<i64>) {
-        use crate::sync::failure::{FailureDiagnostic, FailureKind};
+    /// The single global clock of #90, kept to show the counter-examples it
+    /// paused on: it started when any job became a persistent failure and reset
+    /// only when none was.
+    fn legacy_failure_pause(
+        since: &mut Option<tokio::time::Instant>,
+        failing: bool,
+        grace: Duration,
+        now: tokio::time::Instant,
+    ) -> bool {
+        if !failing {
+            *since = None;
+            return false;
+        }
+        now.saturating_duration_since(*since.get_or_insert(now)) >= grace
+    }
+
+    #[derive(Debug, Default)]
+    struct Simulation {
+        /// `(job, attempt, seconds after start)` of each relay-unavailable exclusion.
+        excluded: Vec<(i64, i64, i64)>,
+        /// When the per-job, exemption-aware pause fired.
+        paused: Option<i64>,
+        /// When the global clock of #90 would have paused.
+        legacy_paused: Option<i64>,
+    }
+
+    const GRACE: Duration = Duration::from_secs(7200);
+    const X: [u8; 32] = [8; 32];
+    const Y: [u8; 32] = [9; 32];
+
+    fn withheld(ids: &[[u8; 32]]) -> Option<FailureDiagnostic> {
+        Some(FailureDiagnostic {
+            kind: FailureKind::Unavailable,
+            missing_count: ids.len() as u64,
+            sample: ids.to_vec(),
+        })
+    }
+
+    fn relay_down() -> Option<FailureDiagnostic> {
+        Some(FailureDiagnostic {
+            kind: FailureKind::Relay,
+            missing_count: 0,
+            sample: Vec::new(),
+        })
+    }
+
+    /// Drive the runtime's tick order against a real ledger with a virtual clock:
+    /// the exclusion turn and health observation precede the pause check and the
+    /// lease, as in `drive`. A session blocks the loop for `session` seconds and
+    /// ends with `report(job_index, attempt)` (or, with `None`, a lost worker),
+    /// released at the runtime's backoff. Job `n` is enqueued `enqueue[n]`
+    /// seconds after the start. Stops at the pause, once every job is complete,
+    /// or after `horizon` seconds.
+    fn simulate(
+        enqueue: &[i64],
+        session: i64,
+        horizon: i64,
+        report: impl Fn(usize, i64) -> Option<FailureDiagnostic>,
+    ) -> Simulation {
         let root = tempfile::tempdir().unwrap();
         let mut ledger =
             JobLedger::open(&root.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
@@ -599,87 +665,147 @@ mod canary_tests {
             .set_relay_unavailable_rule(Some(UnavailableRule::default()))
             .unwrap();
         let dedupe = DedupeIndex::open(root.path().join("dedupe")).unwrap();
-        let job = ledger
-            .enqueue("manual", "wss://a.example", 0, 899)
-            .unwrap()
-            .id;
-        let report = if withheld {
-            FailureDiagnostic {
-                kind: FailureKind::Unavailable,
-                missing_count: 1,
-                sample: vec![[8; 32]],
-            }
-        } else {
-            FailureDiagnostic {
-                kind: FailureKind::Relay,
-                missing_count: 0,
-                sample: Vec::new(),
-            }
-        };
-        let grace = Some(Duration::from_secs(7200));
         let origin = tokio::time::Instant::now();
         let start = 10_000_i64;
-        let mut since = None;
+        let mut jobs = Vec::new();
+        let mut since = HashMap::new();
+        let mut legacy = None;
+        let mut sim = Simulation::default();
         let mut now = start;
-        while now < start + 6 * 3600 {
-            if !ledger
+        while now < start + horizon {
+            while jobs.len() < enqueue.len() && now >= start + enqueue[jobs.len()] {
+                let n = jobs.len() as i64;
+                let job = ledger.enqueue("manual", "wss://a.example", n * 900, n * 900 + 899);
+                jobs.push(job.unwrap().id);
+            }
+            for excluded in ledger
                 .exclude_relay_unavailable(now, &dedupe)
                 .unwrap()
                 .excluded
-                .is_empty()
             {
-                let failing_for = since.map_or(0, |at: tokio::time::Instant| {
-                    (origin + Duration::from_secs((now - start) as u64) - at).as_secs() as i64
-                });
-                assert_eq!(
-                    ledger.get(job).unwrap().state,
-                    super::super::jobs::JobState::Complete
-                );
-                assert!(!ledger.progress_observation(now).unwrap().persistent_failure);
-                return (Some((ledger.get(job).unwrap().attempt, failing_for)), None);
+                let attempt = ledger.get(excluded.job).unwrap().attempt;
+                sim.excluded.push((excluded.job, attempt, now - start));
             }
-            let observation = ledger.progress_observation(now).unwrap();
+            if jobs.len() == enqueue.len()
+                && jobs
+                    .iter()
+                    .all(|&id| ledger.get(id).unwrap().state == JobState::Complete)
+            {
+                break;
+            }
             let at = origin + Duration::from_secs((now - start) as u64);
-            if failure_pause(&mut since, observation.persistent_failure, grace, at) {
-                return (None, Some(now - start));
+            let observation = ledger.progress_observation(now).unwrap();
+            if legacy_failure_pause(&mut legacy, observation.persistent_failure, GRACE, at)
+                && sim.legacy_paused.is_none()
+            {
+                sim.legacy_paused = Some(now - start);
+            }
+            let failing = ledger.pause_failures().unwrap();
+            if failure_pause(&mut since, &failing, Some(GRACE), at) {
+                sim.paused = Some(now - start);
+                break;
             }
             if let Some(lease) = ledger.lease_next(now, LEASE_SECS).unwrap() {
+                let (job, attempt) = (lease.job().id, lease.job().attempt);
+                let index = jobs.iter().position(|&id| id == job).unwrap();
                 now += session;
+                let reason = match report(index, attempt) {
+                    Some(report) => {
+                        ledger
+                            .record_failure_report(&lease, 1, &report, now)
+                            .unwrap();
+                        RetryReason::RelayFailure
+                    }
+                    None => RetryReason::WorkerLost,
+                };
                 ledger
-                    .record_failure_report(&lease, 1, &report, now)
-                    .unwrap();
-                let delay = retry_delay(job, lease.job().attempt);
-                ledger
-                    .retry(&lease, now, delay, RetryReason::RelayFailure)
+                    .retry(&lease, now, retry_delay(job, attempt), reason)
                     .unwrap();
             }
             now += TICK.as_secs() as i64;
         }
-        (None, None)
+        sim
     }
 
     #[test]
-    fn relay_unavailable_exclusion_fires_before_a_two_hour_pause_grace() {
-        // Unresolved failures start after attempt 3. With the default rule (five
-        // identical reports spanning an hour) the exclusion lands at attempt 7 for
-        // short sessions (backoff 4+8+16+32 min after attempts 3-6) and at attempt
-        // 6 for nine-minute sessions, well inside the 7200 s grace either way.
+    fn withheld_window_is_excluded_without_pausing() {
+        // Identical reports from the first attempt: excluded at attempt 7 for
+        // short sessions, at attempt 6 for nine-minute sessions.
         for (session, attempt) in [(30, 7), (540, 6)] {
-            let (excluded, paused) = simulate_failing_job(session, true);
-            assert_eq!(paused, None);
-            let (excluded_attempt, failing_for) = excluded.unwrap();
-            assert_eq!(excluded_attempt, attempt, "session {session}");
-            assert!(
-                failing_for < 7200 - 1200,
-                "session {session}: {failing_for}"
-            );
+            let sim = simulate(&[0], session, 12 * 3600, |_, _| withheld(&[X]));
+            assert_eq!(sim.paused, None, "session {session}");
+            assert_eq!(sim.excluded.len(), 1);
+            assert_eq!(sim.excluded[0].1, attempt, "session {session}");
         }
-        // Any other persistent failure (here the relay failing outright for more
-        // than two hours) still pauses all leasing once the grace has passed.
-        let (excluded, paused) = simulate_failing_job(30, false);
-        assert_eq!(excluded, None);
-        let paused = paused.unwrap();
+    }
+
+    #[test]
+    fn counter_example_a_interrupted_run_no_longer_pauses_before_exclusion() {
+        // A relay (or deadline) report on attempt 3 restarts the identical run at
+        // attempt 4, so the fifth identical report is attempt 8, more than 7200 s
+        // after the third failure. The global clock paused first, at attempt 7.
+        let script = |_: usize, attempt: i64| {
+            if attempt == 3 {
+                relay_down()
+            } else {
+                withheld(&[X])
+            }
+        };
+        let sim = simulate(&[0], 30, 12 * 3600, script);
+        let (_, attempt, excluded_at) = sim.excluded[0];
+        assert_eq!(attempt, 8);
+        assert!(sim.legacy_paused.unwrap() < excluded_at, "{sim:?}");
+        assert_eq!(sim.paused, None);
+    }
+
+    #[test]
+    fn counter_example_b_overlapping_withheld_windows_no_longer_pause() {
+        // Two withheld windows an hour apart: the second becomes a persistent
+        // failure just before the first is excluded, so the global clock never
+        // reset and paused before the second exclusion.
+        let sim = simulate(&[0, 3600], 30, 12 * 3600, |_, _| withheld(&[X]));
+        assert_eq!(sim.excluded.len(), 2, "{sim:?}");
+        assert!(sim.legacy_paused.unwrap() < sim.excluded[1].2, "{sim:?}");
+        assert_eq!(sim.paused, None);
+    }
+
+    #[test]
+    fn a_relay_that_stays_down_still_pauses_after_the_grace() {
+        let sim = simulate(&[0], 30, 12 * 3600, |_, _| relay_down());
+        assert!(sim.excluded.is_empty());
+        let paused = sim.paused.unwrap();
+        // The clock starts at the third failure, a few minutes in.
         assert!((7200..7200 + 600).contains(&paused), "{paused}");
+        // A withheld window alongside a genuine failure: the genuine one still
+        // pauses a grace after its own third failure.
+        let sim = simulate(&[0, 600], 30, 12 * 3600, |index, _| {
+            if index == 0 {
+                withheld(&[X])
+            } else {
+                relay_down()
+            }
+        });
+        assert_eq!(sim.excluded.len(), 1);
+        assert!(sim.paused.unwrap() >= 600 + 7200, "{sim:?}");
+    }
+
+    #[test]
+    fn exemption_is_bounded_for_runs_that_cannot_qualify() {
+        // A changing set is never on track: paused a grace after the third failure.
+        let sim = simulate(&[0], 30, 24 * 3600, |_, attempt| {
+            withheld(if attempt % 2 == 0 { &[X] } else { &[Y] })
+        });
+        assert!(sim.excluded.is_empty());
+        assert!((7200..7200 + 600).contains(&sim.paused.unwrap()), "{sim:?}");
+        // One report followed only by lost workers: exempt through attempt 10,
+        // then counted, so the pause fires a grace later instead of never.
+        let sim = simulate(&[0], 30, 24 * 3600, |_, attempt| {
+            if attempt == 1 { withheld(&[X]) } else { None }
+        });
+        assert!(sim.excluded.is_empty());
+        let paused = sim.paused.unwrap();
+        assert!(paused > 7200 + 600, "{sim:?}");
+        assert!(paused < 12 * 3600, "{sim:?}");
     }
 
     #[test]
@@ -1076,5 +1202,118 @@ mod tests {
         drop(worker);
         tokio::time::sleep(Duration::from_millis(200)).await;
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn withheld_windows_neither_pause_nor_stall_the_real_runtime_loop() {
+        use crate::sync::failure::FailureDiagnostic;
+        // Five identical hourly reports meet the rule: the first tick's lifecycle
+        // turn excludes the window. Three are an in-progress run: exempt. Either
+        // way a zero-grace pause must not withhold the next lease.
+        for reports in [5, 3] {
+            let root = tempfile::tempdir().unwrap();
+            let archive = root.path().join("archive");
+            let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
+            let writer = Arc::new(
+                SegmentWriter::new(
+                    SegmentConfig {
+                        output_dir: archive.clone(),
+                        compress: false,
+                        ..SegmentConfig::default()
+                    },
+                    None,
+                    Some(dedupe.clone()),
+                )
+                .unwrap(),
+            );
+            let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+            let uid: u32 = String::from_utf8(uid.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let ledger_path = root.path().join("jobs.sqlite");
+            let gap = {
+                let mut ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+                let id = ledger
+                    .enqueue("manual", "wss://a.example", 0, 899)
+                    .unwrap()
+                    .id;
+                for n in 0..reports {
+                    let at = 1_000 + n * 3600;
+                    let lease = ledger.lease_next(at, 600).unwrap().unwrap();
+                    let report = FailureDiagnostic {
+                        kind: FailureKind::Unavailable,
+                        missing_count: 1,
+                        sample: vec![[8; 32]],
+                    };
+                    ledger
+                        .record_failure_report(&lease, 1, &report, at + 1)
+                        .unwrap();
+                    ledger
+                        .retry(&lease, at + 1, 60, RetryReason::RelayFailure)
+                        .unwrap();
+                }
+                assert!(
+                    ledger
+                        .progress_observation(30_000)
+                        .unwrap()
+                        .persistent_failure
+                );
+                id
+            };
+            let config = RuntimeConfig {
+                canary_until: None,
+                admission_policy: crate::giftwrap_filter::AdmissionPolicy::default(),
+                socket: root.path().join("worker.sock"),
+                worker_uid: uid,
+                ledger: ledger_path.clone(),
+                inventory: root.path().join("inventory"),
+                archive,
+                segment_prefix: "segment".to_owned(),
+                replay_floor: 0,
+                relays: vec!["wss://a.example".to_owned()],
+                pause_on_persistent_failure: Some(Duration::ZERO),
+                relay_unavailable_rule: Some(UnavailableRule::default()),
+            };
+            let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
+                .await
+                .unwrap();
+            let mut worker = UnixStream::connect(&config.socket).await.unwrap();
+            write_message(
+                &mut worker,
+                &Hello {
+                    version: super::super::ipc::VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            let ParentMessage::Job { .. } = tokio::time::timeout(
+                Duration::from_secs(15),
+                read_message::<_, ParentMessage>(&mut worker),
+            )
+            .await
+            .unwrap()
+            .unwrap() else {
+                panic!("expected assignment");
+            };
+            drop(worker);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            runtime.shutdown().await.unwrap();
+            let ledger = JobLedger::open(&ledger_path, LedgerLimits::default()).unwrap();
+            let job = ledger.get(gap).unwrap();
+            let exclusions = ledger.relay_unavailable_exclusions(gap).unwrap();
+            if reports == 5 {
+                assert_eq!(job.state, JobState::Complete);
+                assert_eq!(
+                    job.reason.as_deref(),
+                    Some(super::super::jobs::RELAY_UNAVAILABLE)
+                );
+                assert_eq!(exclusions, vec![([8; 32], None)]);
+            } else {
+                assert_ne!(job.state, JobState::Complete);
+                assert!(exclusions.is_empty());
+            }
+        }
     }
 }

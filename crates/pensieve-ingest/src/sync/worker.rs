@@ -53,8 +53,10 @@ pub enum WorkerError {
     /// SDK error or some advertised missing IDs were not captured and fetched.
     #[error("worker relay reconciliation incomplete")]
     Incomplete,
-    /// EOSE arrived with advertised IDs missing. This does not prove a volume
-    /// limit or permanent absence: SDK policy drops and relay withholding look
+    /// EOSE arrived with advertised IDs missing, including to a follow-up REQ
+    /// naming exactly the missing IDs (so a per-REQ result cap is not reported).
+    /// This does not prove a volume limit or permanent absence: SDK policy drops
+    /// (expiry, invalid signature, oversized message) and relay withholding look
     /// identical. Preserve the gap; do not automatically split or skip it.
     #[error("worker advertised events unavailable at EOSE")]
     Unavailable(FailureDiagnostic),

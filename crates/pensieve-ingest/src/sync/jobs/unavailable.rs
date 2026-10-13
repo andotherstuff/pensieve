@@ -11,15 +11,30 @@
 //! missing-ID set (`missing_count` equals the sample length, at most `max_ids`),
 //! every one of those IDs was explicitly requested (the attempt's whole diff fit
 //! in the worker's single fetch batch), the reports span at least
-//! `min_span_secs`, every received frame of the job is already archived and none
-//! of the IDs is. Attempts that ended without any report (a lost worker, or a
-//! lease consumed without a session, like job 768's attempt 16) carry no relay
-//! evidence: they are skipped, not counted. Any other report kind, a different
-//! set or a protocol-complete attempt ends the run.
+//! `min_span_secs` and every received frame of the job is already archived.
+//! Attempts that ended without any report (a lost worker, or a lease consumed
+//! without a session, like job 768's attempt 16) carry no relay evidence: they
+//! are skipped, not counted. Any other report kind, a different set or a
+//! protocol-complete attempt ends the run.
+//!
+//! IDs of the set that already carry a durable archive marker count as
+//! delivered: the archive holds them, whichever path brought them in. This
+//! matters for events archived before the inventory replay floor, which the
+//! inventory never lists, so every attempt's diff names them again and normal
+//! reconciliation could never finish the window. Only the remaining IDs are
+//! excluded; when none remain, the window completes with reason
+//! `already_archived` and no exclusion row, because nothing is missing.
+//!
 //! The proof is copied into `relay_unavailable_exclusions` (it outlives
 //! retention of the job's detail), the job completes with reason
 //! `relay_unavailable`, and coverage accounting keeps the count separate from
-//! policy exclusions. Receipts, archive markers and job IDs are untouched.
+//! policy exclusions. Receipts, archive markers and job IDs are untouched. Both
+//! completions fire the `job_completed` trigger, so they advance
+//! `lifecycle.last_success` like any other durable completion.
+//!
+//! [`JobLedger::pause_failures`] exempts from the runtime's failure pause a job
+//! whose in-progress run is on track to such a completion; see
+//! `exemption_ceiling` for the bound.
 //!
 //! Report times are recorded from schema 10 on. Older reports have none; for a
 //! gap that touches one, the span uses the runtime's fixed backoff floor after
@@ -40,11 +55,16 @@ pub(crate) const WORKER_FETCH_BATCH: u64 = 128;
 /// Upper bound on report rows read to measure one job's identical run.
 const MAX_EVIDENCE_ATTEMPTS: i64 = 1024;
 /// Retry-wait jobs examined per evaluation turn.
-const MAX_JOBS_PER_TURN: i64 = 32;
+pub(super) const MAX_JOBS_PER_TURN: i64 = 32;
 /// Unresolved exclusions checked against the archive per turn.
-const MAX_LATE_CHECKS: i64 = 64;
+pub(super) const MAX_LATE_CHECKS: i64 = 64;
+/// Failing jobs whose report history one pause evaluation reads. Any further
+/// candidate is counted toward the pause, the conservative direction.
+const MAX_EXEMPTION_CHECKS: usize = 256;
 /// The reason recorded on the completed job and every exclusion row.
 pub const RELAY_UNAVAILABLE: &str = "relay_unavailable";
+/// The reason recorded on a job whose withheld IDs were all already archived.
+pub const ALREADY_ARCHIVED: &str = "already_archived";
 
 pub(super) const SCHEMA: &str = "
 ALTER TABLE failure_reports ADD COLUMN reported_at INTEGER;
@@ -119,7 +139,7 @@ pub struct UnavailableExclusion {
     pub job: i64,
     /// Relay that advertised and withheld the IDs.
     pub relay: String,
-    /// Excluded event IDs, sorted.
+    /// Excluded event IDs (the withheld set minus IDs already archived), sorted.
     pub event_ids: Vec<[u8; 32]>,
     /// First attempt of the identical run.
     pub first_attempt: i64,
@@ -138,8 +158,9 @@ pub struct UnavailableProgress {
     pub excluded: Vec<UnavailableExclusion>,
     /// Qualifying jobs left in retry because received frames are not yet archived.
     pub awaiting_archive: u32,
-    /// Qualifying jobs left in retry because an excluded ID is already archived.
-    pub already_archived: u32,
+    /// Qualifying jobs completed with reason `already_archived`, without an
+    /// exclusion, because every withheld ID already carried an archive marker.
+    pub already_archived: Vec<i64>,
     /// Exclusions whose event has since reached the archive by another path.
     pub resolved: u32,
 }
@@ -172,79 +193,118 @@ fn span_lower_bound(run: &[(i64, Option<i64>)]) -> i64 {
         .fold(0_i64, i64::saturating_add)
 }
 
-fn qualifies(report: &FailureDiagnostic, rule: &UnavailableRule) -> bool {
-    report.kind == FailureKind::Unavailable
-        && !report.sample.is_empty()
-        && report.missing_count == report.sample.len() as u64
-        && report.sample.len() <= rule.max_ids as usize
+/// Whether an identical run (newest first) already satisfies the rule.
+fn meets(run: &[(i64, Option<i64>)], rule: &UnavailableRule) -> bool {
+    let needed = rule.attempts as usize;
+    run.len() >= needed && span_lower_bound(&run[..needed]) >= i64::from(rule.min_span_secs)
+}
+
+/// Highest job attempt at which an in-progress identical run still exempts its
+/// job from the failure pause: twice the rule's attempt count (10 by default).
+/// This tolerates up to `attempts` interrupting attempts (another failure kind,
+/// or an attempt without a report) while bounding the exemption: past the
+/// ceiling the job counts as a persistent failure whatever it reports, so a
+/// run that keeps restarting cannot hold the pause off forever.
+fn exemption_ceiling(rule: &UnavailableRule) -> i64 {
+    2 * i64::from(rule.attempts)
+}
+
+/// One stored failure report with its attempt's received-frame count.
+struct Reported {
+    attempt: i64,
+    report: FailureDiagnostic,
+    reported_at: Option<i64>,
+    received: u64,
+}
+
+impl Reported {
+    /// A fully enumerated, explicitly requested set within the rule's size cap.
+    fn qualifies(&self, rule: &UnavailableRule) -> bool {
+        self.report.kind == FailureKind::Unavailable
+            && !self.report.sample.is_empty()
+            && self.report.missing_count == self.report.sample.len() as u64
+            && self.report.sample.len() <= rule.max_ids as usize
+            && self.received.saturating_add(self.report.missing_count) <= WORKER_FETCH_BATCH
+    }
+}
+
+type ReportRow = (i64, Option<String>, Option<i64>, u64, bool);
+
+/// The job's failure reports after its last protocol-complete attempt (which
+/// means the relay delivered every advertised ID then), newest first, at most
+/// `limit`. Rows are parsed lazily by [`parse_report`].
+fn reports_since_delivery(
+    db: &Connection,
+    job: i64,
+    attempt: i64,
+    limit: i64,
+) -> Result<Vec<ReportRow>, LedgerError> {
+    let delivered: i64 = db.query_row(
+        "SELECT coalesce(max(attempt),0) FROM attempts WHERE job=?1 AND protocol_done=1",
+        [job],
+        |r| r.get(0),
+    )?;
+    let mut query = db.prepare(
+        "SELECT f.attempt, CASE WHEN length(f.report)<=32768 THEN f.report END, f.reported_at,
+                coalesce(a.received,0), coalesce(a.protocol_done,0)
+         FROM failure_reports f LEFT JOIN attempts a ON a.job=f.job AND a.attempt=f.attempt
+         WHERE f.job=?1 AND f.attempt<=?2 AND f.attempt>?3 ORDER BY f.attempt DESC LIMIT ?4",
+    )?;
+    Ok(query
+        .query_map(params![job, attempt, delivered, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Unparseable stored diagnostics are corruption and fail closed.
+fn parse_report(
+    (attempt, json, reported_at, received, protocol_done): ReportRow,
+) -> Result<Reported, LedgerError> {
+    let report: FailureDiagnostic = json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .filter(FailureDiagnostic::validate)
+        .ok_or(LedgerError::Invalid("invalid stored failure diagnostic"))?;
+    if protocol_done {
+        return Err(LedgerError::Invalid("failed attempt marked protocol done"));
+    }
+    Ok(Reported {
+        attempt,
+        report,
+        reported_at,
+        received,
+    })
 }
 
 /// The identical qualifying run of the job's most recent reported attempts, if it
 /// meets the rule. Attempts without a report (a lost worker, a lease consumed
 /// without a session, a parent-side protocol or deadline error) carry no relay
 /// evidence and are skipped, never counted; a protocol-complete attempt, any
-/// other report kind or a different set ends the run. Unparseable stored
-/// diagnostics are corruption and fail closed.
+/// other report kind or a different set ends the run.
 fn evidence(
     db: &Connection,
     job: &super::Job,
     rule: &UnavailableRule,
 ) -> Result<Option<Evidence>, LedgerError> {
-    let needed = i64::from(rule.attempts);
-    if job.state != JobState::RetryWait || job.attempt < needed {
+    if job.state != JobState::RetryWait || job.attempt < i64::from(rule.attempts) {
         return Ok(None);
     }
-    // A completed protocol means the relay delivered every advertised ID then.
-    let delivered: i64 = db.query_row(
-        "SELECT coalesce(max(attempt),0) FROM attempts WHERE job=?1 AND protocol_done=1",
-        [job.id],
-        |r| r.get(0),
-    )?;
-    let rows = {
-        let mut query = db.prepare(
-            "SELECT f.attempt, CASE WHEN length(f.report)<=32768 THEN f.report END, f.reported_at,
-                    coalesce(a.received,0), coalesce(a.protocol_done,0)
-             FROM failure_reports f LEFT JOIN attempts a ON a.job=f.job AND a.attempt=f.attempt
-             WHERE f.job=?1 AND f.attempt<=?2 AND f.attempt>?3 ORDER BY f.attempt DESC LIMIT ?4",
-        )?;
-        query
-            .query_map(
-                params![job.id, job.attempt, delivered, MAX_EVIDENCE_ATTEMPTS],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, u64>(3)?,
-                        r.get::<_, bool>(4)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?
-    };
     let mut ids: Option<Vec<[u8; 32]>> = None;
     let mut run = Vec::new();
-    for (attempt, json, reported_at, received, protocol_done) in rows {
-        let report: FailureDiagnostic = json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .filter(FailureDiagnostic::validate)
-            .ok_or(LedgerError::Invalid("invalid stored failure diagnostic"))?;
-        if protocol_done {
-            return Err(LedgerError::Invalid("failed attempt marked protocol done"));
-        }
-        if !qualifies(&report, rule)
-            || received.saturating_add(report.missing_count) > WORKER_FETCH_BATCH
-            || ids.as_ref().is_some_and(|ids| *ids != report.sample)
+    for row in reports_since_delivery(db, job.id, job.attempt, MAX_EVIDENCE_ATTEMPTS)? {
+        let reported = parse_report(row)?;
+        if !reported.qualifies(rule)
+            || ids
+                .as_ref()
+                .is_some_and(|ids| *ids != reported.report.sample)
         {
             break;
         }
-        ids.get_or_insert(report.sample);
-        run.push((attempt, reported_at));
+        ids.get_or_insert(reported.report.sample);
+        run.push((reported.attempt, reported.reported_at));
     }
-    if (run.len() as i64) < needed
-        || span_lower_bound(&run[..needed as usize]) < i64::from(rule.min_span_secs)
-    {
+    if !meets(&run, rule) {
         return Ok(None);
     }
     let (Some(ids), Some(&(first_attempt, first_reported_at))) = (ids, run.last()) else {
@@ -259,6 +319,57 @@ fn evidence(
         last_reported_at: run[0].1,
         span_secs: span_lower_bound(&run),
     }))
+}
+
+/// Whether a retry-wait job at `attempt` is on track to a relay-unavailable
+/// completion and so does not count toward the failure pause. All of:
+///
+/// - `attempt` is at most [`exemption_ceiling`];
+/// - its latest reported attempt qualifies (an `unavailable` report naming a
+///   fully enumerated, explicitly requested set of at most `max_ids` IDs);
+/// - every `unavailable` report since its last protocol-complete attempt
+///   qualifies and names that same set (a changed or unqualifiable set is not
+///   on track); reports of other kinds and attempts without a report may
+///   interrupt the run;
+/// - the current identical run does not meet the rule yet. A run that meets it
+///   but is still in retry was held back (receipts not yet archived) and counts
+///   again, so the exemption cannot outlast the evidence it waits for.
+fn on_track(
+    db: &Connection,
+    job: i64,
+    attempt: i64,
+    rule: &UnavailableRule,
+) -> Result<bool, LedgerError> {
+    let ceiling = exemption_ceiling(rule);
+    if attempt > ceiling {
+        return Ok(false);
+    }
+    let mut ids: Option<Vec<[u8; 32]>> = None;
+    let mut run = Vec::new();
+    let mut open = true;
+    for row in reports_since_delivery(db, job, attempt, ceiling)? {
+        let reported = parse_report(row)?;
+        if reported.report.kind != FailureKind::Unavailable {
+            if run.is_empty() {
+                // The latest reported attempt is not an unavailable report.
+                return Ok(false);
+            }
+            open = false;
+            continue;
+        }
+        if !reported.qualifies(rule)
+            || ids
+                .as_ref()
+                .is_some_and(|ids| *ids != reported.report.sample)
+        {
+            return Ok(false);
+        }
+        ids.get_or_insert(reported.report.sample);
+        if open {
+            run.push((reported.attempt, reported.reported_at));
+        }
+    }
+    Ok(!run.is_empty() && !meets(&run, rule))
 }
 
 /// Relay-unavailable exclusions owned by one job, for coverage accounting.
@@ -292,6 +403,52 @@ impl JobLedger {
         }
         self.unavailable_rule = rule;
         Ok(())
+    }
+
+    /// Persistently failing jobs that count toward the runtime's failure pause,
+    /// in ID order. The candidates are exactly the jobs behind `unresolved_failures`
+    /// (blocked, or in retry wait after at least three failed attempts); a
+    /// retry-wait job whose in-progress identical unavailable run is on track to
+    /// a relay-unavailable completion (see `on_track`) is left out. Health is
+    /// unaffected: such a job still counts toward `unresolved_failures`. With the
+    /// rule disabled nothing is exempt. Reads at most `MAX_EXEMPTION_CHECKS`
+    /// report histories; any further candidate is counted.
+    pub fn pause_failures(&self) -> Result<Vec<i64>, LedgerError> {
+        let failing = {
+            let mut query = self.db.prepare(
+                "SELECT id,state='retry_wait',attempt FROM jobs
+                 WHERE state='blocked' OR (state='retry_wait' AND attempt>=3) ORDER BY id",
+            )?;
+            query
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut counted = Vec::with_capacity(failing.len());
+        let mut checked = 0;
+        let mut exempt = 0_u32;
+        for (id, retrying, attempt) in failing {
+            if let Some(rule) = &self.unavailable_rule
+                && retrying
+                && attempt <= exemption_ceiling(rule)
+                && checked < MAX_EXEMPTION_CHECKS
+            {
+                checked += 1;
+                if on_track(&self.db, id, attempt, rule)? {
+                    exempt += 1;
+                    continue;
+                }
+            }
+            counted.push(id);
+        }
+        metrics::gauge!("negentropy_isolated_failure_pause_exempt_jobs").set(f64::from(exempt));
+        metrics::gauge!("negentropy_isolated_failure_pause_counted_jobs").set(counted.len() as f64);
+        Ok(counted)
     }
 
     /// One bounded turn: complete retry-wait jobs whose history proves the relay
@@ -349,18 +506,18 @@ impl JobLedger {
                     progress.awaiting_archive += 1;
                     continue;
                 }
-                // An ID already carrying a durable archive marker was delivered after
-                // all (another path or a neutral attempt); inventory replay will
-                // let normal reconciliation finish this window instead.
-                let mut archived = false;
+                // An ID that already carries a durable archive marker is in the
+                // archive, whichever path brought it in, so it is not missing. An
+                // event archived before the inventory replay floor is never in the
+                // inventory: every attempt's diff names it again, so without this
+                // the window could neither finish normally nor be excluded.
+                let mut withheld = Vec::with_capacity(evidence.ids.len());
                 for event_id in &evidence.ids {
-                    archived |= dedupe.get_status(event_id)? == Some(crate::EventStatus::Archived);
+                    if dedupe.get_status(event_id)? != Some(crate::EventStatus::Archived) {
+                        withheld.push(*event_id);
+                    }
                 }
-                if archived {
-                    progress.already_archived += 1;
-                    continue;
-                }
-                for event_id in &evidence.ids {
+                for event_id in &withheld {
                     tx.execute(
                         "INSERT INTO relay_unavailable_exclusions(event_id,job,relay,since,until,
                          first_attempt,last_attempt,attempts,first_reported_at,last_reported_at,
@@ -382,10 +539,15 @@ impl JobLedger {
                         ],
                     )?;
                 }
+                let reason = if withheld.is_empty() {
+                    ALREADY_ARCHIVED
+                } else {
+                    RELAY_UNAVAILABLE
+                };
                 let changed = tx.execute(
                     "UPDATE jobs SET state='complete',reason=?3,token=NULL,expires_at=NULL
                      WHERE id=?1 AND state='retry_wait' AND attempt=?2",
-                    params![job.id, job.attempt, RELAY_UNAVAILABLE],
+                    params![job.id, job.attempt, reason],
                 )?;
                 if changed != 1 {
                     return Err(LedgerError::Invalid("exclusion candidate changed"));
@@ -394,10 +556,14 @@ impl JobLedger {
                     complete_if_durable(&tx, parent)?;
                 }
                 tx.commit()?;
+                if withheld.is_empty() {
+                    progress.already_archived.push(job.id);
+                    continue;
+                }
                 progress.excluded.push(UnavailableExclusion {
                     job: job.id,
                     relay: job.relay,
-                    event_ids: evidence.ids,
+                    event_ids: withheld,
                     first_attempt: evidence.first_attempt,
                     last_attempt: evidence.last_attempt,
                     attempts: evidence.attempts,
@@ -842,17 +1008,241 @@ mod tests {
     }
 
     #[test]
-    fn an_already_archived_id_is_not_excluded() {
+    fn already_archived_ids_count_as_delivered() {
+        // Every withheld ID is archived (for example before the replay floor, so
+        // the inventory never lists it and each diff names it again): the window
+        // completes without an exclusion, because nothing is missing.
         let mut f = fixture();
         let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
         for n in 0..5 {
-            f.attempt(1000 + n * HOUR, 0, Some(unavailable(&[MISSING])));
+            f.attempt(1000 + n * HOUR, 17, Some(unavailable(&[MISSING])));
         }
         f.dedupe.mark_archived([&MISSING].into_iter()).unwrap();
         let progress = f.run(1000 + 5 * HOUR);
         assert!(progress.excluded.is_empty());
-        assert_eq!(progress.already_archived, 1);
-        assert_eq!(f.db.get(job.id).unwrap().state, JobState::RetryWait);
+        assert_eq!(progress.already_archived, vec![job.id]);
+        let done = f.db.get(job.id).unwrap();
+        assert_eq!(done.state, JobState::Complete);
+        assert_eq!(done.reason.as_deref(), Some(ALREADY_ARCHIVED));
+        assert!(
+            f.db.relay_unavailable_exclusions(job.id)
+                .unwrap()
+                .is_empty()
+        );
+        // Like any completion it advances the durable last-success time.
+        let observation = f.db.progress_observation(1000 + 5 * HOUR).unwrap();
+        assert!(observation.last_success.is_some());
+        assert!(!observation.persistent_failure);
+
+        // Mixed: only the IDs the archive lacks are excluded.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        let other = [0x09; 32];
+        for n in 0..5 {
+            f.attempt(1000 + n * HOUR, 0, Some(unavailable(&[MISSING, other])));
+        }
+        f.dedupe.mark_archived([&MISSING].into_iter()).unwrap();
+        let progress = f.run(1000 + 5 * HOUR);
+        assert!(progress.already_archived.is_empty());
+        assert_eq!(progress.excluded[0].event_ids, vec![other]);
+        assert_eq!(
+            f.db.get(job.id).unwrap().reason.as_deref(),
+            Some(RELAY_UNAVAILABLE)
+        );
+        assert_eq!(
+            f.db.relay_unavailable_exclusions(job.id).unwrap(),
+            vec![(other, None)]
+        );
+    }
+
+    #[test]
+    fn a_diff_of_exactly_one_fetch_batch_qualifies() {
+        // 127 received + 1 missing = 128: the whole diff was one requested batch.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        for n in 0..5 {
+            f.attempt(1000 + n * HOUR, 127, Some(unavailable(&[MISSING])));
+        }
+        let progress = f.run(1000 + 5 * HOUR);
+        assert_eq!(progress.excluded.len(), 1);
+        assert_eq!(progress.excluded[0].job, job.id);
+    }
+
+    #[test]
+    fn keyset_cursors_cover_more_jobs_and_rows_than_one_turn() {
+        // 40 qualifying jobs exceed MAX_JOBS_PER_TURN (32); their 80 exclusion
+        // rows exceed MAX_LATE_CHECKS (64).
+        const JOBS: i64 = 40;
+        const { assert!(JOBS > MAX_JOBS_PER_TURN && 2 * JOBS > MAX_LATE_CHECKS) };
+        let mut f = fixture();
+        for n in 0..JOBS {
+            f.db.enqueue("s", RELAY, n * 900, n * 900 + 899).unwrap();
+        }
+        let other = [0x09; 32];
+        for round in 0..5 {
+            for n in 0..JOBS {
+                let lease = f.attempt(1000 + round * HOUR, 0, Some(unavailable(&[MISSING, other])));
+                assert_eq!(lease.job().id, n + 1);
+            }
+        }
+        let now = 1000 + 5 * HOUR;
+        let first = f.run(now);
+        let ids: Vec<_> = first.excluded.iter().map(|e| e.job).collect();
+        assert_eq!(ids, (1..=MAX_JOBS_PER_TURN).collect::<Vec<_>>());
+        let second = f.run(now + 5);
+        let ids: Vec<_> = second.excluded.iter().map(|e| e.job).collect();
+        assert_eq!(ids, (MAX_JOBS_PER_TURN + 1..=JOBS).collect::<Vec<_>>());
+        // The candidate cursor wrapped: nothing is left and nothing repeats.
+        assert!(f.run(now + 10).excluded.is_empty());
+        let rows: i64 =
+            f.db.db
+                .query_row(
+                    "SELECT count(*) FROM relay_unavailable_exclusions WHERE resolved_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(rows, 2 * JOBS);
+        // Both events later reach the archive. Each turn checks at most 64 rows,
+        // continuing from where the previous turn stopped, so two turns resolve
+        // all 80 and a third finds nothing left.
+        f.dedupe
+            .mark_archived([&MISSING, &other].into_iter())
+            .unwrap();
+        let turns = [f.run(now + 15).resolved, f.run(now + 20).resolved];
+        assert!(turns.iter().all(|&n| i64::from(n) <= MAX_LATE_CHECKS));
+        assert_eq!(i64::from(turns[0] + turns[1]), 2 * JOBS);
+        assert_eq!(f.run(now + 25).resolved, 0);
+        let unresolved: i64 =
+            f.db.db
+                .query_row(
+                    "SELECT count(*) FROM relay_unavailable_exclusions WHERE resolved_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(unresolved, 0);
+    }
+
+    fn relay_failure() -> FailureDiagnostic {
+        FailureDiagnostic {
+            kind: FailureKind::Relay,
+            missing_count: 0,
+            sample: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pause_exempts_only_a_run_on_track_to_exclusion() {
+        let at = |n: i64| 1000 + n * HOUR;
+        // Three identical reports: unresolved for health, exempt from the pause.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        for n in 0..3 {
+            f.attempt(at(n), 0, Some(unavailable(&[MISSING])));
+        }
+        assert!(f.db.progress_observation(at(3)).unwrap().persistent_failure);
+        assert!(f.db.pause_failures().unwrap().is_empty());
+        // With the rule disabled nothing will exclude it, so it counts.
+        f.db.set_relay_unavailable_rule(None).unwrap();
+        assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+        f.db.set_relay_unavailable_rule(Some(UnavailableRule::default()))
+            .unwrap();
+        // A relay failure as the latest report counts; the next identical
+        // report restarts a run that is on track again (counter-example (a)).
+        f.attempt(at(3), 0, Some(relay_failure()));
+        assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+        f.attempt(at(4), 0, Some(unavailable(&[MISSING])));
+        assert!(f.db.pause_failures().unwrap().is_empty());
+        // So does an attempt without a report, inside the ceiling.
+        f.attempt(at(5), 0, None);
+        assert!(f.db.pause_failures().unwrap().is_empty());
+
+        // A changed set is not on track, even when the latest set repeats.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        for ids in [
+            vec![MISSING],
+            vec![MISSING, [9; 32]],
+            vec![MISSING],
+            vec![MISSING],
+        ] {
+            f.attempt(at(0), 0, Some(unavailable(&ids)));
+            f.db.db
+                .execute("UPDATE jobs SET next_eligible=0 WHERE id=?1", [job.id])
+                .unwrap();
+        }
+        assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+
+        // A diff larger than one fetch batch, or a set above max_ids, cannot qualify.
+        for (received, ids) in [
+            (128, vec![MISSING]),
+            (0, (1..=9).map(|n| [n; 32]).collect::<Vec<_>>()),
+        ] {
+            let mut f = fixture();
+            let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+            for n in 0..3 {
+                f.attempt(at(n), received, Some(unavailable(&ids)));
+            }
+            assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+        }
+
+        // The ceiling: past 2 x attempts (10) the job counts whatever it reports.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        f.attempt(at(0), 0, Some(unavailable(&[MISSING])));
+        for n in 1..9 {
+            // Lost workers carry no evidence; the run never grows.
+            f.attempt(at(n), 0, None);
+        }
+        f.attempt(at(9), 0, Some(unavailable(&[MISSING])));
+        assert_eq!(f.db.get(job.id).unwrap().attempt, 10);
+        assert!(f.db.pause_failures().unwrap().is_empty());
+        f.attempt(at(10), 0, Some(unavailable(&[MISSING])));
+        assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+
+        // A run that met the rule but is held back counts again.
+        let mut f = fixture();
+        let job = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        for n in 0..5 {
+            f.attempt(at(n), 0, Some(unavailable(&[MISSING])));
+        }
+        f.db.db
+            .execute(
+                "INSERT INTO attempts(job,attempt,received,bytes,digest) VALUES(?1,99,1,1,zeroblob(32))",
+                [job.id],
+            )
+            .unwrap();
+        f.db.db
+            .execute(
+                "INSERT INTO receipts VALUES(?1,99,1,zeroblob(32),1,1,zeroblob(32))",
+                [job.id],
+            )
+            .unwrap();
+        assert_eq!(f.run(at(5)).awaiting_archive, 1);
+        assert_eq!(f.db.pause_failures().unwrap(), vec![job.id]);
+
+        // Blocked jobs always count; corruption fails closed.
+        let mut f = fixture();
+        let blocked = f.db.enqueue("s", RELAY, 0, 899).unwrap();
+        f.db.db
+            .execute("UPDATE jobs SET state='blocked' WHERE id=?1", [blocked.id])
+            .unwrap();
+        let job = f.db.enqueue("s", RELAY, 900, 1799).unwrap();
+        for n in 0..3 {
+            f.attempt(at(n), 0, Some(unavailable(&[MISSING])));
+        }
+        assert_eq!(f.db.pause_failures().unwrap(), vec![blocked.id]);
+        f.db.db
+            .execute(
+                "UPDATE failure_reports SET report='{}' WHERE job=?1 AND attempt=2",
+                [job.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            f.db.pause_failures(),
+            Err(LedgerError::Invalid(_))
+        ));
     }
 
     #[test]
