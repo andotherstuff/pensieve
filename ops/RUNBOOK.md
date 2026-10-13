@@ -1289,7 +1289,11 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
 `LEDGER=/data/negentropy/production-premium-20261011T180545Z/jobs.sqlite`.
 
 - `unresolved_failures`: a job is blocked or in retry backoff after three failed
-  attempts. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
+  attempts. A job whose relay keeps advertising the same events without delivering
+  them is completed automatically by a relay-unavailable exclusion within about two
+  hours of its third failure (`negentropy relay-unavailable exclusion` WARN lines;
+  see [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions)),
+  so a red monitor that persists is a different fault. Stop only the worker (`sudo systemctl stop pensieve-negentropy-worker`),
   capture `sudo -u pensieve python3 ops/scripts/negentropy-ledger-status.py "$LEDGER"`
   and the `isolated worker attempt failed` journal lines, and leave the monitor red
   for a decision. If the ingester runs with
@@ -1333,8 +1337,62 @@ preflight scan.
    `negentropy_isolated_unhealthy` 0; the status tool shows `states.leased` 0 or 1,
    job 768 back in `retry_wait`, and `last_success` advancing. `/health/negentropy`
    will report `unresolved_failures` (not `runtime_failed`) while job 768 remains
-   unresolved; that is the open decision, not a recovery failure.
+   unresolved. The relay-unavailable exclusion rollout below resolves it.
 7. Record the new release in `ops/systemd/dropins/` and the table above.
+
+### Rolling out relay-unavailable exclusions (ledger schema 10)
+
+The maintainer decision for job 768 (2026-10-13): a window completes, with a
+recorded proof, once its relay has reported the same fully enumerated set of
+advertised-but-undelivered IDs on five consecutive attempts over at least an hour
+(see [continuous readiness](../docs/negentropy_continuous_readiness.md#relay-unavailable-exclusions)).
+Only the ingester changes; the worker binary and IPC version are unchanged, so the
+installed worker stays. Opening the ledger migrates it from schema 9 to 10. A
+pre-change ingester refuses a schema-10 ledger (the isolated runtime stays off,
+live ingestion continues), so roll back with
+`--isolated-negentropy-disable-unavailable-exclusion` on the new build, not by
+downgrading.
+
+1. Stop the worker, then take a consistent ledger backup with the ingester still
+   running: `sudo -u pensieve sqlite3 "$LEDGER" ".backup '$LEDGER.pre-schema10'"`.
+   Record `negentropy-ledger-status.py "$LEDGER"` (it shows `ledger_schema` 9 and
+   job 768 in `retry_wait`).
+2. Build the merged master commit as `releases/ingest-<sha>/pensieve-ingest` (see
+   Routine deploy; ingester only).
+3. Edit `zzzz-bounded-canary.conf`: point `ExecStart` at the new release and keep
+   every existing argument. The defaults need no new flags. Add
+   `--isolated-negentropy-pause-on-failure-secs 7200` only if unattended pausing
+   on other persistent failures is wanted; with the defaults an exclusion lands
+   before that grace ends. Spell out the defaults
+   (`--isolated-negentropy-unavailable-exclusion-attempts 5`,
+   `--isolated-negentropy-unavailable-exclusion-span-secs 3600`,
+   `--isolated-negentropy-unavailable-exclusion-max-ids 8`) only if the drop-in
+   should record them.
+4. `sudo systemctl daemon-reload`, restart the ingester with the graceful-stop
+   checks above; the worker starts with it.
+5. Verify within a minute of startup: one journal line
+   `negentropy relay-unavailable exclusion` with `job=768`,
+   `relay=wss://premium.primal.net`, `count=1`,
+   `event_id=089d1fdc2d1cf0f03be5844014378a3f2bcca0d1092619a70ed6f86b7c286b65`,
+   `first_attempt=1` and `last_attempt` the latest attempt with a report (15 if
+   none ran since the lease race; attempts without a report are skipped);
+   `negentropy_relay_unavailable_exclusions_total` 1 and
+   `negentropy_relay_unavailable_exclusions_unresolved` 1 on `:9091/metrics`;
+   `curl -s localhost:9091/health/negentropy` no longer `unresolved_failures`, and
+   Kuma monitor 46 green after its next push; the status tool shows `ledger_schema`
+   10, `relay_unavailable_exclusions.events` 1 with job 768 in `recent`, and
+   `complete_states.relay_unavailable_exclusion` 1. `isolated worker session
+   budget` lines continue and `last_durable_completion_unix` advances. If no
+   exclusion line appears, job 768's latest reports differ (for example a `relay`
+   failure since the incident): it is excluded once five consecutive identical
+   reports span an hour, and health stays `unresolved_failures` until then.
+6. Record the release in `ops/systemd/dropins/` and the table above.
+
+Every later exclusion logs the same WARN line; check the listed event ID against
+other relays. If one ever looks wrong, restart with
+`--isolated-negentropy-disable-unavailable-exclusion` (recorded exclusions stay;
+new matching jobs keep retrying) and keep the ledger for review. Never delete
+exclusion rows or edit jobs by hand.
 
 ## Cleanup debt
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it

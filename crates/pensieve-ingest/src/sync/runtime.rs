@@ -18,7 +18,9 @@ use tokio::sync::oneshot;
 use super::SyncStateDb;
 use super::binding::{BindingError, WorkerCandidate};
 use super::failure::FailureKind;
-use super::jobs::{JobLedger, LedgerError, LedgerLimits, RetryReason, SplitOutcome};
+use super::jobs::{
+    JobLedger, LedgerError, LedgerLimits, RetryReason, SplitOutcome, UnavailableRule,
+};
 use super::parent::{ParentError, ParentExecutor, SessionOutcome};
 use crate::{DedupeIndex, SegmentWriter};
 
@@ -57,7 +59,13 @@ pub struct RuntimeConfig {
     /// continuously for this long. `None` keeps retrying with paced backoff.
     /// The pause holds until the failure clears or the runtime restarts; every
     /// gap, receipt and archive maintenance turn is kept, and health stays red.
+    /// A job that meets `relay_unavailable_rule` is completed before a 7200 s
+    /// grace runs out; any other persistent failure still pauses all leasing.
     pub pause_on_persistent_failure: Option<Duration>,
+    /// Complete a window, with recorded proof, once its relay has persistently
+    /// advertised the same IDs without delivering them. `None` disables new
+    /// exclusions; recorded ones are kept and still checked for late arrival.
+    pub relay_unavailable_rule: Option<UnavailableRule>,
 }
 
 /// A local failure pauses isolated work without changing live archive ownership.
@@ -149,6 +157,7 @@ impl IsolatedRuntime {
             LedgerLimits::default(),
             config.admission_policy.clone(),
         )?;
+        ledger.set_relay_unavailable_rule(config.relay_unavailable_rule)?;
         if let Some(until) = config.canary_until {
             seed_canary(&mut ledger, &config.relays[0], until)?;
         }
@@ -577,6 +586,102 @@ mod canary_tests {
         assert!(failure_pause(&mut since, true, Some(Duration::ZERO), start));
     }
 
+    /// Drive one job through the runtime's tick order with a virtual clock: the
+    /// exclusion turn and health observation precede the pause check and the
+    /// lease; a session blocks the loop for `session` seconds and ends with an
+    /// authenticated failure released at the runtime's backoff.
+    fn simulate_failing_job(session: i64, withheld: bool) -> (Option<(i64, i64)>, Option<i64>) {
+        use crate::sync::failure::{FailureDiagnostic, FailureKind};
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger =
+            JobLedger::open(&root.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
+        ledger
+            .set_relay_unavailable_rule(Some(UnavailableRule::default()))
+            .unwrap();
+        let dedupe = DedupeIndex::open(root.path().join("dedupe")).unwrap();
+        let job = ledger
+            .enqueue("manual", "wss://a.example", 0, 899)
+            .unwrap()
+            .id;
+        let report = if withheld {
+            FailureDiagnostic {
+                kind: FailureKind::Unavailable,
+                missing_count: 1,
+                sample: vec![[8; 32]],
+            }
+        } else {
+            FailureDiagnostic {
+                kind: FailureKind::Relay,
+                missing_count: 0,
+                sample: Vec::new(),
+            }
+        };
+        let grace = Some(Duration::from_secs(7200));
+        let origin = tokio::time::Instant::now();
+        let start = 10_000_i64;
+        let mut since = None;
+        let mut now = start;
+        while now < start + 6 * 3600 {
+            if !ledger
+                .exclude_relay_unavailable(now, &dedupe)
+                .unwrap()
+                .excluded
+                .is_empty()
+            {
+                let failing_for = since.map_or(0, |at: tokio::time::Instant| {
+                    (origin + Duration::from_secs((now - start) as u64) - at).as_secs() as i64
+                });
+                assert_eq!(
+                    ledger.get(job).unwrap().state,
+                    super::super::jobs::JobState::Complete
+                );
+                assert!(!ledger.progress_observation(now).unwrap().persistent_failure);
+                return (Some((ledger.get(job).unwrap().attempt, failing_for)), None);
+            }
+            let observation = ledger.progress_observation(now).unwrap();
+            let at = origin + Duration::from_secs((now - start) as u64);
+            if failure_pause(&mut since, observation.persistent_failure, grace, at) {
+                return (None, Some(now - start));
+            }
+            if let Some(lease) = ledger.lease_next(now, LEASE_SECS).unwrap() {
+                now += session;
+                ledger
+                    .record_failure_report(&lease, 1, &report, now)
+                    .unwrap();
+                let delay = retry_delay(job, lease.job().attempt);
+                ledger
+                    .retry(&lease, now, delay, RetryReason::RelayFailure)
+                    .unwrap();
+            }
+            now += TICK.as_secs() as i64;
+        }
+        (None, None)
+    }
+
+    #[test]
+    fn relay_unavailable_exclusion_fires_before_a_two_hour_pause_grace() {
+        // Unresolved failures start after attempt 3. With the default rule (five
+        // identical reports spanning an hour) the exclusion lands at attempt 7 for
+        // short sessions (backoff 4+8+16+32 min after attempts 3-6) and at attempt
+        // 6 for nine-minute sessions, well inside the 7200 s grace either way.
+        for (session, attempt) in [(30, 7), (540, 6)] {
+            let (excluded, paused) = simulate_failing_job(session, true);
+            assert_eq!(paused, None);
+            let (excluded_attempt, failing_for) = excluded.unwrap();
+            assert_eq!(excluded_attempt, attempt, "session {session}");
+            assert!(
+                failing_for < 7200 - 1200,
+                "session {session}: {failing_for}"
+            );
+        }
+        // Any other persistent failure (here the relay failing outright for more
+        // than two hours) still pauses all leasing once the grace has passed.
+        let (excluded, paused) = simulate_failing_job(30, false);
+        assert_eq!(excluded, None);
+        let paused = paused.unwrap();
+        assert!((7200..7200 + 600).contains(&paused), "{paused}");
+    }
+
     #[test]
     fn only_a_lapsed_lease_release_is_attempt_local() {
         assert_eq!(attempt_local(Ok(7), 1, 1, "retry").unwrap(), Some(7));
@@ -674,6 +779,7 @@ mod tests {
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
             pause_on_persistent_failure: None,
+            relay_unavailable_rule: Some(UnavailableRule::default()),
         };
         assert!(matches!(
             IsolatedRuntime::start(config, dedupe, writer).await,
@@ -713,6 +819,7 @@ mod tests {
             relays: vec!["wss://a.example".to_owned()],
             canary_until: Some(3600),
             pause_on_persistent_failure: None,
+            relay_unavailable_rule: Some(UnavailableRule::default()),
         };
         let runtime = IsolatedRuntime::start(config.clone(), dedupe.clone(), writer.clone())
             .await
@@ -784,6 +891,7 @@ mod tests {
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
             pause_on_persistent_failure: None,
+            relay_unavailable_rule: Some(UnavailableRule::default()),
         };
         let runtime = IsolatedRuntime::start(config.clone(), dedupe, writer)
             .await
@@ -912,6 +1020,7 @@ mod tests {
             replay_floor: 0,
             relays: vec!["wss://a.example".to_owned()],
             pause_on_persistent_failure: Some(Duration::ZERO),
+            relay_unavailable_rule: Some(UnavailableRule::default()),
         };
         let hello = || Hello {
             version: super::super::ipc::VERSION,

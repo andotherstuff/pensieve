@@ -16,6 +16,11 @@ sorted unique IDs. It includes no relay-provided free-form error text. On the
 first failed fetch batch, the outstanding count/sample can include later IDs not
 yet requested. It is not proof of permanent absence, not a complete missing-ID
 list, and not permission to skip or expire events. Retries retain the whole gap.
+The one exception is the parent's relay-unavailable exclusion, which requires a
+fully enumerated set (count equal to the sample, every ID explicitly requested)
+repeated identically by consecutive attempts over time; see
+[continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions).
+Report times are stored from ledger schema 10.
 
 The parent checks the active lease, exact next upload sequence, diagnostic bounds,
 and ledger budget before recording the report in the same transactional authority

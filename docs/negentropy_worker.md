@@ -89,7 +89,13 @@ The worker cannot override the pinned SDK's unconditional expiry filtering. Befo
 retries/backoff and surface persistent failures for operator action while continuing
 healthy jobs. Explicit size failures must be distinguished from unknown loss before
 enabling volume splitting. No automatic expiry exception or skipped-ID success is
-authorized here. A window containing an undeliverable event can remain unfinished.
+authorized here, with one parent-side exception: after production job 768
+(2026-10-13) the parent completes a window by a recorded relay-unavailable
+exclusion once the same fully enumerated set has been reported unavailable by
+five consecutive attempts over at least an hour (see
+[continuous readiness](negentropy_continuous_readiness.md#relay-unavailable-exclusions)).
+The worker itself is unchanged; any other window containing an undeliverable event
+can remain unfinished.
 
 ## Deadlines and limitations
 

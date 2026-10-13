@@ -67,7 +67,7 @@ class LedgerStatusTests(unittest.TestCase):
 
     def test_unknown_schema_is_not_migrated(self):
         with database(self.path) as db:
-            db.execute("PRAGMA user_version=10")
+            db.execute("PRAGMA user_version=11")
         before = self.path.read_bytes()
         with self.assertRaisesRegex(STATUS.Refusal, "unsupported_identity"):
             STATUS.inspect(self.path)
@@ -87,6 +87,59 @@ class LedgerStatusTests(unittest.TestCase):
         self.assertEqual(report["received_frames"], 3)
         self.assertEqual(report["retained_coverage_accounting"]["received_frames"], 10)
         self.assertFalse(report["continuous_ready"])
+
+    def test_schema10_reports_relay_unavailable_exclusions_apart_from_success(self):
+        with database(self.path) as db:
+            db.executescript("""
+                PRAGMA user_version=10;
+                ALTER TABLE jobs ADD COLUMN reason TEXT;
+                INSERT INTO jobs VALUES(4,'complete',40,15,'relay_unavailable');
+                CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
+                INSERT INTO lifecycle VALUES(1,1234);
+                CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,
+                    lease_grants INTEGER,failures INTEGER,relay_unavailable INTEGER);
+                INSERT INTO completed_coverage VALUES(10,9,1,2,1,2);
+                CREATE TABLE relay_unavailable_exclusions(id INTEGER PRIMARY KEY,event_id BLOB,
+                    job INTEGER,relay TEXT,since INTEGER,until INTEGER,first_attempt INTEGER,
+                    last_attempt INTEGER,attempts INTEGER,first_reported_at INTEGER,
+                    last_reported_at INTEGER,span_secs INTEGER,excluded_at INTEGER,resolved_at INTEGER);
+            """)
+            for n in range(7):
+                db.execute(
+                    "INSERT INTO relay_unavailable_exclusions VALUES(?,?,?,?,0,899,1,15,15,NULL,?,32580,?,?)",
+                    (n + 1, bytes([0x08, n]) + bytes(30), 4 if n == 6 else 100 + n,
+                     "wss://premium.primal.net", 1000 + n, 2000 + n, 3000 if n == 0 else None),
+                )
+        report = STATUS.inspect(self.path)
+        exclusions = report["relay_unavailable_exclusions"]
+        self.assertEqual((exclusions["events"], exclusions["jobs"]), (7, 7))
+        self.assertEqual(exclusions["unresolved_events"], 6)
+        self.assertEqual(report["states"]["complete"], 2)
+        self.assertEqual(
+            exclusions["complete_states"], {"reconciled": 1, "relay_unavailable_exclusion": 1}
+        )
+        recent = exclusions["recent"]
+        self.assertEqual(len(recent), 5)
+        self.assertEqual(recent[0]["event_id"], "0806" + "00" * 30)
+        self.assertEqual(recent[0]["job"], 4)
+        self.assertEqual([r["excluded_at"] for r in recent], [2006, 2005, 2004, 2003, 2002])
+        self.assertEqual(recent[0]["relay"], "wss://premium.primal.net")
+        self.assertEqual(report["retained_coverage_accounting"]["relay_unavailable_events"], 2)
+        self.assertEqual(report["retained_coverage_accounting"]["excluded_frames"], 1)
+        self.assertNotIn("secret diagnostic", str(report))
+        self.assertFalse(report["continuous_ready"])
+
+    def test_schema9_has_no_relay_unavailable_section(self):
+        with database(self.path) as db:
+            db.executescript("""
+                PRAGMA user_version=9;
+                CREATE TABLE lifecycle(singleton INTEGER,last_success INTEGER);
+                INSERT INTO lifecycle VALUES(1,NULL);
+                CREATE TABLE completed_coverage(received INTEGER,archived INTEGER,excluded INTEGER,lease_grants INTEGER,failures INTEGER);
+            """)
+        report = STATUS.inspect(self.path)
+        self.assertIsNone(report["relay_unavailable_exclusions"])
+        self.assertNotIn("relay_unavailable_events", report["retained_coverage_accounting"])
 
     def test_receipt_counter_mismatch_is_not_healthy(self):
         with database(self.path) as db:

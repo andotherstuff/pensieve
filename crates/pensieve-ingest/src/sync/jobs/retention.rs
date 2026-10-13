@@ -172,6 +172,7 @@ impl JobLedger {
 
 #[cfg(test)]
 pub(super) fn strip_for_legacy_fixture(db: &rusqlite::Connection) {
+    super::unavailable::strip_for_v9_fixture(db);
     db.execute_batch(
         "DROP TRIGGER job_recorded; DROP TRIGGER job_completed;
         DROP TABLE lifecycle; DROP TABLE completed_coverage;
@@ -229,7 +230,9 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
     if ids.len() > MAX_TREE {
         return Ok(0);
     }
-    let mut totals = [0_i64; 5];
+    // received, archived, policy-excluded, lease grants, failure reports and
+    // relay-unavailable exclusions (kept apart from policy exclusions).
+    let mut totals = [0_i64; 6];
     let mut detail_rows = ids.len() as i64;
     let mut detail_bytes = 0_i64;
     for id in &ids {
@@ -264,9 +267,12 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
         }
         let grants: i64 =
             tx.query_row("SELECT attempt FROM jobs WHERE id=?1", [id], |r| r.get(0))?;
-        for (total, value) in totals
-            .iter_mut()
-            .zip([received, archived, excluded, grants, failures])
+        // The exclusion rows themselves are self-contained proof and outlive the job.
+        let unavailable = super::unavailable::count_for_job(tx, *id)?;
+        for (total, value) in
+            totals
+                .iter_mut()
+                .zip([received, archived, excluded, grants, failures, unavailable])
         {
             *total = total
                 .checked_add(value)
@@ -274,10 +280,10 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
         }
     }
     let day = since / 86400;
-    let prior: Option<(Vec<u8>, [i64;5])> = tx.query_row(
-        "SELECT windows,received,archived,excluded,lease_grants,failures FROM completed_coverage
+    let prior: Option<(Vec<u8>, [i64;6])> = tx.query_row(
+        "SELECT windows,received,archived,excluded,lease_grants,failures,relay_unavailable FROM completed_coverage
          WHERE relay=?1 AND day=?2 AND policy_identity=?3",
-        params![relay, day, policy], |r| Ok((r.get(0)?, [r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?])),
+        params![relay, day, policy], |r| Ok((r.get(0)?, [r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?])),
     ).optional()?;
     let mut windows = vec![0_u8; 12];
     match prior {
@@ -303,11 +309,14 @@ fn compact_tree(tx: &Transaction<'_>, root: i64, now: i64) -> Result<u32, Ledger
     let slot = (since % 86400 / 900) as usize;
     windows[slot / 8] |= 1 << (slot % 8);
     tx.execute(
-        "INSERT INTO completed_coverage VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        "INSERT INTO completed_coverage(relay,day,policy_identity,windows,received,archived,
+         excluded,lease_grants,failures,compacted_at,relay_unavailable)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(relay,day,policy_identity) DO UPDATE SET windows=excluded.windows,
          received=excluded.received,archived=excluded.archived,excluded=excluded.excluded,
-         lease_grants=excluded.lease_grants,failures=excluded.failures,compacted_at=excluded.compacted_at",
-        params![relay,day,policy,windows,totals[0],totals[1],totals[2],totals[3],totals[4],now],
+         lease_grants=excluded.lease_grants,failures=excluded.failures,compacted_at=excluded.compacted_at,
+         relay_unavailable=excluded.relay_unavailable",
+        params![relay,day,policy,windows,totals[0],totals[1],totals[2],totals[3],totals[4],now,totals[5]],
     )?;
     // Deferred checks permit deleting a whole tree without relying on traversal order.
     tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
@@ -639,7 +648,7 @@ mod tests {
         assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 0);
         assert!(db.get(1).is_ok());
         assert_eq!(db.retain_completed(100_000).unwrap().removed_jobs, 1);
-        db.db.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40) INSERT INTO completed_coverage SELECT 'wss://old.example',x,zeroblob(32),zeroblob(12),0,0,0,0,0,1 FROM n;").unwrap();
+        db.db.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40) INSERT INTO completed_coverage SELECT 'wss://old.example',x,zeroblob(32),zeroblob(12),0,0,0,0,0,1,0 FROM n;").unwrap();
         db.retain_completed(SUMMARY_SECONDS + 2).unwrap();
         assert_eq!(
             db.db

@@ -33,8 +33,14 @@ mod planner;
 mod policy;
 mod retention;
 mod selector;
+mod unavailable;
 pub use planner::PlanningProgress;
 pub use retention::RetentionProgress;
+#[cfg(test)]
+pub(crate) use unavailable::WORKER_FETCH_BATCH;
+pub use unavailable::{
+    RELAY_UNAVAILABLE, UnavailableExclusion, UnavailableProgress, UnavailableRule,
+};
 
 /// A rejected operation leaves the prior durable obligation intact.
 #[derive(Debug, Error)]
@@ -186,6 +192,11 @@ pub struct JobLedger {
     path: PathBuf,
     limits: LedgerLimits,
     policy: crate::giftwrap_filter::AdmissionPolicy,
+    /// Automatic relay-unavailable exclusion policy; `None` disables it.
+    unavailable_rule: Option<UnavailableRule>,
+    /// In-memory keyset cursors for bounded exclusion and late-arrival turns.
+    unavailable_cursor: i64,
+    late_cursor: i64,
 }
 
 impl JobLedger {
@@ -288,16 +299,22 @@ impl JobLedger {
                     tx.pragma_update(None, "user_version", 8)?;
                     check_budget(&tx, path, limits, 0)?;
                 }
-                (APPLICATION_ID, 8 | 9) => {}
+                (APPLICATION_ID, 8..=10) => {}
                 _ => return Err(LedgerError::Invalid("unsupported ledger identity/version")),
             }
             policy::bind(&tx, &policy, matches!(version, 0 | 7))?;
-            if version != 9 {
+            if version < 9 {
                 // A versioned, transactional metadata migration. Legacy completion
                 // times remain unknown and cannot authorize history deletion.
                 tx.execute_batch(retention::SCHEMA)?;
                 tx.pragma_update(None, "user_version", 9)?;
                 check_budget(&tx, path, limits, 0)?;
+            }
+            if version < 10 {
+                // Additive: report times from now on, relay-unavailable proof and
+                // its separate coverage count. No existing row is rewritten.
+                tx.execute_batch(unavailable::SCHEMA)?;
+                tx.pragma_update(None, "user_version", 10)?;
             }
             tx.commit()?;
         }
@@ -314,6 +331,9 @@ impl JobLedger {
             path: path.canonicalize()?,
             limits,
             policy,
+            unavailable_rule: Some(UnavailableRule::default()),
+            unavailable_cursor: 0,
+            late_cursor: 0,
         })
     }
 
@@ -507,8 +527,8 @@ impl JobLedger {
         }
         check_budget(&tx, &self.path, self.limits, 0)?;
         tx.execute(
-            "INSERT INTO failure_reports VALUES(?1,?2,?3)",
-            params![lease.job.id, lease.job.attempt, json],
+            "INSERT INTO failure_reports(job,attempt,report,reported_at) VALUES(?1,?2,?3,?4)",
+            params![lease.job.id, lease.job.attempt, json, now],
         )?;
         commit(tx, &self.path, self.limits)
     }

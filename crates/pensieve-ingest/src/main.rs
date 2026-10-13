@@ -33,6 +33,7 @@ use clap::Parser;
 use metrics::{counter, gauge};
 use pensieve_core::metrics::{init_metrics, start_metrics_server_with_archive_health};
 use pensieve_ingest::pipeline::ArchiveSealTimer;
+use pensieve_ingest::sync::jobs::UnavailableRule;
 use pensieve_ingest::sync::runtime::{IsolatedRuntime, RuntimeConfig};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, CoverageSampler, DedupeIndex,
@@ -392,6 +393,42 @@ struct Args {
     /// backoff. Gaps, receipts and archive maintenance are kept; health stays red.
     #[arg(long, requires = "isolated_negentropy")]
     isolated_negentropy_pause_on_failure_secs: Option<u64>,
+
+    /// Relay-unavailable exclusion: consecutive latest attempts of one job that
+    /// must each report the identical, fully enumerated set of advertised but
+    /// undelivered event IDs before the window completes without them (3-32).
+    #[arg(
+        long,
+        requires = "isolated_negentropy",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(3..=32)
+    )]
+    isolated_negentropy_unavailable_exclusion_attempts: u32,
+
+    /// Relay-unavailable exclusion: minimum seconds from the first to the last
+    /// of those reports (1800-86400).
+    #[arg(
+        long,
+        requires = "isolated_negentropy",
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u32).range(1800..=86_400)
+    )]
+    isolated_negentropy_unavailable_exclusion_span_secs: u32,
+
+    /// Relay-unavailable exclusion: largest missing-ID set that can be excluded
+    /// (1-128, the diagnostic sample cap).
+    #[arg(
+        long,
+        requires = "isolated_negentropy",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=128)
+    )]
+    isolated_negentropy_unavailable_exclusion_max_ids: u32,
+
+    /// Never complete a window by relay-unavailable exclusion; such jobs stay in
+    /// paced retry. Existing exclusions are kept.
+    #[arg(long, requires = "isolated_negentropy")]
+    isolated_negentropy_disable_unavailable_exclusion: bool,
 
     /// Ingester-owned durable SQLite ledger path.
     #[arg(
@@ -1842,7 +1879,22 @@ fn isolated_config(args: &Args) -> Result<Option<RuntimeConfig>> {
         pause_on_persistent_failure: args
             .isolated_negentropy_pause_on_failure_secs
             .map(Duration::from_secs),
+        relay_unavailable_rule: unavailable_rule(args)?,
     }))
+}
+
+fn unavailable_rule(args: &Args) -> Result<Option<UnavailableRule>> {
+    if args.isolated_negentropy_disable_unavailable_exclusion {
+        return Ok(None);
+    }
+    let rule = UnavailableRule {
+        attempts: args.isolated_negentropy_unavailable_exclusion_attempts,
+        min_span_secs: args.isolated_negentropy_unavailable_exclusion_span_secs,
+        max_ids: args.isolated_negentropy_unavailable_exclusion_max_ids,
+    };
+    rule.validate()
+        .map_err(|error| anyhow::anyhow!("relay-unavailable exclusion: {error}"))?;
+    Ok(Some(rule))
 }
 
 fn archive_seal_interval(args: &Args, parquet_shadow_active: bool) -> Option<Duration> {
@@ -1966,6 +2018,77 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn relay_unavailable_exclusion_flags_are_bounded_and_can_disable_it() {
+        let root = tempfile::tempdir().unwrap();
+        let relays = root.path().join("relays.txt");
+        std::fs::write(&relays, "wss://relay.example.com\n").unwrap();
+        let base = [
+            "pensieve-ingest",
+            "--isolated-negentropy",
+            "--isolated-negentropy-relays-file",
+            relays.to_str().unwrap(),
+            "--isolated-negentropy-worker-uid",
+            "501",
+            "--isolated-negentropy-replay-floor",
+            "0",
+        ];
+        let parse = |extra: &[&str]| {
+            Args::try_parse_from(base.iter().chain(extra).copied()).map(|args| {
+                isolated_config(&args)
+                    .unwrap()
+                    .unwrap()
+                    .relay_unavailable_rule
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), Some(UnavailableRule::default()));
+        assert_eq!(
+            parse(&[
+                "--isolated-negentropy-unavailable-exclusion-attempts",
+                "8",
+                "--isolated-negentropy-unavailable-exclusion-span-secs",
+                "7200",
+                "--isolated-negentropy-unavailable-exclusion-max-ids",
+                "1",
+            ])
+            .unwrap(),
+            Some(UnavailableRule {
+                attempts: 8,
+                min_span_secs: 7200,
+                max_ids: 1
+            })
+        );
+        assert_eq!(
+            parse(&["--isolated-negentropy-disable-unavailable-exclusion"]).unwrap(),
+            None
+        );
+        for (flag, value) in [
+            ("--isolated-negentropy-unavailable-exclusion-attempts", "2"),
+            ("--isolated-negentropy-unavailable-exclusion-attempts", "33"),
+            (
+                "--isolated-negentropy-unavailable-exclusion-span-secs",
+                "1799",
+            ),
+            (
+                "--isolated-negentropy-unavailable-exclusion-span-secs",
+                "86401",
+            ),
+            ("--isolated-negentropy-unavailable-exclusion-max-ids", "0"),
+            ("--isolated-negentropy-unavailable-exclusion-max-ids", "129"),
+        ] {
+            assert!(parse(&[flag, value]).is_err(), "{flag} {value}");
+        }
+        // Tuning flags are meaningless without the isolated runtime.
+        assert!(
+            Args::try_parse_from([
+                "pensieve-ingest",
+                "--isolated-negentropy-unavailable-exclusion-attempts",
+                "5"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
