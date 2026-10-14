@@ -29,7 +29,7 @@ mod segment;
 pub use admission::validate_archive_event;
 pub use clickhouse::{
     ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, EventRow, IndexOutcome,
-    IndexerStats,
+    IndexRetryPolicy, IndexerStats, UNJOURNALED_ATTEMPTS,
 };
 pub use coverage::CoverageSampler;
 pub use dedupe::{

@@ -14,15 +14,17 @@
 //! Merges are stopped, so any re-inserted row shows up as a double count.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use clickhouse::Client;
 use nostr_sdk::{EventBuilder, Keys};
 use pensieve_ingest::{
-    ClickHouseConfig, ClickHouseIndexer, EventRow, IndexProgress, IndexQueue, SegmentConfig,
-    SegmentWriter, pack_nostr_event,
+    ClickHouseConfig, ClickHouseIndexer, EventRow, IndexProgress, IndexQueue, IndexRetryPolicy,
+    SegmentConfig, SegmentWriter, UNJOURNALED_ATTEMPTS, pack_nostr_event,
 };
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 const IGNORE_REASON: &str = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL";
 
@@ -130,6 +132,7 @@ impl TestDb {
             table: "events_local".to_string(),
             batch_size: 10,
             index_queue: queue,
+            retry: IndexRetryPolicy::default(),
         }
     }
 
@@ -328,4 +331,358 @@ async fn existing_ids_spans_query_chunks() {
     assert!(!present.contains(&ids[1]));
     assert!(present.contains(&ids[2_498]));
     db.drop().await;
+}
+
+/// TCP forwarder in front of ClickHouse, standing in for a stopped,
+/// restarting or flaky ClickHouse. See [`GateMode`].
+struct Gate {
+    url: String,
+    mode: Arc<AtomicU8>,
+}
+
+/// How a [`Gate`] treats new connections.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum GateMode {
+    /// Accept each connection and close it at once, before any request
+    /// reaches ClickHouse: the client sees the connection drop.
+    Closed = 0,
+    /// Forward both ways.
+    Open = 1,
+    /// Forward the request, wait until ClickHouse starts answering (so an
+    /// insert has committed), then close the client connection without
+    /// passing the answer on: the client sees an error for a committed insert.
+    DropResponses = 2,
+}
+
+impl Gate {
+    /// A closed gate in front of `upstream` (`http://host:port`).
+    async fn closed(upstream: &str) -> Self {
+        let upstream = upstream
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU8::new(GateMode::Closed as u8));
+        let current = Arc::clone(&mode);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let mode = current.load(Ordering::SeqCst);
+                if mode == GateMode::Closed as u8 {
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    if mode == GateMode::Open as u8 {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        return;
+                    }
+                    let (mut client_reads, _client_writes) = inbound.into_split();
+                    let (mut server_reads, mut server_writes) = outbound.into_split();
+                    let request = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut client_reads, &mut server_writes).await;
+                    });
+                    let mut first = [0u8; 1];
+                    let _ = server_reads.read(&mut first).await;
+                    // Dropping both client halves closes the connection.
+                    request.abort();
+                });
+            }
+        });
+        Self { url, mode }
+    }
+
+    fn set(&self, mode: GateMode) {
+        self.mode.store(mode as u8, Ordering::SeqCst);
+    }
+}
+
+async fn wait_for(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn seal(writer: &SegmentWriter, batch: &[nostr_sdk::Event]) -> PathBuf {
+    for event in batch {
+        writer.write(pack_nostr_event(event).unwrap()).unwrap();
+    }
+    let path = writer.seal().unwrap().unwrap().path;
+    writer.wait_for_compression().unwrap();
+    path
+}
+
+/// ClickHouse is unreachable (the gate accepts and immediately drops every
+/// connection) for far longer than the old retry budget (3 attempts, about
+/// 6 s): at start, with a segment left by a previous run, and while
+/// further segments are sealed. Once it is back, every segment is indexed in
+/// seal order, exactly once, without restarting the indexer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn outage_longer_than_retry_budget_heals_in_order_without_restart() {
+    let db = TestDb::new().await;
+    // Record when each row arrived, to check segment order.
+    db.exec(&format!(
+        "CREATE TABLE {}.arrivals (tag String, at DateTime64(9))
+         ENGINE = MergeTree ORDER BY at",
+        db.name
+    ))
+    .await;
+    db.exec(&format!(
+        "CREATE MATERIALIZED VIEW {0}.arrivals_mv TO {0}.arrivals AS
+         SELECT splitByChar(' ', content)[1] AS tag, now64(9) AS at FROM {0}.events_local",
+        db.name
+    ))
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join(".clickhouse_reindex_queue");
+    // Boot: a segment sealed by the previous run was never indexed.
+    let boot = events(14, "boot");
+    let boot_path = write_segments(dir.path(), &[&boot]).remove(0);
+    IndexQueue::open(&journal)
+        .unwrap()
+        .record_sealed(&boot_path)
+        .unwrap();
+
+    let gate = Gate::closed(&db.url).await;
+    let queue = Arc::new(IndexQueue::open(&journal).unwrap());
+    let mut config = db.config(Some(Arc::clone(&queue)));
+    config.url = gate.url.clone();
+    config.retry = IndexRetryPolicy {
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(200),
+    };
+    let indexer = ClickHouseIndexer::new(config).unwrap();
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let writer = SegmentWriter::new(
+        SegmentConfig {
+            output_dir: dir.path().to_path_buf(),
+            compress: true,
+            ..Default::default()
+        },
+        Some(sender),
+        None,
+    )
+    .unwrap()
+    .with_index_queue(Arc::clone(&queue));
+    let handle = indexer.start(receiver);
+
+    // Well past the old budget, sealing more segments meanwhile.
+    let budget = UNJOURNALED_ATTEMPTS as usize;
+    wait_for("retries", Duration::from_secs(30), || {
+        indexer.stats().retries >= 3 * budget
+    })
+    .await;
+    seal(&writer, &events(23, "first"));
+    seal(&writer, &events(5, "second"));
+    wait_for("more retries", Duration::from_secs(30), || {
+        indexer.stats().retries >= 6 * budget
+    })
+    .await;
+    seal(&writer, &events(31, "third"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!handle.is_finished(), "the indexer must keep running");
+    assert_eq!(db.rows().await, 0, "nothing reached ClickHouse");
+    assert_eq!(queue.len(), 4, "every segment stays journaled");
+    assert!(queue.oldest_pending_age().unwrap() > Duration::ZERO);
+    assert_eq!(indexer.stats().segments_indexed, 0);
+
+    gate.set(GateMode::Open);
+    wait_for("the backlog to clear", Duration::from_secs(60), || {
+        queue.is_empty()
+    })
+    .await;
+
+    let total = (14 + 23 + 5 + 31) as u64;
+    assert_eq!(db.rows().await, total, "no row may be inserted twice");
+    assert_eq!(db.view_rows().await, total, "views count each row once");
+    assert_eq!(indexer.stats().segments_indexed, 4);
+    assert_eq!(indexer.stats().events_indexed, total as usize);
+    assert_eq!(queue.oldest_pending_age(), None);
+
+    let order = db
+        .client
+        .query("SELECT tag FROM arrivals GROUP BY tag ORDER BY min(at)")
+        .fetch_all::<String>()
+        .await
+        .unwrap();
+    assert_eq!(order, ["boot", "first", "second", "third"]);
+    // Segments do not interleave: each one finished before the next began.
+    let overlaps = db
+        .count(
+            "SELECT count() FROM
+               (SELECT tag, min(at) AS lo, max(at) AS hi FROM arrivals GROUP BY tag) AS a
+               CROSS JOIN
+               (SELECT tag, min(at) AS lo, max(at) AS hi FROM arrivals GROUP BY tag) AS b
+             WHERE a.tag != b.tag AND a.lo <= b.hi AND b.lo <= a.hi",
+        )
+        .await;
+    assert_eq!(overlaps, 0);
+
+    drop(writer);
+    handle.join().unwrap();
+    assert!(!journal.exists());
+    db.drop().await;
+}
+
+/// An insert commits but its response is lost, so the indexer sees a failure
+/// for a batch that is in the table. Retrying within the run must check that
+/// batch against `events_local` instead of inserting it again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn retry_after_lost_response_does_not_double_count() {
+    let db = TestDb::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join(".clickhouse_reindex_queue");
+    let batch = events(25, "lost");
+    let path = write_segments(dir.path(), &[&batch]).remove(0);
+    IndexQueue::open(&journal)
+        .unwrap()
+        .record_sealed(&path)
+        .unwrap();
+
+    let gate = Gate::closed(&db.url).await;
+    gate.set(GateMode::DropResponses);
+    let queue = Arc::new(IndexQueue::open(&journal).unwrap());
+    let mut config = db.config(Some(Arc::clone(&queue)));
+    config.url = gate.url.clone();
+    config.retry = IndexRetryPolicy {
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(200),
+    };
+    let indexer = ClickHouseIndexer::new(config).unwrap();
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let handle = indexer.start(receiver);
+
+    // The first batch went in although the indexer saw an error; every retry
+    // since then failed at its existence check, before inserting.
+    wait_for("retries", Duration::from_secs(30), || {
+        indexer.stats().retries >= 4
+    })
+    .await;
+    assert_eq!(db.rows().await, 10, "only the first, unacknowledged batch");
+    assert_eq!(
+        queue.progress(&path),
+        Some(IndexProgress {
+            committed: 0,
+            verify_end: 10,
+        })
+    );
+
+    gate.set(GateMode::Open);
+    wait_for("the segment to be indexed", Duration::from_secs(30), || {
+        queue.is_empty()
+    })
+    .await;
+    assert_eq!(db.rows().await, 25, "no row may be inserted twice");
+    assert_eq!(db.view_rows().await, 25, "views count each row once");
+    assert_eq!(indexer.stats().events_indexed, 15);
+
+    drop(sender);
+    handle.join().unwrap();
+    db.drop().await;
+}
+
+/// A shutdown request during a long backoff wakes the indexer promptly. The
+/// journal keeps the failing segment's progress (including the batch whose
+/// outcome is unknown) and every segment sealed meanwhile. Needs no
+/// ClickHouse: the indexer points at a closed port.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_backoff_is_prompt_and_keeps_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join(".clickhouse_reindex_queue");
+    let stranded_path = write_segments(dir.path(), &[&events(25, "stranded")]).remove(0);
+    IndexQueue::open(&journal)
+        .unwrap()
+        .record_progress(
+            &stranded_path,
+            IndexProgress {
+                committed: 10,
+                verify_end: 10,
+            },
+        )
+        .unwrap();
+
+    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let queue = Arc::new(IndexQueue::open(&journal).unwrap());
+    let indexer = ClickHouseIndexer::new(ClickHouseConfig {
+        url: format!("http://127.0.0.1:{closed_port}"),
+        database: "nostr".to_string(),
+        table: "events_local".to_string(),
+        batch_size: 10,
+        index_queue: Some(Arc::clone(&queue)),
+        // 5 ms doubling: the 10th retry sleeps 2.56 s.
+        retry: IndexRetryPolicy {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_secs(60),
+        },
+    })
+    .unwrap();
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    // A writer without the journal: the notification is the only record, as
+    // when the writer's journal write fails.
+    let writer = SegmentWriter::new(
+        SegmentConfig {
+            output_dir: dir.path().to_path_buf(),
+            compress: true,
+            ..Default::default()
+        },
+        Some(sender),
+        None,
+    )
+    .unwrap();
+    let handle = indexer.start(receiver);
+
+    wait_for("retries", Duration::from_secs(30), || {
+        indexer.stats().retries >= 10
+    })
+    .await;
+    // The notification is on the channel once compression is done; the
+    // indexer takes it into memory whenever it next looks.
+    let later_path = seal(&writer, &events(4, "later"));
+    assert!(!handle.is_finished());
+    assert_eq!(queue.len(), 1, "the later segment is not journaled yet");
+
+    // The current backoff is at least 2.56 s (retries >= 10), so stopping
+    // within 1 s means the sleep woke early (or, had it just expired, the
+    // next attempt saw the stop before sending anything).
+    let before = indexer.stats().retries;
+    let asked = Instant::now();
+    indexer.stop();
+    wait_for("shutdown", Duration::from_secs(1), || handle.is_finished()).await;
+    assert!(asked.elapsed() < Duration::from_secs(1));
+    // At most an attempt already under way when the stop landed.
+    assert!(indexer.stats().retries <= before + 1);
+    handle.join().unwrap();
+    drop(writer);
+    drop(queue);
+
+    let reopened = IndexQueue::open(&journal).unwrap();
+    // The batch [10, 20) was sent and failed: its outcome is unknown. Both
+    // entries now name the compressed files the indexer was given.
+    let gz = |path: &Path| path.with_extension("notepack.gz");
+    assert_eq!(
+        reopened.previous_run(),
+        vec![
+            (
+                gz(&stranded_path),
+                IndexProgress {
+                    committed: 10,
+                    verify_end: 20,
+                }
+            ),
+            (gz(&later_path), IndexProgress::default()),
+        ]
+    );
 }

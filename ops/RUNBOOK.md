@@ -116,6 +116,88 @@ double-counted. Watch `clickhouse_index_queue_segments` (normally 0–2) and
 inserted=… already_present=…`. Shutdown gives the indexer 20 s to drain, then stops at
 the next batch boundary.
 
+**ClickHouse outages heal themselves too (since #105).** The indexer never gives up on a
+journaled segment while the ingester runs: a failed attempt is retried after 2 s, doubling
+to at most 60 s, until ClickHouse accepts it. A ClickHouse or Docker restart, a reboot
+where the ingester starts first, an overload or a long merge therefore needs no ingester
+restart. Older binaries tried three times (about 6 s), logged `failed to index segment
+after retries; left queued for next start` and left the segment until the next start.
+Segments sealed meanwhile wait behind the failing one and are indexed in seal order once
+it succeeds; archive admission and sealing never wait on ClickHouse. (Outside a backlog,
+order is notification order: compression can finish out of order, so N+1 may still be
+indexed before N, as before.) While it retries:
+
+- the journal logs `clickhouse index attempt failed; retrying in …` at WARN once per
+  backoff step, then at most every 10 minutes once the backoff reaches 60 s;
+- `clickhouse_index_retries_total` counts failed attempts, `clickhouse_index_queue_segments`
+  grows by one per seal, and `clickhouse_index_oldest_pending_seconds` (0 when nothing is
+  pending, normally at most a few minutes while a segment indexes) grows with the outage;
+- after an hour without progress on the same segment, the journal logs `segment has failed
+  to index for over an hour and blocks every later segment` at ERROR, once an hour;
+- recovery logs `clickhouse indexing recovered; catching up on queued segments`, then
+  `clickhouse index backlog cleared` once nothing is pending.
+
+`PensieveClickHouseIndexBacklog` (in `ops/production/prometheus/archive-alerts.yml`)
+fires when `clickhouse_index_oldest_pending_seconds` exceeds 15 minutes. **It notifies
+nobody**: Prometheus has no Alertmanager receiver, so it only shows on the Prometheus
+alerts page and in Grafana. Check it there, or watch the gauge, after any ClickHouse work.
+While one segment is stuck (unreadable, or failing deterministically) the gauge stays high
+and the alert stays firing, which hides any later outage; clear the stuck segment (below)
+rather than living with the alert.
+
+To confirm a recovery, rely on the metrics: `clickhouse_index_queue_segments` back to 0–2
+and `clickhouse_index_oldest_pending_seconds` near 0. The `clickhouse index backlog
+cleared` log line appears only after failed attempts, and also while an unreadable segment
+is still journaled.
+
+**Rolling out the alert rule.** The rule only loads into a recreated Prometheus container.
+`archive-alerts.yml` is a single-file bind mount: `git merge` replaces the file (a new
+inode), the container keeps the old one, and `/-/reload` re-reads the stale copy. Run
+outside :00–:07 UTC:
+
+```bash
+git -C ~/pensieve merge --ff-only origin/master
+cd ~/pensieve/ops/production
+(
+set -euo pipefail
+docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" --entrypoint promtool \
+  prom/prometheus:v2.48.0 check config /etc/prometheus/prometheus.yml
+docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env \
+  up -d --no-deps prometheus
+)
+```
+
+The project name and env file are required: a bare `docker compose up` uses another
+project name and collides on `container_name`, and never use `up -d` without `--no-deps`
+(it recreates ClickHouse too). Recreating Prometheus replays its WAL: `/-/ready` and
+scrapes return 503 for several scrape intervals and Grafana's panels show a gap, so
+silence the monitoring VM's alert for this target first (see **Downtime** under
+[Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user)).
+Afterwards, check that the Prometheus rules page lists `PensieveClickHouseIndexBacklog`.
+
+A shutdown during the backoff wakes the indexer within 200 ms and leaves the journal
+correct. During an outage `systemctl stop` therefore takes the full 20 s drain grace and
+no more. A segment the indexer cannot *read* (`failed to read segment for clickhouse; left
+queued for next start`) is the one case still deferred to the next start, where it is
+tried once more.
+
+**Skipping a segment the indexer cannot insert.** Every error is retried, deterministic
+ones included: a batch `events_local` always rejects (memory limit, oversized event), or a
+journal write failing because `/archive` is read-only. Such a segment blocks every later
+one, also across restarts, and the indexer never skips on its own. Fix the cause if you
+can (for a read-only `/archive`, fix the filesystem: the journal must be writable and
+editing it will not help). Otherwise:
+
+1. Stop the ingester gracefully (graceful-stop checks above).
+2. Back up `/archive/segments/.clickhouse_reindex_queue`, then delete only the stuck
+   segment's line (`v1 <committed> <batch_end> <path>`). Keep a note of the line.
+3. Start the ingester; the later segments index in order.
+4. Repair the skipped segment separately. Either, once the cause is fixed, add it back at
+   the next graceful stop with every event marked for checking against `events_local`, so
+   nothing is double-counted (the next start indexes it first):
+   `printf 'v1\t0\t*\t%s\n' /archive/segments/segment-NNNNNNNNN.notepack.gz | sudo -u pensieve tee -a /archive/segments/.clickhouse_reindex_queue`,
+   or insert only its missing IDs as in the manual repair below.
+
 Manual repair is only needed if the journal file itself is lost or a build older than
 #73 was killed. Insert only the missing IDs: re-indexing a whole segment double-counts
 the summing views (reactions, replies, reposts, daily user stats). The 2026-10-12 repair
@@ -516,9 +598,13 @@ views.
 
 **Abort:** if any view reports an exception, or inserts into `events_local`
 start failing, run the rollback SQL immediately (step 7). Production inserts
-are synchronous, so a failing view fails the insert. The ingester then
-retries and queues the segment for reindexing, and ClickHouse ingest stalls
-until the view is dropped.
+are synchronous, so a failing view fails the insert, but on 24.8 the batch
+still commits to `events_local` and to the other views. Ingest does not stall:
+the indexer retries, its existence check finds the batch's rows present and
+skips them, and it moves on at about one batch per 2 s or more (each batch
+fails once, then waits out the backoff). The failing view permanently misses
+every row inserted while it was failing, so after fixing or dropping it,
+backfill it for that window (for these tables, the step 4 backfill).
 
 ### 3. Plan and estimate disk
 
@@ -1850,12 +1936,12 @@ The container mounts a file the checkout no longer names (it was replaced after 
 container last started), so neither the handle nor an in-place write reaches it.
 Merge, then restart ClickHouse so it mounts the current file (a restart re-resolves
 the bind mount; recreating is not needed). Do it outside :00–:07
-UTC. The API and preview fail while ClickHouse starts. The ingester's indexer tries a
-sealed segment three times (about 6 s) and then logs `failed to index segment after
-retries; left queued for next start`: that segment stays journaled and is indexed only
-when the ingester next starts, so `clickhouse_index_queue_segments` stays above its
-usual 0–2. Check the journal after the restart and plan a graceful ingester restart
-(see [Routine deploy](#routine-deploy)) if a segment was left queued.
+UTC. The API and preview fail while ClickHouse starts. The ingester's indexer retries
+any segment sealed meanwhile (2 s doubling to 60 s) and catches up once ClickHouse is
+back; no ingester restart is needed. Confirm `clickhouse_index_queue_segments` is back to
+0–2 and `clickhouse_index_oldest_pending_seconds` near 0. Binaries older than
+#105 instead logged `failed to index segment after retries; left queued for next start`
+and needed a graceful ingester restart (see [Routine deploy](#routine-deploy)).
 
 ```bash
 cd ~/pensieve && git merge --ff-only origin/master
@@ -2298,7 +2384,9 @@ Storage Box, which is the copy to rebuild from.
 **Before a reboot.** Every Pensieve unit and timer is enabled (the worker is pulled in by the
 ingester), the four containers use `restart: unless-stopped`, `/run/pensieve` comes from
 `/etc/tmpfiles.d/pensieve-negentropy.conf`, and `/etc/crypttab` is empty, so the host returns
-unattended. The ingester starts before ClickHouse is ready and indexes once it is up. Its drop-in
+unattended. The ingester starts before ClickHouse is ready and indexes once it is up: since
+#105 its indexer retries until ClickHouse accepts inserts, so a segment sealed before then is
+not stranded (older binaries gave up after about 6 s until the next start). Its drop-in
 sets `Restart=no`, so check it after boot and start it by hand if it failed. Stop the worker and
 then the ingester at a quiet moment first (graceful-stop checks above).
 

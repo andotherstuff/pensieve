@@ -42,6 +42,10 @@ These issues can cause permanent event loss or undefined behavior. Fix first.
 
 ### 1.4 No retry on ClickHouse indexing failure
 
+> **Resolved.** #73 journals every sealed segment and resumes it on start;
+> #105 retries a failed segment (2 s doubling to 60 s) until ClickHouse
+> accepts it, without an ingester restart.
+
 - **File:** `pipeline/clickhouse.rs:150-157`
 - **Severity:** High (permanent index gap)
 - **Description:** When `index_segment()` fails (ClickHouse down, network blip, timeout), the `SealedSegment` message is consumed from the channel and gone. There is a `// TODO: Implement retry logic` comment. Since ClickHouse is a derived index (notepack archive is source of truth), this isn't full data loss, but the ClickHouse index becomes permanently incomplete. Manual re-indexing from the archive is the only recovery.

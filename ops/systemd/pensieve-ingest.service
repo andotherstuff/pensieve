@@ -46,7 +46,8 @@ RestartSec=10
 # reach a batch boundary. systemd's 90 s default can kill the process before
 # that clean stop (2026-10-12). A kill is still safe, because the batch was
 # journaled before it was sent, but a clean stop avoids the existence check
-# on restart.
+# on restart. An indexer retrying while ClickHouse is down wakes from its
+# backoff within 200 ms of the stop request.
 TimeoutStopSec=5min
 
 # Open-file limit: the ingester holds many concurrent relay sockets; the systemd

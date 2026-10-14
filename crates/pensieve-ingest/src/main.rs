@@ -1745,6 +1745,7 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
                 table: "events_local".to_string(),
                 batch_size: 10000,
                 index_queue,
+                retry: Default::default(),
             };
             let indexer = ClickHouseIndexer::new(ch_config)
                 .with_context(|| "Failed to create ClickHouse indexer")?;
