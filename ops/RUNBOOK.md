@@ -1344,7 +1344,9 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   is not fully enumerated (`missing_count` above the sample) or exceeds one fetch
   batch or `max-ids`; the window does not overlap the original's; the original
   row is resolved (the event is archived, so the relay is being asked for it
-  again); the job's received frames are not yet archive-confirmed; or
+  again); a frame the job received is of an event not yet archived (a novel
+  event waits for its segment to seal); on `ingest-43d4a26` and earlier, a
+  backlog of more than 64 other retry-wait jobs below it (a relay outage); or
   `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
   like any other `unresolved_failures` job above; the full rule still applies.
 - `owner_observation_stale`: the parent owner thread has not refreshed health for

@@ -64,6 +64,26 @@
 //! whole set. Late arrival resolves carried rows like any other, and a resolved
 //! (archived) ID is no longer known-withheld, so later passes reconcile normally.
 //!
+//! A carry must not wait behind a backlog. A relay outage can leave hundreds of
+//! retry-wait jobs past `attempts` that cannot qualify, with IDs below a
+//! revisit's; the revisit is due again 60 to 90 seconds after its first
+//! failure, and while the worker is busy the runtime runs two lifecycle turns
+//! (and one maintenance turn) between sessions. Two bounded keyset cursors over
+//! all of those jobs let the revisit be leased again, and fail its third
+//! attempt (`unresolved_failures`), before either reached it:
+//!
+//! - each turn screens possible carries (retry-wait jobs whose window overlaps
+//!   an unresolved original exclusion of their relay) on their own cursor,
+//!   before the jobs past `attempts`, instead of sharing one 32-job cursor
+//!   with them;
+//! - [`JobLedger::confirm_carry_receipts`], which the parent runs before each
+//!   turn, archive-confirms the received frames of jobs that would be carried
+//!   but for them, instead of waiting for the fair maintenance cursor, which
+//!   walks every unresolved job 32 at a time once per tick.
+//!
+//! Possible carries are few (windows over already excluded events), so the
+//! screen normally covers them all in one turn.
+//!
 //! The `carried_from` column and the `(relay, event_id)` lookup index are an
 //! additive extension of schema 10, applied idempotently at open without a
 //! version change: a schema-10 reader that predates them (ingest-85a2402) opens
@@ -78,7 +98,10 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{JobLedger, JobState, LedgerError, complete_if_durable, read_job};
+use super::{
+    JobLedger, JobState, LedgerError, MAX_RECEIPT_BATCH, MaintenanceProgress, complete_if_durable,
+    read_job,
+};
 use crate::sync::failure::{FailureDiagnostic, FailureKind, MAX_FAILURE_SAMPLE};
 
 /// IDs the worker requests per fetch subscription. A diff no larger than this
@@ -87,8 +110,16 @@ use crate::sync::failure::{FailureDiagnostic, FailureKind, MAX_FAILURE_SAMPLE};
 pub(crate) const WORKER_FETCH_BATCH: u64 = 128;
 /// Upper bound on report rows read to measure one job's identical run.
 const MAX_EVIDENCE_ATTEMPTS: i64 = 1024;
-/// Retry-wait jobs examined per evaluation turn.
+/// Retry-wait jobs past the rule's attempt count examined per evaluation turn.
 pub(super) const MAX_JOBS_PER_TURN: i64 = 32;
+/// Possible carries examined per turn, before the jobs above.
+pub(super) const MAX_CARRIES_PER_TURN: i64 = 32;
+/// The possible-carry screen over `jobs`: the window overlaps an unresolved
+/// original exclusion of the job's relay. `known_withheld` decides per ID.
+const CARRY_SCREEN: &str = "EXISTS(SELECT 1 FROM relay_unavailable_exclusions e
+ INDEXED BY relay_unavailable_withheld
+ WHERE e.relay=jobs.relay AND e.resolved_at IS NULL AND e.carried_from IS NULL
+ AND e.since<=jobs.until AND e.until>=jobs.since)";
 /// Unresolved exclusions checked against the archive per turn.
 pub(super) const MAX_LATE_CHECKS: i64 = 64;
 /// Failing jobs whose report history one pause evaluation reads. Any further
@@ -621,15 +652,61 @@ impl JobLedger {
         Ok(counted)
     }
 
+    /// Archive-confirm the received frames of retry-wait jobs that would be
+    /// carried but for those frames (see the module docs), ahead of the fair
+    /// maintenance turn. Uses the maintenance proof itself
+    /// ([`JobLedger::reconcile_archived`]): a frame whose event carries a
+    /// durable archive marker (or a policy exclusion) loses its receipt, any
+    /// other keeps it and still defers the carry. Nothing is completed here.
+    /// Reads at most `MAX_CARRIES_PER_TURN` jobs and `MAX_RECEIPT_BATCH`
+    /// receipts. Does nothing with the rule disabled. Call only when archive
+    /// recovery is not required.
+    pub fn confirm_carry_receipts(
+        &mut self,
+        dedupe: &crate::DedupeIndex,
+        writer: &crate::SegmentWriter,
+    ) -> Result<MaintenanceProgress, LedgerError> {
+        let mut progress = MaintenanceProgress::default();
+        let Some(rule) = self.unavailable_rule else {
+            return Ok(progress);
+        };
+        let pending = {
+            let mut query = self.db.prepare(&format!(
+                "SELECT id FROM jobs WHERE state='retry_wait'
+                 AND EXISTS(SELECT 1 FROM receipts WHERE job=jobs.id) AND {CARRY_SCREEN}
+                 ORDER BY id LIMIT ?1"
+            ))?;
+            query
+                .query_map([MAX_CARRIES_PER_TURN], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in pending {
+            if progress.checked >= MAX_RECEIPT_BATCH {
+                break;
+            }
+            if carried(&self.db, &read_job(&self.db, id)?, &rule, dedupe)?.is_none() {
+                continue;
+            }
+            let outcome =
+                self.reconcile_archived(id, dedupe, writer, MAX_RECEIPT_BATCH - progress.checked)?;
+            progress.jobs += 1;
+            progress.checked += outcome.checked;
+            progress.satisfied += outcome.satisfied;
+            progress.completed += u32::from(outcome.complete);
+        }
+        Ok(progress)
+    }
+
     /// One bounded turn: complete retry-wait jobs whose history proves the relay
     /// withholds the same advertised IDs, or whose latest report names only IDs
-    /// already known to be withheld by that relay (carried exclusions; see the
-    /// module docs), then mark earlier exclusions resolved once their event
-    /// carries a durable archive marker. Call only when archive recovery is not
-    /// required. A qualifying job with unarchived receipts stays in retry;
-    /// receipt maintenance must confirm them first. Like retry and expiry, this
-    /// resolves an existing obligation and bypasses the admission ceiling; real
-    /// storage errors still roll back.
+    /// already known to be withheld by that relay (carried exclusions, screened
+    /// first on their own cursor; see the module docs), then mark earlier
+    /// exclusions resolved once their event carries a durable archive marker.
+    /// Call only when archive recovery is not required. A qualifying job with
+    /// unarchived receipts stays in retry; receipt maintenance (or, for a carry,
+    /// [`JobLedger::confirm_carry_receipts`]) must confirm them first. Like retry
+    /// and expiry, this resolves an existing obligation and bypasses the
+    /// admission ceiling; real storage errors still roll back.
     pub fn exclude_relay_unavailable(
         &mut self,
         now: i64,
@@ -640,15 +717,29 @@ impl JobLedger {
         }
         let mut progress = UnavailableProgress::default();
         if let Some(rule) = self.unavailable_rule {
-            // Jobs past the rule's attempt count, and from its first attempt any
-            // job whose window overlaps an unresolved original exclusion of its
-            // relay (a possible carry; `known_withheld` decides).
+            // Possible carries come first, on their own cursor (see the module
+            // docs for why they do not share the cursor below);
+            // `known_withheld` decides.
+            let carries = {
+                let mut query = self.db.prepare(&format!(
+                    "SELECT id FROM jobs WHERE state='retry_wait' AND id>?1 AND {CARRY_SCREEN}
+                     ORDER BY id LIMIT ?2"
+                ))?;
+                query
+                    .query_map(params![self.carry_cursor, MAX_CARRIES_PER_TURN], |r| {
+                        r.get::<_, i64>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            self.carry_cursor = match carries.last() {
+                Some(&last) if carries.len() as i64 == MAX_CARRIES_PER_TURN => last,
+                _ => 0,
+            };
+            // Then jobs past the rule's attempt count. One the carry pass already
+            // screens is skipped: `completion` decides both the same way.
             let candidates = {
                 let mut query = self.db.prepare(
-                    "SELECT id FROM jobs WHERE state='retry_wait' AND id>?2 AND (attempt>=?1
-                     OR EXISTS(SELECT 1 FROM relay_unavailable_exclusions e
-                      WHERE e.relay=jobs.relay AND e.resolved_at IS NULL AND e.carried_from IS NULL
-                      AND e.since<=jobs.until AND e.until>=jobs.since))
+                    "SELECT id FROM jobs WHERE state='retry_wait' AND id>?2 AND attempt>=?1
                      ORDER BY id LIMIT ?3",
                 )?;
                 query
@@ -662,7 +753,8 @@ impl JobLedger {
                 Some(&last) if candidates.len() as i64 == MAX_JOBS_PER_TURN => last,
                 _ => 0,
             };
-            for id in candidates {
+            let rest = candidates.into_iter().filter(|id| !carries.contains(id));
+            for id in carries.iter().copied().chain(rest) {
                 // Read-only screen first; only a qualifying job takes the write lock
                 // and is re-checked inside it.
                 if completion(&self.db, &read_job(&self.db, id)?, &rule, dedupe)?.is_none() {
@@ -968,6 +1060,15 @@ mod tests {
             self.db
                 .exclude_relay_unavailable(now, &self.dedupe)
                 .unwrap()
+        }
+
+        /// The parent's lifecycle turn: confirm possible carries' receipts,
+        /// then [`Self::run`].
+        fn lifecycle(&mut self, now: i64) -> UnavailableProgress {
+            self.db
+                .confirm_carry_receipts(&self.dedupe, &self.writer)
+                .unwrap();
+            self.run(now)
         }
     }
 
@@ -2281,6 +2382,94 @@ mod tests {
                 .unwrap();
             now += HOUR;
         }
+    }
+
+    #[test]
+    fn a_backlog_past_the_rule_does_not_hold_a_revisit_back_from_its_carry() {
+        // Review of #95: possible carries shared one 32-job keyset cursor with
+        // every retry-wait job past the rule's attempt count, and while the
+        // worker is busy the runtime runs exactly two lifecycle turns and one
+        // fair maintenance turn (32 jobs) between sessions. A relay outage
+        // leaves more than 64 such jobs, none qualifying, below a revisit's
+        // ID. Neither the exclusion cursor nor the maintenance cursor (which
+        // must confirm the revisit's 17 received frames first) reached it
+        // before it was leased again and failed attempts 2 and 3, the
+        // failures behind `unresolved_failures`.
+        const BACKLOG: i64 = 4 * MAX_JOBS_PER_TURN;
+        const { assert!(BACKLOG > 2 * MAX_JOBS_PER_TURN) };
+        let mut f = fixture();
+        let (original, rows) = f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let outage = "wss://down.example.com";
+        let start = 1000 + 10 * HOUR;
+        for n in 1..=BACKLOG {
+            f.db.enqueue("outage", outage, n * 900, n * 900 + 899)
+                .unwrap();
+        }
+        for round in 0..5 {
+            for _ in 0..BACKLOG {
+                let lease = f.attempt(start + round * HOUR, 0, Some(relay_failure()));
+                assert_eq!(lease.job().relay, outage);
+            }
+        }
+        // The outage backs them off past this test's sessions.
+        f.db.db
+            .execute(
+                "UPDATE jobs SET next_eligible=?1 WHERE relay=?2",
+                params![i64::MAX, outage],
+            )
+            .unwrap();
+        let failed = start + 5 * HOUR;
+        let job = f.revisit(
+            "pass-2",
+            RELAY,
+            (0, 899),
+            failed,
+            17,
+            unavailable(&[MISSING]),
+        );
+        assert!(job > BACKLOG + original);
+        // Each session: the worker finishes other work 90 seconds later (the
+        // revisit's retry is due after 60), the runtime runs the lifecycle turn
+        // twice, then leases; the session ends with the fair maintenance turn
+        // (`attempt`).
+        let mut carried = None;
+        for session in 0..8 {
+            let at = failed + 90 * (session + 1);
+            let progress = [f.lifecycle(at), f.lifecycle(at + 1)];
+            if let Some(carry) = progress.iter().flat_map(|p| &p.carried).next() {
+                carried = Some((session, carry.clone()));
+                break;
+            }
+            let lease = f.attempt(at + 2, 17, Some(unavailable(&[MISSING])));
+            assert_eq!(lease.job().id, job);
+        }
+        let (session, carry) = carried.expect("carried within eight sessions");
+        assert_eq!(
+            (session, carry.job, carry.last_attempt),
+            (0, job, 1),
+            "carried before the revisit is leased again"
+        );
+        assert_eq!(
+            carry.events,
+            vec![CarriedEvent {
+                event_id: MISSING,
+                original_row: rows[0],
+                original_job: original,
+            }]
+        );
+        // It never reached the three failures behind `unresolved_failures`.
+        let done = f.db.get(job).unwrap();
+        assert_eq!((done.state, done.attempt), (JobState::Complete, 1));
+        // The backlog is untouched and still screened by the full rule.
+        let waiting: i64 =
+            f.db.db
+                .query_row(
+                    "SELECT count(*) FROM jobs WHERE relay=?1 AND state='retry_wait' AND attempt=5",
+                    [outage],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(waiting, BACKLOG);
     }
 
     #[test]
