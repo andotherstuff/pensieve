@@ -128,9 +128,10 @@ struct Args {
     #[arg(long, default_value = "./data/dedupe")]
     rocksdb_path: PathBuf,
 
-    /// Dedicated block cache for the dedupe index, in MiB. Its high-priority
-    /// half must hold every SST's bloom filter and index block (~1.4 bytes per
-    /// key), or each lookup re-reads megabytes of filter. Read option only.
+    /// Dedicated block cache for the dedupe index, in MiB (default 16 GiB).
+    /// Its high-priority half must hold every SST's bloom filter and index
+    /// block (~1.4 bytes per key, ~3 GB in production on 2026-10-14), or each
+    /// lookup re-reads megabytes of filter. Read option only.
     #[arg(long, default_value_t = pensieve_ingest::DEFAULT_BLOCK_CACHE_MIB as u32,
           value_parser = clap::value_parser!(u32).range(1..))]
     dedupe_block_cache_mib: u32,

@@ -45,11 +45,12 @@ use std::sync::Arc;
 /// Measured with these options: 1.25 bytes of full bloom filter and about 0.16
 /// bytes of index block per entry. Production's index (88 GB in ~1,500 64 MB
 /// SSTs, roughly 2.0-2.3 billion entries) therefore needs about 3 GB resident.
-/// Index and filter blocks get the high-priority half of the cache, so 8 GiB
-/// keeps all of them resident with room for growth; the rest holds hot data
-/// blocks. Memory is allocated only as blocks are read, so small databases
-/// (tests, backfills) use little of it.
-pub const DEFAULT_BLOCK_CACHE_MIB: usize = 8 * 1024;
+/// Index and filter blocks get the high-priority half of the cache, so 16 GiB
+/// keeps all of them resident until the key count reaches roughly 2-2.5 times
+/// today's; the rest holds hot data blocks, which also raises the hit rate of
+/// negentropy preflight lookups. Memory is allocated only as blocks are read,
+/// so small databases (tests, backfills) use little of it.
+pub const DEFAULT_BLOCK_CACHE_MIB: usize = 16 * 1024;
 
 /// Tunables for opening a [`DedupeIndex`]. None of them affect the on-disk format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,7 +805,7 @@ mod tests {
         }
         {
             let index = DedupeIndex::open(dir.path()).unwrap();
-            measure("dedicated 8 GiB cache", &|id| {
+            measure("dedicated 16 GiB cache", &|id| {
                 index.get_status(id).unwrap().is_some()
             });
             let usage = index.block_cache_usage();

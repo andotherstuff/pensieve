@@ -158,7 +158,7 @@ could not answer the lifecycle read that refreshes health, and the observation
 aged past the 15-minute threshold.
 
 **Fix.** The dedupe index now opens with a dedicated LRU block cache
-(`--dedupe-block-cache-mib`, default 8192), with index and filter blocks at high
+(`--dedupe-block-cache-mib`, default 16384), with index and filter blocks at high
 priority and L0 blocks pinned; this is a read option only, with no change on
 disk. `archived_window` counts inventory keys before any lookup, so TooDense costs
 one key scan; `reconciliation_window` checks the exclusion count first. A
