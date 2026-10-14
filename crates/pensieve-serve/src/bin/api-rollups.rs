@@ -1,5 +1,5 @@
-//! Operator tool for the insert-fed rollup tables (migrations 019, 020 and
-//! 021).
+//! Operator tool for the insert-fed rollup tables (migrations 019, 020, 021
+//! and 022).
 //!
 //! Subcommands:
 //! - `plan`: fix the view boundary, size a sample shard, write a shard plan
@@ -9,7 +9,7 @@
 //! - `resolve`: settle a pending shard by hand when the tool cannot
 //! - `cutover`: migration 020 phase 2, guarded (switch the old views over)
 //!
-//! `plan`, `backfill` and `validate` take `--migration 019|020|021` or explicit
+//! `plan`, `backfill` and `validate` take `--migration 019|020|021|022` or explicit
 //! `--target`s. See `docs/api_rollups.md` and `ops/RUNBOOK.md`.
 
 use std::path::PathBuf;
@@ -29,8 +29,10 @@ use pensieve_serve::rollups::status;
 use pensieve_serve::rollups::validate::{self, ValidateInputs, ValidateOptions};
 
 /// Manage the ClickHouse rollups of migrations 019 (/stats/publishers,
-/// /stats/longform), 020 (user flags, relay lists, kind totals) and 021
-/// (kind activity for /kinds/{kind} and /kinds/{kind}/activity).
+/// /stats/longform), 020 (user flags, relay lists, kind totals), 021
+/// (kind activity for /kinds/{kind}, /kinds/{kind}/activity, /stats/events
+/// and /stats/throughput) and 022 (hourly authors for
+/// /stats/activity/hourly).
 #[derive(Parser, Debug)]
 #[command(name = "api-rollups", version)]
 struct Args {
@@ -164,6 +166,11 @@ enum Command {
         /// event can pull one granule of content into the scan).
         #[arg(long, default_value_t = 5_000)]
         content_budget_events: u64,
+        /// Hourly-pubkeys: whole UTC days before the cutoff whose hour
+        /// sketches and all-kinds day unions are compared with exact counts
+        /// (1-30; one scan reading pubkey of nearly every granule).
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=30))]
+        hour_days: u32,
         /// Write the JSON report here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -229,6 +236,9 @@ enum Migration {
     /// kind-activity
     #[value(name = "021")]
     M021,
+    /// hourly-pubkeys
+    #[value(name = "022")]
+    M022,
 }
 
 impl Selection {
@@ -238,13 +248,14 @@ impl Selection {
             Some(Migration::M019) => Target::MIGRATION_019.to_vec(),
             Some(Migration::M020) => Target::MIGRATION_020.to_vec(),
             Some(Migration::M021) => Target::MIGRATION_021.to_vec(),
+            Some(Migration::M022) => Target::MIGRATION_022.to_vec(),
             None => Vec::new(),
         };
         all.extend(self.targets.iter().copied());
         if all.is_empty() {
             bail!(
-                "choose targets with --migration 019|020|021 or --target \
-                 publishers|longform|user-flags|relay-lists|kinds|kind-activity"
+                "choose targets with --migration 019|020|021|022 or --target \
+                 publishers|longform|user-flags|relay-lists|kinds|kind-activity|hourly-pubkeys"
             );
         }
         let mut seen = Vec::new();
@@ -405,6 +416,7 @@ async fn run(args: Args) -> Result<ExitCode> {
             pubkeys_max_exact,
             pubkeys_sigmas,
             content_budget_events,
+            hour_days,
             out,
         } => {
             let targets = select.targets()?;
@@ -441,6 +453,7 @@ async fn run(args: Args) -> Result<ExitCode> {
                 pubkeys_max_exact,
                 pubkeys_sigmas,
                 content_budget_events,
+                hour_days,
             };
             let inputs = ValidateInputs {
                 publisher_plan: publisher_plan.as_ref(),

@@ -29,22 +29,36 @@
 //!   `created_at`, the event count and content bytes (sums, exactly once) and
 //!   a `uniqCombined64` sketch of the authors (see [`kind_activity`]).
 //!
+//! The same table serves `/api/v1/stats/events` (kind-filtered or ungrouped)
+//! and `/api/v1/stats/throughput` without a new migration (see
+//! [`event_stats`]).
+//!
+//! **Migration 022** (`docs/migrations/prepared/022_hourly_pubkeys.sql`) moves
+//! `/api/v1/stats/activity/hourly` off scans of `events_local`:
+//!
+//! - `hourly_pubkeys`: per kind and all kinds (`kind = -1`) and UTC hour of
+//!   `created_at` (last 35 days), a `uniqCombined64` author sketch; the counts
+//!   come from `kind_activity`'s hour rows (see [`hourly_pubkeys`]).
+//!
 //! This module holds the SQL shared by the API reads and the `api-rollups`
 //! operator tool (plan, backfill, status, validate, cutover). The backfill
 //! `SELECT` bodies must stay equivalent to the views in the migrations; the
-//! integration tests in `tests/api_rollups.rs`, `tests/derived_views.rs` and
-//! `tests/kind_activity.rs` insert the same events through both paths and
-//! compare. See `docs/api_rollups.md`.
+//! integration tests in `tests/api_rollups.rs`, `tests/derived_views.rs`,
+//! `tests/kind_activity.rs` and `tests/hourly_pubkeys.rs` insert the same
+//! events through both paths and compare. See `docs/api_rollups.md`.
 
 pub mod backfill;
 pub mod cutover;
 pub mod derived;
+pub mod event_stats;
+pub mod hourly_pubkeys;
 pub mod kind_activity;
 pub mod ops;
 pub mod plan;
 pub mod status;
 pub mod validate;
 mod validate_derived;
+mod validate_hourly_pubkeys;
 mod validate_kind_activity;
 
 use std::fmt;
@@ -142,17 +156,21 @@ pub enum Target {
     /// `kind_activity`: per kind and hour/day/month counts, content bytes and
     /// approximate pubkeys (021).
     KindActivity,
+    /// `hourly_pubkeys`: per kind and all kinds, UTC hour author sketches
+    /// (022).
+    HourlyPubkeys,
 }
 
 impl Target {
     /// Every target.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Publishers,
         Self::Longform,
         Self::UserFlags,
         Self::RelayLists,
         Self::Kinds,
         Self::KindActivity,
+        Self::HourlyPubkeys,
     ];
 
     /// Targets created by migration 019.
@@ -164,6 +182,9 @@ impl Target {
     /// Targets created by migration 021.
     pub const MIGRATION_021: [Self; 1] = [Self::KindActivity];
 
+    /// Targets created by migration 022.
+    pub const MIGRATION_022: [Self; 1] = [Self::HourlyPubkeys];
+
     /// Short stable name used in paths and logs.
     pub fn name(self) -> &'static str {
         match self {
@@ -173,6 +194,7 @@ impl Target {
             Self::RelayLists => "relay-lists",
             Self::Kinds => "kinds",
             Self::KindActivity => "kind-activity",
+            Self::HourlyPubkeys => "hourly-pubkeys",
         }
     }
 
@@ -185,6 +207,7 @@ impl Target {
             Self::RelayLists => derived::RELAY_LISTS_TABLE,
             Self::Kinds => derived::KINDS_TABLE,
             Self::KindActivity => kind_activity::KIND_ACTIVITY_TABLE,
+            Self::HourlyPubkeys => hourly_pubkeys::HOURLY_PUBKEYS_TABLE,
         }
     }
 
@@ -197,6 +220,7 @@ impl Target {
             Self::RelayLists => derived::RELAY_LISTS_VIEW,
             Self::Kinds => derived::KINDS_VIEW,
             Self::KindActivity => kind_activity::KIND_ACTIVITY_VIEW,
+            Self::HourlyPubkeys => hourly_pubkeys::HOURLY_PUBKEYS_VIEW,
         }
     }
 
@@ -210,13 +234,14 @@ impl Target {
                 "docs/migrations/prepared/020_incremental_derived_views.sql"
             }
             Self::KindActivity => "docs/migrations/prepared/021_kind_activity.sql",
+            Self::HourlyPubkeys => "docs/migrations/prepared/022_hourly_pubkeys.sql",
         }
     }
 
     /// Whether re-inserting a source row changes the target. Publisher, kind
     /// and kind activity counts are sums, so each source row must be written
-    /// exactly once; the other targets hold `argMin`/`min`/`max` states and
-    /// are idempotent.
+    /// exactly once; the other targets hold `argMin`/`min`/`max` or
+    /// `uniqCombined64` (hourly pubkeys) states and are idempotent.
     pub fn is_additive(self) -> bool {
         matches!(self, Self::Publishers | Self::Kinds | Self::KindActivity)
     }
@@ -260,6 +285,7 @@ impl Target {
                 "indexed_at",
                 "content",
             ],
+            Self::HourlyPubkeys => &["id", "pubkey", "kind", "created_at", "indexed_at"],
         }
     }
 
@@ -281,6 +307,7 @@ impl Target {
                 "kind, grain, period, origin, event_count, content_bytes, pubkeys, \
                  live_min_indexed_at, last_indexed_at"
             }
+            Self::HourlyPubkeys => "kind, period, pubkeys, last_indexed_at",
         }
     }
 
@@ -344,6 +371,7 @@ impl Target {
                     .indexed_before
                     .expect("kind activity backfill needs a view boundary"),
             ),
+            Self::HourlyPubkeys => hourly_pubkeys::backfill_select_sql(database, range_predicate),
         }
     }
 
@@ -365,6 +393,7 @@ impl Target {
             Self::UserFlags => "1".to_string(),
             Self::RelayLists => "kind = 10002".to_string(),
             Self::Kinds | Self::KindActivity => before.unwrap_or_else(|| "1".to_string()),
+            Self::HourlyPubkeys => hourly_pubkeys::recent_hour_predicate(),
         }
     }
 
@@ -610,12 +639,13 @@ mod tests {
             let sample = target.sample_count_sql("scratch", &range, &bounds());
             assert!(!sample.contains('?') && sample.contains(&range), "{sample}");
         }
-        assert_eq!(Target::ALL.len(), 6);
+        assert_eq!(Target::ALL.len(), 7);
         assert_eq!(
             [
                 Target::MIGRATION_019.as_slice(),
                 &Target::MIGRATION_020,
-                &Target::MIGRATION_021
+                &Target::MIGRATION_021,
+                &Target::MIGRATION_022
             ]
             .concat(),
             Target::ALL
@@ -645,9 +675,21 @@ mod tests {
             Target::KindActivity.source_filter(&bounds()),
             "indexed_at < toDateTime(1700000000)"
         );
-        for target in [Target::Longform, Target::UserFlags, Target::RelayLists] {
+        for target in [
+            Target::Longform,
+            Target::UserFlags,
+            Target::RelayLists,
+            Target::HourlyPubkeys,
+        ] {
             assert!(!target.is_additive());
         }
+        let sql = Target::HourlyPubkeys.backfill_sql("db", "1", &SourceBounds::default());
+        assert!(!sql.contains("indexed_at <"), "{sql}");
+        assert!(sql.contains("ARRAY JOIN [toInt32(event_kind), -1] AS scope"));
+        assert_eq!(
+            Target::HourlyPubkeys.source_filter(&SourceBounds::default()),
+            "toStartOfHour(created_at, 'UTC') > now() - toIntervalDay(35)"
+        );
     }
 
     #[test]

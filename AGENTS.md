@@ -50,7 +50,7 @@ just test-preview-verbose   # Run with output
 just coverage-preview       # HTML coverage report (requires cargo-llvm-cov)
 just coverage-preview-summary  # Coverage summary
 just run-preview-lookups --help  # Compact lookup plan/backfill/status/validate/bench
-just run-api-rollups --help      # Rollups (migrations 019–021) plan/backfill/status/validate/resolve/cutover
+just run-api-rollups --help      # Rollups (migrations 019–022) plan/backfill/status/validate/resolve/cutover
 ```
 
 ### Agent Commit Requirement
@@ -102,7 +102,7 @@ pensieve/
 │   │       └── routes/      # HTTP routes (preview, JSON API, llms.txt, health)
 │   │   └── src/bin/         # preview-lookups (compact lookup operator tool)
 │   ├── pensieve-serve/      # HTTP API (/api/v1 stats, kinds, relays) over ClickHouse
-│   │   └── src/bin/         # api-rollups (migrations 019–021 operator tool)
+│   │   └── src/bin/         # api-rollups (migrations 019–022 operator tool)
 │   ├── pensieve-parquet/    # Canonical Parquet schema/writer (notepack-to-parquet, validate, compare, salvage)
 │   ├── pensieve-lake/       # Parquet lake work units, inventory, publication
 │   │                        #   (pensieve-parquet-campaign, pensieve-source-manifest, pensieve-lake-catalog)
@@ -220,9 +220,9 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 3. Register in the metrics initialization if using labels
 
 ### Modifying ClickHouse schema
-1. Add a migration file in `docs/migrations/` with the next free number (`022_description.sql` at the time of writing; `prepared/` and `rollback/` share the numbering)
+1. Add a migration file in `docs/migrations/` with the next free number (`023_description.sql` at the time of writing; `prepared/` and `rollback/` share the numbering)
 2. Ensure idempotency (use `IF NOT EXISTS`, `CREATE OR REPLACE`, etc.)
-3. Run with `just ch-migrate docs/migrations/022_description.sql`
+3. Run with `just ch-migrate docs/migrations/023_description.sql`
 4. If a fresh install should get the change, update `docs/clickhouse_self_hosted.sql` too, or say in the migration why not
 
 ### Working with the dedupe index
@@ -235,9 +235,9 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 ## ClickHouse Migrations
 
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
-`docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`; 020 replaces the `daily_user_stats_mv` lookups and the `kinds_stats_mv` / `relay_distribution_mv` rescans in two phases, the second run by `api-rollups cutover`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
+`docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`; 020 replaces the `daily_user_stats_mv` lookups and the `kinds_stats_mv` / `relay_distribution_mv` rescans in two phases, the second run by `api-rollups cutover`; 021 creates `kind_activity` behind `/kinds/{kind}`, `/kinds/{kind}/activity`, `/stats/events` and `/stats/throughput`; 022 creates `hourly_pubkeys` behind `/stats/activity/hourly`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-13):** 001–015 and prepared 016, 017, 018, 019, 020 and 021 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state (2026-10-13):** 001–015 and prepared 016, 017, 018, 019, 020 and 021 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13). Prepared 022 (`hourly_pubkeys`) is not yet applied; apply, backfill and validate it before deploying an API that reads it (RUNBOOK → Hourly authors). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -280,6 +280,8 @@ just ch-migrate docs/migrations/prepared/017_preview_compact_lookups.sql
 just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views_cutover.sql
+just ch-migrate docs/migrations/prepared/021_kind_activity.sql
+just ch-migrate docs/migrations/prepared/022_hourly_pubkeys.sql
 
 # Verify current state
 just ch-tables

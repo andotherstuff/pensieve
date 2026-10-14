@@ -10,12 +10,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{get_or_compute, get_or_compute_with_ttl, ttl};
 use crate::error::ApiError;
+use crate::rollups::event_stats::{DayWindow, EventGrain, events_per_hour};
+use crate::rollups::hourly_pubkeys::hourly_days;
 use crate::state::AppState;
 
 mod rollup_reads;
 use rollup_reads::{
-    fetch_clickhouse_longform, fetch_clickhouse_publishers, fetch_rollup_earliest_event,
-    fetch_rollup_total_kinds,
+    fetch_clickhouse_longform, fetch_clickhouse_publishers, fetch_event_periods,
+    fetch_event_totals, fetch_hourly_activity, fetch_rollup_earliest_event,
+    fetch_rollup_total_kinds, fetch_throughput_total,
 };
 pub(crate) use rollup_reads::{fetch_kind_detail, fetch_kind_series, fetch_kind_totals};
 
@@ -335,10 +338,13 @@ pub struct EventCountByPeriod {
 ///
 /// Returns event counts with optional filters and grouping.
 ///
-/// **Performance notes:**
-/// - When `kind` is not specified and `group_by` is set, uses pre-aggregated
-///   `daily_user_stats` table for instant results.
-/// - When `kind` is specified, queries `events_local` with projection optimization.
+/// **Sources** (no scan of `events_local`):
+/// - Without `kind` and with `group_by`: the pre-aggregated
+///   `daily_user_stats` table (unchanged).
+/// - Otherwise migration 021's `kind_activity`: exact event counts and
+///   approximate `unique_pubkeys` (merged `uniqCombined64` sketches) over whole
+///   UTC days ([`DayWindow`]); `503 metric_unavailable` if the table is
+///   missing.
 /// - Defaults to last 30 days if no time filter is provided.
 ///
 /// Cached for 1 minute.
@@ -461,97 +467,16 @@ pub async fn events(
             }
         }
 
-        // Fall back to events_local for kind-filtered queries or aggregates
-        let mut conditions = Vec::new();
-
-        // Always exclude future dates (malformed or malicious events)
-        conditions.push("created_at <= now()".to_string());
-
-        if let Some(kind) = kind {
-            conditions.push(format!("kind = {}", kind));
-        }
-
-        if let Some(days) = days {
-            conditions.push(format!("created_at >= now() - INTERVAL {} DAY", days));
-        } else {
-            if let Some(since) = since {
-                conditions.push(format!("created_at >= '{}'", since));
-            }
-            if let Some(until) = until {
-                conditions.push(format!("created_at < '{}'", until));
-            }
-        }
-
-        let where_clause = format!("WHERE {}", conditions.join(" AND "));
-
-        // Determine if we're grouping by time period
-        match group_by.as_deref() {
-            Some("day") => {
-                let query = format!(
-                    "SELECT
-                        toString(toDate(created_at)) AS period,
-                        count() AS count,
-                        uniq(pubkey) AS unique_pubkeys
-                    FROM events_local
-                    {}
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    where_clause, limit
-                );
-
-                let rows: Vec<EventCountByPeriod> =
-                    state.clickhouse.query(&query).fetch_all().await?;
-                Ok(serde_json::to_value(rows)?)
-            }
-            Some("week") => {
-                let query = format!(
-                    "SELECT
-                        toString(toMonday(created_at)) AS period,
-                        count() AS count,
-                        uniq(pubkey) AS unique_pubkeys
-                    FROM events_local
-                    {}
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    where_clause, limit
-                );
-
-                let rows: Vec<EventCountByPeriod> =
-                    state.clickhouse.query(&query).fetch_all().await?;
-                Ok(serde_json::to_value(rows)?)
-            }
-            Some("month") => {
-                let query = format!(
-                    "SELECT
-                        toString(toStartOfMonth(created_at)) AS period,
-                        count() AS count,
-                        uniq(pubkey) AS unique_pubkeys
-                    FROM events_local
-                    {}
-                    GROUP BY period
-                    ORDER BY period DESC
-                    LIMIT {}",
-                    where_clause, limit
-                );
-
-                let rows: Vec<EventCountByPeriod> =
-                    state.clickhouse.query(&query).fetch_all().await?;
+        // Everything else reads kind_activity (migration 021) over whole UTC
+        // days; group_by without kind returned above.
+        let window = DayWindow::new(chrono::Utc::now(), days, since, until);
+        match (group_by.as_deref().and_then(EventGrain::parse), kind) {
+            (Some(grain), Some(kind)) => {
+                let rows = fetch_event_periods(&state, window, kind, grain, limit).await?;
                 Ok(serde_json::to_value(rows)?)
             }
             _ => {
-                // No grouping - return aggregate
-                let query = format!(
-                    "SELECT
-                        count() AS count,
-                        uniq(pubkey) AS unique_pubkeys
-                    FROM events_local
-                    {}",
-                    where_clause
-                );
-
-                let stats: EventCountResponse = state.clickhouse.query(&query).fetch_one().await?;
+                let stats = fetch_event_totals(&state, window, kind).await?;
                 Ok(serde_json::to_value(stats)?)
             }
         }
@@ -857,13 +782,6 @@ pub struct ThroughputQuery {
     pub kind: Option<u16>,
 }
 
-/// Row type for throughput query.
-#[derive(Debug, Clone, Deserialize, Row)]
-struct ThroughputRow {
-    events_per_hour: f64,
-    total_events_7d: u64,
-}
-
 /// Throughput response: 7-day rolling average of events per hour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputResponse {
@@ -875,7 +793,9 @@ pub struct ThroughputResponse {
 
 /// `GET /api/v1/stats/throughput`
 ///
-/// Returns 7-day rolling average of events created per hour.
+/// Returns the average events created per hour over the last 7 days, from
+/// migration 021's `kind_activity` hour rows (from the UTC hour containing
+/// `now() - 7 days`, no upper bound: the `/kinds/{kind}` `events_7d` window).
 /// Cached for 5 minutes.
 pub async fn throughput(
     State(state): State<AppState>,
@@ -889,28 +809,10 @@ pub async fn throughput(
 
     let cache = state.cache.clone();
     let result = get_or_compute(&cache, &cache_key, move || async move {
-        let kind_clause = match kind {
-            Some(kind) => format!("AND kind = {}", kind),
-            None => String::new(),
-        };
-
-        let row: ThroughputRow = state
-            .clickhouse
-            .query(&format!(
-                "SELECT
-                    toFloat64(count()) / 168.0 AS events_per_hour,
-                    count() AS total_events_7d
-                FROM events_local
-                WHERE created_at >= now() - INTERVAL 7 DAY
-                {}",
-                kind_clause
-            ))
-            .fetch_one()
-            .await?;
-
+        let total = fetch_throughput_total(&state, kind).await?;
         Ok(ThroughputResponse {
-            events_per_hour: row.events_per_hour,
-            total_events_7d: row.total_events_7d,
+            events_per_hour: events_per_hour(total),
+            total_events_7d: total,
         })
     })
     .await?;
@@ -1161,7 +1063,7 @@ pub async fn new_users(
 /// Query parameters for hourly activity.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HourlyActivityQuery {
-    /// Number of days to aggregate over (default: 7, max: 90).
+    /// Number of days to aggregate over (default: 7, 1-30; others are `400`).
     pub days: Option<u32>,
     /// Filter by event kind.
     pub kind: Option<u16>,
@@ -1180,13 +1082,17 @@ pub struct HourlyActivityRow {
 
 /// `GET /api/v1/stats/activity/hourly`
 ///
-/// Returns event activity grouped by hour of day (0-23) to show usage patterns.
+/// Returns event activity grouped by UTC hour of day (0-23) to show usage
+/// patterns: exact counts from migration 021's `kind_activity` hour rows and
+/// approximate distinct authors from migration 022's `hourly_pubkeys`, from
+/// the UTC hour containing `now() - days` (no upper bound). `days` must be
+/// 1-30 (the hour rows keep 35 days).
 /// Cached for 10 minutes.
 pub async fn hourly_activity(
     State(state): State<AppState>,
     Query(params): Query<HourlyActivityQuery>,
 ) -> Result<Json<Vec<HourlyActivityRow>>, ApiError> {
-    let days = params.days.unwrap_or(7).min(90);
+    let days = hourly_days(params.days).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let kind = params.kind;
 
     let cache_key = format!(
@@ -1198,30 +1104,7 @@ pub async fn hourly_activity(
     let cache = state.cache.clone();
     let result =
         get_or_compute_with_ttl(&cache, &cache_key, ttl::TIME_SERIES, move || async move {
-            let kind_clause = match kind {
-                Some(kind) => format!("AND kind = {}", kind),
-                None => String::new(),
-            };
-
-            let rows: Vec<HourlyActivityRow> = state
-                .clickhouse
-                .query(&format!(
-                    "SELECT
-                    toHour(created_at) AS hour,
-                    count() AS event_count,
-                    uniq(pubkey) AS unique_pubkeys,
-                    toFloat64(count()) / {} AS avg_per_day
-                FROM events_local
-                WHERE created_at >= now() - INTERVAL {} DAY
-                {}
-                GROUP BY hour
-                ORDER BY hour ASC",
-                    days, days, kind_clause
-                ))
-                .fetch_all()
-                .await?;
-
-            Ok(rows)
+            fetch_hourly_activity(&state, days, kind).await
         })
         .await?;
 

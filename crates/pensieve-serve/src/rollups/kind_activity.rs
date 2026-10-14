@@ -92,9 +92,10 @@ pub fn backfill_select_sql(database: &str, range_predicate: &str, indexed_before
 // API reads
 // ---------------------------------------------------------------------------
 
-/// Hour-row window of `events_{days}`: from the UTC hour containing
-/// `now() - days`, no upper bound.
-fn hour_window(days: u32) -> String {
+/// Hour-row window of `events_{days}` (and of `/stats/throughput` and
+/// `/stats/activity/hourly`): from the UTC hour containing `now() - days`, no
+/// upper bound.
+pub(crate) fn hour_window(days: u32) -> String {
     format!("r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay({days}), 'UTC')")
 }
 

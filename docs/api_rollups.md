@@ -1,4 +1,4 @@
-# ClickHouse rollups (migrations 019, 020 and 021)
+# ClickHouse rollups (migrations 019–022)
 
 > **Status (2026-10-12):** migration 019 is applied, backfilled, validated (0 failed rows)
 > and serving in production since 12:52 UTC (`releases/api-60c4bfe`). Publisher windows
@@ -9,12 +9,17 @@
 > Migration 021 ([below](#migration-021-kind-activity), `/kinds/{kind}` and
 > `/kinds/{kind}/activity`) is applied, backfilled and validated (2026-10-13; the API
 > reads it since 07:36 UTC); results in `ops/RUNBOOK.md` → Kind activity.
+> Migration 022 ([below](#migration-022-hourly-pubkeys), `/stats/activity/hourly`) is
+> prepared, **not yet applied** (2026-10-14). The API release that reads it also serves
+> `/stats/events` and `/stats/throughput` from 021's `kind_activity`
+> ([below](#statsevents-and-statsthroughput-from-kind_activity)).
 
 This document covers the migrations that move derived data off full scans of
 `events_local` and the shared operator tool `api-rollups`. Migration 019 is
-described first; [migration 020](#migration-020-incremental-derived-views)
-and [migration 021](#migration-021-kind-activity) reuse its boundary and shard
-machinery.
+described first; [migration 020](#migration-020-incremental-derived-views),
+[migration 021](#migration-021-kind-activity) and
+[migration 022](#migration-022-hourly-pubkeys) reuse its shard machinery (020
+and 021 also its view boundary).
 
 Without projections, `events_local` (~2.43B rows, `ReplacingMergeTree ORDER
 BY id`) can only be scanned, and two `pensieve-serve` endpoints hit the API's
@@ -218,7 +223,7 @@ api-rollups [--clickhouse-url ... --clickhouse-database nostr] \
 
 | Command | Purpose |
 |---------|---------|
-| `plan` | Fixes the view boundary of additive targets (publishers, kinds, kind-activity) and builds 16^n id-prefix shards (default n = 2: 256 shards of ~9.5M rows). It runs shard 0 as a `SELECT` to size the output and prints the full-table read (from `system.columns`), the pre-merge/peak disk estimate and a wall-clock estimate (sample shard time x shards, pauses, quiet minutes). |
+| `plan` | Fixes the view boundary of additive targets (publishers, kinds, kind-activity; hourly-pubkeys is idempotent and has none) and builds 16^n id-prefix shards (default n = 2: 256 shards of ~9.5M rows). It runs shard 0 as a `SELECT` to size the output and prints the full-table read (from `system.columns`), the pre-merge/peak disk estimate and a wall-clock estimate (sample shard time x shards, pauses, quiet minutes). |
 | `backfill` | Runs remaining shards. Guards: quiet minutes (default :58–:07 UTC), disk (`--min-free-gib`), merge backlog (`--max-target-parts`), session runtime and shard count, delay between shards. Exit code 2 means stopped early; re-run to resume. |
 | `status` | Shards done/pending, parts, rows, size, freshness, and whether the boundary still holds. |
 | `validate` | Oracle comparison (see below). Exits non-zero on any failure or when nothing could be compared. |
@@ -226,8 +231,8 @@ api-rollups [--clickhouse-url ... --clickhouse-database nostr] \
 | `cutover` | Migration 020 phase 2, guarded (see [below](#cutover)). |
 
 `plan`, `backfill` and `validate` act on `--migration 019`, `--migration 020`,
-`--migration 021` or explicit
-`--target publishers|longform|user-flags|relay-lists|kinds|kind-activity`
+`--migration 021`, `--migration 022` or explicit
+`--target publishers|longform|user-flags|relay-lists|kinds|kind-activity|hourly-pubkeys`
 (repeatable). Since 020 there is no implicit "all": running the 019 commands
 again would only hit the replan guard.
 
@@ -576,13 +581,13 @@ unchanged.
   day rows) or 120 month rows and merges their sketches: at most ~35 MiB of
   dense sketches for the largest kinds, well under a second.
 
-**Other readers that still scan `events_local` by kind or time** (noted, not
-moved): `/stats/throughput` (7-day count, optional kind; the hour rows could
-serve it), `/stats/events?kind=…` and its ungrouped/rolling forms (counts and
-`uniq(pubkey)` over arbitrary `since`/`until`), `/stats/activity/hourly`
-(hour-of-day histogram with distinct pubkeys over up to 90 days; hour rows
-have no sketch and keep 35 days), `/stats/events/latest` without the
-watermark file (`max(created_at)`).
+**Other readers that scanned `events_local` by kind or time:**
+`/stats/throughput` and `/stats/events` (kind-filtered or ungrouped) read this
+table since the 022 API release
+([below](#statsevents-and-statsthroughput-from-kind_activity)), and
+`/stats/activity/hourly` reads its hour rows plus 022's `hourly_pubkeys`
+(the hour rows carry no author sketch). Still scanning:
+`/stats/events/latest` without the watermark file (`max(created_at)`).
 
 ### Validation (`validate --migration 021`)
 
@@ -614,3 +619,208 @@ scan reads `kind` once plus `content`, `pubkey`, `indexed_at` of at most
 | Backfill wall-clock | ~1–2 h at 2 threads including 256 × 5 s pauses and the quiet minutes (`plan` prints sample shard × 256) |
 | Pre-merge disk | ≤ ~0.5M rows per shard, mostly tiny sketches; `plan` assumes 512 B/row (conservative); merges collapse to ~1–2M rows / a few GiB |
 | Ingest | one more view: an `ARRAY JOIN` ×2–3 and `GROUP BY` over each insert block (~14k events), a few ms, like `kind_totals_mv` |
+
+## `/stats/events` and `/stats/throughput` from `kind_activity`
+
+No migration: both read 021's table (SQL in
+`crates/pensieve-serve/src/rollups/event_stats.rs`).
+
+### The problem (production, 2026-10-14, API on master)
+
+| Request | Old query | Time |
+|---------|-----------|------|
+| `/stats/events` | `count(), uniq(pubkey) FROM events_local WHERE created_at <= now() AND created_at >= now() - 30 DAY` | 5.46 s |
+| `/stats/events?kind=1` | the same with `kind = 1` | 4.39 s |
+| `/stats/events?kind=7&days=30` | the same with `kind = 7` | 4.33 s |
+| `/stats/throughput` | `count() FROM events_local WHERE created_at >= now() - 7 DAY [AND kind = K]` | < 1 ms, cached |
+
+A `created_at` (or `kind`) filter on `events_local` reads that column for all
+~2.47B rows and `pubkey` of every granule holding a matching row, which for any
+recent window is nearly every granule (ids are random).
+
+`/stats/throughput` was fast only because of the API's response cache.
+`get_or_compute` keeps an answer for 5 minutes (`ttl::AGGREGATES`). For up to
+one more TTL it serves the stale answer while a background task recomputes it,
+and that refresh ran the 7-day scan. `hours` is not a parameter of this
+endpoint: `?hours=168` is ignored and hits the same cache entry.
+`/stats/activity/hourly` (default `days=7`) worked the same way with a
+10-minute TTL ([migration 022](#migration-022-hourly-pubkeys)). None of the
+three has a watermark or in-process precomputation.
+
+### Reads
+
+- **`/stats/events` without `group_by`** (all kinds or one kind):
+  `sum(event_count)` and `uniqCombined64Merge(pubkeys)` over the window's day
+  rows. Long windows read month rows for the full months inside them, and day
+  rows for the partial months at either end (`DayWindow::month_split`). So
+  all history reads at most ~60 day rows and one row per month per kind. The
+  all-kinds union merges every kind's sketch per day. For 30 days that is
+  ~30 dense (~96 KiB) sketches per large kind, a few hundred MiB at most.
+- **`/stats/events?kind=K&group_by=day|week|month`**: the kind's day rows,
+  grouped by UTC day or Monday week. Month grouping takes month rows for full
+  months and day rows for months the window cuts, so a cut month counts only
+  its days inside the window, as before.
+- **`/stats/events?group_by=…` without `kind`** still reads
+  `daily_user_stats`. It never scanned `events_local` and is unchanged.
+- **`/stats/throughput`**: `sum(event_count)` of the hour rows from the UTC
+  hour containing `now() - 7 days`, with no upper bound. This is the same
+  number as `/kinds/{kind}`'s `events_7d`. `events_per_hour = total / 168`.
+
+### Behaviour changes
+
+| Field / endpoint | Before (scan) | After |
+|------------------|---------------|-------|
+| `/stats/events` window with `days=N` (default 30) | `created_at` in `[now() - N days, now()]` | Whole UTC days from the day containing `now() - N days` through today: N to N+1 days. The grouped `daily_user_stats` path already used this window |
+| `/stats/events` `since`/`until` | `created_at >= since AND created_at < until` (server time zone) and `<= now()` | UTC days `[since, until)`, through today at most (identical when the server runs UTC) |
+| `/stats/events` upper bound | `created_at <= now()` | Day rows through today: events dated later today count, later days do not |
+| `/stats/events` `count` | `count()` (exact; unmerged duplicate rows included) | `sum(event_count)` (exact; each inserted row once) |
+| `/stats/events` `unique_pubkeys` | `uniq(pubkey)` (approximate, adaptive sampling) | Merged `uniqCombined64` sketches (approximate, ~0.3% standard error, exact below ~4k authors per sketch). Values change slightly |
+| `/stats/events?kind=K&group_by=…` periods | `toDate`/`toMonday`/`toStartOfMonth(created_at)` in the server time zone | The same in UTC |
+| `/stats/throughput` window | `created_at >= now() - 7 days` | From the UTC hour containing `now() - 7 days` (up to one hour more); no upper bound, as before |
+| Missing `kind_activity` | n/a | `503 metric_unavailable` at once (no fallback scan) |
+
+Response shapes, cache keys, TTLs and the `400` for an unknown `group_by`
+are unchanged.
+
+### Validation
+
+`validate --migration 021` already checks the rows these reads add up: every
+(kind, day/month/hour) count, and sampled kinds' content bytes and day
+sketches. The new read merges day sketches across kinds.
+`validate --migration 022` compares that all-kinds union, and the day's event
+count, with exact counts from `events_local` for every UTC day of the last
+`--hour-days` days ([below](#validation-validate---migration-022)).
+
+## Migration 022: hourly pubkeys
+
+| Piece | Location |
+|-------|----------|
+| Table and view | [`docs/migrations/prepared/022_hourly_pubkeys.sql`](migrations/prepared/022_hourly_pubkeys.sql) |
+| Rollback | [`docs/migrations/rollback/022_drop_hourly_pubkeys.sql`](migrations/rollback/022_drop_hourly_pubkeys.sql) |
+| SQL shared by the tool, API and tests | `crates/pensieve-serve/src/rollups/hourly_pubkeys.rs` (unit tests check the migration contains the same expressions) |
+| API read | `crates/pensieve-serve/src/routes/stats/rollup_reads.rs` (`/stats/activity/hourly`) |
+| Validation | `crates/pensieve-serve/src/rollups/validate_hourly_pubkeys.rs` |
+| Integration tests | `crates/pensieve-serve/tests/hourly_pubkeys.rs` (`just ch-test-up && just test-clickhouse`) |
+
+### The problem
+
+`GET /api/v1/stats/activity/hourly` ran `toHour(created_at)`, `count()` and
+`uniq(pubkey)` over `events_local WHERE created_at >= now() - N days [AND
+kind = K]`, with N up to 90. `days=30` took 6.72 s on 2026-10-14. The default
+(`days=7`) answered in under a millisecond from the API cache, but every
+refresh (10-minute TTL, stale-while-revalidate) scanned again.
+
+021's hour rows hold the counts, but their author sketch is empty. No other
+rollup keeps authors per hour: `daily_user_stats` and `publisher_activity`
+are per day.
+
+### Design
+
+Two options were considered:
+
+- **Make `kind_activity_mv` write hour sketches** (`ALTER ... MODIFY QUERY`).
+  This adds no view. But the last 35 days of hour rows would stay empty until
+  a backfill wrote sketch-only rows into a table whose sums must be written
+  exactly once. The API could not tell a half-filled table from a full one.
+  And the all-kinds read would merge one sketch per kind and hour, ~10k dense
+  sketches for 30 days.
+- **Chosen: a separate `hourly_pubkeys` table** that holds only sketches.
+  Sketches are idempotent, so the backfill follows 017's model: no boundary,
+  and overlap or re-runs are harmless. A missing table is a clean `503`. An
+  all-kinds row per hour (`kind = -1`, as in `publisher_activity`) means the
+  unfiltered read merges one sketch per hour.
+
+```sql
+kind Int32,  -- -1 = all kinds
+period DateTime('UTC'),  -- UTC hour of created_at
+pubkeys AggregateFunction(uniqCombined64, String),
+last_indexed_at SimpleAggregateFunction(max, DateTime)
+ENGINE = AggregatingMergeTree ORDER BY (kind, period)
+TTL least(toDate(period, 'UTC') + INTERVAL 35 DAY, toDate('2106-01-01'))
+```
+
+The view writes every event twice, under its own kind and under all kinds,
+and only for hours newer than `now() - 35 days`. The time basis is 021's:
+`created_at` in UTC, unclamped. The table is unpartitioned, and the TTL is
+applied at most once a day.
+
+Size: one row per active (kind, hour), plus one per hour, for 35 days. That
+is a few hundred thousand rows. Rows are dense (~96 KiB) only for hours with
+more than ~4k authors of a kind: the few largest kinds and the all-kinds rows.
+Expect 1–2 GiB.
+
+### Read
+
+```text
+counts:  kind_activity hour rows   period >= toStartOfHour(now() - N days, 'UTC')  [kind = K]
+authors: hourly_pubkeys            period >= toStartOfHour(now() - N days, 'UTC')  kind = K or -1
+per toHour(period, 'UTC'): sum(event_count), uniqCombined64Merge(pubkeys), sum / N
+```
+
+`days = N` reads at most 24 × 30 + 1 sketches: 721 for an unfiltered 30-day
+request, ~70 MiB if all are dense. It also reads the matching hour rows of
+`kind_activity`, without their sketches.
+
+### Behaviour changes
+
+| | Before (scan) | After (022) |
+|---|---|---|
+| `days` | Default 7; values above 90 silently became 90 | Default 7; must be 1–30, else `400` (both tables keep 35 days, and day rows cannot give an hour of the day) |
+| Window | `created_at >= now() - N days`, no upper bound | From the UTC hour containing `now() - N days` (up to one hour more); no upper bound, so future-dated events still count |
+| `hour` | `toHour(created_at)` in the server time zone | UTC hour (identical when the server runs UTC) |
+| `event_count` | `count()` | `sum(event_count)` of 021's hour rows (exact) |
+| `unique_pubkeys` | `uniq(pubkey)` (approximate) | Merged `uniqCombined64` sketches (approximate, ~0.3%) |
+| `avg_per_day` | `event_count / N` | Unchanged |
+| Missing `hourly_pubkeys` or `kind_activity` | n/a | `503 metric_unavailable` at once |
+
+The response shape, cache key and TTL are unchanged.
+
+### Backfill
+
+`api-rollups plan --migration 022` has no boundary to fix.
+`backfill --migration 022` runs 256 id-prefix shards. Each is an
+`INSERT ... SELECT` with the view's expressions over the rows whose hour is
+newer than `now() - 35 days` at the shard's start. Hours that drop out of
+that window during the backfill are older than anything the API reads.
+
+The preflight is the one for longform and relay lists: the grace period after
+the view's creation has passed, and no insert that started before it is still
+running. Running a shard twice, or overlapping the view, changes nothing.
+
+**Cost.** Recent rows are spread over every granule. So each shard reads
+`created_at` of its id range and `kind`, `pubkey`, `indexed_at` of nearly
+every granule in it. In total that is about the read of 020's kinds backfill:
+id, pubkey, kind, created_at and indexed_at, ~320 GiB uncompressed. `plan`
+prints the measured read and a sample-shard time. The output is small: at most
+a few hundred thousand pre-merge rows per shard, and `plan` assumes 256 B per
+row.
+
+### Validation (`validate --migration 022`)
+
+The rollups are read first, then `events_local` is scanned once. The scan
+starts at the UTC day `--hour-days` days before the cutoff (default 2, at most
+30): `PREWHERE created_at >=` that day. It keeps `sipHash128(pubkey)` and the
+first `indexed_at` per (kind, hour), (all kinds, hour) and (all kinds, UTC
+day).
+
+Each estimate must lie within `max(4σ, 2)` of the exact interval
+`[authors first indexed before the cutoff, all authors]`. This applies to:
+
+- every sketch of `hourly_pubkeys` from that day on;
+- per day, the union of all kinds' `kind_activity` day sketches, which is what
+  `/stats/events` merges.
+
+The day's `kind_activity` event count is bracketed the same way. Missing and
+extra rows show as `missing` and `excess`.
+
+**Cost:** `created_at` of the whole table (~10 GiB uncompressed), plus `kind`,
+`pubkey` and `indexed_at` of nearly every granule (about one full read of
+`pubkey`, ~150 GiB). Expect ~10–30 minutes at 2 threads, like
+`validate --target kinds`. Memory is ~60 B per distinct (scope, period,
+pubkey), spilling to disk beyond half of `--max-memory-gib`.
+
+### Benchmark
+
+Ready-to-run SQL that compares the old and new reads (estimated marks, then
+measured read bytes from `system.query_log`) is in
+[`ops/RUNBOOK.md` → Hourly authors → Benchmark](../ops/RUNBOOK.md#7-benchmark-old-vs-new).

@@ -5,7 +5,11 @@
 //! - `/kinds`, `/stats/kinds/total` and `/stats/events/earliest` (and the
 //!   overview) from migration 020's `kind_totals`;
 //! - `/kinds/{kind}` from `kind_totals` and migration 021's `kind_activity`,
-//!   and `/kinds/{kind}/activity` from `kind_activity`.
+//!   and `/kinds/{kind}/activity` from `kind_activity`;
+//! - `/stats/events` (with `kind`, or without `group_by`) and
+//!   `/stats/throughput` from `kind_activity`;
+//! - `/stats/activity/hourly` from `kind_activity`'s hour rows (counts) and
+//!   migration 022's `hourly_pubkeys` (authors).
 //!
 //! These endpoints used to scan `events_local` (or read the hourly
 //! `kinds_stats_mv` rescan). When a rollup table does not exist (migration not
@@ -16,9 +20,15 @@
 use clickhouse::Row;
 use serde::Deserialize;
 
-use super::{LongformStats, PublisherRow};
+use super::{
+    EventCountByPeriod, EventCountResponse, HourlyActivityRow, LongformStats, PublisherRow,
+};
 use crate::error::ApiError;
 use crate::rollups::derived::{KindsSort, earliest_event_sql, kinds_list_sql, total_kinds_sql};
+use crate::rollups::event_stats::{
+    DayWindow, EventGrain, events_by_period_sql, events_total_sql, throughput_sql,
+};
+use crate::rollups::hourly_pubkeys::{hourly_activity_sql, hourly_pubkeys_kind};
 use crate::rollups::kind_activity::{
     SeriesGrain, average_content_length, kind_detail_sql, kind_series_sql,
 };
@@ -35,8 +45,9 @@ fn missing_rollup_is_unavailable(error: ApiError) -> ApiError {
             tracing::warn!(
                 error = %inner,
                 "rollup table missing; apply docs/migrations/prepared/019_api_publishers_longform.sql \
-                 (publishers, longform), 020_incremental_derived_views.sql (kinds) or \
-                 021_kind_activity.sql (kind detail and activity)"
+                 (publishers, longform), 020_incremental_derived_views.sql (kinds), \
+                 021_kind_activity.sql (kind detail and activity, /stats/events, \
+                 /stats/throughput) or 022_hourly_pubkeys.sql (/stats/activity/hourly)"
             );
             ApiError::MetricUnavailable
         }
@@ -189,6 +200,80 @@ pub(crate) async fn fetch_kind_series(
         .clickhouse
         .query(&kind_series_sql(grain, limit))
         .bind(kind)
+        .fetch_all()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// `/stats/events` without `group_by`: events (exact) and approximate
+/// distinct authors of `window`, for one kind or all kinds.
+pub(super) async fn fetch_event_totals(
+    state: &AppState,
+    window: DayWindow,
+    kind: Option<u16>,
+) -> Result<EventCountResponse, ApiError> {
+    let query = state
+        .clickhouse
+        .query(&events_total_sql(window, kind.is_some()));
+    let query = match kind {
+        Some(kind) => query.bind(kind),
+        None => query,
+    };
+    query
+        .fetch_one()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// `/stats/events?kind=K&group_by=…`: one kind's periods of `window`, newest
+/// first.
+pub(super) async fn fetch_event_periods(
+    state: &AppState,
+    window: DayWindow,
+    kind: u16,
+    grain: EventGrain,
+    limit: u32,
+) -> Result<Vec<EventCountByPeriod>, ApiError> {
+    state
+        .clickhouse
+        .query(&events_by_period_sql(window, grain, limit))
+        .bind(kind)
+        .fetch_all()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// `/stats/throughput`: events of the last 7 days (hour rows).
+pub(super) async fn fetch_throughput_total(
+    state: &AppState,
+    kind: Option<u16>,
+) -> Result<u64, ApiError> {
+    let query = state.clickhouse.query(&throughput_sql(kind.is_some()));
+    let query = match kind {
+        Some(kind) => query.bind(kind),
+        None => query,
+    };
+    query
+        .fetch_one::<u64>()
+        .await
+        .map_err(missing_rollup_is_unavailable)
+}
+
+/// `/stats/activity/hourly` over `days` (already validated).
+pub(super) async fn fetch_hourly_activity(
+    state: &AppState,
+    days: u32,
+    kind: Option<u16>,
+) -> Result<Vec<HourlyActivityRow>, ApiError> {
+    let query = state
+        .clickhouse
+        .query(&hourly_activity_sql(days, kind.is_some()));
+    let query = match kind {
+        Some(kind) => query.bind(kind),
+        None => query,
+    };
+    query
+        .bind(hourly_pubkeys_kind(kind))
         .fetch_all()
         .await
         .map_err(missing_rollup_is_unavailable)
