@@ -823,6 +823,12 @@ async fn hourly_pubkeys_backfill_reads_and_validation() {
     db.drop().await;
 }
 
+/// `value` as a response body parses: through the same JSON text and parser
+/// (serde_json's default float parsing can be one ulp off the original f64).
+fn as_parsed<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::from_str(&serde_json::to_string(value).unwrap()).unwrap()
+}
+
 async fn get(app: &axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
@@ -924,19 +930,19 @@ async fn api_reads_the_rollups_and_keeps_the_response_shapes() {
         let total = recent(&rows, Some(1), 7, before).len() as u64;
         assert_eq!(
             throughput,
-            serde_json::json!({
+            as_parsed(&serde_json::json!({
                 "events_per_hour": events_per_hour(total),
                 "total_events_7d": total,
-            }),
+            })),
             "throughput shape and value"
         );
         assert_eq!(
             hourly,
-            serde_json::to_value(expected_hourly(&rows, Some(1), 30, before)).unwrap()
+            as_parsed(&expected_hourly(&rows, Some(1), 30, before))
         );
         let want = expected_hourly(&rows, None, 7, before);
         assert!(!want.is_empty());
-        assert_eq!(default_hourly, serde_json::to_value(want).unwrap());
+        assert_eq!(default_hourly, as_parsed(&want));
         break;
     }
 
