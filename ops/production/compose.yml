@@ -70,7 +70,10 @@ services:
       - clickhouse_logs:/var/log/clickhouse-server
       # Custom config
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
-      # Users config (for grafana read-only user)
+      # Users config (grafana user: SELECT on nostr only). A single-file bind
+      # mount: `git merge` replaces the file, so the running server keeps the
+      # old copy. To roll out, see "Published ports and the grafana ClickHouse
+      # user" in ops/RUNBOOK.md.
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
       # Schema initialization (repo docs/, two levels up from ops/production/)
       - ../../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -102,8 +105,13 @@ services:
     image: prom/prometheus:v2.48.0
     container_name: pensieve-prometheus
     restart: unless-stopped
+    # Localhost only. Grafana reaches Prometheus over the compose network
+    # (http://prometheus:9090) and Caddy does not proxy it, so nothing outside
+    # the host needs this port. Published on 0.0.0.0 it exposed the query API
+    # and, with --web.enable-lifecycle, unauthenticated POST /-/quit and
+    # /-/reload. Keep the host binding for `curl localhost:9090` and SSH tunnels.
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/archive-alerts.yml:/etc/prometheus/archive-alerts.yml:ro

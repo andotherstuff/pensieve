@@ -15,6 +15,9 @@ host on that date.
 - `ops/production/{caddy,clickhouse,prometheus}/` — config mounted into those containers.
   ClickHouse query settings (profiles) belong in `clickhouse/users.xml` (mounted under
   `users.d`); `<profiles>` in `clickhouse/config.xml` (`config.d`) are silently ignored.
+  These are single-file bind mounts, so a `git merge` that changes one does not reach
+  the running container (see
+  [Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user)).
   The `default` user (ingest, API, migrations) uses stock settings, including
   synchronous inserts. Check effective values by name, e.g.
   `SELECT name, value, changed FROM system.settings WHERE name IN ('async_insert',
@@ -1274,6 +1277,161 @@ Provisioning is no longer in the repo. Configure the Prometheus datasource
 `https://<DOMAIN>/grafana/`. Plugins (ClickHouse, SQLite datasources) are still
 installed at container start. See the ingestion/coverage dashboard guide handed off
 separately for the panel set.
+
+ClickHouse datasources should use the `grafana` user (protocol `http`, host
+`clickhouse`, port `8123`, default database `nostr`; the provisioning removed in #24
+did exactly that). That user can read `nostr.*` and `system.parts` only; see
+[Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user).
+The ClickHouse plugin's bundled dashboards (Query/Cluster/Data Analysis) read
+`system.query_log`, `system.merges`, `system.disks` and similar, so they fail under
+that user by design.
+
+## Published ports and the grafana ClickHouse user
+
+Changed in `fix/ops-prometheus-bind-grafana-user` (not yet rolled out at the time of
+writing). Host ports published by `ops/production/compose.yml`:
+
+| Port | Service | Bind (before → after) | Public? |
+|------|---------|-----------------------|---------|
+| 80, 443 | Caddy | `0.0.0.0` (unchanged) | Yes: TLS for `/api`, `/grafana/` and the preview domain |
+| 8123, 9000 | ClickHouse | `127.0.0.1` (unchanged) | No. Ingest, API and preview use `http://localhost:8123`; Grafana uses `clickhouse:8123` |
+| 9090 | Prometheus | `0.0.0.0` → `127.0.0.1` | No. Grafana uses `http://prometheus:9090`; Caddy's `/prometheus` block is commented out |
+| 3000 | Grafana | `127.0.0.1` (unchanged) | Only through Caddy at `/grafana/` |
+
+ClickHouse's metrics port 9363 is not published (Prometheus scrapes it over the compose
+network). Prometheus scrapes the host through `host.docker.internal` (host-gateway,
+172.18.0.1); that is outbound from the container and does not depend on the
+publication.
+
+The `grafana` ClickHouse user (`ops/production/clickhouse/users.xml`, mounted as
+`users.d/custom.xml`) had no `<grants>`, so ClickHouse gave it `GRANT ALL ON *.*` and
+the `readonly` profile was the only limit: it could read every database and all of
+`system` (`query_log` with every user's query text, `users`, `processes`). It now has:
+
+```
+GRANT SELECT ON nostr.* TO grafana
+GRANT SELECT ON system.parts TO grafana
+```
+
+Tables ClickHouse always allows (`system.one`, `functions`, `settings`, and
+`databases`/`tables`/`columns` filtered to `nostr`) still work, so the plugin's query
+builder (`SHOW DATABASES`, `SHOW TABLES`, `DESCRIBE TABLE`, `system.columns`) keeps
+working. Everything else in `system`, `information_schema` and other databases is
+refused (`ACCESS_DENIED`, code 497). The profile stays `readonly=1`: `readonly=2`
+would allow temporary tables, hence `remote('127.0.0.1', …, 'default', '')` as the
+passwordless `default` user, and any setting change, including the memory and row
+limits. The plugin sends only `max_execution_time`, which the profile allows with
+`changeable_in_readonly`. Tested on 24.8 with Grafana 10.2.2 and plugin 4.14.0, over
+HTTP and native.
+
+### Why `git merge` alone does not apply `users.xml`
+
+ClickHouse re-reads `users.d` within a few seconds, with no restart. But the file
+is a single-file bind mount: the container holds the inode that existed when it was
+created, and `git merge` replaces the file with a new inode. After a plain merge the
+running server keeps the old grants until the container is recreated. The steps
+below keep a hardlink to the mounted inode and write the new content through it.
+
+### 1. Preflight (read-only)
+
+```bash
+cd ~/pensieve && git fetch origin && git status --short   # must be empty
+git log --oneline HEAD..origin/master -- ops/              # everything the merge brings
+# The mounted inode must still be the checkout's file (else see "Fallback" below):
+stat -c %i ops/production/clickhouse/users.xml
+docker exec pensieve-clickhouse stat -c %i /etc/clickhouse-server/users.d/custom.xml
+# Which user each Grafana datasource uses (ClickHouse ones should say grafana):
+GF_PW=$(sudo sed -n 's/^GRAFANA_PASSWORD=//p' /etc/pensieve/pensieve.env)
+curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
+  | python3 -c 'import json,sys; [print(d["uid"], d["type"], d.get("jsonData",{}).get("username") or d.get("user") or "-") for d in json.load(sys.stdin)]'
+# What the grafana user read in the last 7 days. Anything other than nostr.* and
+# system.{parts,databases,tables,columns,functions,one} is refused afterwards:
+just ch-query "SELECT arrayJoin(tables) AS t, count() AS n FROM system.query_log WHERE user = 'grafana' AND event_date >= today() - 7 AND type = 'QueryFinish' GROUP BY t ORDER BY n DESC"
+just ch-query "SHOW GRANTS FOR grafana"                    # before: GRANT SHOW, SELECT, INSERT, … ON *.*
+sudo ss -ltnp | grep ':9090'                                # before: 0.0.0.0:9090 and [::]:9090
+```
+
+If a panel needs another `system` table, add a `GRANT SELECT ON system.<table>` line to
+`users.xml` through master first. Do not grant `system.query_log`; it shows every
+user's queries.
+
+### 2. Apply
+
+```bash
+cd ~/pensieve
+ln -f ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml  # handle on the mounted inode
+git merge --ff-only origin/master
+cat ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml  # in place: the server reloads
+sleep 5 && just ch-query "SHOW GRANTS FOR grafana"
+cd ~/pensieve/ops/production
+docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus
+```
+
+`--no-deps` recreates Prometheus alone (a few seconds without scrapes; its data
+volume is kept). Keep `~/clickhouse-users.mounted.xml` until the ClickHouse container
+is next recreated; after that it no longer refers to the mounted file and can be
+deleted.
+
+### 3. Verify
+
+```bash
+cmp ~/pensieve/ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml && echo same
+just ch-query "SHOW GRANTS FOR grafana"   # exactly the two GRANT lines above
+just ch-query "SELECT user_name, access_type, database, table FROM system.grants WHERE user_name = 'grafana'"
+G='clickhouse-client --user grafana --password "$CLICKHOUSE_GRAFANA_PASSWORD"'
+docker exec pensieve-clickhouse sh -c "$G -q 'SELECT name FROM system.databases'"        # nostr, system
+docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM nostr.events_local'"   # a number
+docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM system.query_log'"     # Code: 497 ACCESS_DENIED
+docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM INFORMATION_SCHEMA.TABLES'"  # Code: 497
+docker logs --since 5m pensieve-clickhouse 2>&1 | grep -iE 'users|error' | tail
+sudo ss -ltnp | grep ':9090'               # only 127.0.0.1:9090
+curl -s localhost:9090/-/ready
+curl -s 'localhost:9090/api/v1/targets?state=active' \
+  | python3 -c 'import json,sys; [print(t["labels"]["job"], t["health"]) for t in json.load(sys.stdin)["data"]["activeTargets"]]'
+# From outside the host: must time out or be refused
+curl -m 5 http://<public IP>:9090/-/ready
+# Grafana datasources (repeat for each uid from the preflight), then open the dashboards
+curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources/uid/<uid>/health
+# After an hour: grafana queries that failed (expect none, or only bundled plugin dashboards)
+just ch-query "SELECT event_time, exception_code, substring(query, 1, 100) FROM system.query_log WHERE user = 'grafana' AND exception_code != 0 AND event_time > now() - INTERVAL 1 HOUR ORDER BY event_time DESC LIMIT 20"
+```
+
+The `node` target is down if node_exporter is not installed; that was true before too.
+
+### 4. Rollback
+
+- **grafana user, no restart:** write the previous file through the handle. Then land
+  a revert on master before the ClickHouse container is next recreated, because a
+  recreate mounts whatever the checkout holds.
+  ```bash
+  cd ~/pensieve
+  git show <commit before this PR>:ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml
+  sleep 5 && just ch-query "SHOW GRANTS FOR grafana"   # GRANT SHOW, SELECT, INSERT, … ON *.*
+  ```
+  For a single missing table, prefer adding a `GRANT SELECT ON system.<table>` line.
+- **Prometheus port:** use `ssh -L 9090:127.0.0.1:9090 pensieve` for remote access.
+  If something off-host really needs `:9090`, revert the `ports:` line on master,
+  `git merge --ff-only origin/master`, and rerun the `up -d --no-deps prometheus` above.
+
+### Fallback: inodes differ in the preflight
+
+The container mounts a file the checkout no longer names (it was replaced after the
+container was created), so neither the handle nor an in-place write reaches it.
+Merge, then recreate ClickHouse so it mounts the current file. Do it outside :00–:07
+UTC. The API and preview fail while ClickHouse starts. The ingester's indexer tries a
+sealed segment three times (about 6 s) and then logs `failed to index segment after
+retries; left queued for next start`: that segment stays journaled and is indexed only
+when the ingester next starts, so `clickhouse_index_queue_segments` stays above its
+usual 0–2. Check the journal after the restart and plan a graceful ingester restart
+(see [Routine deploy](#routine-deploy)) if a segment was left queued.
+
+```bash
+cd ~/pensieve && git merge --ff-only origin/master && cd ops/production
+docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps --force-recreate clickhouse
+```
+
+Then take the handle (`ln -f ~/pensieve/ops/production/clickhouse/users.xml
+~/clickhouse-users.mounted.xml`) so a rollback works without another restart.
 
 ## Negentropy reconciliation
 
