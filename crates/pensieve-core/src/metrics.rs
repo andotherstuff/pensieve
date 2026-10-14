@@ -408,7 +408,26 @@ fn register_common_metrics() {
         "clickhouse_segments_indexed_total",
         "Segments fully indexed into ClickHouse"
     );
-    describe_counter!("clickhouse_insert_errors_total", "ClickHouse insert errors");
+    describe_counter!(
+        "clickhouse_insert_errors_total",
+        "Segments the ClickHouse indexer gave up on for this run (unreadable, or no index queue)"
+    );
+    describe_counter!(
+        "clickhouse_index_retries_total",
+        "Failed ClickHouse index attempts that were retried"
+    );
+    describe_gauge!(
+        "clickhouse_index_queue_segments",
+        "Segments in the ClickHouse index journal (sealed, not yet fully indexed)"
+    );
+    describe_gauge!(
+        "clickhouse_index_oldest_pending_seconds",
+        "Age of the oldest segment in the ClickHouse index journal (0 when empty)"
+    );
+    describe_counter!(
+        "clickhouse_index_queue_errors_total",
+        "Failures to journal a sealed segment for ClickHouse indexing"
+    );
     describe_histogram!(
         "clickhouse_insert_duration_seconds",
         "Time spent on ClickHouse batch inserts"

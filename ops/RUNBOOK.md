@@ -123,23 +123,50 @@ where the ingester starts first, an overload or a long merge therefore needs no 
 restart. Older binaries tried three times (about 6 s), logged `failed to index segment
 after retries; left queued for next start` and left the segment until the next start.
 Segments sealed meanwhile wait behind the failing one and are indexed in seal order once
-it succeeds; archive admission and sealing never wait on ClickHouse. While it retries:
+it succeeds; archive admission and sealing never wait on ClickHouse. (Outside a backlog,
+order is notification order: compression can finish out of order, so N+1 may still be
+indexed before N, as before.) While it retries:
 
 - the journal logs `clickhouse index attempt failed; retrying in …` at WARN once per
   backoff step, then at most every 10 minutes once the backoff reaches 60 s;
 - `clickhouse_index_retries_total` counts failed attempts, `clickhouse_index_queue_segments`
   grows by one per seal, and `clickhouse_index_oldest_pending_seconds` (0 when nothing is
-  pending, normally at most a few minutes while a segment indexes) grows with the outage.
-  `PensieveClickHouseIndexBacklog` fires above 15 minutes;
+  pending, normally at most a few minutes while a segment indexes) grows with the outage;
+- after an hour without progress on the same segment, the journal logs `segment has failed
+  to index for over an hour and blocks every later segment` at ERROR, once an hour;
 - recovery logs `clickhouse indexing recovered; catching up on queued segments`, then
   `clickhouse index backlog cleared` once nothing is pending.
 
+`PensieveClickHouseIndexBacklog` (in `ops/production/prometheus/archive-alerts.yml`)
+fires when `clickhouse_index_oldest_pending_seconds` exceeds 15 minutes. **It notifies
+nobody**: Prometheus has no Alertmanager receiver, so it only shows on the Prometheus
+alerts page and in Grafana. Check it there, or watch the gauge, after any ClickHouse work.
+While one segment is stuck (unreadable, or failing deterministically) the gauge stays high
+and the alert stays firing, which hides any later outage; clear the stuck segment (below)
+rather than living with the alert.
+
 A shutdown during the backoff wakes the indexer within 200 ms and leaves the journal
-correct, so a ClickHouse outage does not slow `systemctl stop`. A segment the indexer
-cannot *read* (`failed to read segment for clickhouse; left queued for next start`) is
-the one case still deferred to the next start; it keeps
-`clickhouse_index_oldest_pending_seconds` growing, so investigate the file before
-restarting.
+correct. During an outage `systemctl stop` therefore takes the full 20 s drain grace and
+no more. A segment the indexer cannot *read* (`failed to read segment for clickhouse; left
+queued for next start`) is the one case still deferred to the next start, where it is
+tried once more.
+
+**Skipping a segment the indexer cannot insert.** Every error is retried, deterministic
+ones included: a batch `events_local` always rejects (memory limit, oversized event), or a
+journal write failing because `/archive` is read-only. Such a segment blocks every later
+one, also across restarts, and the indexer never skips on its own. Fix the cause if you
+can (for a read-only `/archive`, fix the filesystem: the journal must be writable and
+editing it will not help). Otherwise:
+
+1. Stop the ingester gracefully (graceful-stop checks above).
+2. Back up `/archive/segments/.clickhouse_reindex_queue`, then delete only the stuck
+   segment's line (`v1 <committed> <batch_end> <path>`). Keep a note of the line.
+3. Start the ingester; the later segments index in order.
+4. Repair the skipped segment separately. Either, once the cause is fixed, add it back at
+   the next graceful stop with every event marked for checking against `events_local`, so
+   nothing is double-counted (the next start indexes it first):
+   `printf 'v1\t0\t*\t%s\n' /archive/segments/segment-NNNNNNNNN.notepack.gz | sudo -u pensieve tee -a /archive/segments/.clickhouse_reindex_queue`,
+   or insert only its missing IDs as in the manual repair below.
 
 Manual repair is only needed if the journal file itself is lost or a build older than
 #73 was killed. Insert only the missing IDs: re-indexing a whole segment double-counts
@@ -541,9 +568,13 @@ views.
 
 **Abort:** if any view reports an exception, or inserts into `events_local`
 start failing, run the rollback SQL immediately (step 7). Production inserts
-are synchronous, so a failing view fails the insert. The ingester then
-keeps retrying the segment (backoff up to 60 s) and ClickHouse ingest stalls
-until the view is dropped; it catches up on its own after that.
+are synchronous, so a failing view fails the insert, but on 24.8 the batch
+still commits to `events_local` and to the other views. Ingest does not stall:
+the indexer retries, its existence check finds the batch's rows present and
+skips them, and it moves on at about one batch per 2 s or more (each batch
+fails once, then waits out the backoff). The failing view permanently misses
+every row inserted while it was failing, so after fixing or dropping it,
+backfill it for that window (for these tables, the step 4 backfill).
 
 ### 3. Plan and estimate disk
 

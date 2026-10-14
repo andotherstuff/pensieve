@@ -560,16 +560,22 @@ async fn shutdown_during_backoff_is_prompt_and_keeps_the_journal() {
         indexer.stats().retries >= 10
     })
     .await;
+    // The notification is on the channel once compression is done; the
+    // indexer takes it into memory whenever it next looks.
     let later_path = seal(&writer, &events(4, "later"));
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!handle.is_finished());
-    assert_eq!(queue.len(), 1, "the later segment waits in memory");
+    assert_eq!(queue.len(), 1, "the later segment is not journaled yet");
 
+    // The current backoff is at least 2.56 s (retries >= 10), so stopping
+    // within 1 s means the sleep woke early (or, had it just expired, the
+    // next attempt saw the stop before sending anything).
+    let before = indexer.stats().retries;
     let asked = Instant::now();
     indexer.stop();
     wait_for("shutdown", Duration::from_secs(1), || handle.is_finished()).await;
     assert!(asked.elapsed() < Duration::from_secs(1));
-    assert_eq!(indexer.stats().retries, 10, "no attempt after the stop");
+    // At most an attempt already under way when the stop landed.
+    assert!(indexer.stats().retries <= before + 1);
     handle.join().unwrap();
     drop(writer);
     drop(queue);

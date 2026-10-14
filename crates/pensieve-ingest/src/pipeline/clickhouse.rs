@@ -32,12 +32,22 @@
 //! accepts it. A ClickHouse restart, a reboot that starts the ingester first,
 //! or an overload therefore heals without restarting the ingester.
 //!
-//! Segments are indexed one at a time in seal order. Seal notifications that
-//! arrive while a segment is being retried are moved off the channel into a
-//! small in-memory backlog (path and event count only, ordered by segment
-//! number) and indexed after it. The writer never waits on the indexer: the
+//! Segments are indexed one at a time. Seal notifications that arrive while a
+//! segment is being indexed or retried are moved off the channel into a small
+//! in-memory backlog (path and event count only, ordered by segment number),
+//! so a backlog that builds up behind a failing segment is indexed after it in
+//! seal order. Ordering is otherwise the notification order: compression
+//! threads can finish out of order, so while the indexer is idle segment N+1
+//! may still be indexed before N, as before. Segments from a previous run are
+//! indexed before any new ones. The writer never waits on the indexer: the
 //! channel is unbounded and drained continuously, and every segment is
 //! journaled at seal time, so archive admission does not depend on ClickHouse.
+//!
+//! Every error is retried, including deterministic ones (a batch the server
+//! always rejects, or a journal that cannot be written). Such a segment blocks
+//! every later one, also across restarts; after an hour the failure is logged
+//! at ERROR, once an hour. Skipping it is an operator decision (see the
+//! RUNBOOK); the indexer never skips on its own.
 //!
 //! A segment that cannot be *read* is not a ClickHouse problem: it stays in
 //! the journal for the next start and the indexer moves on. Without an index
@@ -88,6 +98,10 @@ pub const UNJOURNALED_ATTEMPTS: u32 = 3;
 
 /// Once the backoff is capped, log a failed attempt at WARN at most this often.
 const RETRY_WARN_INTERVAL: Duration = Duration::from_secs(600);
+
+/// A segment failing for longer than this is logged at ERROR, at most once
+/// per interval: the failure is likely deterministic and needs an operator.
+const STUCK_SEGMENT_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// How often the backlog gauges are refreshed while the indexer runs.
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);
@@ -248,9 +262,13 @@ struct Worker {
 impl ClickHouseIndexer {
     /// Create a new ClickHouse indexer.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
+        // Synchronous inserts: an acknowledged batch must be in the table (and
+        // its views) for the journal's progress to mean anything. Production
+        // pins this server-side too.
         let client = Client::default()
             .with_url(&config.url)
-            .with_database(&config.database);
+            .with_database(&config.database)
+            .with_option("async_insert", "0");
 
         tracing::info!(
             "ClickHouse indexer initialized: url={}, database={}, table={}",
@@ -362,10 +380,36 @@ impl ClickHouseIndexer {
         events: &[EventRow],
         progress: &mut IndexProgress,
     ) -> Result<IndexOutcome> {
+        Self::insert_resumable_with(
+            client,
+            config,
+            queue,
+            stop,
+            segment,
+            events,
+            progress,
+            &mut || {},
+        )
+        .await
+    }
+
+    /// [`Self::insert_resumable`], calling `between_batches` before each batch.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_resumable_with(
+        client: &Client,
+        config: &ClickHouseConfig,
+        queue: Option<&IndexQueue>,
+        stop: &AtomicBool,
+        segment: &Path,
+        events: &[EventRow],
+        progress: &mut IndexProgress,
+        between_batches: &mut dyn FnMut(),
+    ) -> Result<IndexOutcome> {
         let batch = config.batch_size.max(1);
         let mut inserted = 0;
         let mut already_present = 0;
         while progress.committed < events.len() {
+            between_batches();
             if let Some(queue) = queue
                 && stop.load(Ordering::SeqCst)
             {
@@ -656,13 +700,21 @@ impl Worker {
     /// Keep only what indexing needs: the notification also carries every
     /// event ID of the segment, which a long outage must not pile up.
     fn accept(&self, sealed: SealedSegment) {
-        self.backlog.borrow_mut().insert(
+        let previous = self.backlog.borrow_mut().insert(
             sealed.segment_number,
             Pending {
                 path: sealed.path,
                 event_count: sealed.event_count,
             },
         );
+        if let Some(previous) = previous {
+            // Never expected: one notification per sealed segment.
+            tracing::warn!(
+                segment = sealed.segment_number,
+                replaced = %previous.path.display(),
+                "duplicate seal notification for a queued segment; keeping the latest"
+            );
+        }
     }
 
     /// Resume segments journaled by a previous run. Returns true if a shutdown
@@ -724,9 +776,15 @@ impl Worker {
         };
 
         let mut failures = 0;
+        // Start of the current run of failures without progress, and when it
+        // was last escalated to ERROR.
+        let mut stuck_since: Option<Instant> = None;
+        let mut last_stuck_error: Option<Instant> = None;
         loop {
             let committed_before = progress.committed;
-            let result = self.rt.block_on(ClickHouseIndexer::insert_resumable(
+            // Keep the channel drained batch by batch, so a long catch-up
+            // does not pile up notifications (each carries every event ID).
+            let result = self.rt.block_on(ClickHouseIndexer::insert_resumable_with(
                 &self.client,
                 &self.config,
                 queue,
@@ -734,7 +792,9 @@ impl Worker {
                 path,
                 &events,
                 &mut progress,
+                &mut || self.absorb_notifications(),
             ));
+            self.absorb_notifications();
             match result {
                 Ok(IndexOutcome::Complete {
                     inserted,
@@ -771,6 +831,7 @@ impl Worker {
                     // up: start the backoff over.
                     if progress.committed > committed_before {
                         failures = 0;
+                        stuck_since = None;
                     }
                     failures += 1;
                     if queue.is_none() && failures >= UNJOURNALED_ATTEMPTS {
@@ -786,6 +847,24 @@ impl Worker {
                     counter!("clickhouse_index_retries_total").increment(1);
                     self.retries.fetch_add(1, Ordering::Relaxed);
                     self.note_failure(path, failures, backoff, &e);
+                    let now = Instant::now();
+                    let since = *stuck_since.get_or_insert(now);
+                    if now.duration_since(since) >= STUCK_SEGMENT_INTERVAL
+                        && last_stuck_error
+                            .is_none_or(|last| now.duration_since(last) >= STUCK_SEGMENT_INTERVAL)
+                    {
+                        last_stuck_error = Some(now);
+                        tracing::error!(
+                            segment = %path.display(),
+                            failing_secs = now.duration_since(since).as_secs(),
+                            committed = progress.committed,
+                            total = events.len(),
+                            error = %compact_error(&e),
+                            "segment has failed to index for over an hour and blocks every later segment; \
+                             if the error is deterministic, skip it by hand (RUNBOOK: skipping a segment \
+                             the indexer cannot insert)"
+                        );
+                    }
                     if self.sleep_unless_stopped(backoff) {
                         self.keep_queued(path, progress);
                         return Step::Interrupted;
