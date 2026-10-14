@@ -71,9 +71,11 @@ services:
       # Custom config
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
       # Users config (grafana user: SELECT on nostr only). A single-file bind
-      # mount: `git merge` replaces the file, so the running server keeps the
-      # old copy. To roll out, see "Published ports and the grafana ClickHouse
-      # user" in ops/RUNBOOK.md.
+      # mount, resolved at each container start: `git merge` replaces the file,
+      # so a running server keeps the old copy until the container is restarted
+      # or recreated (docker restart, daemon restart and reboot included). To
+      # roll out, see "Published ports and the grafana ClickHouse user" in
+      # ops/RUNBOOK.md.
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
       # Schema initialization (repo docs/, two levels up from ops/production/)
       - ../../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro

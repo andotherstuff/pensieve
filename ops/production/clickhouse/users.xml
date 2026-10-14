@@ -10,8 +10,10 @@
     The `default` profile is intentionally left at stock settings.
 
     Changes reach a running server only if the container sees the new file.
-    This is a single-file bind mount, and `git merge` replaces the file (new
-    inode), so the container keeps the old content until it is recreated.
+    This is a single-file bind mount, resolved to an inode each time the
+    container starts. `git merge` replaces the file (new inode), so a running
+    container keeps the old content until it is restarted or recreated
+    (`docker restart`, a Docker daemon restart and a reboot all count).
     For the in-place rollout, see "Published ports and the grafana ClickHouse
     user" in ops/RUNBOOK.md.
 -->
@@ -84,26 +86,32 @@
                 tables are what url()/remote()/file() need, so readonly=2 would
                 let this user run remote('127.0.0.1', ..., 'default', '') and
                 read everything as `default` (no password in this compose
-                setup), and would let it lift the limits below. The settings the Grafana plugin sends
-                are allowed individually with changeable_in_readonly instead.
+                setup), and would let it change max_memory_usage and
+                max_rows_to_read. With readonly=1 those two are fixed; the one
+                setting the Grafana plugin sends, max_execution_time, may be
+                changed only within the bounds in <constraints> below.
             -->
             <readonly>1</readonly>
 
             <!-- Limit query resources to prevent dashboard queries from impacting ingestion -->
             <max_memory_usage>10000000000</max_memory_usage> <!-- 10 GB max per query -->
-            <max_execution_time>60</max_execution_time> <!-- 60 seconds max -->
+            <max_execution_time>60</max_execution_time> <!-- default; the client may set 1-300 (below) -->
             <max_rows_to_read>1000000000</max_rows_to_read> <!-- 1B rows max -->
 
             <!--
                 Settings the client may change despite readonly=1. The Grafana
                 ClickHouse plugin (clickhouse-go) sends max_execution_time from
-                the datasource's query timeout. If a panel fails with "Cannot
-                modify 'X' setting in readonly mode", add X here; do not switch
-                to readonly=2.
+                the datasource's query timeout (64 with the default 60 s
+                timeout), so it cannot be fixed at 60. It is bounded instead:
+                0 (unlimited) and anything above 300 s are refused. If a panel
+                fails with "Cannot modify 'X' setting in readonly mode", add X
+                here with bounds; do not switch to readonly=2.
             -->
             <constraints>
                 <max_execution_time>
                     <changeable_in_readonly>1</changeable_in_readonly>
+                    <min>1</min>
+                    <max>300</max>
                 </max_execution_time>
             </constraints>
         </readonly>

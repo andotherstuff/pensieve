@@ -136,6 +136,16 @@ Compose changes apply per container: after the 2026-10-12 sync, Prometheus was r
 (`docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus`
 from `ops/production/`, after `promtool check config`) to load `archive-alerts.yml`.
 
+Socket units: `ops/systemd/*.socket` files (today `pensieve-prometheus-proxy.socket`)
+must be installed into `/etc/systemd/system/` with their `.service` and enabled with
+`systemctl enable --now <name>.socket`. The `.service` is socket-activated and is not
+enabled. **Warning (PR #100):** once that PR is on master, an ff-merge followed by a
+routine `systemctl restart pensieve`, before the
+[rollout](#published-ports-and-the-grafana-clickhouse-user), moves Prometheus to
+`127.0.0.1:19090` with nothing on `:9090`. That fails closed, but the monitoring VM
+loses access until the socket is installed. That restart also stops and recreates every
+container, ClickHouse included.
+
 Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown). Copying a
 warm target dir (`cp -a --reflink=auto /data/pensieve-build/<previous> <new>`) and building in a
 resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --property=MemoryMax=8G
@@ -1315,7 +1325,8 @@ it to `127.0.0.1:19090`. The socket is an ordinary host listener, so the existin
 rules gate it exactly like 9100; no firewall change is needed. It fails closed: if the
 proxy or Prometheus is down, the VM's scrape fails and nothing is exposed. Nothing
 depends on Docker's firewall backend or the `DOCKER-USER` chain. Prometheus now sees
-scraper connections as coming from 127.0.0.1 (it does not log clients).
+scraper connections as coming from the compose bridge gateway (172.18.0.1, via
+docker-proxy), not the VM (it does not log clients).
 
 Grafana still uses `http://prometheus:9090` over the compose network, Caddy's
 `/prometheus` block is commented out, and the Kuma probes and ops scripts use the
@@ -1340,70 +1351,147 @@ builder (`SHOW DATABASES`, `SHOW TABLES`, `DESCRIBE TABLE`, `system.columns`) ke
 working. Everything else in `system`, `information_schema` and other databases is
 refused (`ACCESS_DENIED`, code 497). The profile stays `readonly=1`: `readonly=2`
 would allow temporary tables, hence `remote('127.0.0.1', …, 'default', '')` as the
-passwordless `default` user, and any setting change, including the memory and row
-limits. The plugin sends only `max_execution_time`, which the profile allows with
-`changeable_in_readonly`. Tested on 24.8 with Grafana 10.2.2 and plugin 4.14.0, over
-HTTP and native.
+passwordless `default` user, and any setting change. Under `readonly=1`,
+`max_memory_usage` (10 GB) and `max_rows_to_read` (1B) are fixed. The plugin sends only
+`max_execution_time` (64 with its default 60 s query timeout), so that one setting is
+`changeable_in_readonly` within bounds: the default is 60 s and the client may set 1 to
+300 s. Before this change it could set any value, including 0 (unlimited). On 24.8, 0,
+301 and 100000 are refused (`SETTING_CONSTRAINT_VIOLATION`, code 452) and 1, 60, 64 and
+300 are accepted. Tested on 24.8 with Grafana 10.2.2 and plugin 4.14.0, over HTTP and
+native.
 
 ### Why `git merge` alone does not apply `users.xml`
 
 ClickHouse re-reads `users.d` within a few seconds, with no restart. But the file
-is a single-file bind mount: the container holds the inode that existed when it was
-created, and `git merge` replaces the file with a new inode. After a plain merge the
-running server keeps the old grants until the container is recreated. The steps
-below keep a hardlink to the mounted inode and write the new content through it.
+is a single-file bind mount, resolved to an inode each time the container starts, and
+`git merge` replaces the file with a new inode. After a plain merge the running
+server keeps the old grants until the container is restarted or recreated
+(`docker restart`, a Docker daemon restart and a reboot all re-mount the checkout's
+current file). The steps below keep a hardlink to the mounted inode and write the new
+content through it. That handle is only valid until ClickHouse next starts; always
+compare inodes before writing through it.
 
 ### 1. Preflight (read-only)
 
 ```bash
 cd ~/pensieve && git fetch origin && git status --short   # must be empty
 git log --oneline HEAD..origin/master -- ops/              # everything the merge brings
+git diff --stat HEAD origin/master -- ops/production/      # see "Other ops/production changes" below
 # The mounted inode must still be the checkout's file (else see "Fallback" below):
 stat -c %i ops/production/clickhouse/users.xml
 docker exec pensieve-clickhouse stat -c %i /etc/clickhouse-server/users.d/custom.xml
-# Which user each Grafana datasource uses (ClickHouse ones should say grafana):
-GF_PW=$(sudo sed -n 's/^GRAFANA_PASSWORD=//p' /etc/pensieve/pensieve.env)
-curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
-  | python3 -c 'import json,sys; [print(d["uid"], d["type"], d.get("jsonData",{}).get("username") or d.get("user") or "-") for d in json.load(sys.stdin)]'
-# What the grafana user read in the last 7 days. Anything other than nostr.* and
-# system.{parts,databases,tables,columns,functions,one} is refused afterwards:
-just ch-query "SELECT arrayJoin(tables) AS t, count() AS n FROM system.query_log WHERE user = 'grafana' AND event_date >= today() - 7 AND type = 'QueryFinish' GROUP BY t ORDER BY n DESC"
 just ch-query "SHOW GRANTS FOR grafana"                    # before: GRANT SHOW, SELECT, INSERT, … ON *.*
 sudo ss -ltnp | grep -E ':(9090|19090) '                    # before: docker-proxy on 0.0.0.0:9090 and [::]:9090
 sudo ufw status | grep -E '^9090'                           # ALLOW IN <monitoring-vm-ipv4> and <monitoring-vm-ipv6> only
 ip -4 addr show scope global | grep inet                    # the host's public IPv4 (<host-ip> below)
-ls -l /usr/lib/systemd/systemd-socket-proxyd                # ships with systemd
 ip -6 addr show scope global | grep inet6                   # the host's IPv6 (<host-ipv6> below)
+ls -l /usr/lib/systemd/systemd-socket-proxyd                # ships with systemd
 ```
 
-If a panel needs another `system` table, add a `GRANT SELECT ON system.<table>` line to
-`users.xml` through master first. Do not grant `system.query_log`; it shows every
-user's queries.
+**Grafana datasources.** List each datasource's URL, host and user:
+
+```bash
+# GRAFANA_PASSWORD seeds the admin password only when the grafana_data volume is first
+# created. If it was changed in the UI since, curl fails with "error: 401": use the
+# current password instead. The second sed strips quotes, if pensieve.env has them.
+GF_PW=$(sudo sed -n 's/^GRAFANA_PASSWORD=//p' /etc/pensieve/pensieve.env | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")
+curl -sSf -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
+  | python3 -c 'import json,sys; [print(d["uid"], d["type"], d.get("url") or "-", d.get("jsonData",{}).get("host") or "-", d.get("jsonData",{}).get("username") or d.get("user") or "-") for d in json.load(sys.stdin)]'
+# Columns: uid, type, url, host (ClickHouse plugin), user
+```
+
+- **Prometheus datasources** must use `http://prometheus:9090` (the compose network).
+  A URL of `host.docker.internal:9090`, the host's IP or `localhost` breaks after the
+  change. Nothing publishes 9090 for containers any more, and UFW's `INPUT`
+  default-deny applies to container-to-host traffic on 9090 (only the monitoring VM is
+  allowed). Fix such a URL in Grafana first.
+- **ClickHouse datasources** should use host `clickhouse` and user `grafana`. One
+  that uses `default` is unaffected by this change, but it has full admin rights.
+
+**What the grafana user reads.** These tables are refused after the change unless
+they are `nostr.*` or `system.{parts,databases,tables,columns,functions,one}`. The
+`example` column identifies the panel:
+
+```bash
+just ch-query "SELECT arrayJoin(tables) AS t, count() AS n, any(substring(query, 1, 120)) AS example FROM system.query_log WHERE user = 'grafana' AND event_date >= today() - 7 AND type = 'QueryFinish' GROUP BY t ORDER BY n DESC"
+```
+
+For each other table, choose before rolling out:
+- add a narrow `GRANT SELECT ON <db>.<table>` line to `users.xml` through master, or
+- accept that the panel breaks, or remove it.
+
+Never grant `system.query_log`, `system.processes` or `system.users` to `grafana`: they
+show every user's queries and accounts. Panels that need them belong on a separate
+admin datasource with its own ClickHouse user. Grafana alert rules on the ClickHouse
+datasource fail the same way and go to Error or NoData: check Alerting > Alert rules for
+queries on refused tables.
+
+**Other ops/production changes.** If `git diff --stat` lists files besides
+`clickhouse/users.xml` and `compose.yml`'s Prometheus `ports:`, those need their own
+step. For example, a `Caddyfile` change needs `up -d --no-deps caddy`, and a ClickHouse
+`config.xml` change needs a ClickHouse restart. The `up -d --no-deps prometheus` below
+applies only Prometheus's part. Do not use a bare `up -d` or `systemctl restart
+pensieve` for this: that stops and recreates every container, ClickHouse included.
+
+**Downtime.** Recreating Prometheus replays its WAL. `/-/ready` and scrapes return 503
+for several scrape intervals (longer with more head data), and Grafana's Prometheus
+panels show a gap. Silence the monitoring VM's alert for this target during the change.
 
 ### 2. Apply
 
+Run each block as shown. It runs in a subshell with `set -e` and stops at the first
+failure without closing your shell.
+
+**2a. grafana user** (the handle must be the mounted file: link count 2, same inode):
+
 ```bash
 cd ~/pensieve
-ln -f ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml  # handle on the mounted inode
+(
+set -euo pipefail
+ln -f ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml
+read -r h_inode h_links < <(stat -c '%i %h' ~/clickhouse-users.mounted.xml)
+m_inode=$(docker exec pensieve-clickhouse stat -c %i /etc/clickhouse-server/users.d/custom.xml)
+echo "handle inode=$h_inode links=$h_links mounted=$m_inode"
+[ "$h_links" = 2 ] && [ "$h_inode" = "$m_inode" ] || { echo "handle is not the mounted file: stop, see Fallback"; exit 1; }
 git merge --ff-only origin/master
-cat ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml  # in place: the server reloads
-sleep 5 && just ch-query "SHOW GRANTS FOR grafana"
-# Prometheus: install the socket, move the container to 127.0.0.1:19090, then take :9090
-sudo install -m 644 ops/systemd/pensieve-prometheus-proxy.socket \
-  ops/systemd/pensieve-prometheus-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-cd ~/pensieve/ops/production
-docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus
-sudo systemctl enable --now pensieve-prometheus-proxy.socket
+cat ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml   # in place: the server reloads
+sleep 5
+just ch-query "SHOW GRANTS FOR grafana"
+)
 ```
 
-`--no-deps` recreates Prometheus alone (a few seconds without scrapes; its data
-volume is kept). The socket can only bind `:9090` once the recreated container has
-released it, hence the order; the VM misses at most one scrape. The socket is enabled
-in `sockets.target`, so it comes back on boot without Docker; the service starts on
-the first connection. Keep `~/clickhouse-users.mounted.xml` until the ClickHouse
-container is next recreated; after that it no longer refers to the mounted file and
-can be deleted.
+**2b. Prometheus.** Check the merged config, install the units, move the container to
+`127.0.0.1:19090`, then take `:9090`:
+
+```bash
+cd ~/pensieve/ops/production
+(
+set -euo pipefail
+docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" --entrypoint promtool \
+  prom/prometheus:v2.48.0 check config /etc/prometheus/prometheus.yml
+sudo install -m 644 ../systemd/pensieve-prometheus-proxy.socket \
+  ../systemd/pensieve-prometheus-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/pensieve-prometheus-proxy.socket \
+  /etc/systemd/system/pensieve-prometheus-proxy.service
+docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus
+sudo systemctl enable --now pensieve-prometheus-proxy.socket
+)
+```
+
+`promtool` runs in a throwaway container from the same image, against the merged
+`prometheus/` directory. The running container still mounts the old files.
+`--no-deps` recreates Prometheus alone; its data volume is kept. The socket can only
+bind `:9090` once the recreated container has released it, hence the order. The socket
+is enabled in `sockets.target`, so it comes back on boot without Docker. The service is
+socket-activated (not enabled) and starts on the first connection.
+
+`~/clickhouse-users.mounted.xml` stays a handle on the mounted file only until
+ClickHouse is next restarted (including a Docker restart or reboot) or recreated. From
+then on, the container mounts the checkout's current `users.xml` (already the new
+version after the merge), and the handle points to an orphaned inode. Retake it with
+`ln -f ~/pensieve/ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml`
+after any restart, or delete it.
 
 ### 3. Verify
 
@@ -1418,23 +1506,35 @@ docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM system.query_l
 docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM INFORMATION_SCHEMA.TABLES'"  # Code: 497
 docker logs --since 5m pensieve-clickhouse 2>&1 | grep -iE 'users|error' | tail
 # Prometheus, on the host
-sudo ss -ltnp | grep -E ':(9090|19090) '   # *:9090 systemd (pid 1); 127.0.0.1:19090 docker-proxy; no 0.0.0.0:9090
+sudo ss -ltnp | grep -E ':(9090|19090) '   # *:9090 systemd (pid 1) and, after a connection, systemd-socket-proxyd;
+                                           # 127.0.0.1:19090 docker-proxy; no 0.0.0.0:9090
 systemctl is-enabled pensieve-prometheus-proxy.socket; systemctl is-active pensieve-prometheus-proxy.socket
 curl -s localhost:19090/-/ready            # Prometheus directly
 curl -s localhost:9090/-/ready             # through the proxy
 systemctl status pensieve-prometheus-proxy.service --no-pager   # active after the first connection
 curl -s 'localhost:19090/api/v1/targets?state=active' \
   | python3 -c 'import json,sys; [print(t["labels"]["job"], t["health"]) for t in json.load(sys.stdin)["data"]["activeTargets"]]'
+# No Docker DNAT for host port 9090 any more (both print nothing). The only Prometheus
+# rule left is for 19090, with -d 127.0.0.1/32. Do not grep -w 9090: the 19090 rule's
+# --to-destination <container>:9090 matches that.
+sudo iptables -t nat -S DOCKER | grep -E -- '--dport 9090( |$)'
+sudo ip6tables -t nat -S DOCKER 2>/dev/null | grep -E -- '--dport (9090|19090)( |$)'
+sudo iptables -t nat -S DOCKER | grep -E -- '--dport 19090( |$)'   # one rule, -d 127.0.0.1/32
 # From any machine other than the VM (e.g. your workstation): must time out (UFW drops)
 curl -m 5 http://<host-ip>:9090/-/ready
 curl -m 5 http://<host-ip>:19090/-/ready
+curl -m 5 'http://[<host-ipv6>]:9090/-/ready'   # from an IPv6-capable machine that is not the VM
 # From the monitoring VM (ssh to it): must print "Prometheus Server is Ready."
 curl -m 5 http://<host-ip>:9090/-/ready
 curl -m 5 'http://[<host-ipv6>]:9090/-/ready'   # over IPv6, from <monitoring-vm-ipv6>
 # ...and the VM's own scrape job or federation target for this host is up again
 # (its Prometheus UI, Status > Targets, or its alert on this target clears).
-# Grafana datasources (repeat for each uid from the preflight), then open the dashboards
-curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources/uid/<uid>/health
+# Grafana: health of every datasource (works in a new shell), then open the dashboards
+GF_PW=$(sudo sed -n 's/^GRAFANA_PASSWORD=//p' /etc/pensieve/pensieve.env | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")
+for uid in $(curl -sSf -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
+    | python3 -c 'import json,sys; print(" ".join(d["uid"] for d in json.load(sys.stdin)))'); do
+  echo "$uid: $(curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources/uid/$uid/health)"
+done
 # After an hour: grafana queries that failed (expect none, or only bundled plugin dashboards)
 just ch-query "SELECT event_time, exception_code, substring(query, 1, 100) FROM system.query_log WHERE user = 'grafana' AND exception_code != 0 AND event_time > now() - INTERVAL 1 HOUR ORDER BY event_time DESC LIMIT 20"
 ```
@@ -1444,26 +1544,52 @@ The `node` target is down if node_exporter is not installed; that was true befor
 **Restarts.** The 9090 gate lives in a systemd socket and UFW's `INPUT` rules, not in
 Docker's chains, so `systemctl restart docker` cannot open or remove it. Docker only
 re-creates its rules for `127.0.0.1:19090`. Restarting Docker also restarts ClickHouse,
-with the same impact as the [fallback](#fallback-inodes-differ-in-the-preflight); do not
-do it only to test this. At the next planned Docker restart or reboot, rerun the
+with the same impact as the [fallback](#fallback-inodes-differ-in-the-preflight), and
+ClickHouse then mounts the checkout's current `users.xml`. Make sure the checkout holds
+the version you want running. After any ClickHouse restart (`docker restart`, a Docker
+restart, a reboot or `systemctl restart pensieve`) or recreate, the handle points to an
+orphaned inode: retake it with `ln -f ~/pensieve/ops/production/clickhouse/users.xml
+~/clickhouse-users.mounted.xml`, or delete it. Do not restart Docker only to test this. At the next planned Docker restart or reboot, rerun the
 Prometheus block above (host, outside and VM checks). Expect `is-enabled` = `enabled`
 and the socket `active` before Docker is up. The Debian 13 test of these units passed
 across a reboot.
 
 ### 4. Rollback
 
-- **grafana user, no restart:** write the previous file through the handle. Then land
-  a revert on master before the ClickHouse container is next recreated, because a
-  recreate mounts whatever the checkout holds.
+- **grafana user:** first find which path, if any, is the file ClickHouse has mounted.
+  Do not write through the handle without this check: after any ClickHouse restart or
+  recreate, the handle points to a file the container no longer reads.
   ```bash
   cd ~/pensieve
-  git show <commit before this PR>:ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml
+  # <squash-sha>: this PR's squash commit on master; ^ is the commit before it
+  git show <squash-sha>^:ops/production/clickhouse/users.xml > /tmp/users.xml.prev
+  docker exec pensieve-clickhouse stat -c '%i mounted' /etc/clickhouse-server/users.d/custom.xml
+  stat -c '%i %n' ~/clickhouse-users.mounted.xml ops/production/clickhouse/users.xml
+  # (a) handle inode = mounted: write in place through it, no restart
+  cat /tmp/users.xml.prev > ~/clickhouse-users.mounted.xml
+  # (b) checkout inode = mounted (ClickHouse restarted since the rollout): in place, no restart
+  cat /tmp/users.xml.prev > ops/production/clickhouse/users.xml
+  # (c) neither matches: rewrite the checkout file, then restart ClickHouse
+  #     (impact as in the fallback below: outside :00-:07 UTC, check the ingester journal)
+  cat /tmp/users.xml.prev > ops/production/clickhouse/users.xml
+  docker restart pensieve-clickhouse
+  # then, in every case:
   sleep 5 && just ch-query "SHOW GRANTS FOR grafana"   # GRANT SHOW, SELECT, INSERT, … ON *.*
   ```
-  For a single missing table, prefer adding a `GRANT SELECT ON system.<table>` line.
+  Run only the line for your case. In (b) and (c) the checkout is now dirty. Land a revert
+  on master, then `git checkout -- ops/production/clickhouse/users.xml && git merge
+  --ff-only origin/master`. Do that before the next ClickHouse restart, because a
+  restart or recreate mounts whatever the checkout holds. For a single missing table,
+  prefer adding a `GRANT SELECT ON system.<table>` line.
 - **Prometheus, VM loses access:** first check the socket (`systemctl status
   pensieve-prometheus-proxy.socket pensieve-prometheus-proxy.service`,
   `journalctl -u pensieve-prometheus-proxy.service`) and `curl localhost:19090/-/ready`.
+  If the proxy service fails to start, the socket (`Accept=no`) keeps re-triggering it,
+  hits its start or trigger limit and goes `failed` (`Result=service-start-limit-hit`
+  or `trigger-limit-hit` in `systemctl show -p Result`). It stops listening, so it fails closed:
+  nothing is exposed, and the VM is refused until someone fixes the cause and runs
+  `sudo systemctl reset-failed pensieve-prometheus-proxy.service` and
+  `sudo systemctl restart pensieve-prometheus-proxy.socket`.
   Operators can always use `ssh -L 9090:127.0.0.1:19090 pensieve`.
 - **Prometheus, remove the proxy** (the VM stops scraping; nothing is exposed):
   ```bash
@@ -1472,7 +1598,8 @@ across a reboot.
   sudo rm /etc/systemd/system/pensieve-prometheus-proxy.{socket,service} && sudo systemctl daemon-reload
   ```
 - **Prometheus, back to the old publication** (exposes 9090 to the internet again,
-  whatever UFW says): remove the proxy as above, revert the `ports:` line to
+  whatever UFW says): remove the proxy as above, revert the `ports:` line (from
+  `<squash-sha>^`) to
   `"9090:9090"` on master, `git -C ~/pensieve merge --ff-only origin/master`, and rerun
   the `up -d --no-deps prometheus` command from step 2. The socket must be stopped
   first or Docker cannot bind 9090.
@@ -1480,8 +1607,9 @@ across a reboot.
 ### Fallback: inodes differ in the preflight
 
 The container mounts a file the checkout no longer names (it was replaced after the
-container was created), so neither the handle nor an in-place write reaches it.
-Merge, then recreate ClickHouse so it mounts the current file. Do it outside :00–:07
+container last started), so neither the handle nor an in-place write reaches it.
+Merge, then restart ClickHouse so it mounts the current file (a restart re-resolves
+the bind mount; recreating is not needed). Do it outside :00–:07
 UTC. The API and preview fail while ClickHouse starts. The ingester's indexer tries a
 sealed segment three times (about 6 s) and then logs `failed to index segment after
 retries; left queued for next start`: that segment stays journaled and is indexed only
@@ -1490,8 +1618,8 @@ usual 0–2. Check the journal after the restart and plan a graceful ingester re
 (see [Routine deploy](#routine-deploy)) if a segment was left queued.
 
 ```bash
-cd ~/pensieve && git merge --ff-only origin/master && cd ops/production
-docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps --force-recreate clickhouse
+cd ~/pensieve && git merge --ff-only origin/master
+docker restart pensieve-clickhouse
 ```
 
 Then take the handle (`ln -f ~/pensieve/ops/production/clickhouse/users.xml
