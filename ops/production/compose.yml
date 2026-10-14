@@ -105,13 +105,15 @@ services:
     image: prom/prometheus:v2.48.0
     container_name: pensieve-prometheus
     restart: unless-stopped
-    # Localhost only. Grafana reaches Prometheus over the compose network
-    # (http://prometheus:9090) and Caddy does not proxy it, so nothing outside
-    # the host needs this port. Published on 0.0.0.0 it exposed the query API
-    # and, with --web.enable-lifecycle, unauthenticated POST /-/quit and
-    # /-/reload. Keep the host binding for `curl localhost:9090` and SSH tunnels.
+    # Localhost only, on 19090. Docker-published ports bypass UFW, so
+    # "9090:9090" exposed the query API and, with --web.enable-lifecycle,
+    # unauthenticated POST /-/quit and /-/reload to the whole internet.
+    # Grafana uses http://prometheus:9090 over the compose network. The
+    # external scraper (94.130.141.87) reaches :9090 through the host socket
+    # ops/systemd/pensieve-prometheus-proxy.{socket,service}, which UFW gates;
+    # that socket owns host port 9090, so do not publish 9090 here.
     ports:
-      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:19090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/archive-alerts.yml:/etc/prometheus/archive-alerts.yml:ro

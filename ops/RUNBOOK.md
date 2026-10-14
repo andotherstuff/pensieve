@@ -51,6 +51,7 @@ Observed 2026-10-11:
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
+| Prometheus `:9090` for the scraper VM | `pensieve-prometheus-proxy.socket` → `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`; in the repo since PR #100, install per [Published ports](#published-ports-and-the-grafana-clickhouse-user) |
 
 While `zzzz-bounded-canary.conf` is installed, the ingester does **not** restart by itself
 after it exits; check it after any stop or crash.
@@ -1288,20 +1289,38 @@ that user by design.
 
 ## Published ports and the grafana ClickHouse user
 
-Changed in `fix/ops-prometheus-bind-grafana-user` (not yet rolled out at the time of
-writing). Host ports published by `ops/production/compose.yml`:
+Changed in `fix/ops-prometheus-bind-grafana-user` (PR #100; not yet rolled out at the
+time of writing). Host ports published by `ops/production/compose.yml`:
 
-| Port | Service | Bind (before → after) | Public? |
-|------|---------|-----------------------|---------|
-| 80, 443 | Caddy | `0.0.0.0` (unchanged) | Yes: TLS for `/api`, `/grafana/` and the preview domain |
-| 8123, 9000 | ClickHouse | `127.0.0.1` (unchanged) | No. Ingest, API and preview use `http://localhost:8123`; Grafana uses `clickhouse:8123` |
-| 9090 | Prometheus | `0.0.0.0` → `127.0.0.1` | No. Grafana uses `http://prometheus:9090`; Caddy's `/prometheus` block is commented out |
-| 3000 | Grafana | `127.0.0.1` (unchanged) | Only through Caddy at `/grafana/` |
+| Port | Service | Bind (before → after) | Reachable from |
+|------|---------|-----------------------|----------------|
+| 80, 443 | Caddy | `0.0.0.0` (unchanged) | Internet: TLS for `/api`, `/grafana/` and the preview domain |
+| 8123, 9000 | ClickHouse | `127.0.0.1` (unchanged) | Host only. Ingest, API and preview use `http://localhost:8123`; Grafana uses `clickhouse:8123` |
+| 9090 | Prometheus | Docker `0.0.0.0:9090` → host socket `*:9090` (systemd) | Before: the whole internet. After: the scraper VM 94.130.141.87 / 2a01:4f8:13b:2ecd::2 (UFW) and the host |
+| 19090 | Prometheus | new, `127.0.0.1` | Host only (target of the 9090 socket) |
+| 3000 | Grafana | `127.0.0.1` (unchanged) | Through Caddy at `/grafana/` |
 
-ClickHouse's metrics port 9363 is not published (Prometheus scrapes it over the compose
-network). Prometheus scrapes the host through `host.docker.internal` (host-gateway,
-172.18.0.1); that is outbound from the container and does not depend on the
-publication.
+**Why 9090 moved to a host socket.** UFW is active (default deny incoming) and already
+allows `9090/tcp` only from 94.130.141.87 and 2a01:4f8:13b:2ecd::2, a VM that scrapes
+this Prometheus (it also scrapes node_exporter on 9100 under the same kind of rule).
+But Docker-published ports are DNATed in `PREROUTING` and forwarded, so they never
+reach UFW's `INPUT` rules: on 2026-10-14 `http://65.21.129.160:9090/` answered from
+anywhere, including unauthenticated `POST /-/quit` and `/-/reload`
+(`--web.enable-lifecycle`). Now Docker publishes Prometheus on `127.0.0.1:19090` only,
+and `pensieve-prometheus-proxy.socket` (systemd, `ops/systemd/`) listens on `:9090`
+(IPv4 and IPv6) and hands each connection to `systemd-socket-proxyd`, which forwards
+it to `127.0.0.1:19090`. The socket is an ordinary host listener, so the existing UFW
+rules gate it exactly like 9100; no firewall change is needed. It fails closed: if the
+proxy or Prometheus is down, the VM's scrape fails and nothing is exposed. Nothing
+depends on Docker's firewall backend or the `DOCKER-USER` chain. Prometheus now sees
+scraper connections as coming from 127.0.0.1 (it does not log clients).
+
+Grafana still uses `http://prometheus:9090` over the compose network, Caddy's
+`/prometheus` block is commented out, and the Kuma probes and ops scripts use the
+ingester's `:9091`. ClickHouse's metrics port 9363 is not published (Prometheus scrapes
+it over the compose network). Prometheus scrapes the host through
+`host.docker.internal` (host-gateway, 172.18.0.1); that is outbound from the container
+and does not depend on the publication.
 
 The `grafana` ClickHouse user (`ops/production/clickhouse/users.xml`, mounted as
 `users.d/custom.xml`) had no `<grants>`, so ClickHouse gave it `GRANT ALL ON *.*` and
@@ -1348,7 +1367,10 @@ curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
 # system.{parts,databases,tables,columns,functions,one} is refused afterwards:
 just ch-query "SELECT arrayJoin(tables) AS t, count() AS n FROM system.query_log WHERE user = 'grafana' AND event_date >= today() - 7 AND type = 'QueryFinish' GROUP BY t ORDER BY n DESC"
 just ch-query "SHOW GRANTS FOR grafana"                    # before: GRANT SHOW, SELECT, INSERT, … ON *.*
-sudo ss -ltnp | grep ':9090'                                # before: 0.0.0.0:9090 and [::]:9090
+sudo ss -ltnp | grep -E ':(9090|19090) '                    # before: docker-proxy on 0.0.0.0:9090 and [::]:9090
+sudo ufw status | grep -E '^9090'                           # ALLOW IN 94.130.141.87 and 2a01:4f8:13b:2ecd::2 only
+ls -l /usr/lib/systemd/systemd-socket-proxyd                # ships with systemd
+ip -6 addr show scope global | grep inet6                   # the host's IPv6 address, for the checks from the VM
 ```
 
 If a panel needs another `system` table, add a `GRANT SELECT ON system.<table>` line to
@@ -1363,14 +1385,22 @@ ln -f ops/production/clickhouse/users.xml ~/clickhouse-users.mounted.xml  # hand
 git merge --ff-only origin/master
 cat ops/production/clickhouse/users.xml > ~/clickhouse-users.mounted.xml  # in place: the server reloads
 sleep 5 && just ch-query "SHOW GRANTS FOR grafana"
+# Prometheus: install the socket, move the container to 127.0.0.1:19090, then take :9090
+sudo install -m 644 ops/systemd/pensieve-prometheus-proxy.socket \
+  ops/systemd/pensieve-prometheus-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
 cd ~/pensieve/ops/production
 docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus
+sudo systemctl enable --now pensieve-prometheus-proxy.socket
 ```
 
 `--no-deps` recreates Prometheus alone (a few seconds without scrapes; its data
-volume is kept). Keep `~/clickhouse-users.mounted.xml` until the ClickHouse container
-is next recreated; after that it no longer refers to the mounted file and can be
-deleted.
+volume is kept). The socket can only bind `:9090` once the recreated container has
+released it, hence the order; the VM misses at most one scrape. The socket is enabled
+in `sockets.target`, so it comes back on boot without Docker; the service starts on
+the first connection. Keep `~/clickhouse-users.mounted.xml` until the ClickHouse
+container is next recreated; after that it no longer refers to the mounted file and
+can be deleted.
 
 ### 3. Verify
 
@@ -1384,12 +1414,22 @@ docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM nostr.events_l
 docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM system.query_log'"     # Code: 497 ACCESS_DENIED
 docker exec pensieve-clickhouse sh -c "$G -q 'SELECT count() FROM INFORMATION_SCHEMA.TABLES'"  # Code: 497
 docker logs --since 5m pensieve-clickhouse 2>&1 | grep -iE 'users|error' | tail
-sudo ss -ltnp | grep ':9090'               # only 127.0.0.1:9090
-curl -s localhost:9090/-/ready
-curl -s 'localhost:9090/api/v1/targets?state=active' \
+# Prometheus, on the host
+sudo ss -ltnp | grep -E ':(9090|19090) '   # *:9090 systemd (pid 1); 127.0.0.1:19090 docker-proxy; no 0.0.0.0:9090
+systemctl is-enabled pensieve-prometheus-proxy.socket; systemctl is-active pensieve-prometheus-proxy.socket
+curl -s localhost:19090/-/ready            # Prometheus directly
+curl -s localhost:9090/-/ready             # through the proxy
+systemctl status pensieve-prometheus-proxy.service --no-pager   # active after the first connection
+curl -s 'localhost:19090/api/v1/targets?state=active' \
   | python3 -c 'import json,sys; [print(t["labels"]["job"], t["health"]) for t in json.load(sys.stdin)["data"]["activeTargets"]]'
-# From outside the host: must time out or be refused
-curl -m 5 http://<public IP>:9090/-/ready
+# From any machine other than the VM (e.g. your workstation): must time out (UFW drops)
+curl -m 5 http://65.21.129.160:9090/-/ready
+curl -m 5 http://65.21.129.160:19090/-/ready
+# From 94.130.141.87 (ssh to the VM): must print "Prometheus Server is Ready."
+curl -m 5 http://65.21.129.160:9090/-/ready
+curl -m 5 'http://[<host IPv6 from the preflight>]:9090/-/ready'   # over IPv6 from 2a01:4f8:13b:2ecd::2
+# ...and the VM's own scrape job or federation target for this host is up again
+# (its Prometheus UI, Status > Targets, or its alert on this target clears).
 # Grafana datasources (repeat for each uid from the preflight), then open the dashboards
 curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources/uid/<uid>/health
 # After an hour: grafana queries that failed (expect none, or only bundled plugin dashboards)
@@ -1397,6 +1437,15 @@ just ch-query "SELECT event_time, exception_code, substring(query, 1, 100) FROM 
 ```
 
 The `node` target is down if node_exporter is not installed; that was true before too.
+
+**Restarts.** The 9090 gate lives in a systemd socket and UFW's `INPUT` rules, not in
+Docker's chains, so `systemctl restart docker` cannot open or remove it. Docker only
+re-creates its rules for `127.0.0.1:19090`. Restarting Docker also restarts ClickHouse,
+with the same impact as the [fallback](#fallback-inodes-differ-in-the-preflight); do not
+do it only to test this. At the next planned Docker restart or reboot, rerun the
+Prometheus block above (host, outside and VM checks). Expect `is-enabled` = `enabled`
+and the socket `active` before Docker is up. The Debian 13 test of these units passed
+across a reboot.
 
 ### 4. Rollback
 
@@ -1409,9 +1458,21 @@ The `node` target is down if node_exporter is not installed; that was true befor
   sleep 5 && just ch-query "SHOW GRANTS FOR grafana"   # GRANT SHOW, SELECT, INSERT, … ON *.*
   ```
   For a single missing table, prefer adding a `GRANT SELECT ON system.<table>` line.
-- **Prometheus port:** use `ssh -L 9090:127.0.0.1:9090 pensieve` for remote access.
-  If something off-host really needs `:9090`, revert the `ports:` line on master,
-  `git merge --ff-only origin/master`, and rerun the `up -d --no-deps prometheus` above.
+- **Prometheus, VM loses access:** first check the socket (`systemctl status
+  pensieve-prometheus-proxy.socket pensieve-prometheus-proxy.service`,
+  `journalctl -u pensieve-prometheus-proxy.service`) and `curl localhost:19090/-/ready`.
+  Operators can always use `ssh -L 9090:127.0.0.1:19090 pensieve`.
+- **Prometheus, remove the proxy** (the VM stops scraping; nothing is exposed):
+  ```bash
+  sudo systemctl disable --now pensieve-prometheus-proxy.socket
+  sudo systemctl stop pensieve-prometheus-proxy.service
+  sudo rm /etc/systemd/system/pensieve-prometheus-proxy.{socket,service} && sudo systemctl daemon-reload
+  ```
+- **Prometheus, back to the old publication** (exposes 9090 to the internet again,
+  whatever UFW says): remove the proxy as above, revert the `ports:` line to
+  `"9090:9090"` on master, `git -C ~/pensieve merge --ff-only origin/master`, and rerun
+  the `up -d --no-deps prometheus` command from step 2. The socket must be stopped
+  first or Docker cannot bind 9090.
 
 ### Fallback: inodes differ in the preflight
 

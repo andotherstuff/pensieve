@@ -1,0 +1,20 @@
+# Forwards connections accepted by pensieve-prometheus-proxy.socket (:9090) to
+# Prometheus, which Docker publishes on 127.0.0.1:19090 only.
+# systemd-socket-proxyd ships with systemd; no extra package is needed.
+# Started on the first connection; not enabled on its own.
+
+[Unit]
+Description=Pensieve Prometheus proxy (:9090 to 127.0.0.1:19090)
+Requires=pensieve-prometheus-proxy.socket
+After=pensieve-prometheus-proxy.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --connections-max=64 127.0.0.1:19090
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
