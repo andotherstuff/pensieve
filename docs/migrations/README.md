@@ -802,9 +802,11 @@ rows whose hour is newer than now − 35 days (recent rows are spread over
 every granule, so about the read of 020's kinds backfill: ~320 GiB
 uncompressed, ~1.5–2 h at 2 threads including pauses; `plan` prints the
 measured estimate). A re-run shard is harmless. `validate --migration 022` compares every (kind,
-hour) and (all kinds, hour) sketch of the last `--hour-days` days, and the
-all-kinds day unions of `kind_activity` that `/stats/events` reads, with exact
-distinct counts.
+hour) and (all kinds, hour) sketch of the last `--hour-days` days (all 30 by
+default while the view is younger than 35 days), and the all-kinds day unions
+of `kind_activity` that `/stats/events` reads, with exact distinct counts; it
+fails while the backfill is incomplete per the checkpoints. No API release
+from #101 on may be deployed before this passes.
 
 **Behaviour changes** (details in [`docs/api_rollups.md`](../api_rollups.md#migration-022-hourly-pubkeys)):
 - `/stats/activity/hourly`: UTC hours from the UTC hour containing

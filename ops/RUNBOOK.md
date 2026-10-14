@@ -1293,10 +1293,19 @@ and the `/stats/events` section before it.
 **Order:** apply 022 → plan → backfill → validate → deploy the API that reads
 it → benchmark → monitor. The API release reads 021 (applied) for
 `/stats/events` and `/stats/throughput`, and 022 for the hourly pattern.
-Deploying it before step 5 would serve undercounted `unique_pubkeys` on
-`/stats/activity/hourly` until the backfill finishes, or `503` before step 2.
 The previous API does not read `hourly_pubkeys`, so nothing serves the table
 while it fills.
+
+> **Deploy gate.** No `api-*` release cut from master at or after PR #101 may
+> be deployed until 022 has been applied, backfilled (`$AR status`: 256/256
+> shards) and validated (step 5 exits 0). The API cannot tell an
+> un-backfilled `hourly_pubkeys` from a complete one. An early deploy looks
+> like this on `/stats/activity/hourly` only (`/stats/events` and
+> `/stats/throughput` are fine, they need 021):
+> - before step 2: `503 metric_unavailable` on every request;
+> - after step 2, before the backfill completes: `200` with **undercounted
+>   `unique_pubkeys`** (only authors the view has seen since it was created,
+>   plus the shards done so far); `event_count` and `avg_per_day` are right.
 
 Use the `api-rollups` binary from the release that contains this migration
 (`$AR` as for 019–021, same `--checkpoint-dir`; the target gets its own
@@ -1360,18 +1369,28 @@ to resume.
 
 ### 5. Validate
 
+First `$AR status` must show `hourly-pubkeys` at `256/256` shards and `0`
+pending. Then:
+
 ```bash
 $AR validate --migration 022 --out /home/pensieve/api-rollups/validate-022.json
 ```
 
-- It must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target.
-- It compares every (kind, hour) and (all kinds, hour) sketch of the last two
-  whole UTC days (`--hour-days`, up to 30) with exact counts. It also compares
-  each day's all-kinds `kind_activity` union (author sketch and event count)
-  that `/stats/events` reads.
+- It must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target. Do not
+  deploy the API otherwise (see the deploy gate above).
+- While `hourly_pubkeys_mv` is younger than 35 days, a backfill that is not
+  complete per the checkpoints fails the target (row `hourly-pubkeys
+  backfill`), and the default window is all 30 days the API can read, so
+  hours missing from the backfill show as `missing` rows. Do not pass a
+  smaller `--hour-days` for this validation.
+- It compares every (kind, hour) and (all kinds, hour) sketch of that window
+  with exact counts. It also compares each day's all-kinds `kind_activity`
+  union (author sketch and event count) that `/stats/events` reads.
 - Cost: one scan reading `pubkey` of nearly every granule (~150 GiB
-  uncompressed, ~10–30 min at 2 threads). Record the notes, which give the
-  group counts and the largest sketch error.
+  uncompressed, ~10–30 min at 2 threads). Over 30 days it keeps one entry per
+  distinct (kind, hour, pubkey), (hour, pubkey) and (day, pubkey), roughly
+  ~60 B each, and spills to disk beyond half of `--max-memory-gib`. Record
+  the notes, which give the group counts and the largest sketch error.
 
 ### 6. Deploy the API
 
@@ -1413,7 +1432,7 @@ SELECT toHour(created_at) AS hour, count(), uniq(pubkey) FROM events_local WHERE
 SELECT toUInt64(sum(r.event_count)) AS count, uniqCombined64Merge(r.pubkeys) AS unique_pubkeys FROM kind_activity AS r WHERE (r.grain = 'day' AND r.period >= toDateTime(toDate(now() - INTERVAL 30 DAY), 'UTC') AND r.period < toDateTime(toDate(now()) + 1, 'UTC')) SETTINGS max_threads = 4, log_comment = 'bench-022:events:new';
 SELECT toUInt64(sum(r.event_count)) AS count, uniqCombined64Merge(r.pubkeys) AS unique_pubkeys FROM kind_activity AS r WHERE r.kind = 1 AND (r.grain = 'day' AND r.period >= toDateTime(toDate(now() - INTERVAL 30 DAY), 'UTC') AND r.period < toDateTime(toDate(now()) + 1, 'UTC')) SETTINGS max_threads = 4, log_comment = 'bench-022:events-kind1:new';
 SELECT toUInt64(sum(r.event_count)) FROM kind_activity AS r WHERE r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay(7), 'UTC') SETTINGS max_threads = 4, log_comment = 'bench-022:throughput:new';
-SELECT c.hour AS hour, c.event_count AS event_count, p.unique_pubkeys AS unique_pubkeys, toFloat64(c.event_count) / 30 AS avg_per_day FROM (SELECT toHour(r.period, 'UTC') AS hour, toUInt64(sum(r.event_count)) AS event_count FROM kind_activity AS r WHERE r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS c LEFT JOIN (SELECT toHour(h.period, 'UTC') AS hour, uniqCombined64Merge(h.pubkeys) AS unique_pubkeys FROM hourly_pubkeys AS h WHERE h.kind = -1 AND h.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS p ON c.hour = p.hour ORDER BY hour ASC SETTINGS max_threads = 4, log_comment = 'bench-022:hourly30:new' FORMAT Null;
+SELECT c.hour AS hour, c.event_count AS event_count, p.unique_pubkeys AS unique_pubkeys, toFloat64(c.event_count) / 30 AS avg_per_day FROM (SELECT toHour(r.period, 'UTC') AS hour, toUInt64(sum(r.event_count)) AS event_count FROM kind_activity AS r WHERE r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS c LEFT JOIN (SELECT toHour(h.period, 'UTC') AS hour, uniqCombined64Merge(h.pubkeys) AS unique_pubkeys FROM hourly_pubkeys AS h WHERE h.kind = -1 AND h.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS p ON c.hour = p.hour ORDER BY hour ASC SETTINGS join_use_nulls = 0, max_threads = 4, log_comment = 'bench-022:hourly30:new' FORMAT Null;
 
 SYSTEM FLUSH LOGS;
 SELECT log_comment, query_duration_ms, read_rows, formatReadableSize(read_bytes) AS read, formatReadableSize(memory_usage) AS memory

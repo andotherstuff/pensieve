@@ -798,8 +798,17 @@ row.
 ### Validation (`validate --migration 022`)
 
 The rollups are read first, then `events_local` is scanned once. The scan
-starts at the UTC day `--hour-days` days before the cutoff (default 2, at most
-30): `PREWHERE created_at >=` that day. It keeps `sipHash128(pubkey)` and the
+starts at the UTC day `--hour-days` days before the cutoff (at most 30):
+`PREWHERE created_at >=` that day.
+
+**Default window and the backfill.** While `hourly_pubkeys_mv` is younger
+than 35 days, hours the API reads can hold events indexed before the view,
+which only the backfill writes. So the default `--hour-days` is then all 30
+days, and a missing or partial backfill shows up as `missing` rows. Once the
+view is older than 35 days every readable hour was captured by the view, and
+the default drops to 2. Independently, while the view is younger than 35
+days, a backfill that is not complete per the `--checkpoint-dir` checkpoints
+fails the target (a `hourly-pubkeys backfill` row), whatever the window. It keeps `sipHash128(pubkey)` and the
 first `indexed_at` per (kind, hour), (all kinds, hour) and (all kinds, UTC
 day).
 
@@ -812,6 +821,14 @@ Each estimate must lie within `max(4σ, 2)` of the exact interval
 
 The day's `kind_activity` event count is bracketed the same way. Missing and
 extra rows show as `missing` and `excess`.
+
+**Not validated (follow-up):** the month rows' author sketches, which
+`/stats/events` merges for full months inside long windows. An exact all-kinds
+union over a month means tens of millions of distinct authors (hundreds of
+millions with kinds 1059 and 445), too heavy for this scan. Month rows are
+written by the same view expressions as day rows, and 021's tests compare
+both with exact oracles; a sampled-kind month check could be added to
+`validate --migration 021`.
 
 **Cost:** `created_at` of the whole table (~10 GiB uncompressed), plus `kind`,
 `pubkey` and `indexed_at` of nearly every granule (about one full read of

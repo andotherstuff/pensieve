@@ -11,7 +11,13 @@
 //!
 //! Compared, from the UTC day `--hour-days` days before the cutoff on (every
 //! hour the endpoint reads lies within 30 days, so `--hour-days` is at most
-//! 30):
+//! 30). By default that is 30 days while `hourly_pubkeys_mv` is younger than
+//! 35 days: until then hours the API reads may hold events indexed before the
+//! view, which only the backfill writes, so a missing or partial backfill
+//! shows up as `missing` rows. Once the view is older, every readable hour
+//! was captured by the view and 2 days suffice. While the view is younger
+//! than 35 days a backfill that is not complete per the checkpoints also fails
+//! the target, whatever the window.
 //!
 //! - every (kind, hour) and (all kinds, hour) sketch of `hourly_pubkeys`;
 //! - per UTC day, the union of every kind's `kind_activity` day sketch (what
@@ -31,13 +37,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::Target;
-use super::hourly_pubkeys::{HOURLY_MAX_DAYS, HOURLY_PUBKEYS_TABLE};
-use super::kind_activity::KIND_ACTIVITY_TABLE;
+use super::hourly_pubkeys::{HOURLY_MAX_DAYS, HOURLY_PUBKEYS_TABLE, HOURLY_PUBKEYS_VIEW};
+use super::kind_activity::{HOUR_ROWS_DAYS, KIND_ACTIVITY_TABLE};
 use super::validate::{
     Ctx, Outcome, TargetReport, classify_shares, sketch_error, sketch_tolerance,
 };
 use super::validate_derived::{Worst, describe_worst, track_worst};
+use super::{Target, ops};
 
 /// `log_comment` of the exact distinct-pubkeys scan.
 pub const SCAN_LOG_COMMENT: &str = "api-rollups:validate:hourly-pubkeys";
@@ -77,6 +83,27 @@ struct Scan {
     rows_settled: u64,
 }
 
+/// `--hour-days` once the view is older than the hour rows' 35 days.
+const SETTLED_HOUR_DAYS: u32 = 2;
+
+/// Whether hours the API reads may still depend on the backfill: the view
+/// (created at `view_created_at`, `None` if missing) is younger than the
+/// hour rows' [`HOUR_ROWS_DAYS`] at `cutoff`.
+pub(super) fn backfill_matters(view_created_at: Option<u32>, cutoff: u32) -> bool {
+    view_created_at
+        .is_none_or(|t0| u64::from(t0) + u64::from(HOUR_ROWS_DAYS) * 86_400 > u64::from(cutoff))
+}
+
+/// Days compared by default: all [`HOURLY_MAX_DAYS`] while the backfill
+/// matters, else [`SETTLED_HOUR_DAYS`].
+pub(super) fn default_hour_days(backfill_matters: bool) -> u32 {
+    if backfill_matters {
+        HOURLY_MAX_DAYS
+    } else {
+        SETTLED_HOUR_DAYS
+    }
+}
+
 /// First compared second: the start of the UTC day `days` days before
 /// `cutoff`.
 pub(super) fn first_compared_day(cutoff: u32, days: u32) -> u32 {
@@ -108,11 +135,38 @@ fn sketch_outcome(approx: u64, lo: u64, hi: u64, sigmas: f64) -> Outcome {
     }
 }
 
-pub(super) async fn hourly_pubkeys(ctx: &Ctx<'_>) -> Result<TargetReport> {
+pub(super) async fn hourly_pubkeys(
+    ctx: &Ctx<'_>,
+    backfill_complete: Option<bool>,
+) -> Result<TargetReport> {
     let (db, o) = (ctx.db, ctx.options);
     let mut report = TargetReport::new(Target::HourlyPubkeys);
-    let days = o.hour_days.clamp(1, HOURLY_MAX_DAYS);
+    let view_created_at = ops::table_created_at(ctx.client, db, HOURLY_PUBKEYS_VIEW).await?;
+    let matters = backfill_matters(view_created_at, ctx.cutoff);
+    let days = o
+        .hour_days
+        .unwrap_or_else(|| default_hour_days(matters))
+        .clamp(1, HOURLY_MAX_DAYS);
     let start = first_compared_day(ctx.cutoff, days);
+    match (backfill_complete, matters) {
+        (Some(false), true) => report.record(
+            "hourly-pubkeys backfill",
+            Outcome::Missing,
+            "the backfill is not complete per the checkpoints (or not planned here) while \
+             hours the API reads predate the view: finish `backfill --migration 022` first"
+                .to_string(),
+            o.max_examples,
+        ),
+        (Some(false), false) => report.notes.push(
+            "the backfill is not complete per the checkpoints, but the view is older than 35 \
+             days: every hour the API reads was captured by the view"
+                .to_string(),
+        ),
+        (Some(true), _) => report
+            .notes
+            .push("backfill complete per the checkpoints".to_string()),
+        (None, _) => {}
+    }
 
     // Rollups first.
     let hours: Vec<HourSketch> = ctx
@@ -242,6 +296,17 @@ pub(super) async fn hourly_pubkeys(ctx: &Ctx<'_>) -> Result<TargetReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_whole_window_is_compared_while_the_backfill_matters() {
+        let cutoff = 1_791_763_200;
+        assert!(backfill_matters(None, cutoff));
+        assert!(backfill_matters(Some(cutoff - 5 * 86_400), cutoff));
+        assert!(backfill_matters(Some(cutoff - 35 * 86_400 + 1), cutoff));
+        assert!(!backfill_matters(Some(cutoff - 35 * 86_400), cutoff));
+        assert_eq!(default_hour_days(true), 30);
+        assert_eq!(default_hour_days(false), 2);
+    }
 
     #[test]
     fn windows_start_on_whole_utc_days() {

@@ -168,9 +168,11 @@ enum Command {
         content_budget_events: u64,
         /// Hourly-pubkeys: whole UTC days before the cutoff whose hour
         /// sketches and all-kinds day unions are compared with exact counts
-        /// (1-30; one scan reading pubkey of nearly every granule).
-        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=30))]
-        hour_days: u32,
+        /// (1-30; one scan reading pubkey of nearly every granule). Default:
+        /// 30 while hourly_pubkeys_mv is younger than 35 days (hours the API
+        /// reads may still depend on the backfill), else 2.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=30))]
+        hour_days: Option<u32>,
         /// Write the JSON report here.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -420,9 +422,14 @@ async fn run(args: Args) -> Result<ExitCode> {
             out,
         } => {
             let targets = select.targets()?;
+            let mut hourly_pubkeys_backfill_complete = None;
             for target in &targets {
                 let checkpoints = CheckpointDir::new(&args.checkpoint_dir, *target);
-                if !backfill::is_complete(&checkpoints)? {
+                let complete = backfill::is_complete(&checkpoints)?;
+                if *target == Target::HourlyPubkeys {
+                    // Checked by the validator: an incomplete backfill fails.
+                    hourly_pubkeys_backfill_complete = Some(complete);
+                } else if !complete {
                     eprintln!(
                         "warning: {target} backfill is not complete (or not planned here); \
                          missing rows are expected"
@@ -460,6 +467,7 @@ async fn run(args: Args) -> Result<ExitCode> {
                 kinds_plan: kinds_plan.as_ref(),
                 kind_activity_plan: kind_activity_plan.as_ref(),
                 cutover_at,
+                hourly_pubkeys_backfill_complete,
             };
             let report = validate::run_with(&client, &database, &options, &inputs).await?;
             print!("{}", report.render());

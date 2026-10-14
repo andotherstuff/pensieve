@@ -237,7 +237,7 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
 `docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`; 020 replaces the `daily_user_stats_mv` lookups and the `kinds_stats_mv` / `relay_distribution_mv` rescans in two phases, the second run by `api-rollups cutover`; 021 creates `kind_activity` behind `/kinds/{kind}`, `/kinds/{kind}/activity`, `/stats/events` and `/stats/throughput`; 022 creates `hourly_pubkeys` behind `/stats/activity/hourly`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-13):** 001–015 and prepared 016, 017, 018, 019, 020 and 021 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13). Prepared 022 (`hourly_pubkeys`) is not yet applied; apply, backfill and validate it before deploying an API that reads it (RUNBOOK → Hourly authors). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state (2026-10-13):** 001–015 and prepared 016, 017, 018, 019, 020 and 021 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13). Prepared 022 (`hourly_pubkeys`) is not yet applied. **Deploy gate:** no `api-*` release cut from master at or after PR #101 may be deployed until 022 has been applied, backfilled (`api-rollups status`: 256/256) and validated (`validate --migration 022` exits 0); an early deploy answers `/stats/activity/hourly` with 503 before the apply and with undercounted `unique_pubkeys` while the backfill is incomplete (RUNBOOK → Hourly authors). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -351,6 +351,8 @@ Per component, as done for `api-*` and `preview-3ab1045` (full steps in the RUNB
 4. Verify `/proc/<pid>/exe`, the journal and the health endpoint. Keep the previous release directory.
 
 Migrations are applied separately and explicitly (`just ch-migrate <file>`), never with `just ch-migrate-all`.
+
+> **API deploy gate (since PR #101):** an `api-*` release cut from master at or after #101 reads migration 022's `hourly_pubkeys`. Do not deploy one until 022 is applied, backfilled and validated (ops/RUNBOOK.md → Hourly authors (migration 022)): before the apply `/stats/activity/hourly` answers 503, and while the backfill is incomplete it answers 200 with undercounted `unique_pubkeys`.
 
 ### Service Management
 

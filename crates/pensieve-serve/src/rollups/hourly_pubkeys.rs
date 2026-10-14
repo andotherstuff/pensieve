@@ -130,7 +130,8 @@ pub fn hourly_activity_sql(days: u32, kind: bool) -> String {
          WHERE h.kind = ? AND h.period >= toStartOfHour(now() - toIntervalDay({days}), 'UTC') \
          GROUP BY hour \
          ) AS p ON c.hour = p.hour \
-         ORDER BY hour ASC",
+         ORDER BY hour ASC \
+         SETTINGS join_use_nulls = 0",
         hour_window(days)
     )
 }
@@ -231,7 +232,8 @@ mod tests {
         let one = hourly_activity_sql(30, true);
         assert_eq!(one.matches('?').count(), 2);
         assert!(one.find("r.kind = ?").unwrap() < one.find("h.kind = ?").unwrap());
-        assert!(one.ends_with("ORDER BY hour ASC"));
+        // An hour without sketches reads 0 authors, never NULL.
+        assert!(one.ends_with("ORDER BY hour ASC SETTINGS join_use_nulls = 0"));
         assert_eq!(hourly_pubkeys_kind(None), -1);
         assert_eq!(hourly_pubkeys_kind(Some(1059)), 1059);
     }

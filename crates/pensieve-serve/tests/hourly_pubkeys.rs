@@ -395,7 +395,7 @@ fn validate_options() -> ValidateOptions {
     ValidateOptions {
         targets: vec![Target::HourlyPubkeys],
         cutoff_margin: Duration::from_secs(1),
-        hour_days: 30,
+        hour_days: Some(30),
         ..ValidateOptions::default()
     }
 }
@@ -820,6 +820,101 @@ async fn hourly_pubkeys_backfill_reads_and_validation() {
     assert!(!report.passed(), "{}", report.render());
     assert_eq!(report.targets[0].failures(), 1, "{}", report.render());
     assert!(report.targets[0].rows.contains_key(&Outcome::Excess));
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable ClickHouse at PENSIEVE_TEST_CLICKHOUSE_URL"]
+async fn validation_fails_while_the_backfill_is_missing() {
+    let db = TestDb::new().await;
+    let now = db.now().await;
+    // History from 5 days ago, indexed before migration 022: only the
+    // backfill writes it. Outside the old 2-day default window.
+    let history: Vec<Ev> = (0..200)
+        .map(|n| {
+            ev(
+                n,
+                n % 17,
+                [1, 7][n as usize % 2],
+                now - 5 * DAY + n as u32 * 60,
+                5,
+            )
+        })
+        .collect();
+    db.insert_at(now - 5 * DAY + 3 * 3600, &history).await;
+    db.apply(MIGRATION_022).await.expect("migration 022");
+    for chunk in workload(1_000, 100, now).chunks(50) {
+        db.insert(chunk).await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let plan = plan::build_plan(
+        &db.client,
+        &db.name,
+        Target::HourlyPubkeys,
+        &PlanOptions {
+            id_prefix_len: 1,
+            boundary_margin_secs: 5,
+        },
+    )
+    .await
+    .unwrap();
+    let cp = CheckpointDir::new(dir.path(), Target::HourlyPubkeys);
+    cp.save_plan(&plan, false).unwrap();
+    assert!(!backfill::is_complete(&cp).unwrap());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Default window: the view is younger than 35 days, so all 30 days are
+    // compared and the history's hours are missing.
+    let options = ValidateOptions {
+        targets: vec![Target::HourlyPubkeys],
+        cutoff_margin: Duration::from_secs(1),
+        ..ValidateOptions::default()
+    };
+    let report = validate::run_with(&db.client, &db.name, &options, &ValidateInputs::default())
+        .await
+        .unwrap();
+    eprintln!("{}", report.render());
+    assert!(!report.passed(), "{}", report.render());
+    assert!(
+        report.targets[0].rows[&Outcome::Missing] > 5,
+        "{}",
+        report.render()
+    );
+
+    // A 2-day window does not reach the history, but the checkpoints say the
+    // backfill is incomplete: still a failure.
+    let two_days = ValidateOptions {
+        hour_days: Some(2),
+        ..options.clone()
+    };
+    let unknown = validate::run_with(&db.client, &db.name, &two_days, &ValidateInputs::default())
+        .await
+        .unwrap();
+    assert!(unknown.passed(), "{}", unknown.render());
+    let incomplete = ValidateInputs {
+        hourly_pubkeys_backfill_complete: Some(false),
+        ..ValidateInputs::default()
+    };
+    let report = validate::run_with(&db.client, &db.name, &two_days, &incomplete)
+        .await
+        .unwrap();
+    assert!(!report.passed(), "{}", report.render());
+    assert_eq!(report.targets[0].failures(), 1, "{}", report.render());
+    assert_eq!(report.targets[0].examples[0].key, "hourly-pubkeys backfill");
+
+    // After the backfill both pass.
+    let done = backfill::run_backfill(&db.client, &plan, &cp, &backfill_options())
+        .await
+        .unwrap();
+    assert_eq!(done.stopped, StopReason::Complete);
+    let complete = ValidateInputs {
+        hourly_pubkeys_backfill_complete: Some(backfill::is_complete(&cp).unwrap()),
+        ..ValidateInputs::default()
+    };
+    let report = validate::run_with(&db.client, &db.name, &options, &complete)
+        .await
+        .unwrap();
+    assert!(report.passed(), "{}", report.render());
     db.drop().await;
 }
 

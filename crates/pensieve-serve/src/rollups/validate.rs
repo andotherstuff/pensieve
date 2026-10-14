@@ -96,8 +96,9 @@ pub struct ValidateOptions {
     /// can pull one granule of `content` into the scan).
     pub content_budget_events: u64,
     /// Hourly pubkeys: whole UTC days before the cutoff whose hour sketches
-    /// (and all-kinds day unions) are compared exactly (at most 30).
-    pub hour_days: u32,
+    /// (and all-kinds day unions) are compared exactly (at most 30). `None`:
+    /// 30 while `hourly_pubkeys_mv` is younger than 35 days, else 2.
+    pub hour_days: Option<u32>,
 }
 
 impl Default for ValidateOptions {
@@ -120,7 +121,7 @@ impl Default for ValidateOptions {
             pubkeys_max_exact: 20_000_000,
             pubkeys_sigmas: 4.0,
             content_budget_events: 5_000,
-            hour_days: 2,
+            hour_days: None,
         }
     }
 }
@@ -319,6 +320,10 @@ pub struct ValidateInputs<'a> {
     pub kind_activity_plan: Option<&'a Plan>,
     /// Migration 020 cutover time (`finished_at`), when it ran.
     pub cutover_at: Option<u32>,
+    /// Whether the hourly-pubkeys backfill is complete per the checkpoints
+    /// (`None`: unknown, not checked). An incomplete backfill fails the
+    /// target while the view is younger than 35 days.
+    pub hourly_pubkeys_backfill_complete: Option<bool>,
 }
 
 /// Run validation. `client` should carry resource limits. `publisher_plan`
@@ -371,7 +376,13 @@ pub async fn run_with(
             Target::KindActivity => {
                 validate_kind_activity::kind_activity(&ctx, inputs.kind_activity_plan).await?
             }
-            Target::HourlyPubkeys => validate_hourly_pubkeys::hourly_pubkeys(&ctx).await?,
+            Target::HourlyPubkeys => {
+                validate_hourly_pubkeys::hourly_pubkeys(
+                    &ctx,
+                    inputs.hourly_pubkeys_backfill_complete,
+                )
+                .await?
+            }
         });
     }
     Ok(ValidationReport {
