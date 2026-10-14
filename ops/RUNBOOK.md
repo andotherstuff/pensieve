@@ -1268,6 +1268,230 @@ just ch-query "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows), count()
   Re-applying 021 later needs `plan --migration 021 --discard-progress` and a full backfill
   (the migration's guard refuses a non-empty table without its view).
 
+## Hourly authors (migration 022)
+
+Moves three `pensieve-serve` endpoints off scans of `events_local`:
+
+- `GET /api/v1/stats/events` (kind-filtered or ungrouped) and
+  `GET /api/v1/stats/throughput` read 021's `kind_activity`. This needs no
+  migration.
+- `GET /api/v1/stats/activity/hourly` reads `kind_activity`'s hour rows for
+  the counts and `hourly_pubkeys` for the distinct authors. `hourly_pubkeys`
+  is a new insert-fed table of per kind and all-kinds UTC-hour author
+  sketches, kept for 35 days.
+
+Production timings with the API on master (2026-10-14): `/stats/events` 5.46 s,
+`?kind=1` 4.39 s, `?kind=7&days=30` 4.33 s, `/stats/activity/hourly?days=30`
+6.72 s. The default hourly request and `/stats/throughput` answered from the
+API cache, and every cache refresh rescanned. Design, time basis and behaviour
+changes:
+[`docs/api_rollups.md` → Migration 022](../docs/api_rollups.md#migration-022-hourly-pubkeys)
+and the `/stats/events` section before it.
+
+**Status:** prepared, not yet applied.
+
+**Order:** apply 022 → plan → backfill → validate → deploy the API that reads
+it → benchmark → monitor. The API release reads 021 (applied) for
+`/stats/events` and `/stats/throughput`, and 022 for the hourly pattern.
+The previous API does not read `hourly_pubkeys`, so nothing serves the table
+while it fills.
+
+> **Deploy gate.** No `api-*` release cut from master at or after PR #101 may
+> be deployed until 022 has been applied, backfilled (`$AR status`: 256/256
+> shards) and validated (step 5 exits 0). The API cannot tell an
+> un-backfilled `hourly_pubkeys` from a complete one. An early deploy looks
+> like this on `/stats/activity/hourly` only (`/stats/events` and
+> `/stats/throughput` are fine, they need 021):
+> - before step 2: `503 metric_unavailable` on every request;
+> - after step 2, before the backfill completes: `200` with **undercounted
+>   `unique_pubkeys`** (only authors the view has seen since it was created,
+>   plus the shards done so far); `event_count` and `avg_per_day` are right.
+
+Use the `api-rollups` binary from the release that contains this migration
+(`$AR` as for 019–021, same `--checkpoint-dir`; the target gets its own
+`hourly-pubkeys/` subdirectory).
+
+### 1. Preflight (read-only)
+
+```bash
+just ch-query "SELECT version(), timezone()"
+just ch-query "SELECT name, formatReadableSize(unreserved_space) unreserved FROM system.disks"
+just ch-query "SELECT view_name, count() n, round(avg(view_duration_ms)) avg_ms, max(view_duration_ms) max_ms FROM system.query_views_log WHERE event_time > now() - INTERVAL 24 HOUR GROUP BY view_name ORDER BY avg_ms DESC"
+just ch-query "SELECT count() n, quantile(0.95)(query_duration_ms) p95_ms, countIf(exception != '') errors FROM system.query_log WHERE event_time > now() - INTERVAL 3 HOUR AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
+```
+
+`timezone()` should be `UTC`. The old endpoints used the server time zone for
+`since`/`until`, periods and hours; the new reads use UTC.
+
+### 2. Apply
+
+Outside :58–:07 UTC:
+
+```bash
+just ch-migrate docs/migrations/prepared/022_hourly_pubkeys.sql
+```
+
+Watch the new view for 30 minutes. Expect a few ms per insert, like
+`kind_activity_mv`. Also watch insert latency:
+
+```bash
+just ch-query "SELECT view_name, status, count(), round(avg(view_duration_ms)) avg_ms, max(view_duration_ms) max_ms, any(exception) FROM system.query_views_log WHERE event_time > now() - INTERVAL 30 MINUTE AND view_name IN ('nostr.hourly_pubkeys_mv', 'nostr.kind_activity_mv') GROUP BY view_name, status ORDER BY view_name"
+just ch-query "SELECT count() n, countIf(exception != '') errors, any(exception), quantile(0.95)(query_duration_ms) p95_ms FROM system.query_log WHERE event_time > now() - INTERVAL 30 MINUTE AND query_kind = 'Insert' AND has(tables, 'nostr.events_local') AND type != 'QueryStart'"
+```
+
+**Abort:** if the view throws or inserts fail, run
+`docs/migrations/rollback/022_drop_hourly_pubkeys.sql` at once.
+
+### 3. Plan
+
+The view is idempotent, so there is no boundary to wait for:
+
+```bash
+$AR plan --migration 022 --min-free-gib 100
+```
+
+`plan` prints `source bounds: rows whose created_at hour is newer than now() -
+35 days`. Expect about the read of 020's kinds backfill: id, pubkey, kind,
+created_at and indexed_at, ~320 GiB uncompressed (recent rows are in nearly
+every granule). The output is small; the plan assumes 256 B per pre-merge row.
+
+### 4. Backfill (bounded, resumable)
+
+```bash
+$AR --max-threads 2 --max-memory-gib 8 backfill --migration 022 --max-runtime-mins 120 --delay-secs 5 --min-free-gib 100
+$AR status
+```
+
+The backfill starts at least 10 minutes after the view's creation
+(`--grace-mins`). A shard that runs twice is harmless (sketch union), and an
+unknown outcome is simply retried. Exit code 2 means it stopped early; re-run
+to resume.
+
+### 5. Validate
+
+First `$AR status` must show `hourly-pubkeys` at `256/256` shards and `0`
+pending. Then:
+
+```bash
+$AR validate --migration 022 --out /home/pensieve/api-rollups/validate-022.json
+```
+
+- It must exit 0 with `failed rows: 0` and no `INCONCLUSIVE` target. Do not
+  deploy the API otherwise (see the deploy gate above).
+- While `hourly_pubkeys_mv` is younger than 35 days, a backfill that is not
+  complete per the checkpoints fails the target (row `hourly-pubkeys
+  backfill`), and the default window is all 30 days the API can read, so
+  hours missing from the backfill show as `missing` rows. Do not pass a
+  smaller `--hour-days` for this validation.
+- It compares every (kind, hour) and (all kinds, hour) sketch of that window
+  with exact counts. It also compares each day's all-kinds `kind_activity`
+  union (author sketch and event count) that `/stats/events` reads.
+- Cost: one scan reading `pubkey` of nearly every granule (~150 GiB
+  uncompressed, ~10–30 min at 2 threads). Over 30 days it keeps one entry per
+  distinct (kind, hour, pubkey), (hour, pubkey) and (day, pubkey), roughly
+  ~60 B each, and spills to disk beyond half of `--max-memory-gib`. Record
+  the notes, which give the group counts and the largest sketch error.
+
+### 6. Deploy the API
+
+Only after step 5 passed (deploy gate above). Build the release and point the
+`pensieve-api` drop-in (`90-postgres-cutover.conf`) at it as in
+[Routine deploy](#routine-deploy); the migration 019 section's
+[Deploy the API](#api-rollups-migration-019) step shows the same drop-in
+switch. Update the drop-in record in `ops/systemd/dropins/` in the same PR.
+Then:
+
+```bash
+for q in "stats/events" "stats/events?kind=1" "stats/events?kind=7&days=30" "stats/events?kind=1&days=90&group_by=week" \
+         "stats/throughput" "stats/throughput?kind=1" "stats/activity/hourly" "stats/activity/hourly?days=30" "stats/activity/hourly?days=30&kind=1"; do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s $q\n" -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/$q"
+done
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" "http://localhost:8080/api/v1/stats/activity/hourly?days=90"   # 400 now
+journalctl -u pensieve-api --since "10 min ago" | grep -i "rollup\|error"
+```
+
+Expect every request well under a second (they read thousands of small rows,
+not `events_local`), and `400` for `days` above 30 on the hourly pattern.
+
+### 7. Benchmark (old vs new)
+
+Run this on the host, outside :58–:07 UTC. The four old queries take several
+seconds each at the API's 4 threads; the new ones are what the API now sends.
+
+```bash
+docker exec -i pensieve-clickhouse clickhouse-client --database nostr <<'SQL'
+-- Estimates only (no data read): marks and rows each read would touch.
+EXPLAIN ESTIMATE SELECT count(), uniq(pubkey) FROM events_local WHERE created_at <= now() AND created_at >= now() - INTERVAL 30 DAY;
+EXPLAIN ESTIMATE SELECT toUInt64(sum(r.event_count)), uniqCombined64Merge(r.pubkeys) FROM kind_activity AS r WHERE r.grain = 'day' AND r.period >= toDateTime(toDate(now() - INTERVAL 30 DAY), 'UTC');
+EXPLAIN ESTIMATE SELECT uniqCombined64Merge(h.pubkeys) FROM hourly_pubkeys AS h WHERE h.kind = -1 AND h.period >= toStartOfHour(now() - INTERVAL 30 DAY, 'UTC');
+
+-- Old reads (as the API ran them).
+SELECT count(), uniq(pubkey) FROM events_local WHERE created_at <= now() AND created_at >= now() - INTERVAL 30 DAY SETTINGS max_threads = 4, log_comment = 'bench-022:events:old';
+SELECT count(), uniq(pubkey) FROM events_local WHERE created_at <= now() AND kind = 1 AND created_at >= now() - INTERVAL 30 DAY SETTINGS max_threads = 4, log_comment = 'bench-022:events-kind1:old';
+SELECT count() FROM events_local WHERE created_at >= now() - INTERVAL 7 DAY SETTINGS max_threads = 4, log_comment = 'bench-022:throughput:old';
+SELECT toHour(created_at) AS hour, count(), uniq(pubkey) FROM events_local WHERE created_at >= now() - INTERVAL 30 DAY GROUP BY hour ORDER BY hour SETTINGS max_threads = 4, log_comment = 'bench-022:hourly30:old' FORMAT Null;
+
+-- New reads (same SQL as the API, windows as of today).
+SELECT toUInt64(sum(r.event_count)) AS count, uniqCombined64Merge(r.pubkeys) AS unique_pubkeys FROM kind_activity AS r WHERE (r.grain = 'day' AND r.period >= toDateTime(toDate(now() - INTERVAL 30 DAY), 'UTC') AND r.period < toDateTime(toDate(now()) + 1, 'UTC')) SETTINGS max_threads = 4, log_comment = 'bench-022:events:new';
+SELECT toUInt64(sum(r.event_count)) AS count, uniqCombined64Merge(r.pubkeys) AS unique_pubkeys FROM kind_activity AS r WHERE r.kind = 1 AND (r.grain = 'day' AND r.period >= toDateTime(toDate(now() - INTERVAL 30 DAY), 'UTC') AND r.period < toDateTime(toDate(now()) + 1, 'UTC')) SETTINGS max_threads = 4, log_comment = 'bench-022:events-kind1:new';
+SELECT toUInt64(sum(r.event_count)) FROM kind_activity AS r WHERE r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay(7), 'UTC') SETTINGS max_threads = 4, log_comment = 'bench-022:throughput:new';
+SELECT c.hour AS hour, c.event_count AS event_count, p.unique_pubkeys AS unique_pubkeys, toFloat64(c.event_count) / 30 AS avg_per_day FROM (SELECT toHour(r.period, 'UTC') AS hour, toUInt64(sum(r.event_count)) AS event_count FROM kind_activity AS r WHERE r.grain = 'hour' AND r.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS c LEFT JOIN (SELECT toHour(h.period, 'UTC') AS hour, uniqCombined64Merge(h.pubkeys) AS unique_pubkeys FROM hourly_pubkeys AS h WHERE h.kind = -1 AND h.period >= toStartOfHour(now() - toIntervalDay(30), 'UTC') GROUP BY hour) AS p ON c.hour = p.hour ORDER BY hour ASC SETTINGS join_use_nulls = 0, max_threads = 4, log_comment = 'bench-022:hourly30:new' FORMAT Null;
+
+SYSTEM FLUSH LOGS;
+SELECT log_comment, query_duration_ms, read_rows, formatReadableSize(read_bytes) AS read, formatReadableSize(memory_usage) AS memory
+FROM system.query_log
+WHERE type = 'QueryFinish' AND log_comment LIKE 'bench-022:%' AND event_time > now() - INTERVAL 1 HOUR
+ORDER BY log_comment, event_time;
+SQL
+```
+
+Record the table in the change log. The old `events`/`throughput` reads
+should show ~2.47B rows and tens to hundreds of GiB. The new ones should show
+thousands to a few hundred thousand rows and at most a few hundred MiB (the
+all-kinds day sketches). The counts differ by the window changes documented in
+`docs/api_rollups.md`: whole UTC days, and the partial first hour.
+
+### 8. Monitor
+
+Over the next day, check:
+
+- `hourly_pubkeys_mv` takes a few ms per insert in `system.query_views_log`,
+  with no view exceptions;
+- insert p95 is unchanged against step 1;
+- `$AR status` shows a small lag;
+- the API log has no `database_error` for these endpoints.
+
+The new reads should stay small (thousands to a few hundred thousand rows,
+well under a second):
+
+```bash
+just ch-query "SELECT event_time, query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 HOUR AND (has(tables, 'nostr.hourly_pubkeys') OR has(tables, 'nostr.kind_activity')) AND query NOT LIKE '%system.query_log%' AND log_comment NOT LIKE 'api-rollups%' ORDER BY event_time DESC LIMIT 20"
+just ch-query "SELECT count(), max(query_duration_ms), max(read_rows) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 HOUR AND has(tables, 'nostr.events_local') AND query LIKE '%uniq(pubkey)%' AND log_comment NOT LIKE 'bench-022%'"   # old scans: expect 0
+```
+
+The table should stay around 1–2 GiB:
+
+```bash
+just ch-query "SELECT kind = -1 AS all_kinds, count(), min(period), max(period) FROM nostr.hourly_pubkeys GROUP BY all_kinds"
+just ch-query "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows), count() FROM system.parts WHERE database = 'nostr' AND table = 'hourly_pubkeys' AND active"
+```
+
+### 9. Rollback
+
+- **API:** point the drop-in back at `releases/api-fe54f04` (the release
+  before this change, 021 `kind_activity`) and restart. It scans
+  `events_local` again for all three endpoints.
+- **Table and view:** run this with the API rolled back, or accepting `503
+  metric_unavailable` on `/stats/activity/hourly` (`/stats/events` and
+  `/stats/throughput` only need 021):
+
+  ```bash
+  just ch-migrate docs/migrations/rollback/022_drop_hourly_pubkeys.sql
+  ```
+
+  Re-applying 022 later needs `plan --migration 022 --discard-progress` and a
+  backfill (idempotent; last 35 days only).
+
 ## Grafana
 
 Provisioning is no longer in the repo. Configure the Prometheus datasource

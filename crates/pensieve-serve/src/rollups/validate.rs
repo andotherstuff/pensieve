@@ -1,8 +1,10 @@
 //! Validate the rollups against a direct (slow) oracle on `events_local`.
 //!
 //! The migration 020 targets (user flags, relay lists, kinds) are validated in
-//! `validate_derived` and migration 021's kind activity in
-//! `validate_kind_activity`; see their module docs.
+//! `validate_derived`, migration 021's kind activity in
+//! `validate_kind_activity` and migration 022's hourly pubkeys (with the
+//! all-kinds day unions `/stats/events` reads) in `validate_hourly_pubkeys`;
+//! see their module docs.
 //!
 //! **Publishers.** Pubkeys are sampled three ways: a hashed random subset of
 //! the rollup, the pubkeys of one random id-prefix slice of `events_local`
@@ -43,7 +45,8 @@ use serde::{Deserialize, Serialize};
 use super::plan::{Plan, utc_day};
 use super::{
     ACTIVITY_AT_EXPR, ALL_KINDS, EXCLUDED_PUBLISHER_KINDS, LONGFORM_TABLE, PUBLISHER_ROLLUP_DAYS,
-    PUBLISHER_TABLE, Target, ops, validate_derived, validate_kind_activity,
+    PUBLISHER_TABLE, Target, ops, validate_derived, validate_hourly_pubkeys,
+    validate_kind_activity,
 };
 
 /// Validation options.
@@ -92,6 +95,10 @@ pub struct ValidateOptions {
     /// seeded random kinds with at most this many events in total (each event
     /// can pull one granule of `content` into the scan).
     pub content_budget_events: u64,
+    /// Hourly pubkeys: whole UTC days before the cutoff whose hour sketches
+    /// (and all-kinds day unions) are compared exactly (at most 30). `None`:
+    /// 30 while `hourly_pubkeys_mv` is younger than 35 days, else 2.
+    pub hour_days: Option<u32>,
 }
 
 impl Default for ValidateOptions {
@@ -114,6 +121,7 @@ impl Default for ValidateOptions {
             pubkeys_max_exact: 20_000_000,
             pubkeys_sigmas: 4.0,
             content_budget_events: 5_000,
+            hour_days: None,
         }
     }
 }
@@ -312,6 +320,10 @@ pub struct ValidateInputs<'a> {
     pub kind_activity_plan: Option<&'a Plan>,
     /// Migration 020 cutover time (`finished_at`), when it ran.
     pub cutover_at: Option<u32>,
+    /// Whether the hourly-pubkeys backfill is complete per the checkpoints
+    /// (`None`: unknown, not checked). An incomplete backfill fails the
+    /// target while the view is younger than 35 days.
+    pub hourly_pubkeys_backfill_complete: Option<bool>,
 }
 
 /// Run validation. `client` should carry resource limits. `publisher_plan`
@@ -363,6 +375,13 @@ pub async fn run_with(
             Target::Kinds => validate_derived::kinds(&ctx, inputs.kinds_plan).await?,
             Target::KindActivity => {
                 validate_kind_activity::kind_activity(&ctx, inputs.kind_activity_plan).await?
+            }
+            Target::HourlyPubkeys => {
+                validate_hourly_pubkeys::hourly_pubkeys(
+                    &ctx,
+                    inputs.hourly_pubkeys_backfill_complete,
+                )
+                .await?
             }
         });
     }

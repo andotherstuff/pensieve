@@ -18,10 +18,11 @@ just ch-migrate docs/migrations/prepared/019_api_publishers_longform.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views.sql
 just ch-migrate docs/migrations/prepared/020_incremental_derived_views_cutover.sql
 just ch-migrate docs/migrations/prepared/021_kind_activity.sql
+just ch-migrate docs/migrations/prepared/022_hourly_pubkeys.sql
 ```
 
-On an empty database 020's two phases can run back to back, and 021 after
-them: there is no history to backfill (`api-rollups plan/backfill --migration 020` still record
+On an empty database 020's two phases can run back to back, and 021 and 022
+after them: there is no history to backfill (`api-rollups plan/backfill --migration 020` still record
 the plans that `cutover` checks; run them before the cutover file, or apply the
 cutover file by hand as above).
 
@@ -76,6 +77,10 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - Prepared 021 (`kind_activity` for `/kinds/{kind}` and
   `/kinds/{kind}/activity`) was applied at 06:14 UTC on 2026-10-13, backfilled
   and validated (0 failed rows); the API reads it since 07:36 UTC.
+- Prepared 022 (`hourly_pubkeys` for `/stats/activity/hourly`) is **not yet
+  applied** (written 2026-10-14). The API release that reads it also moves
+  `/stats/events` and `/stats/throughput` onto 021's `kind_activity`; apply,
+  backfill and validate 022 before deploying it (RUNBOOK → Hourly authors).
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -104,7 +109,8 @@ snapshot of production. Its header explains how the two differ.
 | prepared/018_drop_events_by_kind_projection.sql | Removal of the full-row kind projection after 017; excluded from `ch-migrate-all`. **Applied in production 2026-10-11** | No (background removal mutation) |
 | prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
 | prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Applied and cut over in production 2026-10-12** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
-| prepared/021_kind_activity.sql | Insert-fed `kind_activity` (per kind and UTC hour (35 days), day and month of `created_at`: event count, content bytes, `uniqCombined64` author sketch) for `pensieve-serve` `/kinds/{kind}` (with `kind_totals`) and `/kinds/{kind}/activity`. Excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-13** | **Yes** (`api-rollups backfill --migration 021`, exactly once) |
+| prepared/021_kind_activity.sql | Insert-fed `kind_activity` (per kind and UTC hour (35 days), day and month of `created_at`: event count, content bytes, `uniqCombined64` author sketch) for `pensieve-serve` `/kinds/{kind}` (with `kind_totals`) and `/kinds/{kind}/activity`; since the 022 API release also `/stats/events` and `/stats/throughput`. Excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-13** | **Yes** (`api-rollups backfill --migration 021`, exactly once) |
+| prepared/022_hourly_pubkeys.sql | Insert-fed `hourly_pubkeys` (per kind and all kinds, UTC hour of `created_at`, last 35 days: `uniqCombined64` author sketch) for `pensieve-serve` `/stats/activity/hourly` (counts from 021's hour rows). Excluded from `ch-migrate-all`. **Not yet applied** | **Yes** (`api-rollups backfill --migration 022`, idempotent, last 35 days only) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).
@@ -773,6 +779,53 @@ snapshot, which the 020 cutover dropped.
 
 ```bash
 just ch-migrate docs/migrations/rollback/021_drop_kind_activity.sql
+```
+
+### prepared/022_hourly_pubkeys.sql
+
+**Purpose:** Serve `GET /api/v1/stats/activity/hourly` without scanning
+`events_local` (6.72 s for `days=30` on 2026-10-14; the default `days=7`
+answered from the API cache but every refresh rescanned). Its per-hour event
+counts come from 021's `kind_activity` hour rows, but those carry an empty
+author sketch, so the distinct authors per hour need this table.
+
+It creates `hourly_pubkeys` (`AggregatingMergeTree ORDER BY (kind, period)`,
+unpartitioned, `TTL` 35 days after the hour), fed by `hourly_pubkeys_mv`: per
+kind and for all kinds (`kind = -1`) and UTC hour of the event's own
+`created_at` (only hours newer than now − 35 days), a `uniqCombined64` sketch
+of the authors. Sketches are **idempotent** (no sums, no view boundary, no
+`origin`); the backfill follows 017's model. It does **not** backfill.
+
+**Backfill:** `api-rollups plan --migration 022` then `backfill --migration
+022`: 256 id-prefix shards reading id, pubkey, kind, created_at, indexed_at of
+rows whose hour is newer than now − 35 days (recent rows are spread over
+every granule, so about the read of 020's kinds backfill: ~320 GiB
+uncompressed, ~1.5–2 h at 2 threads including pauses; `plan` prints the
+measured estimate). A re-run shard is harmless. `validate --migration 022` compares every (kind,
+hour) and (all kinds, hour) sketch of the last `--hour-days` days (all 30 by
+default while the view is younger than 35 days), and the all-kinds day unions
+of `kind_activity` that `/stats/events` reads, with exact distinct counts; it
+fails while the backfill is incomplete per the checkpoints. No API release
+from #101 on may be deployed before this passes.
+
+**Behaviour changes** (details in [`docs/api_rollups.md`](../api_rollups.md#migration-022-hourly-pubkeys)):
+- `/stats/activity/hourly`: UTC hours from the UTC hour containing
+  `now() - days` (up to an hour more); `unique_pubkeys` from merged sketches;
+  `days` must be 1–30 (`400` otherwise; it was silently capped at 90).
+- The same API release serves `/stats/events` (with `kind`, or without
+  `group_by`) and `/stats/throughput` from `kind_activity` (no migration):
+  whole UTC days, merged sketches, see the linked section.
+- `/stats/activity/hourly` answers `503 metric_unavailable` when the table is
+  missing.
+
+**Apply, backfill, validate and roll out:** follow
+[`ops/RUNBOOK.md` → Hourly authors](../../ops/RUNBOOK.md#hourly-authors-migration-022).
+
+**Rollback:** `/stats/activity/hourly` then answers `503
+metric_unavailable`; `/stats/events` and `/stats/throughput` are unaffected:
+
+```bash
+just ch-migrate docs/migrations/rollback/022_drop_hourly_pubkeys.sql
 ```
 
 ---

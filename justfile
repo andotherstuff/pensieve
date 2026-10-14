@@ -301,6 +301,8 @@ test-clickhouse:
         cargo test -p pensieve-serve --test derived_views -- --ignored
     PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
         cargo test -p pensieve-serve --test kind_activity -- --ignored
+    PENSIEVE_TEST_CLICKHOUSE_URL=${PENSIEVE_TEST_CLICKHOUSE_URL:-http://localhost:{{CH_TEST_PORT}}} \
+        cargo test -p pensieve-serve --test hourly_pubkeys -- --ignored
 
 # ============================================================================
 # Utilities

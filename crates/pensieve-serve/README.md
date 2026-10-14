@@ -204,11 +204,33 @@ Event counts with optional filters and grouping.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `kind` | integer | Filter by event kind |
-| `since` | date | Events created on or after (YYYY-MM-DD) |
-| `until` | date | Events created before (YYYY-MM-DD) |
-| `days` | integer | Shorthand: events from last N days (overrides `since`/`until`). Defaults to 30 when none of `days`, `since`, or `until` is given |
+| `since` | date | Events created on or after this UTC day (YYYY-MM-DD) |
+| `until` | date | Events created before this UTC day (YYYY-MM-DD) |
+| `days` | integer | Shorthand: whole UTC days from the day containing `now() - N days` through today, so N to N+1 days (overrides `since`/`until`). Defaults to 30 when none of `days`, `since`, or `until` is given |
 | `group_by` | string | Group results: `day`, `week`, or `month` |
 | `limit` | integer | Max results (default: 100, max: 1000) |
+
+| Field | Description |
+|-------|-------------|
+| `count` | Events created in the window (exact) |
+| `unique_pubkeys` | **Approximate** distinct authors. From `kind_activity`: merged `uniqCombined64` sketches (~0.3% standard error; exact below ~4k authors per kind and day). From `daily_user_stats` (`group_by` without `kind`): exact per day, `uniq` per week or month |
+
+**Sources.** Nothing here scans `events_local`. Days never extend past today,
+and events dated later today count.
+
+- With `group_by` and no `kind`: the pre-aggregated `daily_user_stats`,
+  unchanged. It leaves out kinds 445 and 1059.
+- Everything else: `kind_activity` (migration `021_kind_activity`), all
+  kinds. Long windows read month rows for the full months inside them.
+  `503 metric_unavailable` if the table is missing.
+
+Until the 022 API release the second case scanned `events_local` (4–6 s in
+production), and the differences are small:
+
+- the window was `created_at` in `[now() - N days, now()]`, to the second;
+- `since`/`until` and the periods used the ClickHouse server time zone
+  (production runs UTC);
+- `unique_pubkeys` was `uniq(pubkey)`, also approximate.
 
 **Response (no grouping)**
 
@@ -256,7 +278,7 @@ GET /api/v1/stats/events?since=2024-01-01&until=2024-02-01
 
 #### `GET /api/v1/stats/throughput`
 
-7-day rolling average of events per hour.
+Average events per hour over the last 7 days.
 
 **Query Parameters**
 
@@ -272,6 +294,15 @@ GET /api/v1/stats/events?since=2024-01-01&until=2024-02-01
   "total_events_7d": 4998000
 }
 ```
+
+`total_events_7d` counts events whose `created_at` is at or after the start
+of the UTC hour containing `now() - 7 days` (up to one hour more than a
+rolling window), with no upper bound. It is the same number as `events_7d` of
+`GET /api/v1/kinds/{kind}`. `events_per_hour` is `total_events_7d / 168`.
+
+Read from `kind_activity`'s hour rows (migration `021_kind_activity`). Until
+the 022 API release this endpoint rescanned `events_local` on every cache
+refresh. `503 metric_unavailable` if the table is missing.
 
 ---
 
@@ -489,8 +520,24 @@ Event activity grouped by hour of day (0-23 UTC).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `days` | integer | 7 | Days to aggregate (max: 90) |
+| `days` | integer | 7 | Days to aggregate, 1–30 (`400` otherwise; before the 022 API release values above 90 were silently capped at 90) |
 | `kind` | integer | - | Filter by event kind |
+
+| Field | Description |
+|-------|-------------|
+| `hour` | UTC hour of the day of `created_at` |
+| `event_count` | Events in that hour of the day, from the start of the UTC hour containing `now() - days` on, with no upper bound (exact) |
+| `unique_pubkeys` | **Approximate** distinct authors in that hour of the day (merged `uniqCombined64` sketches, ~0.3% standard error; exact below ~4k) |
+| `avg_per_day` | `event_count / days` |
+
+Counts are read from `kind_activity`'s hour rows (migration
+`021_kind_activity`) and authors from `hourly_pubkeys` (migration
+`022_hourly_pubkeys`). Both keep 35 days, hence the 30-day limit.
+`503 metric_unavailable` if either table is missing.
+
+Until the 022 API release this endpoint scanned `events_local` (6.7 s for
+`days=30`). That query used a rolling window to the second, the ClickHouse
+server time zone (production runs UTC) and `uniq(pubkey)`.
 
 **Response**
 

@@ -59,6 +59,11 @@ const DEFAULT_KINDS_ROW_BYTES: u64 = 16 * 1024;
 /// few hundred bytes); merged day rows of large kinds grow to ~96 KiB.
 const DEFAULT_KIND_ACTIVITY_ROW_BYTES: u64 = 512;
 
+/// Assumed compressed bytes per pre-merge `hourly_pubkeys` row: a shard sees
+/// 1/256 of each hour's authors, so nearly every sketch is a small hash set;
+/// merged rows of busy hours grow to ~96 KiB.
+const DEFAULT_HOURLY_PUBKEYS_ROW_BYTES: u64 = 256;
+
 /// Seconds a shard pauses after it by default (`backfill --delay-secs`).
 const DEFAULT_DELAY_SECS: u64 = 5;
 
@@ -488,6 +493,7 @@ async fn measured_bytes_per_row(client: &Client, database: &str, target: Target)
         Target::Kinds => return Ok(DEFAULT_KINDS_ROW_BYTES),
         // Per-insert sketches say little about a shard's rows either.
         Target::KindActivity => return Ok(DEFAULT_KIND_ACTIVITY_ROW_BYTES),
+        Target::HourlyPubkeys => return Ok(DEFAULT_HOURLY_PUBKEYS_ROW_BYTES),
     };
     // Tiny parts are dominated by per-part overhead; only trust real volume.
     if parts.rows >= 100_000 {
@@ -695,6 +701,11 @@ pub fn describe_plan(plan: &Plan, min_free_bytes: u64) -> String {
         (None, None, Target::RelayLists) => {
             "  source bounds:        all kind 10002 rows (idempotent argMin)\n".to_string()
         }
+        (None, None, Target::HourlyPubkeys) => format!(
+            "  source bounds:        rows whose created_at hour is newer than now() - {} days \
+             at each shard (idempotent uniqCombined64 sketches)\n",
+            super::kind_activity::HOUR_ROWS_DAYS
+        ),
         (None, None, _) => {
             "  source bounds:        all kind 30023 rows (idempotent argMin)\n".to_string()
         }
@@ -829,6 +840,10 @@ mod tests {
         assert!(describe_plan(&plan, 0).contains("by pubkey prefix"));
         plan.target = Target::KindActivity;
         assert!(describe_plan(&plan, 0).contains("hour rows:            hours newer"));
+        plan.target = Target::HourlyPubkeys;
+        plan.view_boundary = None;
+        assert_eq!(plan.source_bounds(), SourceBounds::default());
+        assert!(describe_plan(&plan, 0).contains("idempotent uniqCombined64 sketches"));
     }
 
     #[test]
