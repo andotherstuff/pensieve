@@ -322,7 +322,7 @@ summary below is a quick reference.
 | ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 07:36 UTC) via `pensieve-api.service.d/90-postgres-cutover.conf` |
 | `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` via `pensieve-preview.service.d/10-release.conf` |
-| `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-2e07c31/pensieve-ingest` (master incl. #88, #90, #92, #94 and #95 carried exclusions, since 2026-10-13 16:35 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-43d4a26/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions and #98 16 GiB dedupe block cache, since 2026-10-14 08:24 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against Premium Primal since 2026-10-12) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`) |
 | Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout |
 | Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
@@ -432,9 +432,14 @@ readlink /proc/$(systemctl show -p MainPID --value pensieve-api)/exe
 
 ### Data Directories
 
+Storage (checked 2026-10-14 with `lsblk` and `/proc/mdstat`): `/`, `/data` and swap are LVM
+(`vg0`) on `md1`, a **RAID0** stripe across both NVMe drives, so losing either drive loses all
+of them; only `/boot` (`md0`) is RAID1. `/archive` is a single HDD (`sda1`), copied hourly to
+the Storage Box by `archive-sync`.
+
 | Path | Purpose | Storage |
 |------|---------|---------|
-| `/data/clickhouse/` | ClickHouse data | NVMe (RAID1) |
+| `/data/clickhouse/` | ClickHouse data | NVMe (RAID0) |
 | `/data/rocksdb/` | Dedupe index | NVMe |
 | `/data/relay-stats.db` | Relay quality SQLite | NVMe |
 | `/data/sync-state/`, `/data/negentropy/` | Negentropy sync state and isolated-reconciliation ledgers | NVMe |
