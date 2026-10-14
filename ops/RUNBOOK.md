@@ -43,7 +43,7 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-2e07c31/pensieve-ingest` (master incl. #88, #90, #92, #94 and #95 carried exclusions, since 2026-10-13 16:35 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-43d4a26/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions and #98 16 GiB dedupe block cache, since 2026-10-14 08:24 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -213,9 +213,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-2e07c31` (current
-  ingester, #95; runs with the `ingest-26f2170` worker), `ingest-85a2402` (previous ingester, #94;
-  the rollback target for `2e07c31`: same worker, keep the pause flag, no ledger restore),
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-43d4a26` (current
+  ingester, #98; runs with the `ingest-26f2170` worker), `ingest-2e07c31` (previous ingester, #95;
+  the rollback target for `43d4a26`: same worker, keep the pause flag, no ledger restore, the
+  dedupe DB opens unchanged), `ingest-85a2402` (older ingester, #94),
   `ingest-26f2170` (older ingester and the installed worker, #92),
   `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
@@ -1280,10 +1281,10 @@ separately for the panel set.
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-13 16:35 UTC the ingester runs
-`releases/ingest-2e07c31` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
-pause clock, #94 shrinking-set exemption and #95 carried exclusions, with
-`--isolated-negentropy-pause-on-failure-secs 7200`)
+not covered by the routine deploy above. Since 2026-10-14 08:24 UTC the ingester runs
+`releases/ingest-43d4a26` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
+pause clock, #94 shrinking-set exemption, #95 carried exclusions and #98 dedupe block cache and
+dense-window precount, with `--isolated-negentropy-pause-on-failure-secs 7200`)
 with the `ingest-26f2170` worker (installed 14:09 UTC), from
 `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger
 (schema 10 since 2026-10-13 12:48 UTC; the schema-9 backup is `jobs.sqlite.pre-schema10` next to it);
@@ -1678,6 +1679,39 @@ continues. So there are two paths:
    job 768 is back in `retry_wait` and holds `unresolved_failures` again, windows
    planned since then are planned again, and job IDs issued since the upgrade are
    issued again for other windows. Keep `$LEDGER.schema10` for reference.
+
+## Host maintenance
+
+**Storage.** `/`, `/data` and swap sit on `md1`, a RAID0 stripe across both NVMe drives (LVM `vg0`);
+only `/boot` (`md0`) is mirrored. One NVMe failure loses ClickHouse, the RocksDB dedupe index, the
+negentropy ledgers and the relay database together. `/archive` is a single HDD synced hourly to the
+Storage Box, which is the copy to rebuild from.
+
+**Before a reboot.** Every Pensieve unit and timer is enabled (the worker is pulled in by the
+ingester), the four containers use `restart: unless-stopped`, `/run/pensieve` comes from
+`/etc/tmpfiles.d/pensieve-negentropy.conf`, and `/etc/crypttab` is empty, so the host returns
+unattended. The ingester starts before ClickHouse is ready and indexes once it is up. Its drop-in
+sets `Restart=no`, so check it after boot and start it by hand if it failed. Stop the worker and
+then the ingester at a quiet moment first (graceful-stop checks above).
+
+**2026-10-14 maintenance (done).** Ledger backed up to `jobs.sqlite.pre-maint-20261014`; the drop-in
+pointed at `ingest-43d4a26` before the stop. Graceful stop at 08:21:26 UTC (final segment 31259
+sealed, checkpoint saved, no `.open` files); `containerd.io` 2.4.1, `docker-ce`/`-cli` 29.9.0 and
+`docker-compose-plugin` 5.6.0 installed; reboot onto kernel `6.12.111+deb13-amd64` (from
+`6.12.107`). Ingester back at 08:24:06 (about 3 minutes without live ingestion), containers healthy,
+swap 14 GiB → 0, `systemctl --failed` empty (the stale `pensieve-parquet-retry-29897` transient
+unit went with the reboot). First indexed segment 31260 at 08:29; first worker session at 08:31
+(cold page cache). Startup logged `dedupe block cache configured block_cache_mib=16384` with
+2,483,512,673 entries; `dedupe_block_cache_metadata_bytes` 3.51 GB. Over the next hour: ingester RSS
+4.3 → 9.5 GiB, block cache usage 8.7 GiB, MemAvailable 110 GiB, swap 0, index queue 0, health
+`progress_within_deadline` throughout, 13–49 worker sessions per 10 minutes and no
+`preflight budget spent`. The `negentropy-pare` thread read about 30 MiB/s, down from about 9 GB/s
+during the 2026-10-14 06:16–06:39 UTC stall.
+
+**Swap.** `vm.swappiness` is the Debian default 60. The 14 GiB in swap before the reboot was cold
+ClickHouse heap left from the rollup backfills, with no swap-in or swap-out while sampled and
+115 GiB available; it is not a memory-pressure signal on its own. Revisit swappiness only if
+swap-in shows up during queries.
 
 ## Cleanup debt
 - `ops/scripts/sync-archive.sh` still uploads + prunes `*.notepack` segments; reconcile it
