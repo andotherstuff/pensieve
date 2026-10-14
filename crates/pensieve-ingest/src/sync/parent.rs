@@ -317,7 +317,9 @@ impl ParentExecutor {
                                 if !writer.recovery_required() {
                                     // A carry's received frames are confirmed now,
                                     // not when the fair maintenance cursor reaches it.
-                                    archive_maintenance(&writer, || ledger.confirm_carry_receipts(&dedupe, &writer))?;
+                                    let confirmed = archive_maintenance(&writer, || ledger.confirm_carry_receipts(&dedupe, &writer))?;
+                                    metrics::counter!("negentropy_carry_receipts_confirmed_total")
+                                        .increment(u64::from(confirmed.satisfied));
                                     record_unavailable(&ledger.exclude_relay_unavailable(now, &dedupe)?);
                                 }
                                 let retention = ledger.retain_completed(now)?;

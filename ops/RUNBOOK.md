@@ -1346,7 +1346,10 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   row is resolved (the event is archived, so the relay is being asked for it
   again); a frame the job received is of an event not yet archived (a novel
   event waits for its segment to seal); on `ingest-43d4a26` and earlier, a
-  backlog of more than 64 other retry-wait jobs below it (a relay outage); or
+  backlog of more than 64 other retry-wait jobs below it (a relay outage); on
+  later releases, only a burst of other carries with more than about 256–512
+  receipts awaiting confirmation at once (`negentropy_carry_receipts_confirmed_total`
+  rises while they are confirmed, at most 256 per turn); or
   `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
   like any other `unresolved_failures` job above; the full rule still applies.
 - `owner_observation_stale`: the parent owner thread has not refreshed health for

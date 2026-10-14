@@ -658,42 +658,66 @@ impl JobLedger {
     /// ([`JobLedger::reconcile_archived`]): a frame whose event carries a
     /// durable archive marker (or a policy exclusion) loses its receipt, any
     /// other keeps it and still defers the carry. Nothing is completed here.
-    /// Reads at most `MAX_CARRIES_PER_TURN` jobs and `MAX_RECEIPT_BATCH`
-    /// receipts. Does nothing with the rule disabled. Call only when archive
-    /// recovery is not required.
+    /// Reads at most `MAX_CARRIES_PER_TURN` jobs, on its own keyset cursor, and
+    /// `MAX_RECEIPT_BATCH` receipts per call. Does nothing with the rule
+    /// disabled. Refuses, like [`JobLedger::maintain_archived`], while archive
+    /// recovery is required or when `writer` does not use `dedupe`.
     pub fn confirm_carry_receipts(
         &mut self,
         dedupe: &crate::DedupeIndex,
         writer: &crate::SegmentWriter,
     ) -> Result<MaintenanceProgress, LedgerError> {
+        if writer.recovery_required() || !writer.uses_dedupe(dedupe) {
+            return Err(LedgerError::Invalid(
+                "archive recovery required or different archive authority",
+            ));
+        }
         let mut progress = MaintenanceProgress::default();
         let Some(rule) = self.unavailable_rule else {
             return Ok(progress);
         };
+        // Its own keyset cursor: possible carries that hold receipts but are
+        // not carries (a mixed set, a deadline failure that received frames)
+        // must not take every slot ahead of a real carry.
         let pending = {
             let mut query = self.db.prepare(&format!(
-                "SELECT id FROM jobs WHERE state='retry_wait'
+                "SELECT id FROM jobs WHERE state='retry_wait' AND id>?1
                  AND EXISTS(SELECT 1 FROM receipts WHERE job=jobs.id) AND {CARRY_SCREEN}
-                 ORDER BY id LIMIT ?1"
+                 ORDER BY id LIMIT ?2"
             ))?;
             query
-                .query_map([MAX_CARRIES_PER_TURN], |r| r.get::<_, i64>(0))?
+                .query_map(params![self.confirm_cursor, MAX_CARRIES_PER_TURN], |r| {
+                    r.get::<_, i64>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let selected = pending.len();
+        let mut visited = 0;
+        let mut last = self.confirm_cursor;
         for id in pending {
             if progress.checked >= MAX_RECEIPT_BATCH {
                 break;
             }
-            if carried(&self.db, &read_job(&self.db, id)?, &rule, dedupe)?.is_none() {
-                continue;
+            if carried(&self.db, &read_job(&self.db, id)?, &rule, dedupe)?.is_some() {
+                let budget = MAX_RECEIPT_BATCH - progress.checked;
+                let outcome = self.reconcile_archived(id, dedupe, writer, budget)?;
+                progress.jobs += 1;
+                progress.checked += outcome.checked;
+                progress.satisfied += outcome.satisfied;
+                progress.completed += u32::from(outcome.complete);
+                // The budget ran out inside this job: resume at it next turn.
+                if outcome.checked == budget {
+                    break;
+                }
             }
-            let outcome =
-                self.reconcile_archived(id, dedupe, writer, MAX_RECEIPT_BATCH - progress.checked)?;
-            progress.jobs += 1;
-            progress.checked += outcome.checked;
-            progress.satisfied += outcome.satisfied;
-            progress.completed += u32::from(outcome.complete);
+            last = id;
+            visited += 1;
         }
+        self.confirm_cursor = if visited == selected && selected < MAX_CARRIES_PER_TURN as usize {
+            0
+        } else {
+            last
+        };
         Ok(progress)
     }
 
@@ -2470,6 +2494,77 @@ mod tests {
                 )
                 .unwrap();
         assert_eq!(waiting, BACKLOG);
+    }
+
+    #[test]
+    fn possible_carries_with_receipts_do_not_hold_a_real_carry_from_confirmation() {
+        // More possible carries than one confirmation turn reads, each holding a
+        // receipt for an event the archive does not have and failing with a
+        // relay failure (not a carry), sit below a real carry. Without its own
+        // cursor confirmation reread them every turn and never reached the
+        // carry's receipts, so the carry stayed `awaiting_archive` until the
+        // fair maintenance cursor got there.
+        const NOISE: i64 = MAX_CARRIES_PER_TURN + 12;
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let now = 1000 + 10 * HOUR;
+        // One attempt that receives `ids` and ends with `report`; no
+        // maintenance turn, so its receipts stay.
+        let fail = |f: &mut Fixture, ids: &[[u8; 32]], report: FailureDiagnostic| -> i64 {
+            let lease = f.db.lease_next(now, 600).unwrap().unwrap();
+            for (n, id) in (1..).zip(ids) {
+                f.db.register_received(
+                    &lease,
+                    &ReceiptRecord {
+                        sequence: n,
+                        event_id: *id,
+                        created_at: 100,
+                        frame_bytes: 400,
+                        frame_digest: [n as u8; 32],
+                    },
+                    now,
+                )
+                .unwrap();
+            }
+            f.db.record_failure_report(&lease, ids.len() as u64 + 1, &report, now + 1)
+                .unwrap();
+            f.db.retry(&lease, now + 1, 60, RetryReason::RelayFailure)
+                .unwrap();
+            f.db.db
+                .execute(
+                    "UPDATE jobs SET next_eligible=?2 WHERE id=?1",
+                    [lease.job().id, i64::MAX],
+                )
+                .unwrap();
+            lease.job().id
+        };
+        for n in 0..NOISE {
+            f.db.enqueue(&format!("noise-{n}"), RELAY, 0, 899).unwrap();
+            let mut id = [0xdd; 32];
+            id[31] = n as u8;
+            fail(&mut f, &[id], relay_failure());
+        }
+        f.db.enqueue("pass-2", RELAY, 0, 899).unwrap();
+        let archived: Vec<[u8; 32]> = (0x41..=0x51_u8).map(|n| [n; 32]).collect();
+        f.dedupe.mark_archived(archived.iter()).unwrap();
+        let carry = fail(&mut f, &archived, unavailable(&[MISSING]));
+        assert!(carry > NOISE + 1);
+        let carried: Vec<i64> = (0..2)
+            .flat_map(|turn| f.lifecycle(now + 5 + turn).carried)
+            .map(|c| c.job)
+            .collect();
+        assert_eq!(carried, vec![carry]);
+        assert_eq!(f.db.get(carry).unwrap().attempt, 1);
+        // The non-carries keep their receipts: nothing was confirmed for them.
+        let held: i64 =
+            f.db.db
+                .query_row(
+                    "SELECT count(DISTINCT job) FROM receipts WHERE job<?1",
+                    [carry],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(held, NOISE);
     }
 
     #[test]

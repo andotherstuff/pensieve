@@ -320,23 +320,32 @@ status tool reports `carried` counts and marks each recent row with
 health observation, the pause evaluation and the only place a lease is granted.
 So a carried job is completed before it can be leased again: it stays at attempt
 1, never reaches the three failures behind `unresolved_failures`, and never
-counts toward the pause. A backlog does not delay it. Each turn first screens
-possible carries (retry-wait jobs, from their first attempt, whose window
-overlaps an unresolved original exclusion of their relay) on their own keyset
-cursor of 32, and only then the jobs past `K` attempts on theirs. Before the
-turn, the parent archive-confirms the received frames of any job that would be
-carried but for them (`confirm_carry_receipts`: the same check as receipt
-maintenance, at most 32 jobs and 256 receipts). It does not wait for the fair
-maintenance cursor, which visits every unresolved job 32 at a time once per tick.
+counts toward the pause. A backlog of other retry-wait jobs does not delay it.
+Each turn first screens possible carries (retry-wait jobs, from their first
+attempt, whose window overlaps an unresolved original exclusion of their relay)
+on their own keyset cursor of 32, and only then the jobs past `K` attempts on
+theirs. Before the turn, the parent archive-confirms the received frames of any
+job that would be carried but for them (`confirm_carry_receipts`: the same check
+as receipt maintenance, on its own keyset cursor of 32 possible carries and at
+most 256 receipts per turn). It does not wait for the fair maintenance cursor,
+which visits every unresolved job 32 at a time once per tick. Its progress is
+`negentropy_carry_receipts_confirmed_total` (receipts confirmed this way).
 Until 2026-10-14 (#95 review) carries shared both cursors with every other job.
 While the worker was busy, a loop that runs two turns and one maintenance pass
 between sessions could, behind a relay outage's backlog of more than 64
 retry-wait jobs, lease a revisit again and let it fail attempts 2 and 3 before
-either cursor reached it. What can still defer a carry, as for any exclusion, is
-a received frame whose event is not yet archived (a novel event waits for its
-segment to seal; a revisit normally receives events already archived), or more
-than 32 possible carries at once, which needs that many revisits over windows
-with unresolved exclusions.
+either cursor reached it.
+
+What can still defer a carry, as for any exclusion, is a received frame whose
+event is not yet archived (a novel event waits for its segment to seal; a
+revisit normally receives events already archived). Load among carries
+themselves can defer one too. A qualifying attempt holds up to 127 receipts, so
+the 256-receipt budget can confirm as few as two carries per turn (four per tick
+of two turns). So a carry is reliably completed before its next lease only while
+fewer than about 256–512 carry receipts await confirmation at once. Beyond that,
+or with many more than 32 possible carries queued, a carry can wait a few more
+turns. Reaching that needs many simultaneous revisits over windows with
+unresolved exclusions.
 
 **Interaction with the failure pause.** `unresolved_failures` starts when a
 job's third attempt fails, and an exempt job still counts there. The pause does
