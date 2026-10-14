@@ -46,10 +46,10 @@ Observed 2026-10-11:
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-0a14656/pensieve-serve` (master incl. #101 and #102; since 2026-10-14 14:49 UTC) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-0a14656/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache and #103 carries ahead of a retry backlog, since 2026-10-14 14:09 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-c3f25c5/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache, #103 carries ahead of a retry backlog and #105 indexer retries instead of stranding segments, since 2026-10-14 18:20 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
-| Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
+| Kuma push probes (30–60 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer`, `pensieve-clickhouse-index-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
 | Prometheus `:9090` for the scraper VM | `pensieve-prometheus-proxy.socket` → `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`; in the repo since PR #100, install per [Published ports](#published-ports-and-the-grafana-clickhouse-user) |
 
@@ -140,7 +140,7 @@ indexed before N, as before.) While it retries:
 `PensieveClickHouseIndexBacklog` (in `ops/production/prometheus/archive-alerts.yml`)
 fires when `clickhouse_index_oldest_pending_seconds` exceeds 15 minutes. **It notifies
 nobody**: Prometheus has no Alertmanager receiver, so it only shows on the Prometheus
-alerts page and in Grafana. Check it there, or watch the gauge, after any ClickHouse work.
+alerts page and in Grafana. The notifying signal is the Kuma push probe below.
 While one segment is stuck (unreadable, or failing deterministically) the gauge stays high
 and the alert stays firing, which hides any later outage; clear the stuck segment (below)
 rather than living with the alert.
@@ -149,6 +149,35 @@ To confirm a recovery, rely on the metrics: `clickhouse_index_queue_segments` ba
 and `clickhouse_index_oldest_pending_seconds` near 0. The `clickhouse index backlog
 cleared` log line appears only after failed attempts, and also while an unreadable segment
 is still journaled.
+
+**Kuma probe (the alert that notifies).** `pensieve-clickhouse-index-kuma.timer` runs
+[`ops/scripts/clickhouse-index-kuma.py`](scripts/clickhouse-index-kuma.py) every 60 s. It
+reads `clickhouse_index_oldest_pending_seconds` and `clickhouse_index_queue_segments` from
+`127.0.0.1:9091/metrics` and pushes `up` while the oldest pending segment is younger than
+900 s (the Prometheus rule's threshold), `down` otherwise, or when the metrics page or the
+gauge is missing (an ingester older than #105, or the ingester down). The message carries
+only the two numbers, e.g. `clickhouse index backlog 2 segments, oldest 41s`. It pushes
+to the same Kuma instance as the other probes and refuses any other destination or a
+redirect. Install it once:
+
+1. In Kuma, create a **Push** monitor (heartbeat interval 120 s, so one missed 60 s push
+   does not alert) and copy its push URL.
+2. On the host:
+
+```bash
+sudo install -m 600 -o root -g root /dev/null /etc/pensieve/clickhouse-index-kuma.url
+sudoedit /etc/pensieve/clickhouse-index-kuma.url       # paste the push URL, nothing else
+cd ~/pensieve
+sudo install -m 755 ops/scripts/clickhouse-index-kuma.py /usr/local/libexec/pensieve-clickhouse-index-kuma.py
+sudo install -m 644 ops/systemd/pensieve-clickhouse-index-kuma.service ops/systemd/pensieve-clickhouse-index-kuma.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start pensieve-clickhouse-index-kuma.service   # one push now
+journalctl -u pensieve-clickhouse-index-kuma -n 3 --no-pager  # "...; Kuma accepted"
+sudo systemctl enable --now pensieve-clickhouse-index-kuma.timer
+```
+
+Then test that the monitor's notification fires and resolves (Kuma's own "pause" or a
+temporary `down` push), as for the archive-admission probe.
 
 **Rolling out the alert rule.** The rule only loads into a recreated Prometheus container.
 `archive-alerts.yml` is a single-file bind mount: `git merge` replaces the file (a new
@@ -163,9 +192,13 @@ set -euo pipefail
 docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" --entrypoint promtool \
   prom/prometheus:v2.48.0 check config /etc/prometheus/prometheus.yml
 docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env \
-  up -d --no-deps prometheus
+  up -d --no-deps --force-recreate prometheus
 )
 ```
+
+`--force-recreate` is required here: Compose only recreates a container whose service
+definition changed, and a changed mounted file is not such a change (without it, Compose
+reports `Running` and the old rules stay loaded; this happened on 2026-10-14).
 
 The project name and env file are required: a bare `docker compose up` uses another
 project name and collides on `container_name`, and never use `up -d` without `--no-deps`
@@ -173,7 +206,8 @@ project name and collides on `container_name`, and never use `up -d` without `--
 scrapes return 503 for several scrape intervals and Grafana's panels show a gap, so
 silence the monitoring VM's alert for this target first (see **Downtime** under
 [Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user)).
-Afterwards, check that the Prometheus rules page lists `PensieveClickHouseIndexBacklog`.
+Afterwards, check that the Prometheus rules page lists `PensieveClickHouseIndexBacklog`
+(`curl -s localhost:19090/api/v1/rules`). Loaded in production on 2026-10-14 at 18:23 UTC.
 
 A shutdown during the backoff wakes the indexer within 200 ms and leaves the journal
 correct. During an outage `systemctl stop` therefore takes the full 20 s drain grace and
@@ -216,7 +250,9 @@ container is recreated.
 
 Compose changes apply per container: after the 2026-10-12 sync, Prometheus was recreated alone
 (`docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env up -d --no-deps prometheus`
-from `ops/production/`, after `promtool check config`) to load `archive-alerts.yml`.
+from `ops/production/`, after `promtool check config`) to load `archive-alerts.yml`. When only a
+mounted file changed (not the service in `compose.yml`), add `--force-recreate`: otherwise Compose
+leaves the running container alone.
 
 Socket units: `ops/systemd/*.socket` files (today `pensieve-prometheus-proxy.socket`)
 must be installed into `/etc/systemd/system/` with their `.service` and enabled with
@@ -310,9 +346,9 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
   (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, previous; the rollback target for `api-0a14656`), `api-0a14656`
-  (#101 and #102, current; needs 022), `ingest-0a14656` (current ingester, #103; runs with the
-  `ingest-26f2170` worker), `ingest-43d4a26` (previous ingester, #98; the rollback target for
-  `0a14656`: same worker, keep the pause flag, no ledger restore), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
+  (#101 and #102, current; needs 022), `ingest-c3f25c5` (current ingester, #105; runs with the
+  `ingest-26f2170` worker), `ingest-0a14656` (previous ingester, #103; the rollback target for
+  `c3f25c5`: same worker, keep the pause flag, same index journal format), `ingest-43d4a26` (older ingester, #98), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
   `ingest-26f2170` (older ingester and the installed worker, #92),
   `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
@@ -1956,8 +1992,8 @@ Then take the handle (`ln -f ~/pensieve/ops/production/clickhouse/users.xml
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-14 14:09 UTC the ingester runs
-`releases/ingest-0a14656` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
+not covered by the routine deploy above. Since 2026-10-14 18:20 UTC the ingester runs
+`releases/ingest-c3f25c5` (master, incl. #105 indexer retries, #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
 pause clock, #94 shrinking-set exemption, #95 carried exclusions, #98 dedupe block cache and
 dense-window precount and #103 carries ahead of a retry backlog, with
 `--isolated-negentropy-pause-on-failure-secs 7200`)
