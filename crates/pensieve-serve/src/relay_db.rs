@@ -2,42 +2,66 @@
 //!
 //! The ingester keeps `relay-stats.db` (`RELAY_DB_PATH`) open in WAL mode for
 //! its whole lifetime and commits to it continuously. The API reads it as an
-//! ordinary WAL reader:
+//! ordinary WAL reader and never writes it:
 //!
 //! - **One connection per request.** [`RelayDb::read`] opens a fresh
 //!   connection on a blocking thread, runs the closure and drops it, so a
 //!   request always starts from the latest committed transaction and an
 //!   operator replacing the file (e.g. `relay-cleanup`) is picked up without a
-//!   restart. Relay endpoints are cold and HTTP-cached, so the cost of an
-//!   open (a file open and a schema read) does not matter.
-//! - **Read-only, never `immutable`.** The connection is opened with
-//!   `SQLITE_OPEN_READONLY` (the flag behind the `mode=ro` URI parameter) and
-//!   `PRAGMA query_only`, so it can never write the database or its WAL.
-//!   `immutable=1`, which this module replaced, told SQLite the file never
-//!   changes: it ignored the WAL (serving whatever had been checkpointed into
-//!   the main file) and took no locks (so a checkpoint could tear a read).
+//!   restart. At most [`MAX_CONCURRENT_READS`] run at once; more fail fast with
+//!   `503 analytics_busy`.
+//! - **Read-only.** Connections are opened with `SQLITE_OPEN_READONLY` (the
+//!   flag behind the `mode=ro` URI parameter) and `PRAGMA query_only`.
 //! - **`busy_timeout`.** A WAL reader rarely sees `SQLITE_BUSY` (WAL-index
 //!   recovery, a concurrent checkpoint restart); it waits up to
 //!   [`BUSY_TIMEOUT`], then the request fails with `503 analytics_busy`.
 //!
 //! # `-wal` and `-shm` files
 //!
-//! A WAL reader needs the `-wal` and `-shm` files next to the database:
+//! In production the API unit runs with `ProtectSystem=strict` and no
+//! `ReadWritePaths`, so `/data` is read-only for it, and it can never create or
+//! write the database's `-wal` and `-shm` files. Each read picks one of two
+//! [`Access`] modes:
 //!
-//! - While the ingester runs, both exist. A reader that can write `-shm` uses
-//!   it as shared memory (it updates read marks there, as every WAL reader
-//!   does; it never writes the database or the WAL). A reader that cannot
-//!   write `-shm` falls back to opening it read-only and building the WAL
-//!   index in private memory: slower, still consistent.
-//! - When no connection has the database open (ingester stopped), the last
-//!   writer has checkpointed and deleted both files. SQLite then *creates*
-//!   them on open, owned by the opening process and with the database file's
-//!   mode. If the API ran as a different user from the database's owner, the
-//!   ingester could later be unable to write those files. [`RelayDb::open`]
-//!   therefore refuses (`503 metric_unavailable`) to open a WAL database whose
-//!   `-wal`/`-shm` are missing unless this process is root (SQLite hands new
-//!   files to the database's owner) or owns the database file. When the
-//!   directory is not writable SQLite fails without creating anything.
+//! - **[`Access::Live`]**, when both files exist (the ingester is running, or
+//!   the database is not in WAL mode): a normal read-only WAL reader. If it
+//!   can write `-shm` it updates its read marks there, as every WAL reader
+//!   does; if it cannot (the production case) SQLite opens `-shm` read-only
+//!   and indexes the WAL in private memory: slower, still consistent.
+//! - **[`Access::Snapshot`]**, when a WAL database has neither file: no
+//!   connection has it open, because the last one to close checkpointed the
+//!   WAL into the main file and deleted both. The main file is then complete,
+//!   so it is read with `immutable=1`, which never looks for (or creates) the
+//!   WAL. A plain read-only open would instead try to create `-wal` and fail
+//!   on a read-only directory (`SQLITE_READONLY_DIRECTORY`, or
+//!   `SQLITE_CANTOPEN` on a read-only file system).
+//!
+//! The choice is a check of the file system just before opening, so it can
+//! race with the ingester:
+//!
+//! - The ingester starts while a snapshot read runs. It only appends to the
+//!   new WAL; the main file changes at the first checkpoint, about 1000 pages
+//!   (4 MiB) of commits later, long after the read has finished.
+//! - The ingester stops between the check and the open. The live open then
+//!   finds no `-wal`; [`RelayDb::open`] re-checks and falls back to a
+//!   snapshot when SQLite reports that it could not create the file. If the
+//!   API *can* write the directory, SQLite creates `-wal` and `-shm` instead,
+//!   owned by the API's user with the database file's mode. Where the API
+//!   runs as a different user from the database's owner, that can leave
+//!   files the ingester cannot write until someone removes them. Production
+//!   is not exposed: `/data` is read-only for the API, and both services run
+//!   as `pensieve`, which owns the database.
+//!
+//! Any remaining "could not open or create" error maps to
+//! `503 metric_unavailable`, not `500`.
+//!
+//! # Journal mode probe
+//!
+//! Whether the database is in WAL mode is read from its header once, in
+//! [`RelayDb::new`], at startup before this process opens any SQLite
+//! connection to it. Reading it later through a second file descriptor would
+//! release the POSIX locks held by live connections when that descriptor
+//! closes (SQLite's "How To Corrupt", section 2.2).
 
 use std::fs::File;
 use std::io::Read;
@@ -46,67 +70,57 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
+use tokio::sync::Semaphore;
 
 use crate::error::ApiError;
 
 /// How long a reader waits on `SQLITE_BUSY` before failing the request.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Errors from opening the relay database.
-#[derive(Debug, thiserror::Error)]
-pub enum RelayDbError {
-    /// The database is in WAL mode, has no `-wal`/`-shm` files (no writer is
-    /// attached), and opening it would create them as a user other than the
-    /// database's owner.
-    #[error(
-        "relay database {path} is in WAL mode without -wal/-shm files and this process \
-         (euid {euid}) does not own it (uid {owner}); not creating them"
-    )]
-    SidecarsMissing {
-        /// Database path.
-        path: PathBuf,
-        /// Effective uid of this process.
-        euid: u32,
-        /// Owner of the database file.
-        owner: u32,
-    },
+/// Relay reads allowed to run at once; more get `503 analytics_busy`.
+pub const MAX_CONCURRENT_READS: usize = 16;
 
-    /// Reading the database header or metadata failed.
-    #[error("relay database {path}: {source}")]
-    Io {
-        /// Database path.
-        path: PathBuf,
-        /// Underlying error.
-        source: std::io::Error,
-    },
-
-    /// SQLite failed to open or configure the connection.
-    #[error("relay database: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+/// How a connection reads the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Read-only reader that follows the WAL (writer attached, or not a WAL
+    /// database).
+    Live,
+    /// `immutable=1` read of a WAL database that no connection has open.
+    Snapshot,
 }
 
-impl From<RelayDbError> for ApiError {
-    fn from(error: RelayDbError) -> Self {
-        match error {
-            RelayDbError::SidecarsMissing { .. } => {
-                tracing::warn!(error = %error, "relay database unavailable");
-                ApiError::MetricUnavailable
-            }
-            RelayDbError::Sqlite(error) => sqlite_error(error),
-            other => ApiError::Internal(other.into()),
-        }
-    }
-}
-
-/// Map a SQLite error to an API error: `SQLITE_BUSY`/`SQLITE_LOCKED` after
-/// [`BUSY_TIMEOUT`] become `503 analytics_busy`, everything else `500`.
+/// Map a SQLite error to an API error.
+///
+/// - `SQLITE_BUSY`/`SQLITE_LOCKED` (after [`BUSY_TIMEOUT`]) become
+///   `503 analytics_busy`;
+/// - failures to open or create the database's files (`SQLITE_CANTOPEN`,
+///   `SQLITE_READONLY_DIRECTORY`, `SQLITE_READONLY_CANTINIT`) become
+///   `503 metric_unavailable`;
+/// - everything else is a `500`.
 pub fn sqlite_error(error: rusqlite::Error) -> ApiError {
     match error.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
             tracing::warn!(error = %error, "relay database busy");
             ApiError::Overloaded
         }
+        _ if is_unavailable(&error) => {
+            tracing::warn!(error = %error, "relay database unavailable");
+            ApiError::MetricUnavailable
+        }
         _ => ApiError::Internal(anyhow::anyhow!("relay database query failed: {error}")),
+    }
+}
+
+/// Whether SQLite could not open or create one of the database's files.
+fn is_unavailable(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => {
+            failure.code == ErrorCode::CannotOpen
+                || failure.extended_code == rusqlite::ffi::SQLITE_READONLY_DIRECTORY
+                || failure.extended_code == rusqlite::ffi::SQLITE_READONLY_CANTINIT
+        }
+        _ => false,
     }
 }
 
@@ -115,13 +129,30 @@ pub fn sqlite_error(error: rusqlite::Error) -> ApiError {
 #[derive(Clone, Debug)]
 pub struct RelayDb {
     path: Arc<PathBuf>,
+    wal: bool,
+    permits: Arc<Semaphore>,
 }
 
 impl RelayDb {
-    /// A handle for the database at `path`. Nothing is opened yet.
+    /// A handle for the database at `path`.
+    ///
+    /// Reads the journal mode from the database header (see the module docs),
+    /// so call it before this process opens any connection to `path`. An
+    /// unreadable or empty file is assumed to be WAL, the ingester's mode.
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let wal = match header_says_wal(&path) {
+            Ok(Some(wal)) => wal,
+            Ok(None) => true,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "cannot read relay database header; assuming WAL");
+                true
+            }
+        };
         Self {
-            path: Arc::new(path.into()),
+            path: Arc::new(path),
+            wal,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_READS)),
         }
     }
 
@@ -130,19 +161,37 @@ impl RelayDb {
         &self.path
     }
 
-    /// Open a new read-only connection.
+    /// Whether the header said WAL mode at startup.
+    pub fn is_wal(&self) -> bool {
+        self.wal
+    }
+
+    /// Open a new read-only connection and check that it can read.
     ///
-    /// The connection sees every transaction committed before each of its
-    /// read transactions starts, including ones committed after it opened.
-    pub fn open(&self) -> Result<Connection, RelayDbError> {
-        check_sidecars(&self.path)?;
+    /// A [`Access::Live`] connection sees every transaction committed before
+    /// each of its read transactions starts, including ones committed after
+    /// it opened.
+    pub fn open(&self) -> rusqlite::Result<(Connection, Access)> {
+        if self.wal && !self.sidecars_exist() {
+            return self.open_snapshot();
+        }
         let conn = Connection::open_with_flags(
             self.path.as_path(),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "query_only", true)?;
-        Ok(conn)
+        // The open is lazy: the first read is what opens (or tries to create)
+        // the WAL.
+        match check_readable(&conn) {
+            Ok(()) => Ok((conn, Access::Live)),
+            // The ingester closed between the check and the open.
+            Err(error) if self.wal && is_unavailable(&error) && !self.sidecars_exist() => {
+                drop(conn);
+                self.open_snapshot()
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Run `f` against a fresh read-only connection on a blocking thread.
@@ -151,45 +200,41 @@ impl RelayDb {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, ApiError> + Send + 'static,
     {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::Overloaded)?;
         let db = self.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = db.open()?;
+            let _permit = permit;
+            let (conn, _) = db.open().map_err(sqlite_error)?;
             f(&conn)
         })
         .await
         .map_err(|error| ApiError::Internal(error.into()))?
     }
-}
 
-/// Refuse to let SQLite create `-wal`/`-shm` files owned by the wrong user.
-fn check_sidecars(path: &Path) -> Result<(), RelayDbError> {
-    let io = |source| RelayDbError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    if !is_wal_database(path).map_err(io)? {
-        return Ok(());
+    fn sidecars_exist(&self) -> bool {
+        sidecar(&self.path, "-wal").exists() && sidecar(&self.path, "-shm").exists()
     }
-    let sidecars_exist = sidecar(path, "-wal").exists() && sidecar(path, "-shm").exists();
-    if sidecars_exist {
-        return Ok(());
-    }
-    let (euid, owner) = ownership(path).map_err(io)?;
-    if may_create_sidecars(euid, owner) {
-        Ok(())
-    } else {
-        Err(RelayDbError::SidecarsMissing {
-            path: path.to_path_buf(),
-            euid,
-            owner,
-        })
+
+    fn open_snapshot(&self) -> rusqlite::Result<(Connection, Access)> {
+        let conn = Connection::open_with_flags(
+            format!("{}?mode=ro&immutable=1", file_uri(&self.path)),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        check_readable(&conn)?;
+        Ok((conn, Access::Snapshot))
     }
 }
 
-/// Whether SQLite may create missing `-wal`/`-shm` files on our behalf: root
-/// (SQLite chowns new files to the database's owner) or the owner itself.
-fn may_create_sidecars(euid: u32, owner: u32) -> bool {
-    euid == 0 || euid == owner
+/// One cheap read, so that a connection that cannot read fails here.
+fn check_readable(conn: &Connection) -> rusqlite::Result<()> {
+    conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
 }
 
 /// `<path>-wal` / `<path>-shm`.
@@ -199,32 +244,35 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Whether the database header says WAL mode (file format version 2 at byte
-/// offsets 18 and 19). Short or empty files are not WAL databases.
-fn is_wal_database(path: &Path) -> std::io::Result<bool> {
+/// `file:` URI for `path`, escaping the characters SQLite's URI parser treats
+/// specially.
+fn file_uri(path: &Path) -> String {
+    let mut uri = String::from("file:");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
+        }
+    }
+    uri
+}
+
+/// The journal mode in the database header: `Some(true)` for WAL (file format
+/// version 2 at byte offsets 18 and 19), `None` for a file too short to have a
+/// header.
+fn header_says_wal(path: &Path) -> std::io::Result<Option<bool>> {
     let mut header = [0u8; 20];
     let mut file = File::open(path)?;
     let mut read = 0;
     while read < header.len() {
         match file.read(&mut header[read..])? {
-            0 => return Ok(false),
+            0 => return Ok(None),
             n => read += n,
         }
     }
-    Ok(header[18] == 2 || header[19] == 2)
-}
-
-#[cfg(unix)]
-fn ownership(path: &Path) -> std::io::Result<(u32, u32)> {
-    use std::os::unix::fs::MetadataExt;
-    let owner = std::fs::metadata(path)?.uid();
-    Ok((rustix::process::geteuid().as_raw(), owner))
-}
-
-#[cfg(not(unix))]
-fn ownership(_path: &Path) -> std::io::Result<(u32, u32)> {
-    // No uid model: SQLite's own permission handling is all there is.
-    Ok((0, 0))
+    Ok(Some(header[18] == 2 || header[19] == 2))
 }
 
 #[cfg(test)]
@@ -232,17 +280,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_root_or_the_owner_may_create_sidecars() {
-        assert!(may_create_sidecars(0, 999));
-        assert!(may_create_sidecars(999, 999));
-        assert!(!may_create_sidecars(1000, 999));
-    }
-
-    #[test]
     fn sidecar_paths_append_the_suffix() {
         assert_eq!(
             sidecar(Path::new("/data/relay-stats.db"), "-wal"),
             PathBuf::from("/data/relay-stats.db-wal")
+        );
+    }
+
+    #[test]
+    fn file_uri_escapes_query_and_fragment() {
+        assert_eq!(
+            file_uri(Path::new("/data/a?b#c%d.db")),
+            "file:/data/a%3fb%23c%25d.db"
         );
     }
 
@@ -254,17 +303,38 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE t (x)")
             .unwrap();
-        assert!(!is_wal_database(&rollback).unwrap());
+        assert_eq!(header_says_wal(&rollback).unwrap(), Some(false));
 
         let wal = dir.path().join("wal.db");
         Connection::open(&wal)
             .unwrap()
             .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (x)")
             .unwrap();
-        assert!(is_wal_database(&wal).unwrap());
+        assert_eq!(header_says_wal(&wal).unwrap(), Some(true));
 
         let empty = dir.path().join("empty.db");
         File::create(&empty).unwrap();
-        assert!(!is_wal_database(&empty).unwrap());
+        assert_eq!(header_says_wal(&empty).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn saturated_reads_fail_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        let db = RelayDb::new(&path);
+        let held = db
+            .permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_READS as u32)
+            .await
+            .unwrap();
+        let result = db.read(|_| Ok(())).await;
+        assert!(matches!(result, Err(ApiError::Overloaded)));
+        drop(held);
+        db.read(|_| Ok(())).await.unwrap();
     }
 }

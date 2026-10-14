@@ -62,9 +62,5 @@ http-body-util = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hex_fmt = "0.3"
 
-[target.'cfg(unix)'.dependencies]
-# Effective uid for the relay database's -wal/-shm ownership check
-rustix = { workspace = true, features = ["process"] }
-
 [dev-dependencies]
 tempfile = "3"

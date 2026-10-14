@@ -133,12 +133,23 @@ impl AppState {
             BoundedClickHouse::new(&config.clickhouse_url, &config.clickhouse_database);
 
         // Relay endpoints open a read-only connection per request (see
-        // `relay_db`); try one here so a misconfiguration shows up in the log.
+        // `relay_db`). `RelayDb::new` reads the header before any connection
+        // exists; then open one and read from it, so a misconfiguration shows
+        // up in the log.
         let relay_db = config.relay_db_path.as_ref().map(|path| {
             let db = RelayDb::new(path);
             match db.open() {
-                Ok(_) => tracing::info!(path = %path.display(), "relay database readable (read-only, per request)"),
-                Err(e) => tracing::warn!(path = %path.display(), error = %e, "relay database not readable yet"),
+                Ok((_, access)) => tracing::info!(
+                    path = %path.display(),
+                    wal = db.is_wal(),
+                    ?access,
+                    "relay database readable (read-only, opened per request)"
+                ),
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "relay database not readable at startup; relay endpoints will retry per request"
+                ),
             }
             db
         });

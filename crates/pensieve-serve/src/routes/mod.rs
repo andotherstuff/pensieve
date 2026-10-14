@@ -152,7 +152,11 @@ const API_PREFIX: &str = "/api/v1";
 
 /// Add cache headers to API responses based on the endpoint.
 ///
-/// Sets both `Cache-Control` and `ETag` headers for browser and CDN caching.
+/// Sets both `Cache-Control` and `ETag` headers for client-side caching.
+/// Every route behind this layer requires a Bearer token, so the directive is
+/// `private`: a shared cache (CDN, proxy) must not store a response and hand
+/// it to another client, which may not hold a token. The public `/health` and
+/// `/docs` routes are outside this layer and send no `Cache-Control`.
 ///
 /// TTLs are set per-endpoint based on how frequently the data changes (see
 /// [`cache_policy_for_path`]). ETag enables conditional requests
@@ -176,7 +180,7 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
     let (max_age, stale_while_revalidate) = cache_policy_for_path(&path);
 
     let cache_value =
-        format!("public, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}");
+        format!("private, max-age={max_age}, stale-while-revalidate={stale_while_revalidate}");
 
     // Collect body bytes to compute ETag
     let (parts, body) = response.into_parts();
@@ -281,7 +285,54 @@ fn cache_policy_for_path(path: &str) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_policy_for_path;
+    use super::{api_relative_path, cache_policy_for_path};
+    use axum::body::Body;
+    use axum::extract::{OriginalUri, Request};
+
+    fn request(uri: &str, original: Option<&str>) -> Request {
+        let mut request = Request::get(uri).body(Body::empty()).unwrap();
+        if let Some(original) = original {
+            request
+                .extensions_mut()
+                .insert(OriginalUri(original.parse().unwrap()));
+        }
+        request
+    }
+
+    #[test]
+    fn relative_path_comes_from_the_original_uri() {
+        // Inside the nest axum strips `/api/v1` from the URI; the full path is
+        // only in `OriginalUri`. A different stripped URI proves which is used.
+        assert_eq!(
+            api_relative_path(&request("/elsewhere", Some("/api/v1/stats/events/latest"))),
+            "/stats/events/latest"
+        );
+        assert_eq!(
+            api_relative_path(&request(
+                "/kinds/1/activity",
+                Some("/api/v1/kinds/1/activity?limit=3")
+            )),
+            "/kinds/1/activity"
+        );
+        assert_eq!(api_relative_path(&request("/", Some("/api/v1"))), "/");
+    }
+
+    #[test]
+    fn relative_path_falls_back_to_the_request_uri() {
+        assert_eq!(
+            api_relative_path(&request("/api/v1/stats/events/total", None)),
+            "/stats/events/total"
+        );
+        assert_eq!(
+            api_relative_path(&request("/stats/events/total", None)),
+            "/stats/events/total"
+        );
+        // Only a whole path segment is a prefix.
+        assert_eq!(
+            api_relative_path(&request("/api/v10/stats", None)),
+            "/api/v10/stats"
+        );
+    }
 
     #[test]
     fn cache_policy_uses_realtime_for_latest_event() {

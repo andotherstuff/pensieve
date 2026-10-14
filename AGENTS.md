@@ -393,7 +393,7 @@ are silently ignored. Templates: `env.production.example`,
 | `CLICKHOUSE_URL` | No | Default `http://localhost:8123` |
 | `CLICKHOUSE_DATABASE` | No | Default `nostr` |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_PATH`, `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | No | Ingest-written watermark; when set, `latest_event` is read from it instead of scanning `events_local` (production: `/var/lib/pensieve/latest-event-watermark.json`; max age default 900 s) |
-| `RELAY_DB_PATH` | No | Ingester's relay-stats SQLite for relay endpoints (production: `/data/relay-stats.db`, set in the API drop-in since 2026-10-12; `api-fe54f04` and earlier open it once with `immutable=1` and serve stale relay data, master opens it read-only per request) |
+| `RELAY_DB_PATH` | No | Ingester's relay-stats SQLite for relay endpoints (production: `/data/relay-stats.db`, set in the API drop-in since 2026-10-12; `api-fe54f04` and earlier open it once with `immutable=1` and serve stale relay data; master opens it read-only per request, with `immutable=1` only while the ingester is stopped, since `ProtectSystem=strict` makes `/data` read-only for the API) |
 
 `pensieve-preview` (`crates/pensieve-preview/src/config.rs`):
 

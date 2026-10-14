@@ -90,42 +90,47 @@ async fn each_endpoint_gets_its_own_cache_policy() {
             ("total_kinds", r#"{"count":3}"#),
             ("earliest_event", r#"{"timestamp":1606719600}"#),
             ("kind_activity:kind=1&group_by=day&limit=30", "[]"),
+            ("hourly_activity:days=7&kind=", "[]"),
         ],
     )
     .await;
 
     let expected = [
         (
+            "/api/v1/stats/activity/hourly?days=7",
+            "private, max-age=600, stale-while-revalidate=1800",
+        ),
+        (
             "/api/v1/stats/events/latest",
-            "public, max-age=10, stale-while-revalidate=30",
+            "private, max-age=10, stale-while-revalidate=30",
         ),
         (
             "/api/v1/stats/events/total",
-            "public, max-age=300, stale-while-revalidate=600",
+            "private, max-age=300, stale-while-revalidate=600",
         ),
         (
             "/api/v1/stats/pubkeys/total",
-            "public, max-age=300, stale-while-revalidate=600",
+            "private, max-age=300, stale-while-revalidate=600",
         ),
         (
             "/api/v1/kinds/1/activity",
-            "public, max-age=600, stale-while-revalidate=1800",
+            "private, max-age=600, stale-while-revalidate=1800",
         ),
         (
             "/api/v1/stats/kinds/total",
-            "public, max-age=3600, stale-while-revalidate=7200",
+            "private, max-age=3600, stale-while-revalidate=7200",
         ),
         (
             "/api/v1/stats/events/earliest",
-            "public, max-age=3600, stale-while-revalidate=7200",
+            "private, max-age=3600, stale-while-revalidate=7200",
         ),
         (
             "/api/v1/ping",
-            "public, max-age=60, stale-while-revalidate=300",
+            "private, max-age=60, stale-while-revalidate=300",
         ),
         (
             "/api/v1/relays/summary",
-            "public, max-age=60, stale-while-revalidate=300",
+            "private, max-age=60, stale-while-revalidate=300",
         ),
     ];
     for (path, policy) in expected {
@@ -134,6 +139,12 @@ async fn each_endpoint_gets_its_own_cache_policy() {
         assert_eq!(cache_control(&response), Some(policy), "{path}");
         assert!(response.headers().contains_key(header::ETAG), "{path}");
     }
+
+    // `/stats/engagement` has the 10-minute policy but is disabled: a 503
+    // carries no cache headers until it is re-enabled.
+    let engagement = get(&api, "/api/v1/stats/engagement", None).await;
+    assert_eq!(engagement.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(cache_control(&engagement), None);
 }
 
 #[tokio::test]
@@ -150,7 +161,7 @@ async fn not_modified_keeps_the_endpoint_policy() {
     assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(
         cache_control(&revalidated),
-        Some("public, max-age=10, stale-while-revalidate=30")
+        Some("private, max-age=10, stale-while-revalidate=30")
     );
 }
 
