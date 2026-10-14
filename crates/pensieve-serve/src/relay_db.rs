@@ -26,8 +26,14 @@
 //! - **[`Access::Live`]**, when both files exist (the ingester is running, or
 //!   the database is not in WAL mode): a normal read-only WAL reader. If it
 //!   can write `-shm` it updates its read marks there, as every WAL reader
-//!   does; if it cannot (the production case) SQLite opens `-shm` read-only
-//!   and indexes the WAL in private memory: slower, still consistent.
+//!   does. If it cannot (the production case) SQLite maps `-shm` read-only:
+//!   while the ingester holds it, the reader uses the writer's WAL index and
+//!   read marks at normal speed. Only when no writer holds `-shm` (after a
+//!   crash, or a stop that skipped the final checkpoint) does SQLite rebuild
+//!   the WAL index in private memory, which is slower but still consistent.
+//!   `tests/relay_db.rs` covers the read-only `-shm` path with the writer in
+//!   a separate process; it was also checked on a read-only (`EROFS`) bind
+//!   mount, as production has.
 //! - **[`Access::Snapshot`]**, when a WAL database has neither file: no
 //!   connection has it open, because the last one to close checkpointed the
 //!   WAL into the main file and deleted both. The main file is then complete,
@@ -52,8 +58,9 @@
 //!   is not exposed: `/data` is read-only for the API, and both services run
 //!   as `pensieve`, which owns the database.
 //!
-//! Any remaining "could not open or create" error maps to
-//! `503 metric_unavailable`, not `500`.
+//! Any remaining "could not open, create or recover" error maps to
+//! `503 metric_unavailable`, not `500`, and so does `SQLITE_CORRUPT` in a
+//! snapshot read, which can overlap an ingester restart.
 //!
 //! # Journal mode probe
 //!
@@ -94,10 +101,14 @@ pub enum Access {
 ///
 /// - `SQLITE_BUSY`/`SQLITE_LOCKED` (after [`BUSY_TIMEOUT`]) become
 ///   `503 analytics_busy`;
-/// - failures to open or create the database's files (`SQLITE_CANTOPEN`,
-///   `SQLITE_READONLY_DIRECTORY`, `SQLITE_READONLY_CANTINIT`) become
-///   `503 metric_unavailable`;
-/// - everything else is a `500`.
+/// - `SQLITE_CANTOPEN` and every `SQLITE_READONLY*` code become
+///   `503 metric_unavailable`: the API never writes, so a read-only error
+///   means SQLite could not open, create or recover one of the database's
+///   files (`_DIRECTORY`, `_CANTINIT`, or `_RECOVERY` on a torn WAL-index
+///   header seen through a read-only `-shm`);
+/// - everything else is a `500`, keeping the [`rusqlite::Error`] inside the
+///   [`ApiError::Internal`] so the snapshot rule of [`sqlite_error_in`] can
+///   still inspect it.
 pub fn sqlite_error(error: rusqlite::Error) -> ApiError {
     match error.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
@@ -108,20 +119,42 @@ pub fn sqlite_error(error: rusqlite::Error) -> ApiError {
             tracing::warn!(error = %error, "relay database unavailable");
             ApiError::MetricUnavailable
         }
-        _ => ApiError::Internal(anyhow::anyhow!("relay database query failed: {error}")),
+        _ => ApiError::Internal(anyhow::Error::new(error)),
     }
 }
 
-/// Whether SQLite could not open or create one of the database's files.
-fn is_unavailable(error: &rusqlite::Error) -> bool {
+/// [`sqlite_error`] for a read in `access` mode. A [`Access::Snapshot`] read
+/// can overlap an ingester restart (see the module docs), so
+/// `SQLITE_CORRUPT` there is a `503 metric_unavailable`, not a `500`.
+pub fn sqlite_error_in(access: Access, error: rusqlite::Error) -> ApiError {
+    remap_in(access, sqlite_error(error))
+}
+
+/// Apply the [`Access::Snapshot`] rule of [`sqlite_error_in`] to an error
+/// that a read closure already mapped with [`sqlite_error`].
+fn remap_in(access: Access, error: ApiError) -> ApiError {
     match error {
-        rusqlite::Error::SqliteFailure(failure, _) => {
-            failure.code == ErrorCode::CannotOpen
-                || failure.extended_code == rusqlite::ffi::SQLITE_READONLY_DIRECTORY
-                || failure.extended_code == rusqlite::ffi::SQLITE_READONLY_CANTINIT
+        ApiError::Internal(inner)
+            if access == Access::Snapshot
+                && inner
+                    .downcast_ref::<rusqlite::Error>()
+                    .and_then(rusqlite::Error::sqlite_error_code)
+                    == Some(ErrorCode::DatabaseCorrupt) =>
+        {
+            tracing::warn!(error = %inner, "relay database snapshot read overlapped a write");
+            ApiError::MetricUnavailable
         }
-        _ => false,
+        other => other,
     }
+}
+
+/// Whether SQLite could not open, create or recover one of the database's
+/// files (`SQLITE_CANTOPEN`, any `SQLITE_READONLY*`).
+fn is_unavailable(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::CannotOpen | ErrorCode::ReadOnly)
+    )
 }
 
 /// Handle to the ingester's relay-stats database. Cheap to clone; holds no
@@ -172,25 +205,30 @@ impl RelayDb {
     /// each of its read transactions starts, including ones committed after
     /// it opened.
     pub fn open(&self) -> rusqlite::Result<(Connection, Access)> {
+        let (access, result) = self.open_attempt();
+        result.map(|conn| (conn, access))
+    }
+
+    /// Open a connection. The mode is returned with a failure too, for
+    /// [`sqlite_error_in`].
+    fn open_attempt(&self) -> (Access, rusqlite::Result<Connection>) {
         if self.wal && !self.sidecars_exist() {
-            return self.open_snapshot();
+            return (Access::Snapshot, self.open_snapshot());
         }
-        let conn = Connection::open_with_flags(
-            self.path.as_path(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "query_only", true)?;
+        let conn = match self.open_live() {
+            Ok(conn) => conn,
+            Err(error) => return (Access::Live, Err(error)),
+        };
         // The open is lazy: the first read is what opens (or tries to create)
         // the WAL.
         match check_readable(&conn) {
-            Ok(()) => Ok((conn, Access::Live)),
+            Ok(()) => (Access::Live, Ok(conn)),
             // The ingester closed between the check and the open.
             Err(error) if self.wal && is_unavailable(&error) && !self.sidecars_exist() => {
                 drop(conn);
-                self.open_snapshot()
+                (Access::Snapshot, self.open_snapshot())
             }
-            Err(error) => Err(error),
+            Err(error) => (Access::Live, Err(error)),
         }
     }
 
@@ -208,8 +246,9 @@ impl RelayDb {
         let db = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let (conn, _) = db.open().map_err(sqlite_error)?;
-            f(&conn)
+            let (access, conn) = db.open_attempt();
+            let conn = conn.map_err(|error| sqlite_error_in(access, error))?;
+            f(&conn).map_err(|error| remap_in(access, error))
         })
         .await
         .map_err(|error| ApiError::Internal(error.into()))?
@@ -219,7 +258,17 @@ impl RelayDb {
         sidecar(&self.path, "-wal").exists() && sidecar(&self.path, "-shm").exists()
     }
 
-    fn open_snapshot(&self) -> rusqlite::Result<(Connection, Access)> {
+    fn open_live(&self) -> rusqlite::Result<Connection> {
+        let conn = Connection::open_with_flags(
+            self.path.as_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(conn)
+    }
+
+    fn open_snapshot(&self) -> rusqlite::Result<Connection> {
         let conn = Connection::open_with_flags(
             format!("{}?mode=ro&immutable=1", file_uri(&self.path)),
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -228,7 +277,7 @@ impl RelayDb {
         )?;
         conn.pragma_update(None, "query_only", true)?;
         check_readable(&conn)?;
-        Ok((conn, Access::Snapshot))
+        Ok(conn)
     }
 }
 
@@ -278,6 +327,75 @@ fn header_says_wal(path: &Path) -> std::io::Result<Option<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn busy_and_locked_are_overloaded() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            assert!(matches!(sqlite_error(failure(code)), ApiError::Overloaded));
+        }
+    }
+
+    #[test]
+    fn open_and_read_only_failures_are_unavailable() {
+        use rusqlite::ffi;
+        for code in [
+            ffi::SQLITE_CANTOPEN,
+            ffi::SQLITE_READONLY,
+            ffi::SQLITE_READONLY_RECOVERY,
+            ffi::SQLITE_READONLY_CANTINIT,
+            ffi::SQLITE_READONLY_DIRECTORY,
+            ffi::SQLITE_READONLY_ROLLBACK,
+            ffi::SQLITE_READONLY_DBMOVED,
+        ] {
+            for access in [Access::Live, Access::Snapshot] {
+                assert!(
+                    matches!(
+                        sqlite_error_in(access, failure(code)),
+                        ApiError::MetricUnavailable
+                    ),
+                    "code {code} in {access:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_is_unavailable_only_in_a_snapshot() {
+        let corrupt = rusqlite::ffi::SQLITE_CORRUPT;
+        assert!(matches!(
+            sqlite_error_in(Access::Live, failure(corrupt)),
+            ApiError::Internal(_)
+        ));
+        assert!(matches!(
+            sqlite_error_in(Access::Snapshot, failure(corrupt)),
+            ApiError::MetricUnavailable
+        ));
+        // Errors a read closure already mapped with `sqlite_error`.
+        assert!(matches!(
+            remap_in(Access::Snapshot, sqlite_error(failure(corrupt))),
+            ApiError::MetricUnavailable
+        ));
+        assert!(matches!(
+            remap_in(Access::Live, sqlite_error(failure(corrupt))),
+            ApiError::Internal(_)
+        ));
+        // Other internal errors stay 500 in a snapshot too.
+        assert!(matches!(
+            sqlite_error_in(Access::Snapshot, failure(rusqlite::ffi::SQLITE_ERROR)),
+            ApiError::Internal(_)
+        ));
+        assert!(matches!(
+            remap_in(
+                Access::Snapshot,
+                ApiError::Internal(anyhow::anyhow!("other"))
+            ),
+            ApiError::Internal(_)
+        ));
+    }
 
     #[test]
     fn sidecar_paths_append_the_suffix() {

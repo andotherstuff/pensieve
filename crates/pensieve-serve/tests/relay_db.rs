@@ -158,6 +158,93 @@ fn reader_sees_rows_committed_after_it_opened() {
     assert_eq!(relay_count(&reader), 3);
 }
 
+/// Environment variable that turns [`writer_process`] into the ingester
+/// stand-in for [`live_reader_follows_a_writer_process_through_read_only_shm`].
+const WRITER_DIR_ENV: &str = "PENSIEVE_TEST_RELAY_WRITER_DIR";
+
+/// Wait (up to 30 s) for a marker file another process creates.
+fn wait_for(marker: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            marker.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The writer half of the read-only `-shm` test, run in a child process
+/// (this test binary re-invoked) so that its `-shm` mapping is not shared
+/// with the reader's. Does nothing unless [`WRITER_DIR_ENV`] is set.
+#[test]
+#[ignore = "helper: the writer process of live_reader_follows_a_writer_process_through_read_only_shm"]
+fn writer_process() {
+    let Some(dir) = std::env::var_os(WRITER_DIR_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let writer = open_writer(&dir.join("relay-stats.db"));
+    add_relay(&writer, "wss://one.example", "active");
+    std::fs::File::create(dir.join("ready-1")).unwrap();
+    wait_for(&dir.join("go"));
+    add_relay(&writer, "wss://two.example", "active");
+    add_relay(&writer, "wss://three.example", "idle");
+    std::fs::File::create(dir.join("ready-2")).unwrap();
+    wait_for(&dir.join("stop"));
+}
+
+#[test]
+fn live_reader_follows_a_writer_process_through_read_only_shm() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay-stats.db");
+    create_db(&path);
+    let db = RelayDb::new(&path);
+
+    let mut child = KillOnDrop(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["writer_process", "--exact", "--ignored", "--test-threads=1"])
+            .env(WRITER_DIR_ENV, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&dir.path().join("ready-1"));
+
+    // The writer already has -shm mapped read-write; the reader's O_RDWR open
+    // now fails and SQLite falls back to O_RDONLY, as on production's
+    // read-only /data.
+    let shm = sidecar(&path, "-shm");
+    std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&shm).is_ok() {
+        eprintln!("running as root: -shm stays writable; the read-write path is tested instead");
+    }
+
+    let (reader, access) = db.open().unwrap();
+    assert_eq!(access, Access::Live);
+    assert_eq!(relay_count(&reader), 1);
+
+    std::fs::File::create(dir.path().join("go")).unwrap();
+    wait_for(&dir.path().join("ready-2"));
+    assert_eq!(relay_count(&reader), 3);
+    // A fresh connection sees them too.
+    assert_eq!(relay_count(&db.open().unwrap().0), 3);
+
+    std::fs::File::create(dir.path().join("stop")).unwrap();
+    assert!(child.0.wait().unwrap().success());
+}
+
+/// Kills the writer process if the test fails before it exits.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn reader_cannot_write() {
     let dir = tempfile::tempdir().unwrap();

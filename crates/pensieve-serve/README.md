@@ -1032,10 +1032,12 @@ never create the database's `-wal` and `-shm` files, and each request picks
 one of two ways to read:
 
 - **Ingester running** (`-wal` and `-shm` exist): a normal read-only WAL
-  reader. It cannot write `-shm`, so SQLite opens it read-only and indexes the
-  WAL in private memory: slower than shared memory, still consistent. (A
-  reader that can write `-shm` updates its read marks there, as every WAL
-  reader does.)
+  reader. It cannot write `-shm`, so SQLite maps it read-only and uses the
+  ingester's WAL index and read marks at normal speed. (A reader that can write
+  `-shm` updates its read marks there, as every WAL reader does.) Only when
+  `-wal`/`-shm` exist but no writer holds them, after a crash or a stop that
+  skipped the final checkpoint, does SQLite rebuild the WAL index in private
+  memory: slower, still consistent.
 - **Ingester stopped cleanly** (both files gone; the last connection
   checkpointed the WAL into the main file and deleted them): an
   `immutable=1` read of the main file, which is complete. A plain read-only
@@ -1058,10 +1060,12 @@ Other behaviour:
 - **Busy:** a reader waits up to 2 s (`busy_timeout`) on `SQLITE_BUSY`, then
   the request fails with `503 analytics_busy`. At most 16 relay reads run at
   once; further requests get `503 analytics_busy` immediately.
-- **Unreadable files:** if SQLite cannot open or create a file it needs
-  (`SQLITE_CANTOPEN`, `SQLITE_READONLY_DIRECTORY`,
-  `SQLITE_READONLY_CANTINIT`), the request fails with
-  `503 metric_unavailable`.
+- **Unreadable files:** if SQLite cannot open, create or recover a file it
+  needs (`SQLITE_CANTOPEN` or any `SQLITE_READONLY*` code, such as
+  `_DIRECTORY`, `_CANTINIT` or `_RECOVERY`; the API never writes, so a
+  read-only error always means this), the request fails with
+  `503 metric_unavailable`. So does `SQLITE_CORRUPT` during a snapshot read,
+  which can overlap an ingester restart. Other SQLite errors are `500`.
 
 #### `GET /api/v1/relays/summary`
 
@@ -1170,7 +1174,7 @@ All errors return JSON with the following structure:
 | 500 | `database_error` | Database query failed |
 | 500 | `serialization_error` | Response serialization failed |
 | 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out, or the relay database stayed busy for 2 s or 16 relay reads were already running; retry later |
-| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied, or a relay endpoint when SQLite cannot open or create a file the relay database needs |
+| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied, or a relay endpoint when SQLite cannot open, create or recover a file the relay database needs (or a snapshot read hits `SQLITE_CORRUPT`) |
 
 ---
 
