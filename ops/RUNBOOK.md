@@ -1359,18 +1359,30 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   lookups re-reading filter blocks from the page cache. Check that the release
   logs `dedupe block cache configured` at start and that
   `dedupe_block_cache_usage_bytes` is well above 32 MiB; a release without it
-  has the default 32 MiB cache. The cache (`--dedupe-block-cache-mib`, default
-  16384) needs to grow when the ingester logs `dedupe filter and index blocks
-  exceed half the block cache` at start (it compares the `filter_bytes` +
-  `index_bytes` of the `dedupe block cache configured` line with half the
-  capacity), or when `dedupe_block_cache_pinned_bytes` climbs toward
-  `dedupe_block_cache_usage_bytes` while usage sits at
-  `dedupe_block_cache_capacity_bytes` (pinned blocks cannot be evicted, so the
-  cache has no room left for filters). Since that fix a TooDense window costs no
+  has the default 32 MiB cache. Since that fix a TooDense window costs no
   lookups and a fair-lease command stops preflighting after 60 s, so a stale
   observation that persists points at something else. A restart does not help:
   the runtime resumes the same windows with a cold cache. Leave the ledger alone;
   the ten-minute worker restarts are harmless while no lease is granted.
+
+  **Sizing the dedupe block cache** (`--dedupe-block-cache-mib`, default 16384).
+  Signs it is too small: the start-up warning `dedupe filter and index blocks
+  exceed half the block cache (heuristic)`, which compares the `filter_bytes` +
+  `index_bytes` of the `dedupe block cache configured` line with half the
+  capacity; `dedupe_block_cache_usage_bytes` staying at
+  `dedupe_block_cache_capacity_bytes` (expected once warm, so only supporting
+  evidence); and, decisively, the `rchar` rate of the ingester's threads with the
+  sampling above: several GB/s at about 1 MB per read means filter thrash.
+  `dedupe_block_cache_pinned_bytes` does not show it: only L0 index and filter
+  blocks and blocks held mid-lookup are pinned, so it stays flat while non-L0
+  filters thrash. Memory: the ingester's RSS settles above the cache size; with
+  glibc malloc overhead and fragmentation the 16 GiB default adds roughly
+  17-20 GiB of RSS once warm. Watch `free -g` and swap for the first hours after a deploy that
+  changes the cache. The drop-in sets `Restart=no`, so an OOM kill would stop
+  ingestion until someone restarts it. To shrink the cache, add
+  `--dedupe-block-cache-mib <MiB>` (for example `8192`) to the drop-in's
+  `ExecStart`, `daemon-reload`, and restart the ingester with the graceful-stop
+  checks; the option changes nothing on disk.
 - `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
   it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
   because the runtime removed its socket), find the cause in

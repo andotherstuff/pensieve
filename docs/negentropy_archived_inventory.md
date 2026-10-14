@@ -14,7 +14,8 @@ This set describes known archive inventory, not complete relay history.
 
 The window is read in two passes. The first collects inventory keys only and
 returns TooDense as soon as the 250,001st row is seen, so a dense window costs one
-bounded key scan (about 10 MB of keys) and no dedupe lookups. Only a window within
+bounded key scan (at most about 10 MB of keys, about 20 MB peak while the
+filtered copy is built) and no dedupe lookups. Only a window within
 the cap pays one dedupe `get` per row in the second pass. Before 2026-10-14 the
 lookups were interleaved with the scan, so each TooDense answer was reached only
 after 250,000 wasted lookups, repeated for each split child (see

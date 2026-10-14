@@ -21,9 +21,14 @@
 //! shards of 512 KiB, smaller than a single ~2 MB full filter block of a 64 MB
 //! SST, so with the default nothing stays cached at all. [`DedupeIndex`]
 //! therefore owns a dedicated LRU block cache, sized by
-//! [`DedupeOptions::block_cache_mib`]. Index and filter blocks are inserted
-//! at high priority (RocksDB's default), which reserves half of the capacity
-//! for them; L0 blocks are pinned. These are table read options only: the
+//! [`DedupeOptions::block_cache_mib`]. The LRU cache is sharded (64 shards
+//! at these sizes) and about half of each shard is a high-priority pool that
+//! index and filter blocks enter first (`high_pri_pool_ratio` 0.5, RocksDB's
+//! default). It is not reserved for them: any block that gets a cache hit is
+//! promoted into that pool too, so hot data blocks share it, and overflow is
+//! demoted to the low-priority list rather than evicted, so spillover degrades
+//! gradually. L0 index and filter blocks are pinned. These are table read
+//! options only: the
 //! on-disk format and every SST written are unchanged, so older binaries open
 //! the database as before.
 //!
@@ -45,10 +50,10 @@ use std::sync::Arc;
 /// Measured with these options: 1.25 bytes of full bloom filter and about 0.16
 /// bytes of index block per entry. Production's index (88 GB in ~1,500 64 MB
 /// SSTs, roughly 2.0-2.3 billion entries) therefore needs about 3 GB resident.
-/// Index and filter blocks get the high-priority half of the cache, so 16 GiB
-/// keeps all of them resident until the key count reaches roughly 2-2.5 times
-/// today's; the rest holds hot data blocks, which also raises the hit rate of
-/// negentropy preflight lookups. Memory is allocated only as blocks are read,
+/// Index and filter blocks enter the high-priority pool, about half of each
+/// cache shard, so 16 GiB should keep them resident until the key count
+/// reaches roughly 2-2.5 times today's; the rest holds hot data blocks, which
+/// also raises the hit rate of negentropy preflight lookups. Memory is allocated only as blocks are read,
 /// so small databases (tests, backfills) use little of it.
 pub const DEFAULT_BLOCK_CACHE_MIB: usize = 16 * 1024;
 
@@ -315,14 +320,15 @@ impl DedupeIndex {
             index_bytes = metadata.index_bytes,
             "dedupe block cache configured"
         );
-        // Index and filter blocks get the high-priority half of an LRU cache.
-        // Beyond that they compete with data blocks and lookups start
-        // re-reading them from disk or the page cache.
+        // Heuristic: index and filter blocks enter the high-priority pool,
+        // about half of each shard, which hot data blocks share. Past that
+        // they are demoted to the low-priority list and increasingly compete
+        // with data blocks, so lookups gradually start re-reading them.
         if resident > cache_bytes as u64 / 2 {
             tracing::warn!(
                 resident_bytes = resident,
                 block_cache_bytes = cache_bytes,
-                "dedupe filter and index blocks exceed half the block cache; raise --dedupe-block-cache-mib"
+                "dedupe filter and index blocks exceed half the block cache (heuristic); consider raising --dedupe-block-cache-mib"
             );
         }
         Ok(index)

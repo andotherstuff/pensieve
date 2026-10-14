@@ -96,7 +96,7 @@ its cadence is not a hard wall-clock bound on slow disk operations.
 |------|---------|-------------|
 | `-o, --output-dir` | `./segments` | Output directory for notepack segments |
 | `--rocksdb-path` | `./data/dedupe` | RocksDB path for deduplication |
-| `--dedupe-block-cache-mib` | `16384` | Dedicated block cache for the dedupe index. Half of it must hold every SST's bloom filter and index block (about 1.4 bytes per key); read option only, no on-disk change |
+| `--dedupe-block-cache-mib` | `16384` | Dedicated block cache for the dedupe index. It must hold every SST's bloom filter and index block (about 1.4 bytes per key), ideally within the high-priority pool of about half of it; read option only, no on-disk change. The process RSS settles above this size |
 | `--clickhouse-url` | (none) | ClickHouse URL for indexing |
 | `--clickhouse-db` | `nostr` | ClickHouse database name |
 | `--seed-relays` | (none) | Comma-separated seed relay URLs; overrides the seed file |
