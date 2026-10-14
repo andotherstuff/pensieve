@@ -1346,6 +1346,24 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   again); the job's received frames are not yet archive-confirmed; or
   `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
   like any other `unresolved_failures` job above; the full rule still applies.
+- `owner_observation_stale`: the parent owner thread has not refreshed health for
+  15 minutes. It serves every parent command, including the per-tick lifecycle
+  read that refreshes health, so one long preflight (the inventory scan before a
+  fair lease) blocks it. On 2026-10-14 a chain of dense windows held it for over
+  20 minutes (see [the incident](../docs/negentropy_continuous_readiness.md#incident-2026-10-14-preflight-stalled-the-owner-thread)).
+  Confirm it is a preflight rather than a hang: find the thread
+  (`top -H -p $(systemctl show -p MainPID --value pensieve-ingest)`, name
+  `negentropy-parent`) and sample `/proc/<pid>/task/<tid>/io` twice a few seconds
+  apart. Busy CPU with `rchar` climbing by gigabytes per second (2026-10-14:
+  about 9 GB/s at about 7,700 reads/s, with `read_bytes` flat) means dedupe
+  lookups re-reading filter blocks from the page cache. Check that the release
+  logs `dedupe block cache configured` at start and that
+  `dedupe_block_cache_usage_bytes` is well above 32 MiB; a release without it
+  has the default 32 MiB cache. Since that fix a TooDense window costs no
+  lookups and a fair-lease command stops preflighting after 60 s, so a stale
+  observation that persists points at something else. A restart does not help:
+  the runtime resumes the same windows with a cold cache. Leave the ledger alone;
+  the ten-minute worker restarts are harmless while no lease is granted.
 - `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
   it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
   because the runtime removed its socket), find the cause in

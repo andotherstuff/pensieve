@@ -37,9 +37,9 @@ use pensieve_ingest::sync::jobs::UnavailableRule;
 use pensieve_ingest::sync::runtime::{IsolatedRuntime, RuntimeConfig};
 use pensieve_ingest::{
     ClickHouseConfig, ClickHouseIndexer, ClickHouseIndexerHandle, CoverageSampler, DedupeIndex,
-    IndexQueue, NegentropySyncConfig, NegentropySyncer, ParquetShadowConfig, ParquetShadowHandle,
-    ParquetShadowPublisher, RelayManager, RelayManagerConfig, SealedSegment, SegmentConfig,
-    SegmentWriter, SyncStateDb,
+    DedupeOptions, IndexQueue, NegentropySyncConfig, NegentropySyncer, ParquetShadowConfig,
+    ParquetShadowHandle, ParquetShadowPublisher, RelayManager, RelayManagerConfig, SealedSegment,
+    SegmentConfig, SegmentWriter, SyncStateDb,
     logging::compact_error,
     pack_nostr_event, parse_relay_discovery,
     relay::normalize_relay_url,
@@ -127,6 +127,13 @@ struct Args {
     /// RocksDB path for dedupe index
     #[arg(long, default_value = "./data/dedupe")]
     rocksdb_path: PathBuf,
+
+    /// Dedicated block cache for the dedupe index, in MiB. Its high-priority
+    /// half must hold every SST's bloom filter and index block (~1.4 bytes per
+    /// key), or each lookup re-reads megabytes of filter. Read option only.
+    #[arg(long, default_value_t = pensieve_ingest::DEFAULT_BLOCK_CACHE_MIB as u32,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    dedupe_block_cache_mib: u32,
 
     /// Output directory for notepack segments
     #[arg(long, short, default_value = "./segments")]
@@ -1015,6 +1022,7 @@ async fn main() -> Result<()> {
     let rate_events_received = Arc::clone(&events_received);
     let rate_events_processed = Arc::clone(&events_processed);
     let rate_events_deduplicated = Arc::clone(&events_deduplicated);
+    let rate_dedupe = Arc::clone(&dedupe);
     let verbose_ops = args.verbose_ops;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -1060,6 +1068,13 @@ async fn main() -> Result<()> {
                 0.0
             };
             gauge!("ingest_dedupe_ratio").set(dedupe_ratio);
+
+            // Dedupe block cache: usage near capacity with lookups slowing down
+            // means filter/index blocks no longer fit (see DedupeOptions).
+            let cache = rate_dedupe.block_cache_usage();
+            gauge!("dedupe_block_cache_capacity_bytes").set(cache.capacity_bytes as f64);
+            gauge!("dedupe_block_cache_usage_bytes").set(cache.usage_bytes as f64);
+            gauge!("dedupe_block_cache_pinned_bytes").set(cache.pinned_bytes as f64);
 
             // Save for next iteration
             last_received = curr_received;
@@ -1627,8 +1642,13 @@ fn init_pipeline(args: &Args) -> Result<PipelineComponents> {
     // Initialize dedupe index
     tracing::info!(path = %args.rocksdb_path.display(), "opening dedupe index");
     let dedupe = Arc::new(
-        DedupeIndex::open(&args.rocksdb_path)
-            .with_context(|| format!("Failed to open dedupe index at {:?}", args.rocksdb_path))?,
+        DedupeIndex::open_with_options(
+            &args.rocksdb_path,
+            DedupeOptions {
+                block_cache_mib: args.dedupe_block_cache_mib as usize,
+            },
+        )
+        .with_context(|| format!("Failed to open dedupe index at {:?}", args.rocksdb_path))?,
     );
 
     let dedupe_stats = dedupe.stats();

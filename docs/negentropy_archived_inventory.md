@@ -12,6 +12,16 @@ Both examined and returned rows are capped at 250,000. TooDense returns **no usa
 partial set**; the scheduler must split the interval or block/alert at one second.
 This set describes known archive inventory, not complete relay history.
 
+The window is read in two passes. The first collects inventory keys only and
+returns TooDense as soon as the 250,001st row is seen, so a dense window costs one
+bounded key scan (about 10 MB of keys) and no dedupe lookups. Only a window within
+the cap pays one dedupe `get` per row in the second pass. Before 2026-10-14 the
+lookups were interleaved with the scan, so each TooDense answer was reached only
+after 250,000 wasted lookups, repeated for each split child (see
+[continuous readiness](negentropy_continuous_readiness.md#incident-2026-10-14-preflight-stalled-the-owner-thread)).
+`reconciliation_window` likewise checks the policy exclusion count (SQLite) before
+the inventory's lookups.
+
 `InventoryReplay::begin` checks its canonical archive directory, prefix and exact
 dedupe object against the supplied writer before initializing any cursor. A writer
 without its own dedupe authority cannot authorize replay. It then binds that

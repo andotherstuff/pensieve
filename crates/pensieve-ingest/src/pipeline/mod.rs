@@ -32,7 +32,10 @@ pub use clickhouse::{
     IndexerStats,
 };
 pub use coverage::CoverageSampler;
-pub use dedupe::{DedupeIndex, DedupeStats, EventStatus, PendingAdmission};
+pub use dedupe::{
+    BlockCacheUsage, DEFAULT_BLOCK_CACHE_MIB, DedupeIndex, DedupeOptions, DedupeStats, EventStatus,
+    PendingAdmission, TableMetadataSize,
+};
 pub use index_queue::{IndexProgress, IndexQueue, resolve_segment};
 pub use parquet_shadow::{
     ParquetShadowConfig, ParquetShadowHandle, ParquetShadowPublisher, start_parquet_shadow,

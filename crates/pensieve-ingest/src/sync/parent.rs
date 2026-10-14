@@ -29,6 +29,16 @@ use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, SyncStateDb};
 use crate::{DedupeIndex, SegmentWriter};
 
+/// Wall-clock budget for one fair-lease command's preflight loop.
+///
+/// The owner thread serves every parent command, including the lifecycle
+/// reads that refresh `/health/negentropy`. A chain of dense windows must not
+/// hold it past the 15-minute `owner_observation_stale` threshold: once the
+/// budget is spent no further candidate is preflighted, the command returns
+/// no lease, and the runtime's next tick observes health and resumes from the
+/// durable splits. One preflight already in progress still runs to completion.
+const PREFLIGHT_BUDGET: Duration = Duration::from_secs(60);
+
 /// Parent failures never discharge a lease or erase a received obligation.
 #[derive(Debug, Error)]
 pub enum ParentError {
@@ -408,7 +418,13 @@ impl ParentExecutor {
                                 // Split local density before consuming a worker attempt.
                                 // A concurrent append after preflight can still make the
                                 // eventual session TooDense; that remains unresolved work.
+                                let preflight_started = Instant::now();
                                 for _ in 0..16 {
+                                    if preflight_started.elapsed() >= PREFLIGHT_BUDGET {
+                                        metrics::counter!("negentropy_preflight_budget_exhausted_total").increment(1);
+                                        tracing::info!(elapsed_secs = preflight_started.elapsed().as_secs(), "isolated preflight budget spent; resuming on a later tick");
+                                        break;
+                                    }
                                     let now = clock();
                                     let Some(candidate) = ledger.fair_candidate(now)? else {
                                         return Ok(None);

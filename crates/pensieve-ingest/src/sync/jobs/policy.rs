@@ -199,10 +199,10 @@ impl JobLedger {
         since: u64,
         until: u64,
     ) -> Result<ArchivedWindow, LedgerError> {
-        let mut items = match inventory.archived_window(since, until, MAX_WINDOW_ITEMS, dedupe)? {
-            ArchivedWindow::Complete(items) => items,
-            ArchivedWindow::TooDense => return Ok(ArchivedWindow::TooDense),
-        };
+        // Exclusions first: an over-cap exclusion set is TooDense whatever the
+        // inventory holds, and checking it is far cheaper than the inventory's
+        // per-ID dedupe lookups.
+        let mut exclusions = Vec::new();
         let mut query = self.db.prepare("SELECT event_id,created_at FROM policy_exclusions WHERE created_at>=?1 AND created_at<=?2 ORDER BY created_at,event_id LIMIT ?3")?;
         for (count, item) in query
             .query_map(params![since, until, MAX_WINDOW_ITEMS + 1], |r| {
@@ -213,8 +213,13 @@ impl JobLedger {
             if count == MAX_WINDOW_ITEMS {
                 return Ok(ArchivedWindow::TooDense);
             }
-            items.push(item?);
+            exclusions.push(item?);
         }
+        let mut items = match inventory.archived_window(since, until, MAX_WINDOW_ITEMS, dedupe)? {
+            ArchivedWindow::Complete(items) => items,
+            ArchivedWindow::TooDense => return Ok(ArchivedWindow::TooDense),
+        };
+        items.append(&mut exclusions);
         items.sort_unstable_by_key(|(id, timestamp)| (*timestamp, *id));
         items.dedup();
         if items.len() > MAX_WINDOW_ITEMS {
@@ -516,11 +521,15 @@ mod tests {
         );
         // Deliberately insert synthetic metadata only to exercise the fixed cap.
         db.db.execute("WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<?1) INSERT INTO policy_exclusions SELECT CAST(printf('%032d',n) AS BLOB),150,?2,?3 FROM ids", params![MAX_WINDOW_ITEMS+1, lease.job().id, lease.job().attempt]).unwrap();
+        inventory.record(&[7; 32], 150).unwrap();
+        let lookups = dedupe.point_lookups();
         assert_eq!(
             db.reconciliation_window(&inventory, &dedupe, 100, 200)
                 .unwrap(),
             ArchivedWindow::TooDense
         );
+        // Over-cap exclusions are rejected before any inventory dedupe lookup.
+        assert_eq!(dedupe.point_lookups(), lookups);
         assert_eq!(
             db.reconciliation_window(&inventory, &dedupe, 151, 200)
                 .unwrap(),
