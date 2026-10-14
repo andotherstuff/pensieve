@@ -161,12 +161,16 @@ to the same Kuma instance as the other probes and refuses any other destination 
 redirect. Install it once:
 
 1. In Kuma, create a **Push** monitor (heartbeat interval 120 s, so one missed 60 s push
-   does not alert) and copy its push URL.
-2. On the host:
+   does not alert) and copy its push URL. Store only `https://status.ipf.dev/api/push/<token>`:
+   Kuma's copied URL ends in `?status=up&msg=OK&ping=`, which the probe rejects (it adds its own
+   query), so drop everything from `?` on.
+2. On the host. `sudoedit` refuses files in `/etc/pensieve` because the directory is
+   writable by `pensieve`, so read the URL without echo (zsh, the host's shell) and write it
+   as root:
 
 ```bash
-sudo install -m 600 -o root -g root /dev/null /etc/pensieve/clickhouse-index-kuma.url
-sudoedit /etc/pensieve/clickhouse-index-kuma.url       # paste the push URL, nothing else
+read -rs 'u?Kuma push URL: '; echo; printf '%s\n' "${u%%\?*}" | sudo tee /etc/pensieve/clickhouse-index-kuma.url >/dev/null; unset u
+sudo chown root:root /etc/pensieve/clickhouse-index-kuma.url && sudo chmod 600 /etc/pensieve/clickhouse-index-kuma.url
 cd ~/pensieve
 sudo install -m 755 ops/scripts/clickhouse-index-kuma.py /usr/local/libexec/pensieve-clickhouse-index-kuma.py
 sudo install -m 644 ops/systemd/pensieve-clickhouse-index-kuma.service ops/systemd/pensieve-clickhouse-index-kuma.timer /etc/systemd/system/
@@ -177,7 +181,8 @@ sudo systemctl enable --now pensieve-clickhouse-index-kuma.timer
 ```
 
 Then test that the monitor's notification fires and resolves (Kuma's own "pause" or a
-temporary `down` push), as for the archive-admission probe.
+temporary `down` push), as for the archive-admission probe. Installed in production on
+2026-10-14 at 19:06 UTC; first pushes `clickhouse index backlog 0 segments, oldest 0s; Kuma accepted`.
 
 **Rolling out the alert rule.** The rule only loads into a recreated Prometheus container.
 `archive-alerts.yml` is a single-file bind mount: `git merge` replaces the file (a new
