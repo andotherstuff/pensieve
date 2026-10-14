@@ -10,7 +10,8 @@
 > `/kinds/{kind}/activity`) is applied, backfilled and validated (2026-10-13; the API
 > reads it since 07:36 UTC); results in `ops/RUNBOOK.md` → Kind activity.
 > Migration 022 ([below](#migration-022-hourly-pubkeys), `/stats/activity/hourly`) is
-> prepared, **not yet applied** (2026-10-14). The API release that reads it also serves
+> applied, backfilled and validated (2026-10-14; the API reads it since 14:49 UTC; results
+> in `ops/RUNBOOK.md` → Hourly authors). The API release that reads it also serves
 > `/stats/events` and `/stats/throughput` from 021's `kind_activity`
 > ([below](#statsevents-and-statsthroughput-from-kind_activity)).
 

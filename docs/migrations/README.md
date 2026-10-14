@@ -77,10 +77,10 @@ As of 2026-10-11 (from `system.tables` and `system.mutations` on the host):
 - Prepared 021 (`kind_activity` for `/kinds/{kind}` and
   `/kinds/{kind}/activity`) was applied at 06:14 UTC on 2026-10-13, backfilled
   and validated (0 failed rows); the API reads it since 07:36 UTC.
-- Prepared 022 (`hourly_pubkeys` for `/stats/activity/hourly`) is **not yet
-  applied** (written 2026-10-14). The API release that reads it also moves
-  `/stats/events` and `/stats/throughput` onto 021's `kind_activity`; apply,
-  backfill and validate 022 before deploying it (RUNBOOK → Hourly authors).
+- Prepared 022 (`hourly_pubkeys` for `/stats/activity/hourly`) was applied at
+  14:11 UTC on 2026-10-14, backfilled and validated (0 failed rows); the API
+  `api-0a14656` reads it, and serves `/stats/events` and `/stats/throughput`
+  from 021's `kind_activity`, since 14:49 UTC (RUNBOOK → Hourly authors).
 
 `docs/clickhouse_self_hosted.sql` is the fresh-install starting point, not a
 snapshot of production. Its header explains how the two differ.
@@ -110,7 +110,7 @@ snapshot of production. Its header explains how the two differ.
 | prepared/019_api_publishers_longform.sql | Insert-fed rollups for `pensieve-serve` `/stats/publishers` (`publisher_activity`) and `/stats/longform` (`longform_latest`); excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-12** | **Yes** (`api-rollups backfill`, bounded, resumable, exactly once) |
 | prepared/020_incremental_derived_views.sql (+ `_cutover.sql`) | Phase 1: insert-fed `pubkey_flags`, `relay_list_latest`, `kind_totals` and `daily_user_stats.last_indexed_at`. Phase 2 (cutover, via `api-rollups cutover`): lookup-free `daily_user_stats_mv`, active-users refreshes join the flags, `relay_distribution` from `relay_list_latest` hourly, `kinds_stats_mv` dropped. Excluded from `ch-migrate-all`. **Applied and cut over in production 2026-10-12** | **Yes** (`api-rollups backfill --migration 020`; kinds exactly once) |
 | prepared/021_kind_activity.sql | Insert-fed `kind_activity` (per kind and UTC hour (35 days), day and month of `created_at`: event count, content bytes, `uniqCombined64` author sketch) for `pensieve-serve` `/kinds/{kind}` (with `kind_totals`) and `/kinds/{kind}/activity`; since the 022 API release also `/stats/events` and `/stats/throughput`. Excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-13** | **Yes** (`api-rollups backfill --migration 021`, exactly once) |
-| prepared/022_hourly_pubkeys.sql | Insert-fed `hourly_pubkeys` (per kind and all kinds, UTC hour of `created_at`, last 35 days: `uniqCombined64` author sketch) for `pensieve-serve` `/stats/activity/hourly` (counts from 021's hour rows). Excluded from `ch-migrate-all`. **Not yet applied** | **Yes** (`api-rollups backfill --migration 022`, idempotent, last 35 days only) |
+| prepared/022_hourly_pubkeys.sql | Insert-fed `hourly_pubkeys` (per kind and all kinds, UTC hour of `created_at`, last 35 days: `uniqCombined64` author sketch) for `pensieve-serve` `/stats/activity/hourly` (counts from 021's hour rows). Excluded from `ch-migrate-all`. **Applied, backfilled and validated in production 2026-10-14** | **Yes** (`api-rollups backfill --migration 022`, idempotent, last 35 days only) |
 
 > **⚠️ IMPORTANT:** Migration 005 MUST be run if you applied migration 004. The views in 004 do
 > expensive JOINs at query time that cause 100% CPU usage on large datasets (100M+ events).

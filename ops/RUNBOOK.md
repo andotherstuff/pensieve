@@ -44,9 +44,9 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-fe54f04/pensieve-serve` (master: 019 rollups, 60-day publishers cap, 020 `kind_totals`, 021 `kind_activity`; since 2026-10-13 09:36 CEST) |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-0a14656/pensieve-serve` (master incl. #101 and #102; since 2026-10-14 14:49 UTC) |
 | `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-43d4a26/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions and #98 16 GiB dedupe block cache, since 2026-10-14 08:24 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-0a14656/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache and #103 carries ahead of a retry backlog, since 2026-10-14 14:09 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` (both active) | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
@@ -227,10 +227,10 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, current), `ingest-43d4a26` (current
-  ingester, #98; runs with the `ingest-26f2170` worker), `ingest-2e07c31` (previous ingester, #95;
-  the rollback target for `43d4a26`: same worker, keep the pause flag, no ledger restore, the
-  dedupe DB opens unchanged), `ingest-85a2402` (older ingester, #94),
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, previous; the rollback target for `api-0a14656`), `api-0a14656`
+  (#101 and #102, current; needs 022), `ingest-0a14656` (current ingester, #103; runs with the
+  `ingest-26f2170` worker), `ingest-43d4a26` (previous ingester, #98; the rollback target for
+  `0a14656`: same worker, keep the pause flag, no ledger restore), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
   `ingest-26f2170` (older ingester and the installed worker, #92),
   `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
@@ -1302,7 +1302,17 @@ changes:
 [`docs/api_rollups.md` → Migration 022](../docs/api_rollups.md#migration-022-hourly-pubkeys)
 and the `/stats/events` section before it.
 
-**Status:** prepared, not yet applied.
+**Status:** Applied 2026-10-14 at 14:11:33 UTC; `plan` estimated 323 GiB uncompressed. Backfill
+14:21:44–14:45:44 UTC (256/256 shards, 37,362,167 rows written, 2,237,344 rows / 378 MiB after
+merges; ingest 0 insert errors, insert p95 0.49 s; `hourly_pubkeys_mv` ~2 ms per insert).
+`validate --migration 022`: 0 failed rows (517,098 rows match; largest sketch error 0.730% on an
+all-kinds hour, 0.663% on an all-kinds day union; 2 min 48 s). The API `api-0a14656` reads it
+since 14:49:56 UTC. Benchmark (step 7, `read_rows` / read / ms, old → new): `events` 347,432,822 /
+23.88 GiB / 5033 → 1,145,799 / 179 MiB / 1165; `events-kind1` 24.38 GiB / 4414 → 2.23 MiB / 156;
+`hourly30` 23.89 GiB / 6755 → 15.57 MiB / 401; `throughput` 544 MiB / 147 → 14.20 MiB / 5.
+Through the API: `/stats/events` 5.03 s → 1.26 s, `?kind=1` 4.41 → 0.16 s,
+`?kind=1&days=90&group_by=week` 10.27 → 0.16 s, `/stats/activity/hourly?days=30` 6.93 → 0.40 s,
+`?days=90` 13.8 s → 400 (by design).
 
 **Order:** apply 022 → plan → backfill → validate → deploy the API that reads
 it → benchmark → monitor. The API release reads 021 (applied) for
@@ -1524,8 +1534,13 @@ that user by design.
 
 ## Published ports and the grafana ClickHouse user
 
-Changed in `fix/ops-prometheus-bind-grafana-user` (PR #100; not yet rolled out at the
-time of writing). Host ports published by `ops/production/compose.yml`:
+Changed by PR #100, **rolled out 2026-10-14 at 14:12 UTC**: grafana grants reloaded through the
+hardlink handle (inodes matched; `SHOW GRANTS` gives the two lines; `system.query_log` refused
+with 497 and `max_execution_time=0` with 452); `promtool` and `systemd-analyze verify` passed;
+Prometheus recreated on `127.0.0.1:19090` and the socket enabled. Verified: no DNAT for 9090,
+`localhost:9090` and `:19090` ready, all 4 targets up, all 3 Grafana datasources healthy,
+9090 and 19090 time out from outside, and the monitoring VM reaches `:9090` over IPv4 and IPv6.
+In the 7 days before, the grafana user had run no queries and there were no alert rules. Host ports published by `ops/production/compose.yml`:
 
 | Port | Service | Bind (before → after) | Reachable from |
 |------|---------|-----------------------|----------------|
@@ -1855,10 +1870,11 @@ Then take the handle (`ln -f ~/pensieve/ops/production/clickhouse/users.xml
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by
 `ops/systemd/pensieve-negentropy-tmpfiles.conf`) is rolled out behind explicit gates; it is
-not covered by the routine deploy above. Since 2026-10-14 08:24 UTC the ingester runs
-`releases/ingest-43d4a26` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
-pause clock, #94 shrinking-set exemption, #95 carried exclusions and #98 dedupe block cache and
-dense-window precount, with `--isolated-negentropy-pause-on-failure-secs 7200`)
+not covered by the routine deploy above. Since 2026-10-14 14:09 UTC the ingester runs
+`releases/ingest-0a14656` (master, incl. #88 lease fix, #90 relay-unavailable exclusions, #92 per-job
+pause clock, #94 shrinking-set exemption, #95 carried exclusions, #98 dedupe block cache and
+dense-window precount and #103 carries ahead of a retry backlog, with
+`--isolated-negentropy-pause-on-failure-secs 7200`)
 with the `ingest-26f2170` worker (installed 14:09 UTC), from
 `zzzz-bounded-canary.conf` with the rolling Premium Primal ledger
 (schema 10 since 2026-10-13 12:48 UTC; the schema-9 backup is `jobs.sqlite.pre-schema10` next to it);
