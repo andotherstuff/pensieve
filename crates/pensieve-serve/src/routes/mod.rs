@@ -7,7 +7,7 @@ mod stats;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{OriginalUri, Request};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -147,20 +147,18 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Prefix the protected router is nested under.
+const API_PREFIX: &str = "/api/v1";
+
 /// Add cache headers to API responses based on the endpoint.
 ///
 /// Sets both `Cache-Control` and `ETag` headers for browser and CDN caching.
 ///
-/// TTLs are set per-endpoint based on how frequently the data changes:
-/// - `/stats/events/latest`: 10 seconds (changes frequently)
-/// - `/stats/events/total`, `/stats/pubkeys/total`: 5 minutes
-/// - `/stats/activity/hourly`, `/stats/engagement`, `/kinds/{kind}/activity`: 10 minutes
-/// - `/stats/kinds/total`, `/stats/events/earliest`: 1 hour (stable data)
-/// - Other endpoints: 60 seconds default
-///
-/// ETag enables conditional requests (If-None-Match) for cache validation.
+/// TTLs are set per-endpoint based on how frequently the data changes (see
+/// [`cache_policy_for_path`]). ETag enables conditional requests
+/// (If-None-Match) for cache validation.
 async fn add_cache_headers(request: Request, next: Next) -> Response {
-    let path = request.uri().path().to_string();
+    let path = api_relative_path(&request);
     let if_none_match = request
         .headers()
         .get(header::IF_NONE_MATCH)
@@ -174,7 +172,7 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
         return response;
     }
 
-    // Determine TTL based on endpoint path (paths are relative to /api/v1 nest)
+    // Determine TTL based on the endpoint path relative to `/api/v1`
     let (max_age, stale_while_revalidate) = cache_policy_for_path(&path);
 
     let cache_value =
@@ -236,25 +234,48 @@ async fn add_cache_headers(request: Request, next: Next) -> Response {
     response
 }
 
+/// The request path relative to [`API_PREFIX`].
+///
+/// Middleware layered on a router nested with `Router::nest` sees the URI with
+/// the nest prefix stripped (axum 0.8), so `request.uri()` is `/stats/...` here
+/// while the client asked for `/api/v1/stats/...`. Matching on either form
+/// alone breaks as soon as the layer moves, so take the full path from
+/// [`OriginalUri`] (set by the outer router) and strip the prefix ourselves.
+fn api_relative_path(request: &Request) -> String {
+    let full = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map_or_else(|| request.uri().path(), |uri| uri.0.path());
+    match full.strip_prefix(API_PREFIX) {
+        Some("") => "/".to_string(),
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => full.to_string(),
+    }
+}
+
+/// `(max-age, stale-while-revalidate)` in seconds for a path relative to
+/// [`API_PREFIX`] (e.g. `/stats/events/latest`).
+///
+/// - `/stats/events/latest`: 10 s (changes constantly)
+/// - `/stats/events/total`, `/stats/pubkeys/total`: 5 minutes
+/// - `/stats/activity/hourly`, `/stats/engagement`, `/kinds/{kind}/activity`: 10 minutes
+/// - `/stats/kinds/total`, `/stats/events/earliest`: 1 hour (stable data)
+/// - every other endpoint: 60 s
+///
+/// Keep the table in `crates/pensieve-serve/README.md` ("Caching") in step.
 fn cache_policy_for_path(path: &str) -> (u32, u32) {
-    if path == "/api/v1/stats/events/latest" {
+    match path {
         // Latest event changes frequently - short TTL
-        (10, 30)
-    } else if path == "/api/v1/stats/events/total" || path == "/api/v1/stats/pubkeys/total" {
+        "/stats/events/latest" => (10, 30),
         // Total counts - moderate TTL (5 minutes)
-        (300, 600)
-    } else if path == "/api/v1/stats/activity/hourly"
-        || path == "/api/v1/stats/engagement"
-        || (path.starts_with("/api/v1/kinds/") && path.ends_with("/activity"))
-    {
+        "/stats/events/total" | "/stats/pubkeys/total" => (300, 600),
         // Time series endpoints - 10 minutes
-        (600, 1800)
-    } else if path == "/api/v1/stats/kinds/total" || path == "/api/v1/stats/events/earliest" {
+        "/stats/activity/hourly" | "/stats/engagement" => (600, 1800),
+        _ if path.starts_with("/kinds/") && path.ends_with("/activity") => (600, 1800),
         // Stable data - long TTL (1 hour)
-        (3600, 7200)
-    } else {
+        "/stats/kinds/total" | "/stats/events/earliest" => (3600, 7200),
         // Default for all other endpoints (1 minute)
-        (60, 300)
+        _ => (60, 300),
     }
 }
 
@@ -264,55 +285,34 @@ mod tests {
 
     #[test]
     fn cache_policy_uses_realtime_for_latest_event() {
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/events/latest"),
-            (10, 30)
-        );
+        assert_eq!(cache_policy_for_path("/stats/events/latest"), (10, 30));
     }
 
     #[test]
     fn cache_policy_uses_aggregate_ttl_for_totals() {
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/events/total"),
-            (300, 600)
-        );
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/pubkeys/total"),
-            (300, 600)
-        );
+        assert_eq!(cache_policy_for_path("/stats/events/total"), (300, 600));
+        assert_eq!(cache_policy_for_path("/stats/pubkeys/total"), (300, 600));
     }
 
     #[test]
     fn cache_policy_uses_timeseries_ttl_for_hot_paths() {
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/activity/hourly"),
-            (600, 1800)
-        );
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/engagement"),
-            (600, 1800)
-        );
-        assert_eq!(
-            cache_policy_for_path("/api/v1/kinds/1/activity"),
-            (600, 1800)
-        );
+        assert_eq!(cache_policy_for_path("/stats/activity/hourly"), (600, 1800));
+        assert_eq!(cache_policy_for_path("/stats/engagement"), (600, 1800));
+        assert_eq!(cache_policy_for_path("/kinds/1/activity"), (600, 1800));
     }
 
     #[test]
     fn cache_policy_uses_stable_ttl_for_stable_paths() {
+        assert_eq!(cache_policy_for_path("/stats/kinds/total"), (3600, 7200));
         assert_eq!(
-            cache_policy_for_path("/api/v1/stats/kinds/total"),
-            (3600, 7200)
-        );
-        assert_eq!(
-            cache_policy_for_path("/api/v1/stats/events/earliest"),
+            cache_policy_for_path("/stats/events/earliest"),
             (3600, 7200)
         );
     }
 
     #[test]
     fn cache_policy_falls_back_to_default_for_other_paths() {
-        assert_eq!(cache_policy_for_path("/api/v1/stats/throughput"), (60, 300));
-        assert_eq!(cache_policy_for_path("/api/v1/kinds/1"), (60, 300));
+        assert_eq!(cache_policy_for_path("/stats/throughput"), (60, 300));
+        assert_eq!(cache_policy_for_path("/kinds/1"), (60, 300));
     }
 }

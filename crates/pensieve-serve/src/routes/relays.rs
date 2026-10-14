@@ -1,18 +1,24 @@
 //! Relay statistics API endpoints.
 //!
 //! Provides endpoints for querying relay discovery, connection status,
-//! and event throughput metrics from the ingester's SQLite database.
+//! and event throughput metrics from the ingester's SQLite database. Each
+//! request reads through a fresh read-only connection (see
+//! [`crate::relay_db`]), so responses follow the ingester's commits.
 
 use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::relay_db::{RelayDb, sqlite_error};
 use crate::state::AppState;
 
-/// Helper to convert errors to ApiError::Internal.
-fn internal_error(msg: impl std::fmt::Display) -> ApiError {
-    ApiError::Internal(anyhow::anyhow!("{}", msg))
+/// The configured relay database, or `500` when `RELAY_DB_PATH` is unset.
+fn relay_db(state: &AppState) -> Result<&RelayDb, ApiError> {
+    state
+        .relay_db
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("Relay database not configured")))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -123,17 +129,14 @@ pub struct ThroughputQuery {
 ///
 /// Returns aggregate relay statistics.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<RelaySummary>, ApiError> {
-    let relay_db = state
-        .relay_db
-        .as_ref()
-        .ok_or_else(|| internal_error("Relay database not configured"))?;
+    relay_db(&state)?.read(read_summary).await.map(Json)
+}
 
-    let conn = relay_db.lock();
-
+fn read_summary(conn: &rusqlite::Connection) -> Result<RelaySummary, ApiError> {
     // Get status counts
     let mut stmt = conn
         .prepare("SELECT status, COUNT(*) as cnt FROM relays GROUP BY status")
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+        .map_err(sqlite_error)?;
 
     let mut total_discovered: u64 = 0;
     let mut total_active: u64 = 0;
@@ -142,14 +145,9 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<RelaySummary>
     let mut total_idle: u64 = 0;
     let mut total_pending: u64 = 0;
 
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
 
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| internal_error(format!("Row fetch failed: {}", e)))?
-    {
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
         let status: String = row.get(0).unwrap_or_default();
         let count: u64 = row.get(1).unwrap_or(0);
         total_discovered += count;
@@ -186,7 +184,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<RelaySummary>
     // Calculate events per minute
     let avg_events_per_minute = events_last_hour as f64 / 60.0;
 
-    Ok(Json(RelaySummary {
+    Ok(RelaySummary {
         total_discovered,
         total_active,
         total_blocked,
@@ -196,7 +194,7 @@ pub async fn summary(State(state): State<AppState>) -> Result<Json<RelaySummary>
         avg_events_per_minute,
         events_last_hour,
         novel_events_last_hour,
-    }))
+    })
 }
 
 /// `GET /api/v1/relays`
@@ -206,13 +204,16 @@ pub async fn list(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<RelayListQuery>,
 ) -> Result<Json<RelayListResponse>, ApiError> {
-    let relay_db = state
-        .relay_db
-        .as_ref()
-        .ok_or_else(|| internal_error("Relay database not configured"))?;
+    relay_db(&state)?
+        .read(move |conn| read_list(conn, &params))
+        .await
+        .map(Json)
+}
 
-    let conn = relay_db.lock();
-
+fn read_list(
+    conn: &rusqlite::Connection,
+    params: &RelayListQuery,
+) -> Result<RelayListResponse, ApiError> {
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = params.offset.unwrap_or(0);
 
@@ -287,9 +288,7 @@ pub async fn list(
         prev_hour_start, current_hour_start, where_sql, order_sql, limit, offset
     );
 
-    let mut stmt = conn
-        .prepare(&query)
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+    let mut stmt = conn.prepare(&query).map_err(sqlite_error)?;
 
     // Bind parameters dynamically
     let params_iter: Vec<&dyn rusqlite::ToSql> = bind_values
@@ -297,15 +296,10 @@ pub async fn list(
         .map(|v| v as &dyn rusqlite::ToSql)
         .collect();
 
-    let mut rows = stmt
-        .query(params_iter.as_slice())
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+    let mut rows = stmt.query(params_iter.as_slice()).map_err(sqlite_error)?;
 
     let mut relays = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| internal_error(format!("Row fetch failed: {}", e)))?
-    {
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
         relays.push(RelayStatus {
             url: row.get(0).unwrap_or_default(),
             status: row.get(1).unwrap_or_default(),
@@ -325,7 +319,7 @@ pub async fn list(
         .query_row(&count_query, params_iter.as_slice(), |row| row.get(0))
         .unwrap_or(0);
 
-    Ok(Json(RelayListResponse { relays, total }))
+    Ok(RelayListResponse { relays, total })
 }
 
 /// `GET /api/v1/relays/throughput`
@@ -335,12 +329,16 @@ pub async fn throughput(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<ThroughputQuery>,
 ) -> Result<Json<Vec<RelayHourlyThroughput>>, ApiError> {
-    let relay_db = state
-        .relay_db
-        .as_ref()
-        .ok_or_else(|| internal_error("Relay database not configured"))?;
+    relay_db(&state)?
+        .read(move |conn| read_throughput(conn, &params))
+        .await
+        .map(Json)
+}
 
-    let conn = relay_db.lock();
+fn read_throughput(
+    conn: &rusqlite::Connection,
+    params: &ThroughputQuery,
+) -> Result<Vec<RelayHourlyThroughput>, ApiError> {
     let hours = params.hours.unwrap_or(24).min(168); // Max 1 week
 
     let hours_ago = chrono::Utc::now().timestamp() - (hours as i64 * 3600);
@@ -358,17 +356,12 @@ pub async fn throughput(
             GROUP BY hour_start
             ORDER BY hour_start ASC",
         )
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+        .map_err(sqlite_error)?;
 
-    let mut rows = stmt
-        .query([start_hour])
-        .map_err(|e| internal_error(format!("Query failed: {}", e)))?;
+    let mut rows = stmt.query([start_hour]).map_err(sqlite_error)?;
 
     let mut results = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| internal_error(format!("Row fetch failed: {}", e)))?
-    {
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
         results.push(RelayHourlyThroughput {
             hour_start: row.get(0).unwrap_or(0),
             events_received: row.get(1).unwrap_or(0),
@@ -377,5 +370,5 @@ pub async fn throughput(
         });
     }
 
-    Ok(Json(results))
+    Ok(results)
 }

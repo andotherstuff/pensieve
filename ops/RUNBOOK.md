@@ -1719,7 +1719,12 @@ swap-in shows up during queries.
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
 - `/api/v1/stats/publishers` is capped at `days=60`; a longer window needs a precomputed
   ranking (see [API rollups](#api-rollups-migration-019) → Known limit).
-- The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
-  ingester keeps writing the WAL database, so relay endpoints can be stale.
+- `api-fe54f04` and earlier read `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite
+  connection, which ignores the ingester's WAL, so relay endpoints are stale; they also send
+  `Cache-Control: max-age=60` for every endpoint. Master opens a read-only connection per
+  request and sends the per-endpoint policies (see the
+  [API README](../crates/pensieve-serve/README.md#caching)); both go away with the next API
+  release. That release needs no configuration change: the API runs as `pensieve`, which owns
+  `/data/relay-stats.db`, and reads it while the ingester holds its `-wal`/`-shm` files open.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
   [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.

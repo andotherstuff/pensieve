@@ -24,7 +24,7 @@ Generate a token: `openssl rand -hex 32`
 | `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(optional)* | Canonical ingestion-owned watermark file; when set, `latest_event` (in `/stats` and `/stats/events/latest`) is read from it instead of scanning `events_local` |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | `900` | Maximum accepted watermark publication age |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
-| `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints; ignored if the file does not exist |
+| `RELAY_DB_PATH` | *(optional)* | Path to the ingester's SQLite `relay-stats.db` for the relay endpoints, read through a fresh read-only connection per request (see [Relays](#relays)); ignored if the file does not exist at startup |
 | `RUST_LOG` | `info` | Log filter (`tracing` `EnvFilter` syntax) |
 
 On startup the server loads a `.env` file if one exists. Override its location with
@@ -33,6 +33,31 @@ Variables already set in the process environment take precedence over the file.
 
 Every analytics route is served from ClickHouse. The three operational relay
 routes use `RELAY_DB_PATH`.
+
+---
+
+## Caching
+
+Every successful `/api/v1/*` response carries an `ETag` (a hash of the body)
+and a per-endpoint `Cache-Control`. A request whose `If-None-Match` matches the
+current `ETag` gets `304 Not Modified` with the same `Cache-Control`. Error
+responses (`4xx`, `5xx`, including `503 metric_unavailable`) carry neither.
+
+| Endpoint | `Cache-Control` |
+|----------|-----------------|
+| `/api/v1/stats/events/latest` | `public, max-age=10, stale-while-revalidate=30` |
+| `/api/v1/stats/events/total`, `/api/v1/stats/pubkeys/total` | `public, max-age=300, stale-while-revalidate=600` |
+| `/api/v1/stats/activity/hourly`, `/api/v1/stats/engagement`, `/api/v1/kinds/{kind}/activity` | `public, max-age=600, stale-while-revalidate=1800` |
+| `/api/v1/stats/kinds/total`, `/api/v1/stats/events/earliest` | `public, max-age=3600, stale-while-revalidate=7200` |
+| Every other `/api/v1/*` endpoint | `public, max-age=60, stale-while-revalidate=300` |
+
+Releases up to and including `api-fe54f04` sent the 60-second default for
+every endpoint: the policy was matched against the full `/api/v1/...` path, but the
+middleware runs inside the `/api/v1` nest and only saw the path below it.
+
+The server also keeps its own in-memory cache of ClickHouse results with its
+own per-endpoint TTLs, so a response can be up to one server TTL older than its
+`max-age` suggests.
 
 ---
 
@@ -121,7 +146,7 @@ Returns approximate total event count.
 }
 ```
 
-**Suggested cache TTL:** 5 minutes
+**Cache-Control:** `max-age=300` (5 minutes), `stale-while-revalidate=600`
 
 ---
 
@@ -137,7 +162,7 @@ Returns total unique pubkeys.
 }
 ```
 
-**Suggested cache TTL:** 5 minutes
+**Cache-Control:** `max-age=300` (5 minutes), `stale-while-revalidate=600`
 
 ---
 
@@ -155,7 +180,7 @@ days. Read from the `kind_totals` rollup (migration
 }
 ```
 
-**Suggested cache TTL:** 1 hour
+**Cache-Control:** `max-age=3600` (1 hour), `stale-while-revalidate=7200`
 
 ---
 
@@ -173,7 +198,7 @@ earliest). Read from the `kind_totals` rollup (migration 020), like
 }
 ```
 
-**Suggested cache TTL:** 1 hour
+**Cache-Control:** `max-age=3600` (1 hour), `stale-while-revalidate=7200`
 
 ---
 
@@ -189,7 +214,7 @@ Returns latest event timestamp (excludes future timestamps).
 }
 ```
 
-**Suggested cache TTL:** 10 seconds
+**Cache-Control:** `max-age=10`, `stale-while-revalidate=30`
 
 ---
 
@@ -969,13 +994,38 @@ GET /api/v1/stats/relays/distribution?limit=50
 GET /api/v1/stats/relays/distribution
 ```
 
-**Suggested cache TTL:** 1 minute (the server sends `Cache-Control: public, max-age=60, stale-while-revalidate=300`)
+**Cache-Control:** `max-age=60` (1 minute), `stale-while-revalidate=300` (the default)
 
 ---
 
 ### Relays
 
 Relay endpoints require the `RELAY_DB_PATH` environment variable to be set to the path of the ingester's SQLite relay stats database. If it is unset or the file does not exist at startup, these endpoints return `500` (`internal_error`).
+
+Each request opens its own read-only SQLite connection (`SQLITE_OPEN_READONLY`,
+the flag behind `mode=ro`, plus `PRAGMA query_only`), so a response includes
+everything the ingester has committed, transactions still in the WAL
+included, and a replaced database file is picked up without a restart. The API
+never writes the database or its WAL. Releases up to and including
+`api-fe54f04` instead held one connection, opened at startup with
+`immutable=1`: SQLite then ignores the WAL and takes no locks, so relay data
+was only as fresh as the last checkpoint and a concurrent checkpoint could
+tear a read.
+
+- **Busy:** a reader waits up to 2 s (`busy_timeout`) on `SQLITE_BUSY`, then
+  the request fails with `503 analytics_busy`.
+- **`-wal` and `-shm`:** a WAL reader needs both files. While the ingester
+  runs they exist. A reader that can write `-shm` updates its read marks there
+  (it never writes the database or the WAL); one that cannot opens `-shm`
+  read-only and indexes the WAL in private memory, which is slower but
+  consistent. When nothing has the database open, both files are gone and
+  SQLite would create them, owned by the API's user with the database file's
+  mode. The API lets that happen only when it runs as root (SQLite hands the
+  new files to the database's owner) or as the database's owner; otherwise the
+  relay endpoints return `503 metric_unavailable` until the ingester runs
+  again. If the directory is not writable, SQLite fails without creating
+  anything (`500`). In production both services run as `pensieve`, which owns
+  `/data/relay-stats.db`.
 
 #### `GET /api/v1/relays/summary`
 
@@ -1083,8 +1133,8 @@ All errors return JSON with the following structure:
 | 500 | `internal_error` | Server error |
 | 500 | `database_error` | Database query failed |
 | 500 | `serialization_error` | Response serialization failed |
-| 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out; retry later |
-| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied |
+| 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out, or the relay database stayed busy for 2 s; retry later |
+| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied, or the relay endpoints while the relay database has no `-wal`/`-shm` files and the API may not create them |
 
 ---
 

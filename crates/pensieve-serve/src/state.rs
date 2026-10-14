@@ -5,11 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::bounded_clickhouse::BoundedClickHouse;
-use anyhow::{Context, bail};
-use parking_lot::Mutex;
-use rusqlite::Connection;
-
 use crate::cache::{self, ResponseCache};
+use crate::relay_db::RelayDb;
+use anyhow::{Context, bail};
 
 /// Application configuration loaded from environment.
 #[derive(Clone)]
@@ -121,8 +119,8 @@ pub struct AppState {
     /// Application configuration.
     pub config: Arc<Config>,
 
-    /// SQLite connection for relay stats (optional, shared via Arc<Mutex>).
-    pub relay_db: Option<Arc<Mutex<Connection>>>,
+    /// Ingester relay-stats database (optional); opened read-only per request.
+    pub relay_db: Option<RelayDb>,
 
     /// In-memory response cache for expensive queries.
     pub cache: ResponseCache,
@@ -134,32 +132,15 @@ impl AppState {
         let clickhouse =
             BoundedClickHouse::new(&config.clickhouse_url, &config.clickhouse_database);
 
-        // Open SQLite connection if path is configured
-        // Use immutable=1 to safely read WAL-mode databases without write access
-        // to -wal/-shm auxiliary files
-        let relay_db = config.relay_db_path.as_ref().and_then(|path| {
-            // Convert path to file URI with immutable flag for WAL-mode safety
-            // SQLite URI format requires file:///path for absolute POSIX paths
-            // Using file:// so that absolute paths (starting with /) produce file:///
-            let uri = format!(
-                "file://{}?immutable=1",
-                path.to_string_lossy().replace('?', "%3F")
-            );
-            match Connection::open_with_flags(
-                &uri,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-            ) {
-                Ok(conn) => {
-                    tracing::info!(path = %path.display(), "relay database connected (immutable)");
-                    Some(Arc::new(Mutex::new(conn)))
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to open relay database");
-                    None
-                }
+        // Relay endpoints open a read-only connection per request (see
+        // `relay_db`); try one here so a misconfiguration shows up in the log.
+        let relay_db = config.relay_db_path.as_ref().map(|path| {
+            let db = RelayDb::new(path);
+            match db.open() {
+                Ok(_) => tracing::info!(path = %path.display(), "relay database readable (read-only, per request)"),
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "relay database not readable yet"),
             }
+            db
         });
 
         // Create response cache
