@@ -328,6 +328,7 @@ summary below is a quick reference.
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against Premium Primal since 2026-10-12) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`) |
 | Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout |
 | Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
+| Prometheus `:9090` for the monitoring VM | `pensieve-prometheus-proxy.socket` (enabled), socket-activated `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`, gated by UFW. In the repo since PR #100; installed by its RUNBOOK rollout, not yet on the host |
 
 The `ExecStart` lines in `ops/systemd/*.service` still point at
 `~/pensieve/target/release/`; production overrides them. Copies of the

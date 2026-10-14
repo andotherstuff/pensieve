@@ -70,7 +70,12 @@ services:
       - clickhouse_logs:/var/log/clickhouse-server
       # Custom config
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
-      # Users config (for grafana read-only user)
+      # Users config (grafana user: SELECT on nostr only). A single-file bind
+      # mount, resolved at each container start: `git merge` replaces the file,
+      # so a running server keeps the old copy until the container is restarted
+      # or recreated (docker restart, daemon restart and reboot included). To
+      # roll out, see "Published ports and the grafana ClickHouse user" in
+      # ops/RUNBOOK.md.
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
       # Schema initialization (repo docs/, two levels up from ops/production/)
       - ../../docs/clickhouse_self_hosted.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -102,8 +107,15 @@ services:
     image: prom/prometheus:v2.48.0
     container_name: pensieve-prometheus
     restart: unless-stopped
+    # Localhost only, on 19090. Docker-published ports bypass UFW, so
+    # "9090:9090" exposed the query API and, with --web.enable-lifecycle,
+    # unauthenticated POST /-/quit and /-/reload to the whole internet.
+    # Grafana uses http://prometheus:9090 over the compose network. The
+    # external scraper (the monitoring VM) reaches :9090 through the host socket
+    # ops/systemd/pensieve-prometheus-proxy.{socket,service}, which UFW gates;
+    # that socket owns host port 9090, so do not publish 9090 here.
     ports:
-      - "9090:9090"
+      - "127.0.0.1:19090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/archive-alerts.yml:/etc/prometheus/archive-alerts.yml:ro

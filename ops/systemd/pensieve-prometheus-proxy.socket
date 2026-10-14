@@ -1,0 +1,20 @@
+# :9090 for the external Prometheus scraper (the monitoring VM).
+#
+# Prometheus itself is published by Docker on 127.0.0.1:19090 only, because
+# Docker-published ports bypass UFW. This socket is an ordinary host listener,
+# so UFW's INPUT rules gate it: only the host's `9090/tcp ALLOW IN` rules (see
+# `sudo ufw status`) let anyone in. Connections are handed to
+# pensieve-prometheus-proxy.service, which forwards them to 127.0.0.1:19090.
+#
+# Install: see "Published ports and the grafana ClickHouse user" in ops/RUNBOOK.md.
+
+[Unit]
+Description=Pensieve Prometheus on :9090 for the UFW-allowed scraper
+
+[Socket]
+ListenStream=9090
+BindIPv6Only=both
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
