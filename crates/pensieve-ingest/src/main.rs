@@ -1033,6 +1033,7 @@ async fn main() -> Result<()> {
         let mut last_received = 0usize;
         let mut last_processed = 0usize;
         let mut last_deduplicated = 0usize;
+        let mut ticks = 0u64;
 
         while rate_running.load(Ordering::SeqCst) {
             interval.tick().await;
@@ -1077,6 +1078,16 @@ async fn main() -> Result<()> {
             gauge!("dedupe_block_cache_capacity_bytes").set(cache.capacity_bytes as f64);
             gauge!("dedupe_block_cache_usage_bytes").set(cache.usage_bytes as f64);
             gauge!("dedupe_block_cache_pinned_bytes").set(cache.pinned_bytes as f64);
+            // Filter + index bytes over all SSTs: what must stay cached. Compare
+            // with about half the capacity (the high-priority pools). Aggregating
+            // table properties walks every live SST, so refresh every 5 minutes.
+            if ticks.is_multiple_of(60)
+                && let Ok(metadata) = rate_dedupe.table_metadata_size()
+            {
+                gauge!("dedupe_block_cache_metadata_bytes")
+                    .set((metadata.filter_bytes + metadata.index_bytes) as f64);
+            }
+            ticks += 1;
 
             // Save for next iteration
             last_received = curr_received;

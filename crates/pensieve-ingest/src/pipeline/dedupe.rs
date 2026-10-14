@@ -83,6 +83,19 @@ pub struct BlockCacheUsage {
     pub pinned_bytes: u64,
 }
 
+/// Physical memory from `/proc/meminfo` (`MemTotal`); `None` where unavailable.
+fn physical_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_total(&meminfo)
+}
+
+/// Parse the `MemTotal: <n> kB` line of `/proc/meminfo` into bytes.
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
 /// Size of the SST metadata that lookups need resident, from table properties.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TableMetadataSize {
@@ -329,6 +342,15 @@ impl DedupeIndex {
                 resident_bytes = resident,
                 block_cache_bytes = cache_bytes,
                 "dedupe filter and index blocks exceed half the block cache (heuristic); consider raising --dedupe-block-cache-mib"
+            );
+        }
+        if let Some(total) = physical_memory_bytes()
+            && cache_bytes as u64 > total / 4
+        {
+            tracing::warn!(
+                block_cache_bytes = cache_bytes,
+                physical_memory_bytes = total,
+                "dedupe block cache exceeds 25% of physical memory; check --dedupe-block-cache-mib"
             );
         }
         Ok(index)
@@ -619,17 +641,25 @@ mod tests {
         );
     }
 
-    /// Table options of builds before the dedicated block cache: RocksDB's
-    /// default 32 MiB LRU cache, nothing pinned.
-    fn legacy_table_options() -> rocksdb::BlockBasedOptions {
+    /// Open with the options of builds before the dedicated block cache:
+    /// RocksDB's default 32 MiB LRU cache, nothing pinned.
+    ///
+    /// Frozen copy of the pre-change `DedupeIndex::open` option set, kept
+    /// inline (not built on `db_options`) so later edits to the production
+    /// options cannot silently change what "legacy" means in these tests.
+    fn open_legacy(path: &Path) -> DBWithThreadMode<MultiThreaded> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        opts.set_max_write_buffer_number(3);
+        opts.set_target_file_size_base(64 * 1024 * 1024);
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false);
         block_opts.set_cache_index_and_filter_blocks(true);
-        block_opts
-    }
-
-    fn open_legacy(path: &Path) -> DBWithThreadMode<MultiThreaded> {
-        let opts = DedupeIndex::db_options(&legacy_table_options());
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.increase_parallelism(num_cpus::get() as i32);
+        opts.set_max_background_jobs(4);
         DBWithThreadMode::<MultiThreaded>::open(&opts, path).unwrap()
     }
 
@@ -681,6 +711,15 @@ mod tests {
         // 10 bits/key bloom: about 1.25 bytes per key.
         assert!((10_000..=15_000).contains(&metadata.filter_bytes));
         assert!(metadata.index_bytes > 0);
+    }
+
+    #[test]
+    fn mem_total_parses_from_meminfo() {
+        assert_eq!(
+            parse_mem_total("MemTotal:       131072000 kB\nMemFree: 1 kB\n"),
+            Some(131_072_000 * 1024)
+        );
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
     }
 
     #[test]

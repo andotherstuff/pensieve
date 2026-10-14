@@ -130,7 +130,8 @@ for data after this fix; it only means the red monitor hides later faults.
 
 ## Incident 2026-10-14: preflight stalled the owner thread
 
-**Symptom.** The `negentropy-parent` thread of the ingester sat at about 90% CPU for
+**Symptom.** The `negentropy-parent` thread of the ingester (`negentropy-pare` in
+`top -H` and `comm`, which truncate names to 15 characters) sat at about 90% CPU for
 more than 20 minutes on one fair-lease preflight. `/health/negentropy` returned 503
 `owner_observation_stale`, the waiting worker got no job and hit its ten-minute
 `RuntimeMaxSec`, and the ledger did not change. The same stall left hour 04 UTC
@@ -162,8 +163,8 @@ aged past the 15-minute threshold.
 priority and L0 blocks pinned; this is a read option only, with no change on
 disk. `archived_window` counts inventory keys before any lookup, so TooDense costs
 one key scan; `reconciliation_window` checks the exclusion count first. A
-fair-lease command stops preflighting new candidates after 60 s and returns no
-lease, so the next runtime tick refreshes health and continues from the durable
+fair-lease command stops after its first TooDense split past 60 s and returns
+no lease, so the next runtime tick refreshes health and continues from the durable
 splits. A restart does not help: the runtime resumes the same dense windows with
 the same cold cache.
 

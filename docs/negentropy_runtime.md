@@ -75,9 +75,11 @@ unchanged. Session-budget logs expose the actual admitted duration.
 The listener never infers a verified OOM from EOF. Local inventory density is
 checked before leasing and split atomically without an
 attempt; a one-second dense interval is blocked and logged. One fair-lease
-command preflights at most 16 candidates and starts no new one after 60 s
-(`negentropy_preflight_budget_exhausted_total`); it then returns no lease and
-the next tick, which refreshes health first, continues from the durable splits. A concurrent append
+command preflights at most 16 candidates; once 60 s have passed, it stops
+after the next TooDense split (`negentropy_preflight_budget_exhausted_total`)
+and returns no lease, and the next tick, which refreshes health first,
+continues from the durable splits. Every command preflights at least one
+candidate. A concurrent append
 between preflight and session can still cause a later TooDense outcome, which
 remains an unresolved gap. Only an authenticated `Volume` report from the worker
 triggers a post-lease split. Other failure reports and unknown loss retain the
