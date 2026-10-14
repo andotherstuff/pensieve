@@ -1296,15 +1296,17 @@ time of writing). Host ports published by `ops/production/compose.yml`:
 |------|---------|-----------------------|----------------|
 | 80, 443 | Caddy | `0.0.0.0` (unchanged) | Internet: TLS for `/api`, `/grafana/` and the preview domain |
 | 8123, 9000 | ClickHouse | `127.0.0.1` (unchanged) | Host only. Ingest, API and preview use `http://localhost:8123`; Grafana uses `clickhouse:8123` |
-| 9090 | Prometheus | Docker `0.0.0.0:9090` → host socket `*:9090` (systemd) | Before: the whole internet. After: the scraper VM 94.130.141.87 / 2a01:4f8:13b:2ecd::2 (UFW) and the host |
+| 9090 | Prometheus | Docker `0.0.0.0:9090` → host socket `*:9090` (systemd) | Before: the whole internet. After: the monitoring VM (`<monitoring-vm-ipv4>`, `<monitoring-vm-ipv6>`, per UFW) and the host |
 | 19090 | Prometheus | new, `127.0.0.1` | Host only (target of the 9090 socket) |
 | 3000 | Grafana | `127.0.0.1` (unchanged) | Through Caddy at `/grafana/` |
 
 **Why 9090 moved to a host socket.** UFW is active (default deny incoming) and already
-allows `9090/tcp` only from 94.130.141.87 and 2a01:4f8:13b:2ecd::2, a VM that scrapes
+allows `9090/tcp` only from the monitoring VM's IPv4 and IPv6 addresses (read them
+with `sudo ufw status`; called `<monitoring-vm-ipv4>` and `<monitoring-vm-ipv6>`
+below), a VM that scrapes
 this Prometheus (it also scrapes node_exporter on 9100 under the same kind of rule).
 But Docker-published ports are DNATed in `PREROUTING` and forwarded, so they never
-reach UFW's `INPUT` rules: on 2026-10-14 `http://65.21.129.160:9090/` answered from
+reach UFW's `INPUT` rules: on 2026-10-14 `http://<host-ip>:9090/` answered from
 anywhere, including unauthenticated `POST /-/quit` and `/-/reload`
 (`--web.enable-lifecycle`). Now Docker publishes Prometheus on `127.0.0.1:19090` only,
 and `pensieve-prometheus-proxy.socket` (systemd, `ops/systemd/`) listens on `:9090`
@@ -1368,9 +1370,10 @@ curl -s -u "admin:$GF_PW" http://127.0.0.1:3000/grafana/api/datasources \
 just ch-query "SELECT arrayJoin(tables) AS t, count() AS n FROM system.query_log WHERE user = 'grafana' AND event_date >= today() - 7 AND type = 'QueryFinish' GROUP BY t ORDER BY n DESC"
 just ch-query "SHOW GRANTS FOR grafana"                    # before: GRANT SHOW, SELECT, INSERT, … ON *.*
 sudo ss -ltnp | grep -E ':(9090|19090) '                    # before: docker-proxy on 0.0.0.0:9090 and [::]:9090
-sudo ufw status | grep -E '^9090'                           # ALLOW IN 94.130.141.87 and 2a01:4f8:13b:2ecd::2 only
+sudo ufw status | grep -E '^9090'                           # ALLOW IN <monitoring-vm-ipv4> and <monitoring-vm-ipv6> only
+ip -4 addr show scope global | grep inet                    # the host's public IPv4 (<host-ip> below)
 ls -l /usr/lib/systemd/systemd-socket-proxyd                # ships with systemd
-ip -6 addr show scope global | grep inet6                   # the host's IPv6 address, for the checks from the VM
+ip -6 addr show scope global | grep inet6                   # the host's IPv6 (<host-ipv6> below)
 ```
 
 If a panel needs another `system` table, add a `GRANT SELECT ON system.<table>` line to
@@ -1423,11 +1426,11 @@ systemctl status pensieve-prometheus-proxy.service --no-pager   # active after t
 curl -s 'localhost:19090/api/v1/targets?state=active' \
   | python3 -c 'import json,sys; [print(t["labels"]["job"], t["health"]) for t in json.load(sys.stdin)["data"]["activeTargets"]]'
 # From any machine other than the VM (e.g. your workstation): must time out (UFW drops)
-curl -m 5 http://65.21.129.160:9090/-/ready
-curl -m 5 http://65.21.129.160:19090/-/ready
-# From 94.130.141.87 (ssh to the VM): must print "Prometheus Server is Ready."
-curl -m 5 http://65.21.129.160:9090/-/ready
-curl -m 5 'http://[<host IPv6 from the preflight>]:9090/-/ready'   # over IPv6 from 2a01:4f8:13b:2ecd::2
+curl -m 5 http://<host-ip>:9090/-/ready
+curl -m 5 http://<host-ip>:19090/-/ready
+# From the monitoring VM (ssh to it): must print "Prometheus Server is Ready."
+curl -m 5 http://<host-ip>:9090/-/ready
+curl -m 5 'http://[<host-ipv6>]:9090/-/ready'   # over IPv6, from <monitoring-vm-ipv6>
 # ...and the VM's own scrape job or federation target for this host is up again
 # (its Prometheus UI, Status > Targets, or its alert on this target clears).
 # Grafana datasources (repeat for each uid from the preflight), then open the dashboards

@@ -109,7 +109,7 @@ services:
     # "9090:9090" exposed the query API and, with --web.enable-lifecycle,
     # unauthenticated POST /-/quit and /-/reload to the whole internet.
     # Grafana uses http://prometheus:9090 over the compose network. The
-    # external scraper (94.130.141.87) reaches :9090 through the host socket
+    # external scraper (the monitoring VM) reaches :9090 through the host socket
     # ops/systemd/pensieve-prometheus-proxy.{socket,service}, which UFW gates;
     # that socket owns host port 9090, so do not publish 9090 here.
     ports:
