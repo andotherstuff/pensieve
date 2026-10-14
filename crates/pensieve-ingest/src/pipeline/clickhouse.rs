@@ -62,7 +62,7 @@
 //!
 //! - `clickhouse_index_queue_segments`: segments in the journal.
 //! - `clickhouse_index_oldest_pending_seconds`: how long the oldest of them
-//!   has waited (0 when empty), refreshed every few seconds.
+//!   has waited (0 when empty), refreshed every second.
 //! - `clickhouse_index_retries_total`: failed attempts that were retried.
 //! - `clickhouse_insert_errors_total`: segments given up for this run
 //!   (unreadable, or no queue).
@@ -104,7 +104,7 @@ const RETRY_WARN_INTERVAL: Duration = Duration::from_secs(600);
 const STUCK_SEGMENT_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// How often the backlog gauges are refreshed while the indexer runs.
-const METRICS_INTERVAL: Duration = Duration::from_secs(5);
+const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Backoff between attempts to index a segment.
 ///

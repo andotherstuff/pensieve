@@ -145,6 +145,36 @@ While one segment is stuck (unreadable, or failing deterministically) the gauge 
 and the alert stays firing, which hides any later outage; clear the stuck segment (below)
 rather than living with the alert.
 
+To confirm a recovery, rely on the metrics: `clickhouse_index_queue_segments` back to 0–2
+and `clickhouse_index_oldest_pending_seconds` near 0. The `clickhouse index backlog
+cleared` log line appears only after failed attempts, and also while an unreadable segment
+is still journaled.
+
+**Rolling out the alert rule.** The rule only loads into a recreated Prometheus container.
+`archive-alerts.yml` is a single-file bind mount: `git merge` replaces the file (a new
+inode), the container keeps the old one, and `/-/reload` re-reads the stale copy. Run
+outside :00–:07 UTC:
+
+```bash
+git -C ~/pensieve merge --ff-only origin/master
+cd ~/pensieve/ops/production
+(
+set -euo pipefail
+docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" --entrypoint promtool \
+  prom/prometheus:v2.48.0 check config /etc/prometheus/prometheus.yml
+docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env \
+  up -d --no-deps prometheus
+)
+```
+
+The project name and env file are required: a bare `docker compose up` uses another
+project name and collides on `container_name`, and never use `up -d` without `--no-deps`
+(it recreates ClickHouse too). Recreating Prometheus replays its WAL: `/-/ready` and
+scrapes return 503 for several scrape intervals and Grafana's panels show a gap, so
+silence the monitoring VM's alert for this target first (see **Downtime** under
+[Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user)).
+Afterwards, check that the Prometheus rules page lists `PensieveClickHouseIndexBacklog`.
+
 A shutdown during the backoff wakes the indexer within 200 ms and leaves the journal
 correct. During an outage `systemctl stop` therefore takes the full 20 s drain grace and
 no more. A segment the indexer cannot *read* (`failed to read segment for clickhouse; left
@@ -1908,8 +1938,8 @@ Merge, then restart ClickHouse so it mounts the current file (a restart re-resol
 the bind mount; recreating is not needed). Do it outside :00–:07
 UTC. The API and preview fail while ClickHouse starts. The ingester's indexer retries
 any segment sealed meanwhile (2 s doubling to 60 s) and catches up once ClickHouse is
-back; no ingester restart is needed. Confirm `clickhouse index backlog cleared` in the
-ingester journal (or `clickhouse_index_queue_segments` back to 0–2). Binaries older than
+back; no ingester restart is needed. Confirm `clickhouse_index_queue_segments` is back to
+0–2 and `clickhouse_index_oldest_pending_seconds` near 0. Binaries older than
 #105 instead logged `failed to index segment after retries; left queued for next start`
 and needed a graceful ingester restart (see [Routine deploy](#routine-deploy)).
 
