@@ -2538,6 +2538,12 @@ mod tests {
                 .unwrap();
             lease.job().id
         };
+        // A mixed-set possible carry whose received events are all archived:
+        // not a carry, so only the fair maintenance turn confirms its receipts.
+        f.db.enqueue("mixed", RELAY, 0, 899).unwrap();
+        let mixed_frames: Vec<[u8; 32]> = (0x61..=0x63_u8).map(|n| [n; 32]).collect();
+        f.dedupe.mark_archived(mixed_frames.iter()).unwrap();
+        let mixed = fail(&mut f, &mixed_frames, unavailable(&[MISSING, OTHER]));
         for n in 0..NOISE {
             f.db.enqueue(&format!("noise-{n}"), RELAY, 0, 899).unwrap();
             let mut id = [0xdd; 32];
@@ -2548,23 +2554,78 @@ mod tests {
         let archived: Vec<[u8; 32]> = (0x41..=0x51_u8).map(|n| [n; 32]).collect();
         f.dedupe.mark_archived(archived.iter()).unwrap();
         let carry = fail(&mut f, &archived, unavailable(&[MISSING]));
-        assert!(carry > NOISE + 1);
+        assert!(carry > NOISE + 2);
         let carried: Vec<i64> = (0..2)
             .flat_map(|turn| f.lifecycle(now + 5 + turn).carried)
             .map(|c| c.job)
             .collect();
         assert_eq!(carried, vec![carry]);
         assert_eq!(f.db.get(carry).unwrap().attempt, 1);
-        // The non-carries keep their receipts: nothing was confirmed for them.
-        let held: i64 =
+        // The non-carries keep their receipts: nothing was confirmed for them,
+        // including the mixed set's, although its events are archived.
+        let held = |f: &Fixture, sql: &str, job: i64| -> i64 {
+            f.db.db.query_row(sql, [job], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(
+            held(
+                &f,
+                "SELECT count(DISTINCT job) FROM receipts WHERE job<?1",
+                carry
+            ),
+            NOISE + 1
+        );
+        assert_eq!(
+            held(&f, "SELECT count(*) FROM receipts WHERE job=?1", mixed),
+            3
+        );
+        assert_eq!(f.db.get(mixed).unwrap().state, JobState::RetryWait);
+    }
+
+    #[test]
+    fn the_carry_cursor_advances_past_one_turn_and_wraps() {
+        // More possible carries than one turn reads (none qualifying, no
+        // receipts), then a real carry above them: the cursor must advance to
+        // reach it. Then one of the low IDs becomes a carry after the cursor
+        // passed it: the cursor must wrap to reach it.
+        const NOISE: i64 = MAX_CARRIES_PER_TURN + 8;
+        let mut f = fixture();
+        f.excluded("pass-1", RELAY, (0, 899), &[MISSING], 1000);
+        let mut now = 1000 + 10 * HOUR;
+        // Fail the next due job once without receipts, then hold it back.
+        let fail = |f: &mut Fixture, at: i64, report: FailureDiagnostic| -> i64 {
+            let job = f.attempt(at, 0, Some(report)).job().id;
             f.db.db
-                .query_row(
-                    "SELECT count(DISTINCT job) FROM receipts WHERE job<?1",
-                    [carry],
-                    |r| r.get(0),
+                .execute(
+                    "UPDATE jobs SET next_eligible=?2 WHERE id=?1",
+                    [job, i64::MAX],
                 )
                 .unwrap();
-        assert_eq!(held, NOISE);
+            job
+        };
+        let mut noise = Vec::new();
+        for n in 0..NOISE {
+            f.db.enqueue(&format!("noise-{n}"), RELAY, 0, 899).unwrap();
+            noise.push(fail(&mut f, now, relay_failure()));
+        }
+        f.db.enqueue("pass-2", RELAY, 0, 899).unwrap();
+        let high = fail(&mut f, now, unavailable(&[MISSING]));
+        assert!(high > NOISE + 1);
+        let carried = |f: &mut Fixture, now: i64| -> Vec<i64> {
+            (0..2)
+                .flat_map(|turn| f.run(now + turn).carried)
+                .map(|c| c.job)
+                .collect()
+        };
+        assert_eq!(carried(&mut f, now + 5), vec![high]);
+        // The lowest possible carry fails again, now naming only the withheld ID.
+        now += HOUR;
+        let low = noise[0];
+        f.db.db
+            .execute("UPDATE jobs SET next_eligible=0 WHERE id=?1", [low])
+            .unwrap();
+        assert_eq!(fail(&mut f, now, unavailable(&[MISSING])), low);
+        assert_eq!(carried(&mut f, now + 5), vec![low]);
+        assert_eq!(f.db.get(low).unwrap().attempt, 2);
     }
 
     #[test]
@@ -2591,8 +2652,20 @@ mod tests {
                 [job],
             )
             .unwrap();
-        let progress = f.run(now + 6);
+        f.db.db
+            .execute("UPDATE receipt_totals SET retained=retained+1", [])
+            .unwrap();
+        // The parent's turn confirms carries' receipts first; an unarchived
+        // event keeps its receipt, so the carry stays deferred.
+        let progress = f.lifecycle(now + 6);
         assert_eq!((progress.carried.len(), progress.awaiting_archive), (0, 1));
+        let held: i64 =
+            f.db.db
+                .query_row("SELECT count(*) FROM receipts WHERE job=?1", [job], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+        assert_eq!(held, 1);
         f.db.db
             .execute_batch("DELETE FROM receipts; UPDATE receipt_totals SET retained=0")
             .unwrap();

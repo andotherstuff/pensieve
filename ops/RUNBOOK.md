@@ -1345,13 +1345,26 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   batch or `max-ids`; the window does not overlap the original's; the original
   row is resolved (the event is archived, so the relay is being asked for it
   again); a frame the job received is of an event not yet archived (a novel
-  event waits for its segment to seal); on `ingest-43d4a26` and earlier, a
-  backlog of more than 64 other retry-wait jobs below it (a relay outage); on
-  later releases, only a burst of other carries with more than about 256–512
-  receipts awaiting confirmation at once (`negentropy_carry_receipts_confirmed_total`
-  rises while they are confirmed, at most 256 per turn); or
-  `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
-  like any other `unresolved_failures` job above; the full rule still applies.
+  event waits for its segment to seal); a cursor had not reached the job yet
+  (below); or `--isolated-negentropy-disable-unavailable-exclusion` is set.
+  Then triage it like any other `unresolved_failures` job above; the full rule
+  still applies. Nothing is carried on builds before `ingest-2e07c31`.
+
+  Cursors by build. On `ingest-2e07c31` and `ingest-43d4a26` a carry passes two
+  bounded gates that other jobs share. The exclusion turn's single 32-job
+  cursor covers every retry-wait job past `K` attempts plus every possible
+  carry, two turns between sessions. The job's received frames must be
+  archive-confirmed (receipts gone), which only the fair maintenance turn does:
+  32 jobs per tick over every unresolved job, wrapping. So with many
+  unresolved jobs (a relay outage) the revisit can be leased again before
+  either cursor reaches it. Check for retained receipts (read-only):
+  `sudo -u pensieve sqlite3 -readonly "$LEDGER" "SELECT attempt,count(*) FROM receipts WHERE job=<job> GROUP BY attempt"`.
+  From the release after `ingest-43d4a26` that includes #103, possible carries
+  have their own exclusion cursor and their receipts are confirmed on their own
+  cursor before each turn (`negentropy_carry_receipts_confirmed_total`). What
+  remains is a burst of other carries with more than about 256–512 receipts
+  awaiting confirmation at once (256 confirmed per turn), which delays a carry
+  by a few turns.
 - `owner_observation_stale`: the parent owner thread has not refreshed health for
   15 minutes. It serves every parent command, including the per-tick lifecycle
   read that refreshes health, so one long preflight (the inventory scan before a

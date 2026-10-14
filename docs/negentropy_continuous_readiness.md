@@ -330,7 +330,8 @@ as receipt maintenance, on its own keyset cursor of 32 possible carries and at
 most 256 receipts per turn). It does not wait for the fair maintenance cursor,
 which visits every unresolved job 32 at a time once per tick. Its progress is
 `negentropy_carry_receipts_confirmed_total` (receipts confirmed this way).
-Until 2026-10-14 (#95 review) carries shared both cursors with every other job.
+On `ingest-2e07c31` and `ingest-43d4a26` (before #103) carries shared both
+cursors with every other job.
 While the worker was busy, a loop that runs two turns and one maintenance pass
 between sessions could, behind a relay outage's backlog of more than 64
 retry-wait jobs, lease a revisit again and let it fail attempts 2 and 3 before
