@@ -292,6 +292,7 @@ async fn index_segments_mode(
         table: "events_local".to_string(),
         batch_size: 10000,
         index_queue: None,
+        retry: Default::default(),
     };
     let indexer = ClickHouseIndexer::new(ch_config)?;
 
@@ -724,6 +725,7 @@ fn init_pipeline(args: &Args, output: &Path) -> Result<PipelineComponents> {
                 table: "events_local".to_string(),
                 batch_size: 10000,
                 index_queue: None,
+                retry: Default::default(),
             };
             let indexer = ClickHouseIndexer::new(ch_config)?;
             Some(indexer.start(receiver))

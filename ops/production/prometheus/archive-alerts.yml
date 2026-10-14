@@ -17,3 +17,15 @@ groups:
         annotations:
           summary: "Pensieve ingester is unavailable"
           description: "Inspect systemd journal and archive recovery state before restarting."
+  - name: pensieve-clickhouse-index
+    rules:
+      # The archive is unaffected; ClickHouse (and the API, Grafana and stats
+      # built on it) is behind. The indexer retries on its own; no restart.
+      - alert: PensieveClickHouseIndexBacklog
+        expr: clickhouse_index_oldest_pending_seconds{job="ingest"} > 900
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse indexing is more than 15 minutes behind the archive"
+          description: "Check ClickHouse health and the ingester journal for 'clickhouse index attempt failed' (retries on its own once ClickHouse accepts inserts) or 'failed to read segment' (needs an operator). See the RUNBOOK section on ClickHouse indexing."

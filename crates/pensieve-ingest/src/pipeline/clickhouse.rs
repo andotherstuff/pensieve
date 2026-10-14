@@ -16,7 +16,7 @@
 //! segment as it is sealed, and the indexer records its offset before each
 //! insert batch, removing the entry once the segment is fully indexed. On
 //! start, the indexer first resumes every segment left in the journal by a
-//! previous run (killed, timed out, stopped early, or failed after retries).
+//! previous run (killed, timed out, or stopped early).
 //!
 //! Downstream materialized views on `events_local` are not duplicate-safe, so
 //! recovery never re-inserts a committed row: batches before the recorded
@@ -24,8 +24,38 @@
 //! against `events_local` so only missing IDs are inserted. Retries within a
 //! run use the same rule.
 //!
-//! A shutdown request stops the indexer at the next batch boundary and leaves
-//! the rest of the segment (and any segments still queued) in the journal.
+//! # ClickHouse outages
+//!
+//! With an [`IndexQueue`], the indexer never gives up on a segment while it
+//! runs: a failed attempt is retried with capped exponential backoff
+//! ([`IndexRetryPolicy`], 2 s doubling to 60 s by default) until ClickHouse
+//! accepts it. A ClickHouse restart, a reboot that starts the ingester first,
+//! or an overload therefore heals without restarting the ingester.
+//!
+//! Segments are indexed one at a time in seal order. Seal notifications that
+//! arrive while a segment is being retried are moved off the channel into a
+//! small in-memory backlog (path and event count only, ordered by segment
+//! number) and indexed after it. The writer never waits on the indexer: the
+//! channel is unbounded and drained continuously, and every segment is
+//! journaled at seal time, so archive admission does not depend on ClickHouse.
+//!
+//! A segment that cannot be *read* is not a ClickHouse problem: it stays in
+//! the journal for the next start and the indexer moves on. Without an index
+//! queue (the backfill tools) a segment is given up after
+//! [`UNJOURNALED_ATTEMPTS`] attempts, since nothing would remember it.
+//!
+//! A shutdown request stops the indexer at the next batch boundary, or wakes
+//! it from a backoff sleep within 200 ms, and leaves the rest of the segment
+//! (and any segments still queued) in the journal.
+//!
+//! # Metrics
+//!
+//! - `clickhouse_index_queue_segments`: segments in the journal.
+//! - `clickhouse_index_oldest_pending_seconds`: how long the oldest of them
+//!   has waited (0 when empty), refreshed every few seconds.
+//! - `clickhouse_index_retries_total`: failed attempts that were retried.
+//! - `clickhouse_insert_errors_total`: segments given up for this run
+//!   (unreadable, or no queue).
 
 use super::index_queue::{IndexProgress, IndexQueue, resolve_segment};
 use super::segment::SealedSegment;
@@ -37,21 +67,62 @@ use flate2::read::GzDecoder;
 use metrics::counter;
 use pensieve_parquet::CanonicalEvent;
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// IDs per existence-check query. 1,000 hex IDs keep the query text (~68 KB)
 /// well under ClickHouse's default 256 KiB `max_query_size`.
 const EXISTS_QUERY_IDS: usize = 1_000;
 
-/// Attempts per segment before it is left in the journal for the next start.
-const MAX_ATTEMPTS: u32 = 3;
+/// Attempts per segment before an indexer without an [`IndexQueue`] gives it
+/// up. With a queue there is no limit.
+pub const UNJOURNALED_ATTEMPTS: u32 = 3;
+
+/// Once the backoff is capped, log a failed attempt at WARN at most this often.
+const RETRY_WARN_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How often the backlog gauges are refreshed while the indexer runs.
+const METRICS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Backoff between attempts to index a segment.
+///
+/// The first retry waits `initial_backoff`; each further consecutive failure
+/// doubles the wait, up to `max_backoff`. A failed attempt that still
+/// committed batches starts over at `initial_backoff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexRetryPolicy {
+    /// Wait after the first failure.
+    pub initial_backoff: Duration,
+    /// Longest wait between attempts.
+    pub max_backoff: Duration,
+}
+
+impl Default for IndexRetryPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(60),
+        }
+    }
+}
+
+impl IndexRetryPolicy {
+    /// Wait after `failures` consecutive failed attempts (1 for the first).
+    pub fn backoff(&self, failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(31);
+        self.initial_backoff
+            .saturating_mul(1u32 << doublings)
+            .min(self.max_backoff)
+    }
+}
 
 /// Configuration for the ClickHouse indexer.
 #[derive(Debug, Clone)]
@@ -72,8 +143,12 @@ pub struct ClickHouseConfig {
     /// indexer records per-batch progress there, resumes unfinished segments
     /// on start, and may stop mid-segment on shutdown. The segment writer
     /// should share the same queue (see `SegmentWriter::with_index_queue`) so
-    /// segments are journaled at seal time.
+    /// segments are journaled at seal time. With a queue, failed segments are
+    /// retried until they succeed or shutdown is requested.
     pub index_queue: Option<Arc<IndexQueue>>,
+
+    /// Backoff between attempts to index a segment.
+    pub retry: IndexRetryPolicy,
 }
 
 impl Default for ClickHouseConfig {
@@ -84,6 +159,7 @@ impl Default for ClickHouseConfig {
             table: "events_local".to_string(),
             batch_size: 10000,
             index_queue: None,
+            retry: IndexRetryPolicy::default(),
         }
     }
 }
@@ -124,8 +200,8 @@ pub struct ClickHouseIndexerHandle {
 
 impl ClickHouseIndexerHandle {
     /// Ask the indexer to stop. With an index queue it stops at the next batch
-    /// boundary and leaves unfinished work journaled; without one it finishes
-    /// the current segment first.
+    /// boundary (or wakes from a retry backoff) and leaves unfinished work
+    /// journaled; without one it finishes the current segment first.
     pub fn request_shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -149,9 +225,10 @@ pub struct ClickHouseIndexer {
     stop: Arc<AtomicBool>,
     segments_indexed: Arc<AtomicUsize>,
     events_indexed: Arc<AtomicUsize>,
+    retries: Arc<AtomicUsize>,
 }
 
-/// State shared by the indexer thread's helpers.
+/// State owned by the indexer thread.
 struct Worker {
     client: Client,
     config: ClickHouseConfig,
@@ -159,6 +236,13 @@ struct Worker {
     stop: Arc<AtomicBool>,
     segments_indexed: Arc<AtomicUsize>,
     events_indexed: Arc<AtomicUsize>,
+    retries: Arc<AtomicUsize>,
+    receiver: Receiver<SealedSegment>,
+    /// Segments handed over by the writer and not indexed yet, by segment
+    /// number (seal order).
+    backlog: RefCell<BTreeMap<u64, Pending>>,
+    /// Set from the first failed attempt until the backlog is empty again.
+    outage: Cell<Option<Outage>>,
 }
 
 impl ClickHouseIndexer {
@@ -182,6 +266,7 @@ impl ClickHouseIndexer {
             stop: Arc::new(AtomicBool::new(false)),
             segments_indexed: Arc::new(AtomicUsize::new(0)),
             events_indexed: Arc::new(AtomicUsize::new(0)),
+            retries: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -196,8 +281,12 @@ impl ClickHouseIndexer {
         let stop = Arc::clone(&self.stop);
         let segments_indexed = Arc::clone(&self.segments_indexed);
         let events_indexed = Arc::clone(&self.events_indexed);
+        let retries = Arc::clone(&self.retries);
 
         self.running.store(true, Ordering::SeqCst);
+        if let Some(queue) = &config.index_queue {
+            Self::start_metrics_thread(Arc::clone(queue), Arc::clone(&self.running));
+        }
 
         let thread = thread::spawn(move || {
             tracing::info!("ClickHouse indexer thread started");
@@ -215,8 +304,12 @@ impl ClickHouseIndexer {
                 stop,
                 segments_indexed,
                 events_indexed,
+                retries,
+                receiver,
+                backlog: RefCell::new(BTreeMap::new()),
+                outage: Cell::new(None),
             };
-            worker.run(&receiver);
+            worker.run();
             running.store(false, Ordering::SeqCst);
             tracing::info!("ClickHouse indexer thread stopped");
         });
@@ -224,6 +317,26 @@ impl ClickHouseIndexer {
         ClickHouseIndexerHandle {
             thread,
             stop: Arc::clone(&self.stop),
+        }
+    }
+
+    /// Keep the backlog gauges current while the indexer runs. A separate
+    /// thread, so the age keeps growing even while an insert hangs.
+    fn start_metrics_thread(queue: Arc<IndexQueue>, running: Arc<AtomicBool>) {
+        let spawned = thread::Builder::new()
+            .name("clickhouse-index-metrics".to_string())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    queue.publish_metrics();
+                    let deadline = Instant::now() + METRICS_INTERVAL;
+                    while running.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // The gauges are still updated whenever the journal changes.
+            tracing::warn!(error = %e, "failed to start clickhouse index metrics thread");
         }
     }
 
@@ -434,6 +547,7 @@ impl ClickHouseIndexer {
         IndexerStats {
             segments_indexed: self.segments_indexed.load(Ordering::Relaxed),
             events_indexed: self.events_indexed.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
             is_running: self.running.load(Ordering::Relaxed),
         }
     }
@@ -461,48 +575,24 @@ impl Worker {
         self.stop.load(Ordering::SeqCst)
     }
 
-    fn run(&self, receiver: &Receiver<SealedSegment>) {
+    fn run(&self) {
         // Finish what a previous run left behind before consuming new
         // segments, so ClickHouse catches up with the archive in order.
-        if !self.resume_previous_run() {
-            loop {
-                if self.stop_requested() {
-                    break;
-                }
-                match receiver.recv_timeout(Duration::from_secs(1)) {
-                    Ok(sealed) => {
-                        tracing::info!(
-                            "Indexing segment {}: {} events from {}",
-                            sealed.segment_number,
-                            sealed.event_count,
-                            sealed.path.display()
-                        );
-                        let progress = self
-                            .queue()
-                            .and_then(|queue| queue.progress(&sealed.path))
-                            .unwrap_or_default();
-                        if self.index_segment(&sealed.path, progress) == Step::Interrupted {
-                            break;
-                        }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        tracing::info!("Segment channel disconnected, stopping indexer");
-                        return;
-                    }
-                }
-            }
+        if !self.resume_previous_run() && !self.consume_backlog() {
+            return;
         }
 
-        // Stopping early: make sure every segment still waiting on the channel
-        // is journaled (the writer normally did this at seal time already).
+        // Stopping early: make sure every segment handed over by the writer
+        // but not indexed yet is journaled (the writer normally did this at
+        // seal time already).
         let Some(queue) = self.queue() else {
             return;
         };
-        while let Ok(sealed) = receiver.try_recv() {
-            if let Err(e) = queue.record_sealed(&sealed.path) {
+        self.absorb_notifications();
+        for pending in self.backlog.borrow().values() {
+            if let Err(e) = queue.record_sealed(&pending.path) {
                 tracing::error!(
-                    segment = sealed.segment_number,
+                    segment = %pending.path.display(),
                     error = %compact_error(&e),
                     "failed to journal unindexed segment at shutdown"
                 );
@@ -515,6 +605,64 @@ impl Worker {
                 "clickhouse indexer stopped early; pending segments resume on next start"
             );
         }
+    }
+
+    /// Index segments handed over by the writer, oldest first, until the
+    /// channel disconnects (returns false) or a shutdown request stops the
+    /// indexer (returns true).
+    fn consume_backlog(&self) -> bool {
+        loop {
+            if self.stop_requested() {
+                return true;
+            }
+            self.absorb_notifications();
+            let next = self.backlog.borrow_mut().pop_first();
+            if let Some((number, pending)) = next {
+                tracing::info!(
+                    "Indexing segment {}: {} events from {}",
+                    number,
+                    pending.event_count,
+                    pending.path.display()
+                );
+                let progress = self
+                    .queue()
+                    .and_then(|queue| queue.progress(&pending.path))
+                    .unwrap_or_default();
+                if self.index_segment(&pending.path, progress) == Step::Interrupted {
+                    return true;
+                }
+                continue;
+            }
+            self.note_backlog_cleared();
+            match self.receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(sealed) => self.accept(sealed),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    tracing::info!("Segment channel disconnected, stopping indexer");
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Move every notification waiting on the channel into the backlog, so
+    /// the channel stays empty while a segment is being retried.
+    fn absorb_notifications(&self) {
+        while let Ok(sealed) = self.receiver.try_recv() {
+            self.accept(sealed);
+        }
+    }
+
+    /// Keep only what indexing needs: the notification also carries every
+    /// event ID of the segment, which a long outage must not pile up.
+    fn accept(&self, sealed: SealedSegment) {
+        self.backlog.borrow_mut().insert(
+            sealed.segment_number,
+            Pending {
+                path: sealed.path,
+                event_count: sealed.event_count,
+            },
+        );
     }
 
     /// Resume segments journaled by a previous run. Returns true if a shutdown
@@ -555,21 +703,29 @@ impl Worker {
         false
     }
 
-    /// Index one segment with bounded retries, keeping the journal in step.
+    /// Index one segment, keeping the journal in step.
+    ///
+    /// With an index queue a failed attempt is retried, with capped
+    /// exponential backoff, until it succeeds or shutdown is requested; later
+    /// segments wait in the backlog meanwhile. Without one the segment is
+    /// given up after [`UNJOURNALED_ATTEMPTS`].
     fn index_segment(&self, path: &Path, mut progress: IndexProgress) -> Step {
         let queue = self.queue();
         let events = match ClickHouseIndexer::read_segment(path) {
             Ok(events) => events,
             Err(e) => {
+                // Not a ClickHouse problem: retrying in this run would not
+                // help, and waiting on it would stall every later segment.
                 counter!("clickhouse_insert_errors_total").increment(1);
-                tracing::error!(segment = %path.display(), error = %compact_error(&e), "failed to read segment for clickhouse; left queued");
+                tracing::error!(segment = %path.display(), error = %compact_error(&e), "failed to read segment for clickhouse; left queued for next start");
                 self.keep_queued(path, progress);
                 return Step::Failed;
             }
         };
 
-        let mut attempt = 0;
+        let mut failures = 0;
         loop {
+            let committed_before = progress.committed;
             let result = self.rt.block_on(ClickHouseIndexer::insert_resumable(
                 &self.client,
                 &self.config,
@@ -598,6 +754,7 @@ impl Worker {
                         already_present,
                         "indexed segment"
                     );
+                    self.note_recovered();
                     return Step::Done;
                 }
                 Ok(IndexOutcome::Interrupted) => {
@@ -610,25 +767,25 @@ impl Worker {
                     return Step::Interrupted;
                 }
                 Err(e) => {
-                    attempt += 1;
-                    if attempt >= MAX_ATTEMPTS {
+                    // Batches went in before this failure, so the server is
+                    // up: start the backoff over.
+                    if progress.committed > committed_before {
+                        failures = 0;
+                    }
+                    failures += 1;
+                    if queue.is_none() && failures >= UNJOURNALED_ATTEMPTS {
                         counter!("clickhouse_insert_errors_total").increment(1);
                         tracing::error!(
                             segment = %path.display(),
                             error = %compact_error(&e),
-                            "failed to index segment after retries; left queued for next start"
+                            "failed to index segment after retries; no index queue, so it is not retried"
                         );
-                        self.keep_queued(path, progress);
                         return Step::Failed;
                     }
-                    let backoff = Duration::from_secs(2u64.pow(attempt));
-                    tracing::warn!(
-                        segment = %path.display(),
-                        attempt,
-                        error = %compact_error(&e),
-                        "clickhouse index attempt failed; retrying in {:?}",
-                        backoff
-                    );
+                    let backoff = self.config.retry.backoff(failures);
+                    counter!("clickhouse_index_retries_total").increment(1);
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                    self.note_failure(path, failures, backoff, &e);
                     if self.sleep_unless_stopped(backoff) {
                         self.keep_queued(path, progress);
                         return Step::Interrupted;
@@ -638,15 +795,90 @@ impl Worker {
         }
     }
 
+    /// Log a failed attempt: one WARN per backoff step while the backoff
+    /// grows, then at most one per [`RETRY_WARN_INTERVAL`] once it is capped.
+    fn note_failure(&self, path: &Path, failures: u32, backoff: Duration, error: &Error) {
+        let now = Instant::now();
+        let mut outage = self.outage.get().unwrap_or(Outage {
+            since: now,
+            failures: 0,
+            last_warn: None,
+            recovered: false,
+        });
+        outage.failures += 1;
+        outage.recovered = false;
+        let capped = backoff >= self.config.retry.max_backoff;
+        let warn = !capped
+            || outage
+                .last_warn
+                .is_none_or(|last| now.duration_since(last) >= RETRY_WARN_INTERVAL);
+        let pending = self.queue().map_or(0, IndexQueue::len);
+        let outage_secs = now.duration_since(outage.since).as_secs();
+        if warn {
+            outage.last_warn = Some(now);
+            tracing::warn!(
+                segment = %path.display(),
+                attempt = failures,
+                pending,
+                outage_secs,
+                error = %compact_error(error),
+                "clickhouse index attempt failed; retrying in {:?}",
+                backoff
+            );
+        } else {
+            tracing::debug!(
+                segment = %path.display(),
+                attempt = failures,
+                pending,
+                outage_secs,
+                error = %compact_error(error),
+                "clickhouse index attempt failed; retrying in {:?}",
+                backoff
+            );
+        }
+        self.outage.set(Some(outage));
+    }
+
+    /// First success after failed attempts: say so once.
+    fn note_recovered(&self) {
+        let Some(mut outage) = self.outage.get() else {
+            return;
+        };
+        if outage.recovered {
+            return;
+        }
+        outage.recovered = true;
+        self.outage.set(Some(outage));
+        tracing::info!(
+            failed_attempts = outage.failures,
+            outage_secs = outage.since.elapsed().as_secs(),
+            pending = self.queue().map_or(0, IndexQueue::len),
+            "clickhouse indexing recovered; catching up on queued segments"
+        );
+    }
+
+    /// Nothing left to index: close out a run of failures.
+    fn note_backlog_cleared(&self) {
+        if let Some(outage) = self.outage.take() {
+            tracing::info!(
+                failed_attempts = outage.failures,
+                outage_secs = outage.since.elapsed().as_secs(),
+                "clickhouse index backlog cleared"
+            );
+        }
+    }
+
     /// Sleep, waking early for a shutdown request when a queue can hold the
-    /// remaining work. Returns true if interrupted.
+    /// remaining work. Notifications that arrive meanwhile join the backlog.
+    /// Returns true if interrupted.
     fn sleep_unless_stopped(&self, duration: Duration) -> bool {
-        let deadline = std::time::Instant::now() + duration;
+        let deadline = Instant::now() + duration;
         loop {
+            self.absorb_notifications();
             if self.queue().is_some() && self.stop_requested() {
                 return true;
             }
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= deadline {
                 return false;
             }
@@ -661,6 +893,21 @@ impl Worker {
             tracing::error!(segment = %path.display(), error = %compact_error(&e), "failed to journal unindexed segment");
         }
     }
+}
+
+/// A sealed segment waiting in the indexer's in-memory backlog.
+struct Pending {
+    path: PathBuf,
+    event_count: usize,
+}
+
+/// A run of failed index attempts, for logging.
+#[derive(Debug, Clone, Copy)]
+struct Outage {
+    since: Instant,
+    failures: u64,
+    last_warn: Option<Instant>,
+    recovered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,6 +925,9 @@ pub struct IndexerStats {
 
     /// Number of events indexed.
     pub events_indexed: usize,
+
+    /// Failed index attempts that were retried.
+    pub retries: usize,
 
     /// Whether the indexer is running.
     pub is_running: bool,
@@ -726,5 +976,22 @@ mod tests {
         assert_eq!(row.content.len(), 700_000);
     }
 
-    // Integration tests would require a running ClickHouse instance
+    #[test]
+    fn retry_backoff_doubles_up_to_the_cap() {
+        let policy = IndexRetryPolicy::default();
+        let waits: Vec<u64> = (1..=8).map(|n| policy.backoff(n).as_secs()).collect();
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_secs(60));
+        assert_eq!(policy.backoff(0), Duration::from_secs(2));
+
+        let fast = IndexRetryPolicy {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(25),
+        };
+        assert_eq!(fast.backoff(2), Duration::from_millis(20));
+        assert_eq!(fast.backoff(3), Duration::from_millis(25));
+    }
+
+    // Outage, ordering and shutdown behaviour is covered in
+    // tests/clickhouse_index_recovery.rs.
 }

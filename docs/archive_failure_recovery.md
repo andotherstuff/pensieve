@@ -73,7 +73,9 @@ deploy simply because unit tests pass.
 
 `archive_recovery_required = 1` and `archive_admission_failures_total` expose the
 latched fault. Rules are in `ops/production/prometheus/archive-alerts.yml`, with
-a separate ingester-unavailable rule for process/startup failure. These changes
+a separate ingester-unavailable rule for process/startup failure. The same file
+holds `PensieveClickHouseIndexBacklog`, a freshness rule for the derived
+ClickHouse index (not the archive). These changes
 are not deployed automatically. Verify rule loading and the site's notification
 receiver routing before claiming operator notifications are delivered.
 The selected notification system is Uptime Kuma. Monitor

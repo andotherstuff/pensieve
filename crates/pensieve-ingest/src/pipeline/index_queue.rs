@@ -26,6 +26,14 @@
 //!
 //! A line without the `v1` prefix is a bare segment path from older binaries
 //! and has unknown progress.
+//!
+//! # Backlog age
+//!
+//! The journal also knows how long its oldest entry has waited
+//! ([`IndexQueue::oldest_pending_age`]). Entries sealed by this process are
+//! timed from when they were journaled; entries from a previous run use the
+//! segment file's modification time, which is when it was sealed (or
+//! compressed, a few seconds later).
 
 use crate::{Error, Result};
 use metrics::gauge;
@@ -34,6 +42,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 const LINE_PREFIX: &str = "v1";
 
@@ -70,6 +79,8 @@ struct Entry {
     path: PathBuf,
     progress: IndexProgress,
     from_previous_run: bool,
+    /// When the segment started waiting for ClickHouse.
+    pending_since: SystemTime,
 }
 
 /// Durable, process-shared journal of segments pending ClickHouse indexing.
@@ -87,6 +98,7 @@ impl IndexQueue {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let mut entries = BTreeMap::new();
+        let opened_at = SystemTime::now();
         match fs::read_to_string(&path) {
             Ok(contents) => {
                 for line in contents.lines() {
@@ -94,10 +106,11 @@ impl IndexQueue {
                         continue;
                     };
                     let key = segment_key(&segment);
-                    let entry = entries.entry(key).or_insert(Entry {
+                    let entry = entries.entry(key).or_insert_with(|| Entry {
                         path: segment.clone(),
                         progress,
                         from_previous_run: true,
+                        pending_since: sealed_at(&segment).unwrap_or(opened_at),
                     });
                     // Duplicate lines (older binaries appended blindly): keep
                     // the most conservative progress.
@@ -134,6 +147,7 @@ impl IndexQueue {
                 path: segment.to_path_buf(),
                 progress: IndexProgress::default(),
                 from_previous_run: false,
+                pending_since: SystemTime::now(),
             },
         );
         self.persist(&entries)
@@ -144,11 +158,14 @@ impl IndexQueue {
         // Validate before mutating so a bad path never poisons later writes.
         format_line(segment, progress)?;
         let mut entries = self.entries.lock();
-        let entry = entries.entry(segment_key(segment)).or_insert(Entry {
-            path: segment.to_path_buf(),
-            progress,
-            from_previous_run: false,
-        });
+        let entry = entries
+            .entry(segment_key(segment))
+            .or_insert_with(|| Entry {
+                path: segment.to_path_buf(),
+                progress,
+                from_previous_run: false,
+                pending_since: SystemTime::now(),
+            });
         entry.path = segment.to_path_buf();
         entry.progress = progress;
         self.persist(&entries)
@@ -193,6 +210,18 @@ impl IndexQueue {
         self.entries.lock().is_empty()
     }
 
+    /// How long the longest-waiting segment has been pending, or `None` when
+    /// the journal is empty.
+    pub fn oldest_pending_age(&self) -> Option<Duration> {
+        oldest_age(&self.entries.lock())
+    }
+
+    /// Publish the backlog gauges: `clickhouse_index_queue_segments` and
+    /// `clickhouse_index_oldest_pending_seconds` (0 when empty).
+    pub fn publish_metrics(&self) {
+        self.publish_depth(&self.entries.lock());
+    }
+
     fn persist(&self, entries: &BTreeMap<PathBuf, Entry>) -> Result<()> {
         self.publish_depth(entries);
         let parent = self
@@ -229,7 +258,22 @@ impl IndexQueue {
 
     fn publish_depth(&self, entries: &BTreeMap<PathBuf, Entry>) {
         gauge!("clickhouse_index_queue_segments").set(entries.len() as f64);
+        let age = oldest_age(entries).unwrap_or_default();
+        gauge!("clickhouse_index_oldest_pending_seconds").set(age.as_secs_f64());
     }
+}
+
+fn oldest_age(entries: &BTreeMap<PathBuf, Entry>) -> Option<Duration> {
+    let oldest = entries.values().map(|entry| entry.pending_since).min()?;
+    Some(SystemTime::now().duration_since(oldest).unwrap_or_default())
+}
+
+/// Seal time of a journaled segment from a previous run: its file's mtime.
+fn sealed_at(segment: &Path) -> Option<SystemTime> {
+    fs::metadata(resolve_segment(segment)?)
+        .ok()?
+        .modified()
+        .ok()
 }
 
 /// Locate a journaled segment on disk. The writer journals the uncompressed
@@ -451,6 +495,47 @@ mod tests {
         assert_eq!(resolve_segment(&plain), Some(gz.clone()));
         fs::remove_file(&plain).unwrap();
         assert_eq!(resolve_segment(&plain), Some(gz));
+    }
+
+    #[test]
+    fn oldest_pending_age_tracks_the_longest_waiting_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join(".clickhouse_reindex_queue");
+        let old = dir.path().join("segment-000000010.notepack.gz");
+        fs::write(&old, b"").unwrap();
+        let sealed = SystemTime::now() - Duration::from_secs(3_600);
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(sealed)
+            .unwrap();
+        // Journaled by a previous run, without its compression suffix.
+        fs::write(
+            &journal,
+            format!(
+                "v1\t0\t0\t{}\n",
+                dir.path().join("segment-000000010.notepack").display()
+            ),
+        )
+        .unwrap();
+
+        let queue = IndexQueue::open(&journal).unwrap();
+        let age = queue.oldest_pending_age().unwrap();
+        assert!(
+            (3_599..3_700).contains(&age.as_secs()),
+            "previous-run entries are aged from the segment's mtime: {age:?}"
+        );
+
+        // A newer seal does not hide the stranded one.
+        let new = dir.path().join("segment-000000011.notepack");
+        queue.record_sealed(&new).unwrap();
+        assert!(queue.oldest_pending_age().unwrap() >= age);
+
+        queue.complete(&old).unwrap();
+        assert!(queue.oldest_pending_age().unwrap() < Duration::from_secs(60));
+        queue.complete(&new).unwrap();
+        assert_eq!(queue.oldest_pending_age(), None);
     }
 
     #[test]
