@@ -310,11 +310,16 @@ impl ParentExecutor {
                 while let Some(command) = receiver.blocking_recv() {
                     match command {
                         Command::Lifecycle { reply } => {
-                            let result = (|| {
+                            let result = (|| -> Result<_, ParentError> {
                                 let now = clock();
                                 // Archive uncertainty blocks new exclusions; the
                                 // runtime pauses on it at the next tick.
                                 if !writer.recovery_required() {
+                                    // A carry's received frames are confirmed now,
+                                    // not when the fair maintenance cursor reaches it.
+                                    let confirmed = archive_maintenance(&writer, || ledger.confirm_carry_receipts(&dedupe, &writer))?;
+                                    metrics::counter!("negentropy_carry_receipts_confirmed_total")
+                                        .increment(u64::from(confirmed.satisfied));
                                     record_unavailable(&ledger.exclude_relay_unavailable(now, &dedupe)?);
                                 }
                                 let retention = ledger.retain_completed(now)?;
@@ -322,9 +327,9 @@ impl ParentExecutor {
                                     .increment(u64::from(retention.removed_jobs));
                                 metrics::counter!("negentropy_retention_skipped_roots_total")
                                     .increment(u64::from(retention.retained_candidate));
-                                ledger.progress_observation(now)
+                                Ok(ledger.progress_observation(now)?)
                             })();
-                            let _ = reply.send(result.map_err(Into::into));
+                            let _ = reply.send(result);
                         }
                         Command::PauseFailures { reply } => {
                             let _ = reply.send(ledger.pause_failures().map_err(Into::into));
@@ -2394,13 +2399,27 @@ mod tests {
                     .id;
                 let lease = ledger.lease_next(25_000, 600).unwrap().unwrap();
                 assert_eq!(lease.job().id, job);
+                // It received one frame, of an event the archive already holds.
+                ledger
+                    .register_received(
+                        &lease,
+                        &ipc::ReceiptRecord {
+                            sequence: 1,
+                            event_id: [1; 32],
+                            created_at: 105,
+                            frame_bytes: 500,
+                            frame_digest: [2; 32],
+                        },
+                        25_000,
+                    )
+                    .unwrap();
                 let report = FailureDiagnostic {
                     kind: FailureKind::Unavailable,
                     missing_count: 1,
                     sample: vec![[8; 32]],
                 };
                 ledger
-                    .record_failure_report(&lease, 1, &report, 25_001)
+                    .record_failure_report(&lease, 2, &report, 25_001)
                     .unwrap();
                 ledger
                     .retry(&lease, 25_001, 60, RetryReason::RelayFailure)
@@ -2408,6 +2427,8 @@ mod tests {
                 job
             },
         );
+        h.dedupe.mark_archived([&[1; 32]].into_iter()).unwrap();
+        // No maintenance turn: the lifecycle turn confirms the receipt itself.
         let observation = h.executor.lifecycle().await.unwrap();
         let job = h.executor.job(h.job).await.unwrap();
         assert_eq!((job.state, job.attempt), (JobState::Complete, 1));

@@ -197,6 +197,8 @@ pub struct JobLedger {
     unavailable_rule: Option<UnavailableRule>,
     /// In-memory keyset cursors for bounded exclusion and late-arrival turns.
     unavailable_cursor: i64,
+    carry_cursor: i64,
+    confirm_cursor: i64,
     late_cursor: i64,
 }
 
@@ -337,6 +339,8 @@ impl JobLedger {
             policy,
             unavailable_rule: Some(UnavailableRule::default()),
             unavailable_cursor: 0,
+            carry_cursor: 0,
+            confirm_cursor: 0,
             late_cursor: 0,
         })
     }
