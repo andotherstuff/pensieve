@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the ClickHouse index backlog every 60 seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=1
+Unit=pensieve-clickhouse-index-kuma.service
+
+[Install]
+WantedBy=timers.target
