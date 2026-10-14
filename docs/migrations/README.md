@@ -952,4 +952,4 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/longform` | Long-form content stats | None |
 | `GET /api/v1/stats/publishers` | Top publishers | None |
 
-All endpoints include HTTP caching headers (`Cache-Control: public, max-age=60, stale-while-revalidate=300`).
+All endpoints include HTTP caching headers (`ETag` and a per-endpoint `Cache-Control`; see [Caching](../../crates/pensieve-serve/README.md#caching)).

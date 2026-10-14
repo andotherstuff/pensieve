@@ -11,7 +11,7 @@
 //!
 //! # Architecture
 //!
-//! - **AppState**: Shared ClickHouse client, relay database, and response cache
+//! - **AppState**: Shared ClickHouse client, relay database handle, and response cache
 //! - **Auth**: Bearer token middleware for request authentication
 //! - **Routes**: Endpoint handlers grouped by domain
 //! - **Rollups**: SQL and operator tooling for the migration 019 rollup tables
@@ -20,6 +20,7 @@ mod auth;
 pub mod bounded_clickhouse;
 pub mod cache;
 mod error;
+pub mod relay_db;
 pub mod rollups;
 mod routes;
 mod state;
@@ -27,5 +28,6 @@ mod state;
 pub use self::auth::require_auth;
 pub use self::cache::{ResponseCache, get_or_compute, new_cache};
 pub use self::error::ApiError;
+pub use self::relay_db::RelayDb;
 pub use self::routes::router;
 pub use self::state::{AppState, Config};

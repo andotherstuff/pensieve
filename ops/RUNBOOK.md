@@ -1961,7 +1961,16 @@ swap-in shows up during queries.
   [`docs/migration-plan.md`](../docs/migration-plan.md)).
 - `/api/v1/stats/publishers` is capped at `days=60`; a longer window needs a precomputed
   ranking (see [API rollups](#api-rollups-migration-019) → Known limit).
-- The API reads `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite connection while the
-  ingester keeps writing the WAL database, so relay endpoints can be stale.
+- `api-fe54f04` and earlier read `RELAY_DB_PATH` through one long-lived `immutable=1` SQLite
+  connection, which ignores the ingester's WAL, so relay endpoints are stale; they also send
+  `Cache-Control: public, max-age=60` for every endpoint. Master opens a read-only connection
+  per request and sends `private` per-endpoint policies (see the
+  [API README](../crates/pensieve-serve/README.md#caching)); both go away with the next API
+  release. `pensieve-api.service` runs with `ProtectSystem=strict` and no `ReadWritePaths`, so
+  `/data` is read-only for the API and it can never create `relay-stats.db-wal`/`-shm`. While
+  the ingester runs, the API reads the WAL with a read-only `-shm`; after a clean ingester stop
+  (both files deleted) it reads the checkpointed main file with `immutable=1` (see
+  [Relays](../crates/pensieve-serve/README.md#relays)). Neither needs a unit or drop-in change;
+  do not add `/data` to the API's `ReadWritePaths`.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
   [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.

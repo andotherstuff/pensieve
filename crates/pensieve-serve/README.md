@@ -24,7 +24,7 @@ Generate a token: `openssl rand -hex 32`
 | `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` | *(optional)* | Canonical ingestion-owned watermark file; when set, `latest_event` (in `/stats` and `/stats/events/latest`) is read from it instead of scanning `events_local` |
 | `PENSIEVE_LATEST_EVENT_WATERMARK_MAX_AGE_SECS` | `900` | Maximum accepted watermark publication age |
 | `PENSIEVE_API_TOKENS` | *(required)* | Comma-separated API tokens |
-| `RELAY_DB_PATH` | *(optional)* | Path to ingester's SQLite relay-stats.db for relay endpoints; ignored if the file does not exist |
+| `RELAY_DB_PATH` | *(optional)* | Path to the ingester's SQLite `relay-stats.db` for the relay endpoints, read through a fresh read-only connection per request (see [Relays](#relays)); ignored if the file does not exist at startup |
 | `RUST_LOG` | `info` | Log filter (`tracing` `EnvFilter` syntax) |
 
 On startup the server loads a `.env` file if one exists. Override its location with
@@ -33,6 +33,45 @@ Variables already set in the process environment take precedence over the file.
 
 Every analytics route is served from ClickHouse. The three operational relay
 routes use `RELAY_DB_PATH`.
+
+---
+
+## Caching
+
+Every successful `/api/v1/*` response carries an `ETag` (a hash of the body)
+and a per-endpoint `Cache-Control`. A request whose `If-None-Match` matches the
+current `ETag` gets `304 Not Modified` with the same `Cache-Control`. Error
+responses (`4xx`, `5xx`, including `503 metric_unavailable`) carry neither.
+
+| Endpoint | `Cache-Control` |
+|----------|-----------------|
+| `/api/v1/stats/events/latest` | `private, max-age=10, stale-while-revalidate=30` |
+| `/api/v1/stats/events/total`, `/api/v1/stats/pubkeys/total` | `private, max-age=300, stale-while-revalidate=600` |
+| `/api/v1/stats/activity/hourly`, `/api/v1/stats/engagement`, `/api/v1/kinds/{kind}/activity` | `private, max-age=600, stale-while-revalidate=1800` |
+| `/api/v1/stats/kinds/total`, `/api/v1/stats/events/earliest` | `private, max-age=3600, stale-while-revalidate=7200` |
+| Every other `/api/v1/*` endpoint | `private, max-age=60, stale-while-revalidate=300` |
+
+The directive is `private` because every `/api/v1/*` response requires a
+Bearer token: a browser or other client cache may keep it, but a shared cache
+(CDN, reverse proxy) must not store it and serve it to a client without a
+token. `/health` and `/docs` need no token and send no `Cache-Control`.
+
+Releases up to and including `api-fe54f04` sent
+`public, max-age=60, stale-while-revalidate=300` for every endpoint: the policy
+was matched against the full `/api/v1/...` path, but the middleware runs inside
+the `/api/v1` nest and only saw the path below it.
+
+`max-age` is not the worst-case age of the data. The server also keeps its own
+in-memory cache of ClickHouse results with per-endpoint TTLs, and while one
+refresh runs it may serve an expired entry for up to one more TTL (never for
+the latest-event watermark). A client cache can then keep the response for
+`max-age` and serve it stale for `stale-while-revalidate`. The worst case is
+therefore about 2 × the server TTL + `max-age` + `stale-while-revalidate`:
+about 50 s for `/stats/events/latest` (10 s server TTL, never stale), 25
+minutes for `/stats/events/total` (5 minutes server TTL) and 5 hours for
+`/stats/kinds/total` (1 hour server TTL). The server TTLs are in
+`crates/pensieve-serve/src/cache.rs` and the handlers. `private` keeps shared
+caches (and their own revalidation windows) out of this chain.
 
 ---
 
@@ -121,7 +160,7 @@ Returns approximate total event count.
 }
 ```
 
-**Suggested cache TTL:** 5 minutes
+**Cache-Control:** `max-age=300` (5 minutes), `stale-while-revalidate=600`
 
 ---
 
@@ -137,7 +176,7 @@ Returns total unique pubkeys.
 }
 ```
 
-**Suggested cache TTL:** 5 minutes
+**Cache-Control:** `max-age=300` (5 minutes), `stale-while-revalidate=600`
 
 ---
 
@@ -155,7 +194,7 @@ days. Read from the `kind_totals` rollup (migration
 }
 ```
 
-**Suggested cache TTL:** 1 hour
+**Cache-Control:** `max-age=3600` (1 hour), `stale-while-revalidate=7200`
 
 ---
 
@@ -173,7 +212,7 @@ earliest). Read from the `kind_totals` rollup (migration 020), like
 }
 ```
 
-**Suggested cache TTL:** 1 hour
+**Cache-Control:** `max-age=3600` (1 hour), `stale-while-revalidate=7200`
 
 ---
 
@@ -189,7 +228,7 @@ Returns latest event timestamp (excludes future timestamps).
 }
 ```
 
-**Suggested cache TTL:** 10 seconds
+**Cache-Control:** `max-age=10`, `stale-while-revalidate=30`
 
 ---
 
@@ -1016,13 +1055,64 @@ GET /api/v1/stats/relays/distribution?limit=50
 GET /api/v1/stats/relays/distribution
 ```
 
-**Suggested cache TTL:** 1 minute (the server sends `Cache-Control: public, max-age=60, stale-while-revalidate=300`)
+**Cache-Control:** `max-age=60` (1 minute), `stale-while-revalidate=300` (the default)
 
 ---
 
 ### Relays
 
 Relay endpoints require the `RELAY_DB_PATH` environment variable to be set to the path of the ingester's SQLite relay stats database. If it is unset or the file does not exist at startup, these endpoints return `500` (`internal_error`).
+
+Each request opens its own read-only SQLite connection (`SQLITE_OPEN_READONLY`,
+the flag behind `mode=ro`, plus `PRAGMA query_only`), so a response includes
+everything the ingester has committed, transactions still in the WAL
+included, and a replaced database file is picked up without a restart. The API
+never writes the database, its WAL or its directory. Releases up to and
+including `api-fe54f04` instead held one connection, opened at startup with
+`immutable=1`: SQLite then ignores the WAL and takes no locks, so relay data
+was only as fresh as the last checkpoint and a concurrent checkpoint could
+tear a read.
+
+In production `/data` is read-only for the API: `pensieve-api.service` runs
+with `ProtectSystem=strict` and no `ReadWritePaths`. The API therefore can
+never create the database's `-wal` and `-shm` files, and each request picks
+one of two ways to read:
+
+- **Ingester running** (`-wal` and `-shm` exist): a normal read-only WAL
+  reader. It cannot write `-shm`, so SQLite maps it read-only and uses the
+  ingester's WAL index and read marks at normal speed. (A reader that can write
+  `-shm` updates its read marks there, as every WAL reader does.) Only when
+  `-wal`/`-shm` exist but no writer holds them, after a crash or a stop that
+  skipped the final checkpoint, does SQLite rebuild the WAL index in private
+  memory: slower, still consistent.
+- **Ingester stopped cleanly** (both files gone; the last connection
+  checkpointed the WAL into the main file and deleted them): an
+  `immutable=1` read of the main file, which is complete. A plain read-only
+  open would try to create `-wal` and fail. If the ingester starts during such
+  a read, it only appends to its new WAL; the main file changes at the first
+  checkpoint, about 4 MiB of commits later.
+
+Other behaviour:
+
+- **Journal mode** is read from the database header once at startup, before
+  any connection exists. Reading it again later through a second file
+  descriptor would release live connections' POSIX locks.
+- **Race at stop:** if the ingester stops between the check for `-wal`/`-shm`
+  and the open, the open re-checks and falls back to the snapshot. If the API
+  *can* write the directory (not production), SQLite instead recreates the
+  files, owned by the API's user with the database file's mode. Where that user
+  is not the database's owner, the ingester may then be unable to write them
+  until they are removed. Run the API as the database's owner, or with the
+  directory read-only.
+- **Busy:** a reader waits up to 2 s (`busy_timeout`) on `SQLITE_BUSY`, then
+  the request fails with `503 analytics_busy`. At most 16 relay reads run at
+  once; further requests get `503 analytics_busy` immediately.
+- **Unreadable files:** if SQLite cannot open, create or recover a file it
+  needs (`SQLITE_CANTOPEN` or any `SQLITE_READONLY*` code, such as
+  `_DIRECTORY`, `_CANTINIT` or `_RECOVERY`; the API never writes, so a
+  read-only error always means this), the request fails with
+  `503 metric_unavailable`. So does `SQLITE_CORRUPT` during a snapshot read,
+  which can overlap an ingester restart. Other SQLite errors are `500`.
 
 #### `GET /api/v1/relays/summary`
 
@@ -1130,8 +1220,8 @@ All errors return JSON with the following structure:
 | 500 | `internal_error` | Server error |
 | 500 | `database_error` | Database query failed |
 | 500 | `serialization_error` | Response serialization failed |
-| 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out; retry later |
-| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied |
+| 503 | `analytics_busy` | Analytics query capacity exhausted or query timed out, or the relay database stayed busy for 2 s or 16 relay reads were already running; retry later |
+| 503 | `metric_unavailable` | Metric temporarily disabled (currently `/stats/engagement`), or `/stats/publishers` and `/stats/longform` before migration 019 is applied, or a relay endpoint when SQLite cannot open, create or recover a file the relay database needs (or a snapshot read hits `SQLITE_CORRUPT`) |
 
 ---
 
