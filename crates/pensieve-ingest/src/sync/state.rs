@@ -107,6 +107,10 @@ impl SyncStateDb {
         }
         let start = Self::make_key(since, &[0; 32]);
         let end = Self::make_key(until, &[u8::MAX; 32]);
+        // Pass 1 reads inventory keys only. A dense window is rejected after at
+        // most max_items + 1 cheap iterator steps, before any dedupe lookup:
+        // each lookup consults a filter and index block per LSM level of the
+        // multi-billion-key dedupe index, and a TooDense answer discards them.
         let mut items = Vec::new();
         // This range crosses timestamp prefixes. Do not depend on the current
         // bloom-filter/memtable configuration for complete cross-prefix reads.
@@ -131,11 +135,16 @@ impl SyncStateDb {
             if examined == max_items {
                 return Ok(ArchivedWindow::TooDense);
             }
+            items.push((id, timestamp));
+        }
+        // Pass 2 keeps only durable archive-confirmed IDs, in the same order.
+        let mut archived = Vec::with_capacity(items.len());
+        for (id, timestamp) in items {
             if dedupe.get_status(&id)? == Some(crate::EventStatus::Archived) {
-                items.push((id, timestamp));
+                archived.push((id, timestamp));
             }
         }
-        Ok(ArchivedWindow::Complete(items))
+        Ok(ArchivedWindow::Complete(archived))
     }
 
     /// Open or create a sync state database at the given path.
@@ -432,6 +441,51 @@ mod tests {
 
         // Still "empty" since threshold is 100
         assert!(db.is_empty().unwrap());
+    }
+
+    #[test]
+    fn archived_window_rejects_dense_windows_before_any_dedupe_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let db = SyncStateDb::open(tmp.path().join("sync")).unwrap();
+        {
+            // A legacy on-disk Pending marker written by an older build.
+            let raw = rocksdb::DB::open_default(tmp.path().join("dedupe")).unwrap();
+            raw.put(test_event_id(4), [crate::EventStatus::Pending as u8])
+                .unwrap();
+        }
+        let dedupe = crate::DedupeIndex::open(tmp.path().join("dedupe")).unwrap();
+        // 6 rows in [100, 102]: archived, legacy Pending and missing IDs, plus
+        // rows on both sides of the window that must not count.
+        let archived: Vec<[u8; 32]> = (1..=3).map(test_event_id).collect();
+        dedupe.mark_archived(archived.iter()).unwrap();
+        for (n, ts) in [(1, 102), (2, 100), (3, 101), (4, 100), (5, 101), (6, 102)] {
+            db.record(&test_event_id(n), ts).unwrap();
+        }
+        db.record(&test_event_id(7), 99).unwrap();
+        db.record(&test_event_id(8), 103).unwrap();
+
+        let before = dedupe.point_lookups();
+        assert_eq!(
+            db.archived_window(100, 102, 5, &dedupe).unwrap(),
+            ArchivedWindow::TooDense
+        );
+        assert_eq!(
+            dedupe.point_lookups(),
+            before,
+            "a TooDense window must not pay for dedupe lookups"
+        );
+
+        // Exactly max_items examined rows is still complete: one lookup per
+        // in-window row, archived IDs only, in timestamp/ID order.
+        assert_eq!(
+            db.archived_window(100, 102, 6, &dedupe).unwrap(),
+            ArchivedWindow::Complete(vec![
+                (test_event_id(2), 100),
+                (test_event_id(3), 101),
+                (test_event_id(1), 102),
+            ])
+        );
+        assert_eq!(dedupe.point_lookups(), before + 6);
     }
 
     #[test]

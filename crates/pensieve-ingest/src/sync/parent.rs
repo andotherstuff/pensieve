@@ -29,6 +29,31 @@ use super::worker::{self as transport, Assignment, Hello, ParentMessage};
 use super::{ArchivedWindow, SyncStateDb};
 use crate::{DedupeIndex, SegmentWriter};
 
+/// Wall-clock budget for one fair-lease command's preflight loop.
+///
+/// The owner thread serves every parent command, including the lifecycle
+/// reads that refresh `/health/negentropy`. A chain of dense windows must not
+/// hold it past the 15-minute `owner_observation_stale` threshold: the budget
+/// is checked after each durable TooDense split, and once it is spent the
+/// command returns no lease and the runtime's next tick observes health and
+/// resumes from the splits. A preflight in progress still runs to completion,
+/// and every command preflights at least one candidate, so work always advances.
+const PREFLIGHT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Whether a fair-lease command has spent `budget`; counts and logs when it has.
+fn preflight_budget_spent(started: Instant, budget: Duration) -> bool {
+    let elapsed = started.elapsed();
+    if elapsed < budget {
+        return false;
+    }
+    metrics::counter!("negentropy_preflight_budget_exhausted_total").increment(1);
+    tracing::info!(
+        elapsed_secs = elapsed.as_secs(),
+        "isolated preflight budget spent; resuming on a later tick"
+    );
+    true
+}
+
 /// Parent failures never discharge a lease or erase a received obligation.
 #[derive(Debug, Error)]
 pub enum ParentError {
@@ -256,7 +281,7 @@ impl ParentExecutor {
         dedupe: Arc<DedupeIndex>,
         writer: Arc<SegmentWriter>,
     ) -> Result<Self, ParentError> {
-        Self::with_clock(ledger, inventory, dedupe, writer, now)
+        Self::with_clock(ledger, inventory, dedupe, writer, now, PREFLIGHT_BUDGET)
     }
 
     fn with_clock<F>(
@@ -265,6 +290,7 @@ impl ParentExecutor {
         dedupe: Arc<DedupeIndex>,
         writer: Arc<SegmentWriter>,
         clock: F,
+        preflight_budget: Duration,
     ) -> Result<Self, ParentError>
     where
         F: Fn() -> i64 + Send + 'static,
@@ -408,6 +434,7 @@ impl ParentExecutor {
                                 // Split local density before consuming a worker attempt.
                                 // A concurrent append after preflight can still make the
                                 // eventual session TooDense; that remains unresolved work.
+                                let preflight_started = Instant::now();
                                 for _ in 0..16 {
                                     let now = clock();
                                     let Some(candidate) = ledger.fair_candidate(now)? else {
@@ -435,6 +462,11 @@ impl ParentExecutor {
                                             if result == SplitOutcome::Blocked {
                                                 metrics::counter!("negentropy_dense_timestamp_blocked_total").increment(1);
                                                 tracing::error!(job = candidate.id, relay = %candidate.relay, timestamp = candidate.since, "isolated inventory too dense at one second");
+                                            }
+                                            // The split is durable; let the next tick
+                                            // refresh health before preflighting more.
+                                            if preflight_budget_spent(preflight_started, preflight_budget) {
+                                                break;
                                             }
                                         }
                                     }
@@ -1025,6 +1057,14 @@ mod tests {
             F: Fn() -> i64 + Send + 'static,
             S: FnOnce(&mut JobLedger) -> i64,
         {
+            Self::with_budget(clock, seed, PREFLIGHT_BUDGET)
+        }
+        /// Like [`Self::with_ledger`] with an explicit fair-lease preflight budget.
+        fn with_budget<F, S>(clock: F, seed: S, budget: Duration) -> Self
+        where
+            F: Fn() -> i64 + Send + 'static,
+            S: FnOnce(&mut JobLedger) -> i64,
+        {
             let root = tempfile::tempdir().unwrap();
             let dedupe = Arc::new(DedupeIndex::open(root.path().join("dedupe")).unwrap());
             let writer = Arc::new(
@@ -1049,6 +1089,7 @@ mod tests {
                 dedupe.clone(),
                 writer.clone(),
                 clock,
+                budget,
             )
             .unwrap();
             Self {
@@ -2172,6 +2213,75 @@ mod tests {
         let job = h.executor.job(gap).await.unwrap();
         assert_eq!((job.state, job.attempt), (JobState::RetryWait, 15));
         h.executor.shutdown().await.unwrap();
+    }
+
+    /// A fair-lease command over a window denser than the inventory cap, with
+    /// the given preflight budget. Returns the harness and the dense job.
+    async fn dense_fair_lease(budget: Duration) -> (Harness, i64, Option<Lease>) {
+        const RELAY: &str = "wss://relay.example.com";
+        let mut h = Harness::with_budget(
+            || 10_000,
+            |ledger| {
+                ledger.configure_planner(&[RELAY]).unwrap();
+                ledger.enqueue("dense", RELAY, 100, 101).unwrap().id
+            },
+            budget,
+        );
+        // Every row at the first second: [100, 101] is TooDense, its child
+        // [100, 100] blocks at one second and [101, 101] is empty and leasable.
+        let ids: Vec<[u8; 32]> = (0..=super::super::MAX_WINDOW_ITEMS as u64)
+            .map(|n| {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                id
+            })
+            .collect();
+        h.inventory
+            .record_batch(ids.iter().map(|id| (id, 100)))
+            .unwrap();
+        let job = h.job;
+        let lease = h.executor.lease_next_fair(600).await.unwrap();
+        (h, job, lease)
+    }
+
+    #[tokio::test]
+    async fn spent_preflight_budget_returns_no_lease_after_a_durable_split() {
+        let (mut h, dense, lease) = dense_fair_lease(Duration::ZERO).await;
+        assert!(
+            lease.is_none(),
+            "a spent budget must stop before the children"
+        );
+        // The split happened before the budget stopped the loop and is durable.
+        assert_eq!(h.executor.job(dense).await.unwrap().state, JobState::Split);
+        // The next command resumes from the children; each preflights at least one.
+        let mut leased = None;
+        for _ in 0..3 {
+            if let Some(lease) = h.executor.lease_next_fair(600).await.unwrap() {
+                leased = Some(lease);
+                break;
+            }
+        }
+        let leased = leased.expect("a later command leases the empty child");
+        assert_eq!(leased.job().parent, Some(dense));
+        assert_eq!((leased.job().since, leased.job().until), (101, 101));
+        h.executor.shutdown().await.unwrap();
+
+        // Control: with the production budget one command gets that far itself.
+        let (h, dense, lease) = dense_fair_lease(PREFLIGHT_BUDGET).await;
+        let lease = lease.expect("an unspent budget keeps preflighting the children");
+        assert_eq!(lease.job().parent, Some(dense));
+        h.executor.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn preflight_budget_counts_only_when_spent() {
+        let log = CounterLog::default();
+        metrics::with_local_recorder(&log, || {
+            assert!(!preflight_budget_spent(Instant::now(), PREFLIGHT_BUDGET));
+            assert!(preflight_budget_spent(Instant::now(), Duration::ZERO));
+        });
+        let counts = log.0.lock().unwrap().clone();
+        assert_eq!(counts["negentropy_preflight_budget_exhausted_total"], 1);
     }
 
     /// A window whose relay withheld the same ID on `attempts` hourly attempts.

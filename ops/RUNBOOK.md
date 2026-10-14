@@ -1346,6 +1346,51 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   again); the job's received frames are not yet archive-confirmed; or
   `--isolated-negentropy-disable-unavailable-exclusion` is set. Then triage it
   like any other `unresolved_failures` job above; the full rule still applies.
+- `owner_observation_stale`: the parent owner thread has not refreshed health for
+  15 minutes. It serves every parent command, including the per-tick lifecycle
+  read that refreshes health, so one long preflight (the inventory scan before a
+  fair lease) blocks it. On 2026-10-14 a chain of dense windows held it for over
+  20 minutes (see [the incident](../docs/negentropy_continuous_readiness.md#incident-2026-10-14-preflight-stalled-the-owner-thread)).
+  Confirm it is a preflight rather than a hang. Linux truncates thread names to
+  15 characters, so `top -H`, `ps -T` and `comm` show `negentropy-pare`. Find
+  its tid with
+  `P=$(systemctl show -p MainPID --value pensieve-ingest); for t in /proc/$P/task/*; do grep -q '^negentropy-pare' $t/comm && echo ${t##*/}; done`
+  and sample `/proc/$P/task/<tid>/io` twice a few seconds apart. Busy CPU with
+  `rchar` climbing by gigabytes per second (2026-10-14: about 9 GB/s at about
+  7,700 reads/s, with `read_bytes` flat) means dedupe lookups re-reading filter
+  blocks from the page cache. Check that the release logs `dedupe block cache
+  configured` at start and that `dedupe_block_cache_capacity_bytes` is
+  `17179869184` (the 16 GiB default) or the configured size; a release without
+  it has RocksDB's 32 MiB default cache. Since that fix a TooDense window costs
+  no lookups and a fair-lease command stops splitting after 60 s, so a stale observation that persists points at something else. A
+  restart does not help: the runtime resumes the same windows with a cold
+  cache. Leave the ledger alone; the ten-minute worker restarts are harmless
+  while no lease is granted.
+
+  **Sizing the dedupe block cache** (`--dedupe-block-cache-mib`, default 16384).
+  The rule: compare `dedupe_block_cache_metadata_bytes` (filter + index blocks
+  over all SSTs, refreshed every 5 minutes) with about half of
+  `dedupe_block_cache_capacity_bytes`, the high-priority pools those blocks
+  enter first. Above that, they increasingly compete with data blocks; the
+  start-up warning `dedupe filter and index blocks exceed half the block cache
+  (heuristic)` makes the same comparison once. Then confirm thrash with the
+  `rchar` sampling above, across the ingester's threads: several GB/s at about
+  1 MB per read means filter blocks are being re-read, and the cache should
+  grow. `dedupe_block_cache_usage_bytes` sitting at capacity is normal once
+  warm; `dedupe_block_cache_pinned_bytes` covers only L0 metadata and blocks
+  held mid-lookup, so it stays flat during filter thrash and is not a signal.
+
+  **Memory.** The ingester's RSS settles above the cache size; with glibc
+  malloc overhead and fragmentation the 16 GiB default adds roughly 17-20 GiB
+  of RSS once warm. Watch RSS, `MemAvailable` and swap for the first hours after
+  a deploy that changes the cache, and again after a host reboot: every cache
+  (block cache and page cache) starts cold and refills over hours. The drop-in
+  sets `Restart=no`, so an OOM kill would stop ingestion until someone restarts
+  it. To shrink the cache, add `--dedupe-block-cache-mib <MiB>` (for example
+  `8192`) to the drop-in's `ExecStart`, `daemon-reload`, and restart the ingester
+  with the graceful-stop checks; the option changes nothing on disk. A WARN
+  `dedupe block cache exceeds 25% of physical memory` at start flags an
+  oversized value.
 - `runtime_failed`: the isolated runtime stopped; only an ingester restart clears
   it. Stop the worker (it otherwise restarts every 5 s with `worker IPC failed`
   because the runtime removed its socket), find the cause in

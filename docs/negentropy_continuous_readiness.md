@@ -128,6 +128,46 @@ moving part that can misread a transient reason, while the in-process pause uses
 ledger's own durable classification. Leaving the runtime retrying (no flag) is safe
 for data after this fix; it only means the red monitor hides later faults.
 
+## Incident 2026-10-14: preflight stalled the owner thread
+
+**Symptom.** The `negentropy-parent` thread of the ingester (`negentropy-pare` in
+`top -H` and `comm`, which truncate names to 15 characters) sat at about 90% CPU for
+more than 20 minutes on one fair-lease preflight. `/health/negentropy` returned 503
+`owner_observation_stale`, the waiting worker got no job and hit its ten-minute
+`RuntimeMaxSec`, and the ledger did not change. The same stall left hour 04 UTC
+with no sessions overnight. Live ingestion was unaffected. `/proc/<tid>/io` for
+the thread showed `rchar` growing about 9 GB/s at about 7,700 `read` calls per
+second (about 1.17 MB per read) with negligible real disk reads: the thread was
+re-reading files from the page cache.
+
+**Cause.** Two problems compounded:
+
+- The preflight (`archived_window`) did one dedupe lookup per inventory row and
+  noticed TooDense only after examining 250,001 rows, so a dense window paid
+  250,000 lookups before being split, and each split child paid them again. The
+  windows being processed (2026-10-12 05:00 to 08:00) were dense enough to split
+  down to 225 s.
+- Each of those lookups was itself expensive. The dedupe index (88 GB, 1,479 SSTs
+  of about 64 MB) caches its bloom filter and index blocks in the block cache,
+  which was RocksDB's default 32 MiB LRU cache: 64 shards of 512 KiB, each smaller
+  than one SST's ~2 MB full filter block. Nothing stayed cached, so every `get`
+  re-read a filter block and an index block from the page cache. Live ingestion's
+  per-event checks paid the same cost, just at a rate it could absorb.
+
+The parent owner thread serves every parent command, so while it preflighted it
+could not answer the lifecycle read that refreshes health, and the observation
+aged past the 15-minute threshold.
+
+**Fix.** The dedupe index now opens with a dedicated LRU block cache
+(`--dedupe-block-cache-mib`, default 16384), with index and filter blocks at high
+priority and L0 blocks pinned; this is a read option only, with no change on
+disk. `archived_window` counts inventory keys before any lookup, so TooDense costs
+one key scan; `reconciliation_window` checks the exclusion count first. A
+fair-lease command stops after its first TooDense split past 60 s and returns
+no lease, so the next runtime tick refreshes health and continues from the durable
+splits. A restart does not help: the runtime resumes the same dense windows with
+the same cold cache.
+
 ## Relay-unavailable exclusions
 
 This is the one case in which a window completes without an event that its relay
