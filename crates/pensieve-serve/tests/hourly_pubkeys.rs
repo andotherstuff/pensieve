@@ -49,6 +49,8 @@ const MIGRATION_020: &str =
 const MIGRATION_021: &str = include_str!("../../../docs/migrations/prepared/021_kind_activity.sql");
 const MIGRATION_022: &str =
     include_str!("../../../docs/migrations/prepared/022_hourly_pubkeys.sql");
+const ROLLBACK_021: &str =
+    include_str!("../../../docs/migrations/rollback/021_drop_kind_activity.sql");
 const ROLLBACK_022: &str =
     include_str!("../../../docs/migrations/rollback/022_drop_hourly_pubkeys.sql");
 const DAY: u32 = 86_400;
@@ -359,6 +361,36 @@ fn workload(first_id: u64, count: u64, now: u32) -> Vec<Ev> {
                 created_at,
                 (r >> 32) as usize % 300,
             )
+        })
+        .collect()
+}
+
+/// Events on the first and last second of the 1st and the last day of each
+/// of the last 16 months (kinds 1, 20001, 4242, so the windows' partial and
+/// full months and their month rows are exercised at both edges), and one
+/// event dated later today.
+fn month_edges(first_id: u64, now: u32) -> Vec<Ev> {
+    let today = day_of(now);
+    let month = today.with_day(1).unwrap();
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u32;
+    let mut times = Vec::new();
+    for back in 0..16 {
+        let first = month - chrono::Months::new(back);
+        let last = first + chrono::Months::new(1) - chrono::Days::new(1);
+        for day in [first, last] {
+            if day <= today {
+                times.extend([midnight(day), midnight(day) + DAY - 1]);
+            }
+        }
+    }
+    let end_of_today = midnight(today) + DAY - 1;
+    times.push((now + 600).min(end_of_today));
+    times
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let n = first_id + i as u64;
+            ev(n, n % 5, [1, 20001, 4242][i % 3], t, 3)
         })
         .collect()
 }
@@ -694,6 +726,8 @@ async fn hourly_pubkeys_backfill_reads_and_validation() {
         db.insert_at(now - 40 * DAY + i as u32 * 3 * DAY, chunk)
             .await;
     }
+    db.insert_at(now - 10 * DAY, &month_edges(30_000, now))
+        .await;
     db.apply(MIGRATION_022).await.expect("migration 022");
     db.apply(MIGRATION_022).await.expect("022 is idempotent");
     db.set_merges("hourly_pubkeys", false).await;
@@ -975,6 +1009,7 @@ async fn api_reads_the_rollups_and_keeps_the_response_shapes() {
     for chunk in workload(0, 400, now).chunks(80) {
         db.insert(chunk).await;
     }
+    db.insert(&month_edges(30_000, now)).await;
     let rows = db.stored().await;
     let app = db.api().await;
 
@@ -1010,6 +1045,7 @@ async fn api_reads_the_rollups_and_keeps_the_response_shapes() {
     let (status, _) = get(&app, "/api/v1/stats/events?kind=1&group_by=year").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    let mut checked = false;
     for _ in 0..3 {
         let before = db.now().await;
         let app = db.api().await;
@@ -1038,8 +1074,10 @@ async fn api_reads_the_rollups_and_keeps_the_response_shapes() {
         let want = expected_hourly(&rows, None, 7, before);
         assert!(!want.is_empty());
         assert_eq!(default_hourly, as_parsed(&want));
+        checked = true;
         break;
     }
+    assert!(checked, "the hour kept changing while reading");
 
     // Rolled back: the hourly pattern answers 503 again; the rest is
     // unaffected.
@@ -1049,7 +1087,24 @@ async fn api_reads_the_rollups_and_keeps_the_response_shapes() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let (status, _) = get(&app, "/api/v1/stats/events?kind=1").await;
     assert_eq!(status, StatusCode::OK);
-    // Ingest keeps working without the view.
+    // Without kind_activity (021 rolled back), /stats/events and
+    // /stats/throughput answer 503 at once too; grouped all-kinds events
+    // still read daily_user_stats.
+    db.apply(ROLLBACK_021).await.expect("rollback 021");
+    let app = db.api().await;
+    for path in [
+        "/api/v1/stats/events",
+        "/api/v1/stats/events?kind=1&group_by=week",
+        "/api/v1/stats/throughput",
+        "/api/v1/stats/throughput?kind=1",
+    ] {
+        let (status, body) = get(&app, path).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+        assert_eq!(body["error"], "metric_unavailable", "{path}");
+    }
+    let (status, _) = get(&app, "/api/v1/stats/events?group_by=day&days=7").await;
+    assert_eq!(status, StatusCode::OK);
+    // Ingest keeps working without the views.
     db.insert(&workload(10_000, 20, now)).await;
     db.drop().await;
 }

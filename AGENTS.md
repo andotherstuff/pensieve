@@ -293,7 +293,7 @@ just ch-tables
 - **Truncate + backfill**: Some migrations truncate tables and repopulate from `events_local` (2.4 billion rows in production). These take a long time.
 - **Materialized views**: When fixing MV logic, you typically: drop the view, recreate with new logic, truncate the target table, and backfill.
 - **Prepared operations**: Files under `docs/migrations/prepared/` are excluded from `just ch-migrate-all` and require explicit operator preflight and invocation.
-- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017 and 019) produces the same tables and views as production (prepared 020 then replaces three derived views, which production gets when it is rolled out), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
+- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017, 019, 020 with its cutover, 021 and 022, as in the block above) produces the same tables and views as production once production has 022 (prepared 020 replaced three derived views and is applied; 022 is not yet applied there), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
 - **Test locally first**: `just ch-test-up` starts a disposable ClickHouse 24.8 (same line as production).
 
 ---

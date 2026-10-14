@@ -1394,9 +1394,12 @@ $AR validate --migration 022 --out /home/pensieve/api-rollups/validate-022.json
 
 ### 6. Deploy the API
 
-Build and point the `pensieve-api` drop-in at the release as in
-[API rollups → Deploy the API](#6-deploy-the-api), and update the drop-in
-record in the same PR. Then:
+Only after step 5 passed (deploy gate above). Build the release and point the
+`pensieve-api` drop-in (`90-postgres-cutover.conf`) at it as in
+[Routine deploy](#routine-deploy); the migration 019 section's
+[Deploy the API](#api-rollups-migration-019) step shows the same drop-in
+switch. Update the drop-in record in `ops/systemd/dropins/` in the same PR.
+Then:
 
 ```bash
 for q in "stats/events" "stats/events?kind=1" "stats/events?kind=7&days=30" "stats/events?kind=1&days=90&group_by=week" \
@@ -1458,6 +1461,14 @@ Over the next day, check:
 - `$AR status` shows a small lag;
 - the API log has no `database_error` for these endpoints.
 
+The new reads should stay small (thousands to a few hundred thousand rows,
+well under a second):
+
+```bash
+just ch-query "SELECT event_time, query_duration_ms, read_rows, formatReadableSize(read_bytes) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 HOUR AND (has(tables, 'nostr.hourly_pubkeys') OR has(tables, 'nostr.kind_activity')) AND query NOT LIKE '%system.query_log%' AND log_comment NOT LIKE 'api-rollups%' ORDER BY event_time DESC LIMIT 20"
+just ch-query "SELECT count(), max(query_duration_ms), max(read_rows) FROM system.query_log WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 1 HOUR AND has(tables, 'nostr.events_local') AND query LIKE '%uniq(pubkey)%' AND log_comment NOT LIKE 'bench-022%'"   # old scans: expect 0
+```
+
 The table should stay around 1–2 GiB:
 
 ```bash
@@ -1467,8 +1478,9 @@ just ch-query "SELECT formatReadableSize(sum(bytes_on_disk)), sum(rows), count()
 
 ### 9. Rollback
 
-- **API:** point the drop-in back at the previous `releases/api-*` and
-  restart. Those builds scan `events_local` again for all three endpoints.
+- **API:** point the drop-in back at `releases/api-fe54f04` (the release
+  before this change, 021 `kind_activity`) and restart. It scans
+  `events_local` again for all three endpoints.
 - **Table and view:** run this with the API rolled back, or accepting `503
   metric_unavailable` on `/stats/activity/hourly` (`/stats/events` and
   `/stats/throughput` only need 021):
