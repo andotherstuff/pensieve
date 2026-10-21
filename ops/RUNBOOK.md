@@ -2415,6 +2415,52 @@ continues. So there are two paths:
    planned since then are planned again, and job IDs issued since the upgrade are
    issued again for other windows. Keep `$LEDGER.schema10` for reference.
 
+## Container CA stores
+
+Caddy, Grafana, Prometheus and ClickHouse mount the host's CA store read-only
+(`/etc/ssl/certs` and `/usr/share/ca-certificates`, see `ops/production/compose.yml`).
+Their images are pinned and old (Grafana 10.2.2 on Alpine 3.18, Prometheus v2.48.0,
+ClickHouse 24.8 on Ubuntu 20.04), and on 2026-10-21 their own bundles still trusted
+`emSign ECC Root CA - G3` and `AAA Certificate Services`, the roots behind the
+compromised eMudhra intermediates (https://emudhra.we-have-a-problem.com/). The host's
+Debian `ca-certificates` (`20250419+deb13u1` and later) distrusts them, and `apt` keeps
+it current, so the containers follow the host. The directories are mounted, not the
+bundle file, so an update (new inodes) is visible without recreating anything. Go
+(Caddy, Grafana, Prometheus) and OpenSSL (ClickHouse `url()`/`s3()`) read
+`/etc/ssl/certs/ca-certificates.crt`; the hashed links resolve through the second mount.
+
+**Rollout** (a changed service definition, so a plain `up -d --no-deps` recreates):
+after `git -C ~/pensieve merge --ff-only origin/master`, recreate one service at a time
+from `~/pensieve/ops/production`, outside :58–:07 UTC:
+
+```bash
+C="docker compose --project-name pensieve-deploy --env-file /etc/pensieve/pensieve.env"
+$C up -d --no-deps prometheus   # scrape gap of a few intervals (WAL replay)
+$C up -d --no-deps grafana
+$C up -d --no-deps caddy        # public API, preview and Grafana drop for a few seconds
+$C up -d --no-deps clickhouse   # inserts fail while it restarts; the ingester retries (#105)
+```
+
+Recreating ClickHouse also re-reads `users.xml` from the checkout, so the hardlink handle
+from the grafana-user rollout points to an orphaned inode afterwards; delete it or retake
+it (see [Published ports and the grafana ClickHouse user](#published-ports-and-the-grafana-clickhouse-user)).
+
+**Verify:**
+
+```bash
+H=$(sha256sum /etc/ssl/certs/ca-certificates.crt | cut -d' ' -f1)
+for c in pensieve-caddy pensieve-grafana pensieve-prometheus pensieve-clickhouse; do
+  echo "$c $(docker exec $c sha256sum /etc/ssl/certs/ca-certificates.crt | cut -d' ' -f1 | grep -qx "$H" && echo host-bundle || echo IMAGE-BUNDLE)"
+done
+# A compromised-chain test host must fail, a normal one must work (ClickHouse's TLS stack):
+docker exec pensieve-clickhouse clickhouse-client -q "SELECT length(c) FROM url('https://dv-g3b-emudhra.we-have-a-problem.com/', 'RawBLOB', 'c String')"   # error 1001
+docker exec pensieve-clickhouse clickhouse-client -q "SELECT length(c) FROM url('https://www.debian.org/', 'RawBLOB', 'c String')"                       # a number
+```
+
+Then check Grafana datasources, `/api/v1/stats` through Caddy, Prometheus targets and the
+ingester's `clickhouse_index_queue_segments` back to 0–2. **Rollback:** remove the two
+mount lines from a service on master, ff-merge and recreate that service.
+
 ## Host maintenance
 
 **Storage.** `/`, `/data` and swap sit on `md1`, a RAID0 stripe across both NVMe drives (LVM `vg0`);
