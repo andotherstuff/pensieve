@@ -44,10 +44,10 @@ Observed 2026-10-11:
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
 | ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-0a14656/pensieve-serve` (master incl. #101 and #102; since 2026-10-14 14:49 UTC) |
-| `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-3ab1045/pensieve-preview` |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-c3f25c5/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache, #103 carries ahead of a retry backlog and #105 indexer retries instead of stranding segments, since 2026-10-14 18:20 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-26f2170` worker since 2026-10-13 14:09 UTC; the previous `ba0c4a1` build is kept beside it as `pensieve-negentropy-worker.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
+| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-89f526b/pensieve-serve` (master incl. #101, #102 and #107; since 2026-10-21 08:42 UTC) |
+| `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-89f526b/pensieve-preview` (preview code of `3ab1045` plus #107; since 2026-10-21 08:42 UTC) |
+| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-89f526b/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache, #103 carries ahead of a retry backlog, #105 indexer retries and #107, since 2026-10-21 08:43 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-89f526b` worker, with #107 eMudhra-distrusting TLS roots, since 2026-10-21 08:43 UTC; the previous builds are kept beside it as `pensieve-negentropy-worker.26f2170` and `.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30–60 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer`, `pensieve-clickhouse-index-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
@@ -350,16 +350,21 @@ that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
   this file" predates migration 018; do not follow it.
 - `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
   unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`, previous; the rollback target for `api-0a14656`), `api-0a14656`
-  (#101 and #102, current; needs 022), `ingest-c3f25c5` (current ingester, #105; runs with the
-  `ingest-26f2170` worker), `ingest-0a14656` (previous ingester, #103; the rollback target for
-  `c3f25c5`: same worker, keep the pause flag, same index journal format), `ingest-43d4a26` (older ingester, #98), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
+  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`), `api-0a14656` (#101 and #102; needs 022),
+  `api-0a14656-ca-20261021` (OpenClaw's build of `0a14656` with the #107 lockfile; the rollback target
+  for `api-89f526b`), `api-89f526b` (current), `ingest-89f526b` (current ingester and the installed
+  worker, #107), `ingest-c3f25c5-ca-20261021` (OpenClaw's build of `c3f25c5` with the #107 lockfile;
+  the rollback target for `ingest-89f526b`: same flags, keep the installed worker),
+  `ingest-c3f25c5` (#105; trusts the compromised eMudhra intermediates), `ingest-0a14656` (#103), `ingest-43d4a26` (older ingester, #98), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
   `ingest-26f2170` (older ingester and the installed worker, #92),
   `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
   with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
   downgrading leaves isolated reconciliation off unless `jobs.sqlite.pre-schema10` is restored),
-  `ingest-ba0c4a1` (PR #72 build, with the previously installed worker) and only
-  `preview-3ab1045`. Build target dirs other than the latest `api-*`/`ingest-*` caches in
+  `ingest-ba0c4a1` (PR #72 build, with the previously installed worker), `preview-89f526b` (current),
+  `preview-3ab1045-ca-20261021` (OpenClaw's build of `3ab1045` with the #107 lockfile; byte-identical to
+  `preview-89f526b`) and `preview-3ab1045` (trusts the compromised intermediates). Releases built
+  before 2026-10-21 08:40 UTC (other than OpenClaw's `*-ca-20261021`) trust the compromised eMudhra
+  intermediates; do not roll back to them. Build target dirs other than the latest `api-*`/`ingest-*` caches in
   `/data/pensieve-build/` were removed on 2026-10-12.
 - Schema changes roll back through `docs/migrations/rollback/` where a file exists.
 
@@ -2415,6 +2420,24 @@ continues. So there are two paths:
    planned since then are planned again, and job IDs issued since the upgrade are
    issued again for other windows. Keep `$LEDGER.schema10` for reference.
 
+## TLS trust (eMudhra intermediates, 2026-10-21)
+
+Eight eMudhra intermediates (cross-signed by Sectigo) had derivable private keys
+(https://emudhra.we-have-a-problem.com/). What trusts what in production:
+
+- **Host** (`curl`, Python Kuma probes, `native-tls`, DuckDB): Debian `ca-certificates`
+  `20250419+deb13u1`, installed 07:24 UTC 2026-10-21.
+- **Rust binaries** (relay websockets, the negentropy worker, preview avatar fetches, S3):
+  `webpki-roots` 1.0.10 and `rustls-webpki` 0.103.16 since #107. Releases `api-89f526b`,
+  `ingest-89f526b` (and its worker) and `preview-89f526b` run them since 08:42–08:43 UTC.
+  OpenClaw had first deployed patched builds of the then-running commits (`*-ca-20261021`,
+  through temporary `zzzzz-ca.conf` / `20-ca.conf` drop-ins, now removed). Keep
+  `rustls-webpki >= 0.103.16` and `webpki-roots >= 1.0.10` in `Cargo.lock`.
+- **Containers:** the host store, mounted (below).
+
+Check a client with the incident's test hosts: `https://dv-g3b-emudhra.we-have-a-problem.com/`
+and `https://dv-g3b-aaa-emudhra.we-have-a-problem.com/` must fail certificate verification.
+
 ## Container CA stores
 
 Caddy, Grafana, Prometheus and ClickHouse mount the host's CA store read-only
@@ -2428,6 +2451,13 @@ it current, so the containers follow the host. The directories are mounted, not 
 bundle file, so an update (new inodes) is visible without recreating anything. Go
 (Caddy, Grafana, Prometheus) and OpenSSL (ClickHouse `url()`/`s3()`) read
 `/etc/ssl/certs/ca-certificates.crt`; the hashed links resolve through the second mount.
+
+**Done 2026-10-21** (PR #108): Prometheus, Grafana and Caddy recreated at 08:50 UTC,
+ClickHouse at 08:53:34 at a quiet moment (healthy at 08:53:48; the next segment indexed
+normally). All four containers show the host bundle; ClickHouse `url()` to the compromised
+test host fails and `www.debian.org` works; Prometheus targets up, `:9090` proxy ready,
+Grafana datasources healthy, `/api/v1/stats` 200 through Caddy. The `users.xml` handle was
+retaken after the ClickHouse recreate (grants unchanged).
 
 **Rollout** (a changed service definition, so a plain `up -d --no-deps` recreates):
 after `git -C ~/pensieve merge --ff-only origin/master`, recreate one service at a time
