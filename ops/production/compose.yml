@@ -39,6 +39,12 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      # Host CA store (Debian, kept current by apt), read-only: the images' own
+      # bundles are pinned/old and still trusted the compromised eMudhra
+      # intermediates on 2026-10-21. Mount the directories, not the bundle file,
+      # so ca-certificates updates (new inodes) are seen without a recreate.
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/ca-certificates:/usr/share/ca-certificates:ro
     environment:
       - DOMAIN=${DOMAIN:-localhost}
       - PREVIEW_DOMAIN=${PREVIEW_DOMAIN:-localhost:8081}
@@ -68,6 +74,12 @@ services:
       - /data/clickhouse:/var/lib/clickhouse
       # Logs
       - clickhouse_logs:/var/log/clickhouse-server
+      # Host CA store (Debian, kept current by apt), read-only: the images' own
+      # bundles are pinned/old and still trusted the compromised eMudhra
+      # intermediates on 2026-10-21. Mount the directories, not the bundle file,
+      # so ca-certificates updates (new inodes) are seen without a recreate.
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/ca-certificates:/usr/share/ca-certificates:ro
       # Custom config
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
       # Users config (grafana user: SELECT on nostr only). A single-file bind
@@ -120,6 +132,12 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/archive-alerts.yml:/etc/prometheus/archive-alerts.yml:ro
       - prometheus_data:/prometheus
+      # Host CA store (Debian, kept current by apt), read-only: the images' own
+      # bundles are pinned/old and still trusted the compromised eMudhra
+      # intermediates on 2026-10-21. Mount the directories, not the bundle file,
+      # so ca-certificates updates (new inodes) are seen without a recreate.
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/ca-certificates:/usr/share/ca-certificates:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -145,6 +163,12 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      # Host CA store (Debian, kept current by apt), read-only: the images' own
+      # bundles are pinned/old and still trusted the compromised eMudhra
+      # intermediates on 2026-10-21. Mount the directories, not the bundle file,
+      # so ca-certificates updates (new inodes) are seen without a recreate.
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/ca-certificates:/usr/share/ca-certificates:ro
       # Datasources/dashboards are configured directly on the running instance
       # (repo-managed Grafana provisioning was removed during the migration).
       # Mount relay database for SQLite datasource (read-only)
