@@ -1,0 +1,16 @@
+[Unit]
+Description=Grafana Alloy log shipper
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/alloy/alloy.env
+ExecStart=/usr/local/bin/alloy run --storage.path=/var/lib/alloy --server.http.listen-addr=127.0.0.1:12345 --disable-reporting /etc/alloy/config.alloy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

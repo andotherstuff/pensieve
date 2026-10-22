@@ -1,5 +1,5 @@
 //! Integration tests for the compact preview lookups against a real
-//! ClickHouse (24.8, matching production).
+//! ClickHouse (26.8 LTS, matching production).
 //!
 //! Run with a disposable server:
 //!

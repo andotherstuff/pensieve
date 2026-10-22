@@ -1,5 +1,5 @@
 //! Integration tests for migration 020 (incremental derived views) against a
-//! real ClickHouse (24.8, matching production).
+//! real ClickHouse (26.8 LTS, matching production).
 //!
 //! Run with a disposable server:
 //!
@@ -148,6 +148,44 @@ impl TestDb {
 
     /// One insert with an explicit `indexed_at` (an ingest flush at `at`).
     async fn insert_at(&self, at: u32, events: &[Ev]) {
+        // These fixtures model the pre-020 data produced on ClickHouse 24.8:
+        // legacy lookups saw only earlier flushes. Newer servers can expose
+        // same-flush writes from sibling lookup MVs to the daily-stats MV.
+        // Snapshot only the legacy lookup inputs
+        // so the migration fixture preserves its historical meaning. Once the
+        // real cutover removes lookups, its actual insert query is untouched.
+        let query = self.as_select("daily_user_stats_mv").await.unwrap();
+        let mut historical_query = query.clone();
+        for (live, snapshot) in [
+            ("pubkeys_with_profile_data", "pre_flush_profiles"),
+            ("pubkeys_with_follows_data", "pre_flush_follows"),
+        ] {
+            if query.contains(live) || query.contains(snapshot) {
+                self.exec(&format!(
+                    "CREATE TABLE IF NOT EXISTS {}.{snapshot} (pubkey String) ENGINE = Memory",
+                    self.name
+                ))
+                .await;
+                self.exec(&format!("TRUNCATE TABLE {}.{snapshot}", self.name))
+                    .await;
+                self.exec(&format!(
+                    "INSERT INTO {}.{snapshot} SELECT DISTINCT pubkey FROM {}.{live}",
+                    self.name, self.name
+                ))
+                .await;
+                historical_query = historical_query.replace(
+                    &format!("{}.{live}", self.name),
+                    &format!("{}.{snapshot}", self.name),
+                );
+            }
+        }
+        if historical_query != query {
+            self.exec(&format!(
+                "ALTER TABLE {}.daily_user_stats_mv MODIFY QUERY {historical_query}",
+                self.name
+            ))
+            .await;
+        }
         let client = self.client.clone().with_option("async_insert", "0");
         let mut insert = client.insert("events_local").expect("insert");
         for e in events {

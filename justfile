@@ -273,15 +273,15 @@ ch-tables:
     @docker exec -i {{CH_CONTAINER}} clickhouse-client --database {{CH_DB}} \
         --query "SELECT name, engine FROM system.tables WHERE database = '{{CH_DB}}' ORDER BY engine, name"
 
-# Disposable ClickHouse for integration tests (same 24.8 line as production)
+# Disposable ClickHouse for integration tests (same 26.8 LTS line as production)
 CH_TEST_CONTAINER := env_var_or_default("CH_TEST_CONTAINER", "pensieve-ch-test")
 CH_TEST_PORT := env_var_or_default("CH_TEST_PORT", "18123")
 
-# Start a disposable ClickHouse 24.8 for integration tests
+# Start a disposable ClickHouse 26.8 LTS for integration tests
 ch-test-up:
-    @docker run -d --rm --name {{CH_TEST_CONTAINER}} -p {{CH_TEST_PORT}}:8123 \
+    @docker run -d --rm --name {{CH_TEST_CONTAINER}} -p 127.0.0.1:{{CH_TEST_PORT}}:8123 \
         -e CLICKHOUSE_SKIP_USER_SETUP=1 --ulimit nofile=262144:262144 \
-        clickhouse/clickhouse-server:24.8 >/dev/null
+        clickhouse/clickhouse-server:26.8@sha256:8b28eb09479c36c4533eec7a6268917d04ba3a6fd90e3f4205f70e761b6d7779 >/dev/null
     @until curl -sf http://localhost:{{CH_TEST_PORT}}/ping >/dev/null; do sleep 1; done
     @echo "✓ ClickHouse test server on http://localhost:{{CH_TEST_PORT}}"
 

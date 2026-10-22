@@ -1,0 +1,118 @@
+discovery.relabel "journal" {
+	targets = []
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		regex         = "(pensieve-api.service|pensieve-preview.service|prometheus-node-exporter.service)"
+		action        = "keep"
+	}
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__journal_priority_keyword"]
+		target_label  = "level"
+	}
+}
+
+loki.source.journal "journal" {
+	max_age       = "12h0m0s"
+	path          = "/var/log/journal"
+	relabel_rules = discovery.relabel.journal.rules
+	forward_to    = [loki.write.default.receiver]
+	labels        = {
+		host   = "pensieve",
+		job    = "systemd-journal",
+		source = "journald",
+	}
+}
+
+loki.process "ingest_journal" {
+	forward_to = [loki.write.default.receiver]
+
+	stage.match {
+		selector = "{service=\"pensieve-ingest.service\"}"
+
+		stage.regex {
+			expression = "^(?P<msg>.*)$"
+		}
+
+		stage.match {
+			selector            = "{service=\"pensieve-ingest.service\", level!~\"(?i)warning|err|crit|alert|emerg\"} !~ \".*(Starting live ingestion|Starting relay source|Starting negentropy sync task|Connected to [0-9]+ relays|Live mode: subscribing to new events only|Optimization: disconnecting|Relay stats:|negentropy sync state opened|negentropy configuration|metrics server listening|sealed final segment|saved final checkpoint|shutdown summary).*\""
+			action              = "drop"
+			drop_counter_reason = "ingest_drop_nonessential"
+		}
+	}
+}
+
+discovery.relabel "ingest_journal" {
+	targets = []
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		regex         = "pensieve-ingest.service"
+		action        = "keep"
+	}
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__journal_priority_keyword"]
+		target_label  = "level"
+	}
+}
+
+loki.source.journal "ingest_journal" {
+	max_age       = "1h0m0s"
+	path          = "/var/log/journal"
+	relabel_rules = discovery.relabel.ingest_journal.rules
+	forward_to    = [loki.process.ingest_journal.receiver]
+	labels        = {
+		host   = "pensieve",
+		job    = "systemd-journal",
+		source = "journald",
+	}
+}
+
+// Discover by container name so recreation never leaves stale log-file paths.
+discovery.docker "pensieve" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "15s"
+}
+
+discovery.relabel "pensieve_docker" {
+	targets = discovery.docker.pensieve.targets
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/pensieve-(caddy|clickhouse|prometheus)"
+		action        = "keep"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "service"
+		replacement   = "$1"
+	}
+}
+
+loki.source.docker "pensieve" {
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.pensieve_docker.output
+	labels     = {job = "docker", host = "pensieve", source = "docker"}
+	forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+	endpoint {
+		url = sys.env("PENSIEVE_LOKI_URL")
+	}
+	external_labels = {}
+}

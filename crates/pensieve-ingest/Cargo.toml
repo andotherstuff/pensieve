@@ -49,7 +49,7 @@ pensieve-parquet = { path = "../pensieve-parquet" }
 # Nostr
 notepack.workspace = true
 nostr-sdk.workspace = true
-negentropy = "=0.5.0"
+negentropy = "=0.5.2"
 
 # Async runtime
 tokio.workspace = true

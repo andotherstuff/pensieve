@@ -2545,3 +2545,57 @@ swap-in shows up during queries.
   do not add `/data` to the API's `ReadWritePaths`.
 - `ops/systemd/*.service` `ExecStart` lines do not match production; the drop-ins in
   [`ops/systemd/dropins/`](systemd/dropins/README.md) are the record.
+
+
+## Security maintenance procedure (2026-10-22)
+
+The reviewed targets are Caddy 2.11.7, Grafana 13.2.4 (ClickHouse plugin 4.23.2,
+SQLite plugin 4.0.6), Prometheus 3.15.1 and ClickHouse 26.8 LTS. Compose pins image
+digests; test/CI ClickHouse uses the same 26.8 digest. Rust dependencies now require
+Rust 1.94.1 or newer; the maintenance build used 1.99.1. Negentropy is pinned to
+0.5.2. The S3 SDK explicitly selects its modern HTTPS client without enabling the
+legacy rustls 0.21 feature. Refreshing the lockfile alone does not remove that
+legacy stack when the S3 SDK's compatibility feature is enabled.
+
+Promtail is replaced by `/usr/local/bin/alloy` (1.21.1), with
+`ops/systemd/alloy.service` and `ops/production/alloy/config.alloy` copied to `/etc`.
+The deployment-specific Loki destination is `PENSIEVE_LOKI_URL` in the root-owned
+`/etc/alloy/alloy.env` (see the example file); do not commit real endpoint credentials.
+The UI listens only on 127.0.0.1:12345. Journal filters retain the original labels
+and ingest filtering; Docker discovery follows the three configured infrastructure
+container names across recreation. Verify Loki HTTP 204 acknowledgements and the
+Docker/journal read counters. Keep the original Promtail config/positions for
+rollback; stop Alloy before re-enabling Promtail to avoid concurrent shipping.
+
+Before a Grafana major upgrade, stop it and archive its complete data/plugin
+volume. Rehearse against an extracted copy and verify the dashboard count plus
+all three datasource health checks before changing production. For Prometheus,
+archive the stopped TSDB and test a copy: v3 data cannot be downgraded directly to
+2.48, so a rollback must use the original image **and original pre-v3 TSDB**.
+
+The ClickHouse version path is 24.8 -> 25.3 -> 25.8 -> 26.3 -> 26.8. Rehearse the
+actual schema and immutable part copies, including aggregate-state tables; compare
+query results, then run all opt-in integration suites on the target release. The
+26.8 statistics optimizer can prune all parts before projection selection, which
+makes `force_optimize_projection=1` reject an empty read. `projection_client`
+disables statistics-based part pruning only for explicit projection-proof operator
+queries, retaining the force guard; normal serving queries keep pruning enabled.
+Do not weaken the projection guard or replay schema migrations to perform a server
+version upgrade.
+
+For the cutover, stop the worker and gracefully stop the ingester, verifying its
+exit result and shutdown-complete log. Finish a fresh archive sync and back up the
+SQLite ledgers. Stop ClickHouse and retain a cold rollback snapshot with independent
+metadata/mutable files and hardlinked immutable parts; preserve owners/modes. A
+local hardlink snapshot is a version-rollback facility, not independent protection
+from RAID failure. Verify a restore on the old image. Keep the old image, native
+releases and unit drop-ins. Apply/verify one LTS step at a time while writers remain
+stopped. A rollback after resuming writes also needs explicit accounting for those
+new writes; never silently discard them by swapping an older data directory back.
+
+Coordinate Docker/containerd upgrades and kernel activation with that clean stop.
+Confirm native units and the user Gateway are enabled (user linger is required),
+arrange durable post-reboot verification, and explicitly check the ingester because
+its canary drop-in has `Restart=no`. The window is not complete until a new segment
+has been sealed, indexed and published with zero rejects, the index/publication
+backlog is clear, reconciliation progresses, and endpoints/monitoring are healthy.

@@ -69,7 +69,7 @@ just ch-migrate <file>        # Run a single migration
 just ch-migrate-all           # FRESH INSTALLS ONLY: replays every top-level migration (see below)
 just ch-query "<sql>"         # Run raw SQL query
 just ch-tables                # List tables and views
-just ch-test-up               # Disposable ClickHouse 24.8 for integration tests
+just ch-test-up               # Disposable ClickHouse 26.8 LTS for integration tests
 just test-clickhouse          # ClickHouse integration tests (needs ch-test-up)
 ```
 
@@ -126,7 +126,7 @@ pensieve/
 
 ### Rust Configuration
 - **Edition**: 2024
-- **Minimum Rust version**: 1.90
+- **Minimum Rust version**: 1.94.1
 - **Formatting**: Default `cargo fmt` (no custom `.rustfmt.toml`)
 - **Linting**: `cargo clippy -- -D warnings` (all warnings are errors)
 
@@ -294,7 +294,7 @@ just ch-tables
 - **Materialized views**: When fixing MV logic, you typically: drop the view, recreate with new logic, truncate the target table, and backfill.
 - **Prepared operations**: Files under `docs/migrations/prepared/` are excluded from `just ch-migrate-all` and require explicit operator preflight and invocation.
 - **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017, 019, 020 with its cutover, 021 and 022, as in the block above) produces the same tables and views as production once production has 022 (prepared 020 replaced three derived views and is applied; 022 is not yet applied there), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
-- **Test locally first**: `just ch-test-up` starts a disposable ClickHouse 24.8 (same line as production).
+- **Test locally first**: `just ch-test-up` starts a disposable ClickHouse 26.8 LTS (same line as production).
 
 ---
 
