@@ -155,8 +155,19 @@ What is where:
    two minutes for the new binary, `ingest configuration` in the journal, archive admission
    200 and an active worker. It prints the rollback command.
 5. Watch the first sealed segment reach the Parquet shadow (`Parquet shadow work unit
-   published … replayed=false`; with startup replay on, older segments are re-checked
-   first, roughly 10 per second), the negentropy Kuma probe and RSS for the first hour.
+   published … replayed=false`), the negentropy Kuma probe and RSS for the first hour.
+   At start the shadow replays sealed segments from its recorded floor (7703) before it
+   takes live ones. Since `v2026.11.23.1` the start log `replaying sealed segments through
+   Parquet shadow` reports `already_published` (skipped: the inventory holds a published
+   work unit for the same path and size) and `to_process` (hashed and published), and the
+   replay takes seconds. Older releases re-hashed every segment at about 10 per second,
+   over an hour in which nothing new was published (2026-11-23).
+
+   **Never change `PENSIEVE_PARQUET_SHADOW_REPLAY_FROM_SEGMENT`.** The floor is recorded
+   in the inventory at first activation, and a start with a different value disables the
+   shadow (`failed to initialize Parquet shadow; continuing without shadow publication
+   error=Parquet shadow setting parquet_shadow.replay_policy.v1 differs from its
+   inventory`) while the ingester keeps archiving. Put the old value back and restart.
 6. Record the release in "What runs how" above and in AGENTS.md.
 
 **Rollback:** `~/pensieve/ops/scripts/deploy-ingest.sh <previous tag>`, which runs the same

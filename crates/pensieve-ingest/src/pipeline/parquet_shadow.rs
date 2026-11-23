@@ -3,6 +3,7 @@
 //! The sink is deliberately downstream of [`super::SegmentWriter`]. Failure here
 //! never changes notepack archival or deduplication state.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
@@ -12,7 +13,7 @@ use crossbeam_channel::Receiver;
 use metrics::{counter, gauge};
 use pensieve_lake::{
     CampaignConfig, Inventory, LocalObjectStore, Publisher, S3Publisher, S3PublisherConfig,
-    run_notepack_work_unit,
+    WorkState, run_notepack_work_unit,
 };
 
 use super::SealedSegment;
@@ -162,9 +163,16 @@ impl ShadowWorker {
         if let Some(replay_dir) = self.config.replay_dir.clone() {
             match discover_sealed_segments(&replay_dir, self.config.replay_from_segment) {
                 Ok(paths) => {
+                    let discovered = paths.len();
+                    let paths = self.skip_published(paths);
+                    let already_published = discovered - paths.len();
+                    counter!("parquet_shadow_replay_skipped_total")
+                        .increment(already_published as u64);
                     tracing::info!(
                         path = %replay_dir.display(),
-                        segments = paths.len(),
+                        segments = discovered,
+                        already_published,
+                        to_process = paths.len(),
                         replay_from_segment = ?self.config.replay_from_segment,
                         "replaying sealed segments through Parquet shadow"
                     );
@@ -205,6 +213,39 @@ impl ShadowWorker {
         }
     }
 
+    /// Drop replay candidates the inventory already holds as published.
+    ///
+    /// A work unit's identity is the SHA-256 of its source, so confirming a
+    /// segment through [`run_notepack_work_unit`] re-reads and hashes the whole
+    /// file. Every restart re-checked the entire archive above the replay floor
+    /// that way (about 36,000 segments, over an hour on the archive HDD in
+    /// November 2026), and live segments waited behind it. Sealed segments are
+    /// never rewritten, so a published work unit recorded for the same path
+    /// with the same byte size is that segment. Anything else (no record, an
+    /// unfinished or failed record, a different size) still takes the full,
+    /// checksummed path. If the inventory cannot be read, nothing is skipped.
+    fn skip_published(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let published = match published_source_sizes(&self.inventory) {
+            Ok(published) => published,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not read published work units; replay checks every segment"
+                );
+                return paths;
+            }
+        };
+        paths
+            .into_iter()
+            .filter(|path| {
+                let Some(&recorded) = published.get(path) else {
+                    return true;
+                };
+                fs::metadata(path).map_or(true, |metadata| metadata.len() != recorded)
+            })
+            .collect()
+    }
+
     fn process(&mut self, path: &Path, replayed: bool) {
         match run_notepack_work_unit(
             &mut self.inventory,
@@ -238,6 +279,21 @@ impl ShadowWorker {
             }
         }
     }
+}
+
+/// Source byte sizes of published work units, keyed by recorded source path.
+fn published_source_sizes(inventory: &Inventory) -> Result<HashMap<PathBuf, u64>> {
+    Ok(inventory
+        .work_units()?
+        .into_iter()
+        .filter(|unit| {
+            matches!(
+                unit.state,
+                WorkState::Published | WorkState::SourceCommitted
+            )
+        })
+        .map(|unit| (unit.source_path, unit.source_bytes))
+        .collect())
 }
 
 fn ensure_inventory_settings(
@@ -544,6 +600,72 @@ mod tests {
         let active = inventory.active_raw_objects().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].row_count, 1);
+    }
+
+    #[test]
+    fn replay_trusts_the_inventory_for_published_segments_of_unchanged_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let segment_dir = directory.path().join("segments");
+        let inventory_path = directory.path().join("inventory.sqlite");
+        fs::create_dir(&segment_dir).unwrap();
+        let config = ParquetShadowConfig {
+            state_db: inventory_path.clone(),
+            campaign: CampaignConfig::new(directory.path().join("staging")),
+            publisher: ParquetShadowPublisher::Local {
+                root: directory.path().join("lake"),
+            },
+            replay_dir: Some(segment_dir.clone()),
+            replay_from_segment: Some(0),
+        };
+        let replay = || {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            drop(sender);
+            start_parquet_shadow(config.clone(), receiver)
+                .unwrap()
+                .join()
+                .unwrap();
+            Inventory::open(&inventory_path)
+                .unwrap()
+                .work_units()
+                .unwrap()
+        };
+        // First activation records the floor (the next segment, 0).
+        assert!(replay().is_empty());
+
+        let segment_writer = SegmentWriter::new(
+            SegmentConfig {
+                output_dir: segment_dir,
+                compress: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "published once")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        segment_writer
+            .write(pack_nostr_event(&event).unwrap())
+            .unwrap();
+        let sealed = segment_writer.seal().unwrap().expect("sealed segment");
+        drop(segment_writer);
+
+        let units = replay();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].state, WorkState::Published);
+
+        // Same path and size: replay must not re-read the segment. Different
+        // bytes would hash to a new work unit, so a second row would mean it
+        // was hashed again.
+        let size = fs::metadata(&sealed.path).unwrap().len();
+        fs::write(&sealed.path, vec![0u8; usize::try_from(size).unwrap()]).unwrap();
+        assert_eq!(replay().len(), 1);
+
+        // A different size is not the published segment: it takes the full,
+        // checksummed path and registers its own work unit.
+        fs::write(&sealed.path, vec![0u8; usize::try_from(size + 1).unwrap()]).unwrap();
+        assert_eq!(replay().len(), 2);
     }
 
     #[test]
