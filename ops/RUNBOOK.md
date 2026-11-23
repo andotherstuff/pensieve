@@ -45,7 +45,7 @@ Observed 2026-11-23:
 |-----------|---------|-----------------------------------|
 | Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | ClickHouse 26.8 | **retired 2026-11-23** | stopped; behind the `clickhouse-retired` Compose profile (see [ClickHouse retirement](#clickhouse-retirement-2026-11-23)) |
-| `pensieve-ingest` | `pensieve-ingest.service` from `ops/systemd/`, no drop-ins | `~/pensieve/releases/current/pensieve-ingest`, `current` → `v2026.11.23` ([Releases](#releases)); `Restart=on-failure`, at most 3 starts per hour |
+| `pensieve-ingest` | `pensieve-ingest.service` from `ops/systemd/`, no drop-ins | `~/pensieve/releases/current/pensieve-ingest`, `current` → `v2026.11.23.2` ([Releases](#releases)); `Restart=on-failure`, at most 3 starts per hour |
 | isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; the ingester `Wants=` it) | `/usr/local/libexec/pensieve-negentropy-worker`, installed from the current release; the replaced builds are kept beside it |
 | `pensieve-serve`, `pensieve-preview` | retired 2026-11-23 | units removed from the host; `ops/systemd/pensieve-{api,preview}.service` are kept only as a reference |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
@@ -196,6 +196,14 @@ and preview had two each. The switch, done once:
 5. Remove the retired units: the API and preview units with their drop-ins, and the
    ClickHouse-index Kuma units, `/usr/local/libexec/pensieve-clickhouse-index-kuma.py` and
    `/etc/pensieve/clickhouse-index-kuma.url`; `daemon-reload`.
+
+### Release history
+
+| Tag | Commit | Deployed (UTC) | Change |
+|-----|--------|----------------|--------|
+| `v2026.11.23` | `2294f94` (#112) | 2026-11-23 10:15 | First tagged release, no drop-ins, no ClickHouse |
+| `v2026.11.23.1` | `39e3289` (#114) | 2026-11-23 11:04 | Parquet startup replay skips already-published segments |
+| `v2026.11.23.2` | `9ffdfa0` (#115) | 2026-11-23 11:39 | Removed negentropy relays no longer hold `/health/negentropy` red or pause leasing |
 
 ## Routine deploy
 
