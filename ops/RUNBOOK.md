@@ -45,9 +45,9 @@ Observed 2026-11-23:
 |-----------|---------|-----------------------------------|
 | Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
 | ClickHouse 26.8 | **retired 2026-11-23** | stopped; behind the `clickhouse-retired` Compose profile (see [ClickHouse retirement](#clickhouse-retirement-2026-11-23)) |
-| `pensieve-ingest` | `pensieve-ingest.service` + 7 drop-ins | `~/pensieve/releases/ingest-security-20261022/pensieve-ingest` (built from `974d8fb`) via `zzzzzz-no-clickhouse-20261123.conf`: the flags of `zzzzz-security-20261022.conf` without `--clickhouse-url`, with `--isolated-negentropy` and `--isolated-negentropy-pause-on-failure-secs 7200`. `zzzz-bounded-canary.conf` still sets `Restart=no`; `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-security-20261022` worker; `.26f2170` and `.ba0c4a1` kept beside it) |
-| `pensieve-serve`, `pensieve-preview` | `pensieve-api.service`, `pensieve-preview.service` | **stopped and disabled 2026-11-23** (ClickHouse-only readers); last ran `releases/api-security-20261022`, `releases/preview-security-20261022` |
+| `pensieve-ingest` | `pensieve-ingest.service` from `ops/systemd/`, no drop-ins | `~/pensieve/releases/current/pensieve-ingest`, `current` → `v2026.11.23` ([Releases](#releases)); `Restart=on-failure`, at most 3 starts per hour |
+| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; the ingester `Wants=` it) | `/usr/local/libexec/pensieve-negentropy-worker`, installed from the current release; the replaced builds are kept beside it |
+| `pensieve-serve`, `pensieve-preview` | retired 2026-11-23 | units removed from the host; `ops/systemd/pensieve-{api,preview}.service` are kept only as a reference |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
 | Kuma push probes (30–60 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
 | log shipping | `alloy.service` | `/usr/local/bin/alloy` ([Security maintenance procedure](#security-maintenance-procedure-2026-10-22)) |
@@ -55,8 +55,6 @@ Observed 2026-11-23:
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
 | Prometheus `:9090` for the scraper VM | `pensieve-prometheus-proxy.socket` → `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090` |
 
-While `zzzz-bounded-canary.conf` is installed, the ingester does **not** restart by itself
-after it exits; check it after any stop or crash.
 
 ## ClickHouse retirement (2026-11-23)
 
@@ -74,7 +72,7 @@ What was done on the host, in order:
    153 GiB at once). **Lesson:** a FREEZE snapshot is not free; remove it (or
    `SYSTEM UNFREEZE WITH NAME …`) as soon as the rehearsal it protects is over.
 2. Added `/etc/systemd/system/pensieve-ingest.service.d/zzzzzz-no-clickhouse-20261123.conf`
-   (record in [`ops/systemd/dropins/`](systemd/dropins/README.md)), `daemon-reload`, and a
+   (replaced the same day by the drop-in-free unit, see [Releases](#releases)), `daemon-reload`, and a
    graceful restart (`Result=success`, `shutdown complete`, the in-flight segment 43904
    indexed first). The start logs `ingest configuration … clickhouse=disabled`. Without
    `--clickhouse-url` the ingester neither opens `/archive/segments/.clickhouse_reindex_queue`
@@ -96,8 +94,8 @@ from before the archive-first ingester) were recovered on 2026-08-11 into
 archived segments. To delete: `docker rm pensieve-clickhouse`, `sudo rm -rf /data/clickhouse`,
 `docker volume rm pensieve-deploy_clickhouse_logs`.
 
-To bring ClickHouse back before the data is deleted: remove the drop-in from step 2,
-`daemon-reload`, restart the ingester, start the container
+To bring ClickHouse back before the data is deleted: add `--clickhouse-url http://localhost:8123`
+to the unit's `ExecStart` in a release, deploy it, start the container
 with `--profile clickhouse-retired`, and re-enable the units from step 3. Segments sealed while ClickHouse was off are
 not journaled and stay unindexed until backfilled by hand.
 
@@ -106,6 +104,85 @@ rollups, the `grafana` ClickHouse user, ClickHouse indexing and outages) are his
 
 Grafana datasources/dashboards are configured **on the running instance** (no repo
 provisioning). The ingester exposes Prometheus metrics on `:9091`.
+
+## Releases
+
+Since 2026-11-23 production runs **tagged releases of `master`**, installed from the repo's
+unit files with no drop-ins. A release is a CalVer tag `vYYYY.MM.DD` (`vYYYY.MM.DD.N` for a
+second one that day) on a `master` commit, published as a GitHub release, and built on the
+host into a root-owned `~/pensieve/releases/<tag>/` that is never overwritten. The
+ingester unit starts `~/pensieve/releases/current/pensieve-ingest`; deploying switches the
+`current` link. Only the ingester and its negentropy worker are released; `pensieve-serve`
+and `pensieve-preview` are retired with ClickHouse.
+
+What is where:
+
+| Piece | Source | On the host |
+|-------|--------|-------------|
+| Ingester unit | `ops/systemd/pensieve-ingest.service` (all production flags) | `/etc/systemd/system/pensieve-ingest.service`, no `pensieve-ingest.service.d/` |
+| Worker unit | `ops/systemd/pensieve-negentropy-worker.service` | `/etc/systemd/system/` |
+| Ingester binary | the release | `~/pensieve/releases/current` → `<tag>/pensieve-ingest` |
+| Worker binary | the release | `/usr/local/libexec/pensieve-negentropy-worker` (root-owned outside the pensieve-owned checkout, so the worker's sandbox stays separate); the replaced one is kept beside it as `pensieve-negentropy-worker.<previous tag>` |
+| Ops scripts, Compose files | the `~/pensieve` checkout | clean `origin/master`, updated with `git merge --ff-only` |
+
+### Cut and deploy a release
+
+1. Merge to `master` with CI green. Tag and publish the release from your machine:
+   ```bash
+   gh release create v2026.11.23 --target <master sha> --title v2026.11.23 --generate-notes
+   ```
+2. On the host, update the checkout (it carries the scripts and unit files) and build. The
+   build runs in a transient unit capped at 4 CPUs and 12 GiB at idle I/O priority, with a
+   shared warm target dir in `/data/pensieve-build/target`; the release is not deployed yet.
+   ```bash
+   git -C ~/pensieve fetch origin && git -C ~/pensieve merge --ff-only origin/master
+   ~/pensieve/ops/scripts/build-release.sh v2026.11.23
+   ```
+3. If `ops/systemd/pensieve-ingest.service` or `pensieve-negentropy-worker.service` changed,
+   install it now (`sudo install -m 644 ops/systemd/<unit> /etc/systemd/system/` and
+   `sudo systemctl daemon-reload`); the running process keeps its old settings until the
+   restart in the next step.
+4. Deploy at a quiet moment:
+   ```bash
+   ~/pensieve/ops/scripts/deploy-ingest.sh v2026.11.23
+   ```
+   It checks the release against its manifest, refuses if a drop-in overrides `ExecStart`
+   or an archive recovery marker exists, stops the worker and then the ingester and
+   requires a graceful stop (`Result=success`, exit 0, `shutdown complete`). After a stop
+   that was not graceful it starts nothing: investigate as in
+   [Archive admission monitoring and recovery](#archive-admission-monitoring-and-recovery).
+   Then it installs the worker, switches `current`, starts the ingester and waits up to
+   two minutes for the new binary, `ingest configuration` in the journal, archive admission
+   200 and an active worker. It prints the rollback command.
+5. Watch the first sealed segment reach the Parquet shadow (`Parquet shadow work unit
+   published … replayed=false`; with startup replay on, older segments are re-checked
+   first, roughly 10 per second), the negentropy Kuma probe and RSS for the first hour.
+6. Record the release in "What runs how" above and in AGENTS.md.
+
+**Rollback:** `~/pensieve/ops/scripts/deploy-ingest.sh <previous tag>`, which runs the same
+checks. Keep the current and the previous two releases; delete older directories by hand.
+
+**Restart policy:** `Restart=on-failure` after 30 s, at most three starts per hour
+(`StartLimitBurst=3`). A crash or OOM kill restarts the ingester. An archive fault does not
+exit the process, and a leftover recovery marker fails every start, so a recovery case ends
+with the unit `failed` and the admission probe red instead of a restart loop. After fixing
+the cause: `sudo systemctl reset-failed pensieve-ingest && sudo systemctl start pensieve-ingest`.
+
+### One-time switch from drop-ins (2026-11-23)
+
+Before this, the ingester's `ExecStart` came from the last of seven drop-ins, and the API
+and preview had two each. The switch, done once:
+
+1. Back up the units: `sudo cp -a /etc/systemd/system/pensieve-{ingest,api,preview}.service{,.d} ~/maintenance-backups/units-20261123/`.
+2. Point `current` at the binary that was running, so a crash before step 4 still starts it:
+   `sudo ln -sfn ingest-security-20261022 ~/pensieve/releases/current`.
+3. Install `ops/systemd/pensieve-ingest.service`, `sudo rm -r /etc/systemd/system/pensieve-ingest.service.d`,
+   `daemon-reload`. Check `systemctl show pensieve-ingest -p DropInPaths -p ExecStart`: no
+   drop-ins, `releases/current/pensieve-ingest`. The running process is untouched.
+4. Build and deploy the first tag, `v2026.11.23`, with the scripts above.
+5. Remove the retired units: the API and preview units with their drop-ins, and the
+   ClickHouse-index Kuma units, `/usr/local/libexec/pensieve-clickhouse-index-kuma.py` and
+   `/etc/pensieve/clickhouse-index-kuma.url`; `daemon-reload`.
 
 ## Routine deploy
 
@@ -293,13 +370,11 @@ converted each segment with `notepack-to-parquet`, selected the IDs absent from
 `events_local` through a `clickhouse-client --external` table into a Native file,
 checked its row count, inserted it, and re-counted to zero missing.
 
-Production deploys one component at a time from a release build of an exact
-commit. Do **not** deploy with `git pull` + `just build-release` in `~/pensieve`:
-the services do not run `target/release/` (drop-ins override `ExecStart`). The
-checkout is what the Compose stack and `archive-sync` use; keep it a clean
-`master` (synced 2026-10-12) and update it with
-`git -C ~/pensieve merge --ff-only origin/master` when `ops/` changes, never with
-hand edits. Mounted configs and `compose.yml` take effect only when the affected
+Deploy the ingester only as a tagged release ([Releases](#releases)). Do **not** deploy with
+`git pull` + `just build-release` in `~/pensieve`: nothing runs `target/release/`. The
+checkout is what the Compose stack, `archive-sync` and the release scripts use; keep it a
+clean `master` and update it with `git -C ~/pensieve merge --ff-only origin/master`, never
+with hand edits. Mounted configs and `compose.yml` take effect only when the affected
 container is recreated.
 
 Compose changes apply per container: after the 2026-10-12 sync, Prometheus was recreated alone
@@ -308,114 +383,32 @@ from `ops/production/`, after `promtool check config`) to load `archive-alerts.y
 mounted file changed (not the service in `compose.yml`), add `--force-recreate`: otherwise Compose
 leaves the running container alone.
 
-Socket units: `ops/systemd/*.socket` files (today `pensieve-prometheus-proxy.socket`)
-must be installed into `/etc/systemd/system/` with their `.service` and enabled with
-`systemctl enable --now <name>.socket`. The `.service` is socket-activated and is not
-enabled. **Warning (PR #100):** once that PR is on master, an ff-merge followed by a
-routine `systemctl restart pensieve`, before the
-[rollout](#published-ports-and-the-grafana-clickhouse-user), moves Prometheus to
-`127.0.0.1:19090` with nothing on `:9090`. That fails closed, but the monitoring VM
-loses access until the socket is installed. That restart also stops and recreates every
-container, ClickHouse included.
-
-Pattern (used for `releases/api-*` and `releases/preview-3ab1045`; preview shown). Copying a
-warm target dir (`cp -a --reflink=auto /data/pensieve-build/<previous> <new>`) and building in a
-resource-limited unit (`systemd-run --uid=pensieve --property=CPUQuota=400% --property=MemoryMax=8G
---property=IOSchedulingClass=idle --setenv=CARGO_TARGET_DIR=…`) keeps ingestion unaffected; the
-2026-10-12 API build took 57 s that way.
-
-1. **Build the exact commit in a detached worktree** with its own target dir:
-   ```bash
-   git -C ~/pensieve fetch origin
-   SHA=<7-char commit>
-   git -C ~/pensieve worktree add --detach ~/pensieve-preview-$SHA $SHA
-   cd ~/pensieve-preview-$SHA
-   CARGO_TARGET_DIR=~/pensieve-preview-target cargo build --release --locked -p pensieve-preview
-   ```
-2. **Install into a new release directory** (root-owned, never overwritten):
-   ```bash
-   sudo install -d -m 755 /home/pensieve/pensieve/releases/preview-$SHA
-   sudo install -m 755 ~/pensieve-preview-target/release/pensieve-preview \
-     ~/pensieve-preview-target/release/preview-lookups \
-     /home/pensieve/pensieve/releases/preview-$SHA/
-   ```
-3. **Point the drop-in at it** and restart only that service:
-   ```bash
-   sudoedit /etc/systemd/system/pensieve-preview.service.d/10-release.conf
-   #   [Service]
-   #   ExecStart=
-   #   ExecStart=/home/pensieve/pensieve/releases/preview-<sha>/pensieve-preview
-   sudo systemctl daemon-reload
-   sudo systemctl restart pensieve-preview
-   ```
-4. **Verify** the running binary, the journal and health:
-   ```bash
-   readlink /proc/$(systemctl show -p MainPID --value pensieve-preview)/exe
-   journalctl -u pensieve-preview --since '5 minutes ago' --no-pager
-   curl -fsS localhost:8081/health   # API: localhost:8080/health
-   ```
-5. **Record it:** update the copy in [`ops/systemd/dropins/`](systemd/dropins/README.md)
-   in the PR, and keep the previous `releases/` directory for rollback.
-
-Drop-ins per service (2026-10-11): `pensieve-api.service.d/90-postgres-cutover.conf`
-(also sets `PENSIEVE_BIND_ADDR`, `PENSIEVE_LATEST_EVENT_WATERMARK_PATH` and
-`RELAY_DB_PATH` inline), `pensieve-preview.service.d/10-release.conf`,
-and for the ingester `giftwrap-recipient-block.conf`, `nip66-monitor.conf`,
-`override.conf`, `stop-timeout.conf` (`TimeoutStopSec=15min`), `zzzz-bounded-canary.conf` (the last `ExecStart` wins).
-
-**Ingester exception.** The running ingester was built from a plain source copy in
-`~/releases/negentropy-<sha>/` with `CARGO_TARGET_DIR=/data/pensieve-build/negentropy-<sha>`
-and is run from that target dir; the matching `pensieve-negentropy-worker` was installed
-to `/usr/local/libexec/`. Follow the graceful-stop checks above for every ingester stop.
+Socket units: `ops/systemd/*.socket` files (today `pensieve-prometheus-proxy.socket`, installed
+and enabled) go into `/etc/systemd/system/` with their `.service` and are enabled with
+`systemctl enable --now <name>.socket`. The `.service` is socket-activated and is not enabled.
 
 **Units.** Install only the unit files you changed, then `daemon-reload`. Do not glob
-`ops/systemd/*.service`: that also installs gated units (`pensieve-negentropy-worker`,
-the Kuma probes, `pensieve-parquet-campaign`) and the base `ExecStart` lines.
+`ops/systemd/*.service`: that also installs gated or retired units (`pensieve-parquet-campaign`,
+`pensieve-api`, `pensieve-preview`).
 ```bash
 sudo install -m 644 ops/systemd/<changed>.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
+No unit in production has a drop-in since 2026-11-23; keep it that way. Change the unit
+file in the repo instead.
 
 **Docker infra:** restart only if `ops/production/` changed, and only after the
 checkout holds the intended files: `sudo systemctl restart pensieve`.
 
-**Migrations:** apply one file explicitly, `just ch-migrate docs/migrations/NNN_description.sql`.
-Never run `just ch-migrate-all` here: it replays every top-level migration,
-including drops, `TRUNCATE` and full backfills (see
-[`docs/migrations/README.md`](../docs/migrations/README.md)).
-
-Verify: `systemctl status pensieve pensieve-api pensieve-ingest pensieve-preview`,
-`curl localhost:8080/health`, `journalctl -u pensieve-ingest -f`.
+Verify: `systemctl status pensieve pensieve-ingest pensieve-negentropy-worker`,
+`curl -s localhost:9091/health/archive-admission`, `journalctl -u pensieve-ingest -f`.
 
 ### Rollback
 
-Point the drop-in back at the previous release directory, `daemon-reload`, restart
-that service, and check `/proc/<pid>/exe`. Do not rebuild from the checkout.
-
-- Removing a drop-in falls back to `~/pensieve/target/release/<binary>`. Those are old
-  builds (2026-10-11: `pensieve-preview` from 2026-07-27, before compact lookups, so it
-  would do 10–30 s scans now that `events_by_kind` is gone; `pensieve-ingest` is the
-  2026-10-05 giftwrap hotfix). The comment inside `10-release.conf` that says "remove
-  this file" predates migration 018; do not follow it.
-- `releases/` holds `api-6b21547`, `api-8a6bc61`, `api-9829378`, `api-7ac5121` (built from the
-  unmerged `codex/negentropy-hardening` branch), `api-8bdac94` (master, previous), `api-f60f003`
-  (master after the Postgres removal, previous), `api-60c4bfe` (019 rollups and `api-rollups`), `api-ff8a446` (90-day cap), `api-b466b37` (60-day cap, previous), `api-d026d53` (020 `kind_totals` and `api-rollups cutover`, previous), `api-fe54f04` (021 `kind_activity`), `api-0a14656` (#101 and #102; needs 022),
-  `api-0a14656-ca-20261021` (OpenClaw's build of `0a14656` with the #107 lockfile; the rollback target
-  for `api-89f526b`), `api-89f526b` (current), `ingest-89f526b` (current ingester and the installed
-  worker, #107), `ingest-c3f25c5-ca-20261021` (OpenClaw's build of `c3f25c5` with the #107 lockfile;
-  the rollback target for `ingest-89f526b`: same flags, keep the installed worker),
-  `ingest-c3f25c5` (#105; trusts the compromised eMudhra intermediates), `ingest-0a14656` (#103), `ingest-43d4a26` (older ingester, #98), `ingest-2e07c31` (older ingester, #95), `ingest-85a2402` (older ingester, #94),
-  `ingest-26f2170` (older ingester and the installed worker, #92),
-  `ingest-e73bebb` (older ingester, #88 and #90; reads schema 10; run it
-  with the `ba0c4a1` worker and without the pause flag), `ingest-b466b37` (older; it refuses the schema-10 negentropy ledger, so
-  downgrading leaves isolated reconciliation off unless `jobs.sqlite.pre-schema10` is restored),
-  `ingest-ba0c4a1` (PR #72 build, with the previously installed worker), `preview-89f526b` (current),
-  `preview-3ab1045-ca-20261021` (OpenClaw's build of `3ab1045` with the #107 lockfile; byte-identical to
-  `preview-89f526b`) and `preview-3ab1045` (trusts the compromised intermediates). Releases built
-  before 2026-10-21 08:40 UTC (other than OpenClaw's `*-ca-20261021`) trust the compromised eMudhra
-  intermediates; do not roll back to them. Build target dirs other than the latest `api-*`/`ingest-*` caches in
-  `/data/pensieve-build/` were removed on 2026-10-12.
-- Schema changes roll back through `docs/migrations/rollback/` where a file exists.
+`~/pensieve/ops/scripts/deploy-ingest.sh <previous tag>` (see [Releases](#releases)). The
+releases built before 2026-11-23 (`ingest-*`, `api-*`, `preview-*`, all started by drop-ins)
+are described in this file's history; only `ingest-security-20261022` is kept, as the
+fallback for the first tagged release.
 
 ## First live Parquet shadow activation
 
@@ -2047,6 +2040,10 @@ Then take the handle (`ln -f ~/pensieve/ops/production/clickhouse/users.xml
 ~/clickhouse-users.mounted.xml`) so a rollback works without another restart.
 
 ## Negentropy reconciliation
+
+> Since 2026-11-23 there are no drop-ins. Where a procedure below edits
+> `zzzz-bounded-canary.conf`, change `ops/systemd/pensieve-ingest.service` instead and
+> install it with the next release ([Releases](#releases)).
 
 The ingester's isolated NIP-77 reconciliation (`--isolated-negentropy`, a separate
 `pensieve-negentropy-worker` process over `/run/pensieve/negentropy.sock`, provisioned by

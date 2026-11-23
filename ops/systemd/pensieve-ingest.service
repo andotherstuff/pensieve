@@ -1,8 +1,32 @@
+# Pensieve ingester: the production unit, installed verbatim to
+# /etc/systemd/system/pensieve-ingest.service. Production has no drop-ins for it.
+#
+# The binary comes from the release that /home/pensieve/pensieve/releases/current
+# points at; ops/scripts/deploy-ingest.sh switches that link and restarts this
+# unit with the graceful-stop checks. See ops/RUNBOOK.md -> Releases.
+#
+# Pipeline: relays -> RocksDB dedupe (/data/rocksdb) -> notepack segments
+# (/archive/segments) -> Parquet shadow -> object storage (settings in
+# /etc/pensieve/parquet-shadow.env), plus isolated NIP-77 reconciliation through
+# pensieve-negentropy-worker. ClickHouse indexing was retired on 2026-11-23, so
+# there is no --clickhouse-url.
+
 [Unit]
 Description=Pensieve Nostr Ingester
 Documentation=https://github.com/andotherstuff/pensieve
-After=network.target docker.service tor.service
-Wants=docker.service tor.service
+After=network-online.target tor.service
+Wants=network-online.target tor.service
+# Isolated NIP-77 reconciliation runs in its own sandboxed unit; start it with
+# the ingester (including at boot).
+Wants=pensieve-negentropy-worker.service
+# Restart after a crash or OOM kill, but give up after three failed starts in an
+# hour instead of looping. An archive fault does not exit the process (it blocks
+# admission and waits for an operator), and a leftover recovery marker makes
+# every start fail, so this stops after three attempts and leaves the unit
+# failed and the admission probe red. Recover by hand; see
+# docs/archive_failure_recovery.md.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -12,17 +36,14 @@ WorkingDirectory=/home/pensieve/pensieve
 EnvironmentFile=-/etc/pensieve/parquet-shadow.env
 StateDirectory=pensieve
 StateDirectoryMode=0750
+Environment=RUST_BACKTRACE=1
+# Recipients whose NIP-59 gift wraps are dropped (docs/giftwrap_recipient_hotfix.md).
+Environment="PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS=d0182d1b03c946beeb5d4b6742216c021f38322e8f089bf63722cdddc1f819aa"
 
-# Binary location (after cargo build --release)
-# Tor proxy enabled by default - .onion relays route through Tor, clearnet connects directly
-# Remove --tor-proxy if you don't want Tor support (or don't have tor installed)
-#
-# Negentropy sync (NIP-77) enabled - periodically reconciles with trusted relays
-# to discover events missed during normal streaming
-#
-# Add --verbose-ops to ExecStart when you want periodic throughput/checkpoint
-# progress at INFO without raising RUST_LOG for everything else.
-ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
+# --negentropy-* without --negentropy configure the in-process syncer, which is
+# off; --isolated-negentropy runs reconciliation through the worker instead.
+# Add --verbose-ops for periodic throughput/checkpoint progress at INFO.
+ExecStart=/home/pensieve/pensieve/releases/current/pensieve-ingest \
     --seed-file /home/pensieve/pensieve/data/relays/seed.txt \
     --import-discovered-json /home/pensieve/pensieve/data/relays/relay_discovery_results.json \
     --output-dir /archive/segments \
@@ -30,44 +51,40 @@ ExecStart=/home/pensieve/pensieve/target/release/pensieve-ingest \
     --relay-db-path /data/relay-stats.db \
     --metrics-port 9091 \
     --tor-proxy 127.0.0.1:9050 \
-    --negentropy \
     --negentropy-db-path /data/sync-state \
     --negentropy-relays-file /home/pensieve/pensieve/data/relays/negentropy.txt \
     --negentropy-interval-secs 1800 \
-    --negentropy-lookback-days 14
+    --negentropy-lookback-days 14 \
+    --nip66-monitor-relays wss://relay.nostr.watch \
+    --isolated-negentropy \
+    --isolated-negentropy-relays-file /etc/pensieve/negentropy-premium-canary-20261010T162833Z.txt \
+    --isolated-negentropy-worker-uid 999 \
+    --isolated-negentropy-replay-floor 29808 \
+    --isolated-negentropy-ledger /data/negentropy/production-premium-20261011T180545Z/jobs.sqlite \
+    --isolated-negentropy-pause-on-failure-secs 7200 \
+    --archive-seal-interval-secs 300
 
-# Restart policy
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=30
 
-# Stop budget: archive shutdown (final seal, compression, RocksDB flush) and the
-# Parquet shadow finishing its current work unit. systemd's 90 s default has
-# killed the process before a clean stop (2026-10-12, when a ClickHouse indexer
-# still ran; ClickHouse was retired on 2026-11-23).
-TimeoutStopSec=5min
+# Stop budget: final seal and compression, RocksDB flush, and the Parquet shadow
+# finishing its current work unit. A stop that runs out of time is killed, and
+# a killed stop needs the RUNBOOK's checks before the next start, so be generous.
+TimeoutStopSec=15min
 
-# Open-file limit: the ingester holds many concurrent relay sockets; the systemd
-# default caused "Too many open files" (notably during shutdown).
+# The ingester holds many concurrent relay sockets.
 LimitNOFILE=524288
 
-# Logging: the binary defaults to info with noisy upstream crates suppressed.
-# To override:  systemctl edit pensieve-ingest  →  Environment=RUST_LOG=debug
-# Environment=RUST_LOG=info
-
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pensieve-ingest
 
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-# Allow writes to data directories (includes negentropy sync-state in /data)
-# Optional while isolated reconciliation is disabled; tmpfiles must provision
-# the socket directory before explicitly enabling isolated mode.
-ReadWritePaths=/data /archive /var/lib/pensieve -/run/pensieve
+# /run/pensieve holds the worker socket (from /etc/tmpfiles.d/pensieve-negentropy.conf).
+ReadWritePaths=/data /archive /var/lib/pensieve /run/pensieve
 
 [Install]
 WantedBy=multi-user.target
