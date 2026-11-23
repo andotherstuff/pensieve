@@ -1,44 +1,17 @@
-# Production systemd drop-ins (record)
+# Production systemd drop-ins
 
-Production does not run the `ExecStart` lines in `ops/systemd/*.service`.
-Drop-ins under `/etc/systemd/system/<unit>.d/` reset `ExecStart=` and point each
-service at a release build (see [`ops/RUNBOOK.md` → Routine deploy](../../RUNBOOK.md#routine-deploy)).
-This directory records those drop-ins so the repo shows how services actually
-start. Paths mirror `/etc/systemd/system/`.
+Since 2026-11-23 production has **no** drop-ins for Pensieve units. Each unit is
+installed verbatim from `ops/systemd/`, and the ingester binary comes from the release
+that `~/pensieve/releases/current` points at (see
+[`ops/RUNBOOK.md` → Releases](../../RUNBOOK.md#releases)). Change a unit in the repo and
+install it with the next release instead of adding a drop-in.
 
-Captured from the production host on 2026-10-11; every file here was compared byte for byte with the host on 2026-11-23. These are **records, not
-install sources**: they name specific release directories and canary files
-that change on every deploy. When you change a drop-in on the host, update the
-copy here in the same PR as the code it deploys.
+Until then, drop-ins under `/etc/systemd/system/<unit>.d/` reset `ExecStart=` and pointed
+each service at a release directory. Their last state (the ingester's seven, the API's
+and the preview's two each) is in this directory's git history, and a copy taken on the
+host before removal is in `~pensieve/maintenance-backups/units-20261123/`.
 
-| Unit | Drop-in | Effect |
-|------|---------|--------|
-| `pensieve-api` | `90-postgres-cutover.conf` | Runs `releases/api-89f526b/pensieve-serve` (master incl. #101, #102 and #107, since 2026-10-21 08:42 UTC; previously `api-0a14656-ca-20261021` via OpenClaw's temporary `zzzzz-ca.conf`, removed, and `api-0a14656`), plus `RELAY_DB_PATH=/data/relay-stats.db` and the latest-event watermark path |
-| `pensieve-preview` | `10-release.conf` | Runs `releases/preview-89f526b/pensieve-preview` (since 2026-10-21 08:42 UTC; previously `preview-3ab1045-ca-20261021` via OpenClaw's temporary `20-ca.conf`, removed, and `preview-3ab1045`) |
-| `pensieve-ingest` | `giftwrap-recipient-block.conf` | Sets `PENSIEVE_BLOCKED_GIFTWRAP_RECIPIENTS` (see [`docs/giftwrap_recipient_hotfix.md`](../../../docs/giftwrap_recipient_hotfix.md)) |
-| `pensieve-ingest` | `nip66-monitor.conf` | Older `ExecStart` adding `--nip66-monitor-relays`; superseded by `zzzz-bounded-canary.conf` |
-| `pensieve-ingest` | `negentropy-worker.conf` | `Wants=pensieve-negentropy-worker.service`: starts the isolated NIP-77 worker whenever the ingester starts, including at boot (continuous Premium Primal reconciliation since 2026-10-12) |
-| `pensieve-ingest` | `override.conf` | `RUST_BACKTRACE=1` |
-| `pensieve-ingest` | `stop-timeout.conf` | `TimeoutStopSec=15min` (added 2026-10-12): a ClickHouse insert slowed by the hourly refreshable views must finish instead of being killed mid-segment |
-| `pensieve-ingest` | `zzzz-bounded-canary.conf` | Runs `releases/ingest-89f526b/pensieve-ingest` (master incl. #88, #90, #92, #94, #95, #98, #103, #105 and #107, since 2026-10-21 08:43 UTC; previously `ingest-c3f25c5-ca-20261021` via OpenClaw's temporary `zzzzz-ca.conf`, removed, and `releases/ingest-c3f25c5/` (#105); before that `releases/ingest-0a14656/` (#103), with `--isolated-negentropy-pause-on-failure-secs 7200` and the default 16 GiB `--dedupe-block-cache-mib`; previously `releases/ingest-2e07c31/` (#95, same flags; the rollback target), `releases/ingest-85a2402/` (#94, same flags; the rollback target), `releases/ingest-26f2170/` (#92, same flags; the rollback target), `releases/ingest-e73bebb/` (#88 and #90, schema 10, no pause flag), before that `releases/ingest-b466b37/` (#72 and #73), which cannot open the schema-10 ledger, and before that the PR #72 build `releases/ingest-ba0c4a1/` with its worker) with `--isolated-negentropy` and the rolling Premium Primal ledger, adds `/run/pensieve` to `ReadWritePaths`, and sets `Restart=no` (the ingester does not restart itself after exiting) |
-| `pensieve-ingest` | `zzzzz-security-20261022.conf` | Written by the 2026-10-22 security maintenance (Sven): runs `releases/ingest-security-20261022/pensieve-ingest`, built from `974d8fb`, with the flags of `zzzz-bounded-canary.conf`. Superseded by the next file |
-| `pensieve-ingest` | `zzzzzz-no-clickhouse-20261123.conf` | **The effective `ExecStart` since 2026-11-23**: the same binary and flags without `--clickhouse-url` ([ClickHouse retirement](../../RUNBOOK.md#clickhouse-retirement-2026-11-23)) |
-| `pensieve-api`, `pensieve-preview` | `zzzzz-security-20261022.conf` | Run `releases/api-security-20261022/pensieve-serve` and `releases/preview-security-20261022/pensieve-preview` (from `974d8fb`). Both units are stopped and disabled since 2026-11-23 |
-
-### Obsolete settings in the API drop-in
-
-The Postgres analytics backend was removed from `pensieve-serve` on 2026-10-12, and the
-API drop-in no longer sets `PENSIEVE_POSTGRES_API_FAMILIES` (since `api-f60f003`).
-
-The comment inside `10-release.conf` ("Rollback: remove this file") predates
-migration 018. Removing it now would start the 2026-07-27 build in
-`~/pensieve/target/release/`, which has no compact lookups and would scan
-`events_local` for every profile, zap and naddr preview. Roll back by pointing
-`ExecStart` at another `releases/` directory instead.
-
-Drop-ins apply in lexical order and each `ExecStart=` line clears the previous
-value, so the last file that sets `ExecStart` wins (`zzzzzz-no-clickhouse-20261123.conf` for the ingester).
-Check what is really running with:
+Check that nothing overrides a unit:
 
 ```bash
 systemctl show pensieve-ingest -p DropInPaths -p ExecStart
