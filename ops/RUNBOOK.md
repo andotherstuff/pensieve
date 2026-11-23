@@ -39,22 +39,70 @@ host on that date.
 
 ## What runs how
 
-Observed 2026-10-11:
+Observed 2026-11-23:
 
 | Component | Runs as | Binary / command actually started |
 |-----------|---------|-----------------------------------|
-| ClickHouse 24.8, Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` + `90-postgres-cutover.conf` | `~/pensieve/releases/api-89f526b/pensieve-serve` (master incl. #101, #102 and #107; since 2026-10-21 08:42 UTC) |
-| `pensieve-preview` | `pensieve-preview.service` + `10-release.conf` | `~/pensieve/releases/preview-89f526b/pensieve-preview` (preview code of `3ab1045` plus #107; since 2026-10-21 08:42 UTC) |
-| `pensieve-ingest` | `pensieve-ingest.service` + 5 drop-ins | `~/pensieve/releases/ingest-89f526b/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache, #103 carries ahead of a retry backlog, #105 indexer retries and #107, since 2026-10-21 08:43 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) with `--isolated-negentropy` (from `zzzz-bounded-canary.conf`, which also sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-89f526b` worker, with #107 eMudhra-distrusting TLS roots, since 2026-10-21 08:43 UTC; the previous builds are kept beside it as `pensieve-negentropy-worker.26f2170` and `.ba0c4a1`), continuous against Premium Primal since 2026-10-12 |
+| Prometheus, Grafana, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
+| ClickHouse 26.8 | **retired 2026-11-23** | stopped; behind the `clickhouse-retired` Compose profile (see [ClickHouse retirement](#clickhouse-retirement-2026-11-23)) |
+| `pensieve-ingest` | `pensieve-ingest.service` + 7 drop-ins | `~/pensieve/releases/ingest-security-20261022/pensieve-ingest` (built from `974d8fb`) via `zzzzzz-no-clickhouse-20261123.conf`: the flags of `zzzzz-security-20261022.conf` without `--clickhouse-url`, with `--isolated-negentropy` and `--isolated-negentropy-pause-on-failure-secs 7200`. `zzzz-bounded-canary.conf` still sets `Restart=no`; `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| isolated NIP-77 worker | `pensieve-negentropy-worker.service` (static; started with the ingester via `negentropy-worker.conf`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-security-20261022` worker; `.26f2170` and `.ba0c4a1` kept beside it) |
+| `pensieve-serve`, `pensieve-preview` | `pensieve-api.service`, `pensieve-preview.service` | **stopped and disabled 2026-11-23** (ClickHouse-only readers); last ran `releases/api-security-20261022`, `releases/preview-security-20261022` |
 | archive sync (hourly) | `archive-sync.timer` → `archive-sync.service` | `~/pensieve/ops/scripts/sync-archive.sh` |
-| Kuma push probes (30–60 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer`, `pensieve-clickhouse-index-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
+| Kuma push probes (30–60 s) | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (sources: `ops/scripts/*-kuma.py`) |
+| log shipping | `alloy.service` | `/usr/local/bin/alloy` ([Security maintenance procedure](#security-maintenance-procedure-2026-10-22)) |
+| host maintenance agent | `openclaw-gateway.service` (Sven) | OpenClaw, running as `pensieve` with sudo |
 | Parquet historical campaign | `pensieve-parquet-campaign.service` | in the repo, **not installed** on the host |
-| Prometheus `:9090` for the scraper VM | `pensieve-prometheus-proxy.socket` → `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`; in the repo since PR #100, install per [Published ports](#published-ports-and-the-grafana-clickhouse-user) |
+| Prometheus `:9090` for the scraper VM | `pensieve-prometheus-proxy.socket` → `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090` |
 
 While `zzzz-bounded-canary.conf` is installed, the ingester does **not** restart by itself
 after it exits; check it after any stop or crash.
+
+## ClickHouse retirement (2026-11-23)
+
+`/data` (3.4T, NVMe RAID0, shared with RocksDB and the negentropy state) reached 100%:
+ClickHouse held 3.3T, 2.0T of it in `shadow/maint20261022rehearsal`, the hardlink
+snapshot `ALTER TABLE … FREEZE` left by the 2026-10-22 version rehearsal. Every merge since
+then kept the replaced parts alive through the snapshot (153 GiB had no other link).
+ClickHouse analytics was retired rather than grown. The archive pipeline (relays →
+RocksDB dedupe → notepack segments → Parquet shadow → object storage, plus isolated
+negentropy) is unchanged; nothing in it reads ClickHouse.
+
+What was done on the host, in order:
+
+1. `sudo rm -rf /data/clickhouse/shadow/maint20261022rehearsal` (frees the unique
+   153 GiB at once). **Lesson:** a FREEZE snapshot is not free; remove it (or
+   `SYSTEM UNFREEZE WITH NAME …`) as soon as the rehearsal it protects is over.
+2. Added `/etc/systemd/system/pensieve-ingest.service.d/zzzzzz-no-clickhouse-20261123.conf`
+   (record in [`ops/systemd/dropins/`](systemd/dropins/README.md)), `daemon-reload`, and a
+   graceful restart (`Result=success`, `shutdown complete`, the in-flight segment 43904
+   indexed first). The start logs `ingest configuration … clickhouse=disabled`. Without
+   `--clickhouse-url` the ingester neither opens `/archive/segments/.clickhouse_reindex_queue`
+   nor starts the indexer; the stale queue file is harmless.
+3. `sudo systemctl disable --now pensieve-api pensieve-preview pensieve-clickhouse-index-kuma.timer`.
+   Public API and preview routes behind Caddy answer 502; Grafana panels that read
+   ClickHouse are empty. Pause the ClickHouse-index monitor in Uptime Kuma.
+4. `docker update --restart=no pensieve-clickhouse && docker stop -t 300 pensieve-clickhouse`,
+   and a temporary `~/pensieve/ops/production/compose.override.yml` keeping ClickHouse out
+   of `docker compose up`. `compose.yml` now does that with the `clickhouse-retired`
+   profile; delete the override once the checkout has this change. Prometheus no longer
+   scrapes ClickHouse and the ClickHouse index alert is gone (reload Prometheus after the
+   checkout update: `docker restart pensieve-prometheus`).
+
+No data is lost by deleting `/data/clickhouse`: the only ClickHouse-only events (347,112,
+from before the archive-first ingester) were recovered on 2026-08-11 into
+`/archive/recovery/clickhouse-legacy-20260811/` and published to the Parquet lake (its
+`reconciliation/seven-field.json` shows `equal: true`); everything since was indexed from
+archived segments. To delete: `docker rm pensieve-clickhouse`, `sudo rm -rf /data/clickhouse`,
+`docker volume rm pensieve-deploy_clickhouse_logs`.
+
+To bring ClickHouse back before the data is deleted: remove the drop-in from step 2,
+`daemon-reload`, restart the ingester, start the container
+with `--profile clickhouse-retired`, and re-enable the units from step 3. Segments sealed while ClickHouse was off are
+not journaled and stay unindexed until backfilled by hand.
+
+The sections below about ClickHouse (migrations 016–023, preview compact lookups, API
+rollups, the `grafana` ClickHouse user, ClickHouse indexing and outages) are history.
 
 Grafana datasources/dashboards are configured **on the running instance** (no repo
 provisioning). The ingester exposes Prometheus metrics on `:9091`.
@@ -94,7 +142,7 @@ replay, the shadow must drain its notification queue. Check catch-up and current
 work-unit duration before choosing a stop deadline, particularly when replacing
 an older binary that still drains the entire historical replay.
 
-**Do not stop the ingester during :00–:07 UTC.** Refreshable views rescan all of
+*(Until 2026-11-23, while ClickHouse ran.)* **Do not stop the ingester during :00–:07 UTC.** Refreshable views rescan all of
 `events_local` at those times: `kinds_stats_mv` (180 GiB) every hour and
 `relay_distribution_mv` (1.3 TiB read) at 00/06/12/18 UTC; `active_users_daily_mv` also
 refreshes hourly at :00 (from `daily_user_stats`). The migration 020 cutover removes both
@@ -105,7 +153,7 @@ exceeded the then 90 s `TimeoutStopSec` and was killed; `stop-timeout.conf` now
 allows 15 minutes. Check `system.view_refreshes` (`status`, `next_refresh_time`)
 before stopping.
 
-**Killed shutdowns heal themselves (since `ingest-b466b37`, #73).** Every sealed
+*(ClickHouse indexing, retired 2026-11-23.)* **Killed shutdowns heal themselves (since `ingest-b466b37`, #73).** Every sealed
 segment is journaled in `/archive/segments/.clickhouse_reindex_queue` before it is
 indexed (`v1 <committed> <batch_end> <path>`), progress is recorded before each insert
 batch, and the entry is removed once the segment is fully in `events_local`. On start
@@ -150,8 +198,9 @@ and `clickhouse_index_oldest_pending_seconds` near 0. The `clickhouse index back
 cleared` log line appears only after failed attempts, and also while an unreadable segment
 is still journaled.
 
-**Kuma probe (the alert that notifies).** `pensieve-clickhouse-index-kuma.timer` runs
-[`ops/scripts/clickhouse-index-kuma.py`](scripts/clickhouse-index-kuma.py) every 60 s. It
+**Kuma probe (the alert that notifies; disabled and removed from the repo 2026-11-23, see git
+history).** `pensieve-clickhouse-index-kuma.timer` ran
+`ops/scripts/clickhouse-index-kuma.py` every 60 s. It
 reads `clickhouse_index_oldest_pending_seconds` and `clickhouse_index_queue_segments` from
 `127.0.0.1:9091/metrics` and pushes `up` while the oldest pending segment is younger than
 900 s (the Prometheus rule's threshold), `down` otherwise, or when the metrics page or the

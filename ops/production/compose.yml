@@ -1,6 +1,7 @@
 # Pensieve Production Docker Compose
 #
-# This runs the infrastructure services (ClickHouse, Grafana, Prometheus, Caddy).
+# This runs the infrastructure services (Grafana, Prometheus, Caddy). ClickHouse
+# was retired on 2026-11-23 and is behind the `clickhouse-retired` profile.
 # The Rust binaries (API, Ingester, Preview) run as native binaries via systemd.
 #
 # Normally manage infrastructure through systemd (ops/systemd/pensieve.service):
@@ -63,6 +64,11 @@ services:
   # ClickHouse - Analytics Database
   # ═══════════════════════════════════════════════════════════════════════════
   clickhouse:
+    # Retired 2026-11-23 (/data full; analytics moved to the Parquet lake). The
+    # profile keeps `docker compose up` (pensieve.service) from starting it. The
+    # definition stays for reference until /data/clickhouse is deleted and the
+    # ClickHouse code is removed; `--profile clickhouse-retired` would start it.
+    profiles: ["clickhouse-retired"]
     image: clickhouse/clickhouse-server:26.8.36.3@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
     container_name: pensieve-clickhouse
     restart: unless-stopped
@@ -183,7 +189,6 @@ services:
       - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource 4.23.2,frser-sqlite-datasource 4.0.6
     depends_on:
       - prometheus
-      - clickhouse
     logging:
       driver: "json-file"
       options:
