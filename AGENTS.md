@@ -325,7 +325,7 @@ summary below is a quick reference.
 |-----------|---------|-----------------------------------|
 | Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` (images pinned by digest) |
 | ClickHouse | **retired 2026-11-23**: stopped, behind the `clickhouse-retired` Compose profile | nothing; `/data/clickhouse` is to be deleted |
-| `pensieve-ingest` | `pensieve-ingest.service`, installed verbatim from `ops/systemd/` (no drop-ins) | `~/pensieve/releases/current/pensieve-ingest`; `current` → `v2026.11.23`. `Restart=on-failure` (at most 3 starts per hour), `TimeoutStopSec=15min` |
+| `pensieve-ingest` | `pensieve-ingest.service`, installed verbatim from `ops/systemd/` (no drop-ins) | `~/pensieve/releases/current/pensieve-ingest`; `current` → `v2026.11.23.2`. `Restart=on-failure` (at most 3 starts per hour), `TimeoutStopSec=15min` |
 | `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; the ingester unit `Wants=` it) | `/usr/local/libexec/pensieve-negentropy-worker`, installed from the current release by `deploy-ingest.sh` |
 | `pensieve-serve`, `pensieve-preview` | retired 2026-11-23 | units removed from the host (they only read ClickHouse) |
 | Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout |
