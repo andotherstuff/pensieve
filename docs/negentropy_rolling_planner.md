@@ -6,8 +6,10 @@ The isolated runtime now calls them only behind the explicit, default-off
 There is still no process launcher or production activation in this change.
 
 An explicit allowlist contains at most 32 entries; normalized duplicates collapse.
-Empty disables planning. Removal disables only future planning for that relay;
-its jobs and frozen sweep cursor remain. Re-adding resumes that cursor. The ledger
+Empty disables planning. Removal disables future planning and leasing for that
+relay; its jobs and frozen sweep cursor remain, but its unfinished jobs no longer
+count toward `/health/negentropy` (`unresolved_failures`, the progress deadline)
+or the failure pause. Re-adding resumes that cursor and counts its jobs again. The ledger
 retains at most 128 distinct relay identities. Further configuration churn fails
 closed atomically; it never deletes old gaps or silently replaces identities.
 Pure removals/disabling bypass admission ceilings so a full ledger cannot prevent

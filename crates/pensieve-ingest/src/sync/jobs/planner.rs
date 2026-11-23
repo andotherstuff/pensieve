@@ -45,7 +45,8 @@ pub struct PlanningProgress {
 impl JobLedger {
     /// Replace the explicit planning allowlist (at most 32 input entries).
     /// Canonical duplicates collapse. Empty disables planning. Removed relays'
-    /// cursors and jobs remain; re-adding resumes them. At most 128 relay identities
+    /// cursors and jobs remain but are not leased and do not count toward health
+    /// or the failure pause; re-adding resumes them. At most 128 relay identities
     /// are retained for the ledger lifetime; churn beyond that fails atomically.
     pub fn configure_planner(&mut self, relays: &[&str]) -> Result<(), LedgerError> {
         if relays.len() > MAX_ACTIVE {

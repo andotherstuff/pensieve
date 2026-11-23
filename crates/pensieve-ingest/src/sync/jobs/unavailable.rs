@@ -608,7 +608,8 @@ impl JobLedger {
 
     /// Persistently failing jobs that count toward the runtime's failure pause,
     /// in ID order. The candidates are exactly the jobs behind `unresolved_failures`
-    /// (blocked, or in retry wait after at least three failed attempts); a
+    /// (blocked, or in retry wait after at least three failed attempts, of a relay
+    /// not removed from the planner allowlist); a
     /// retry-wait job whose in-progress identical unavailable run is on track to
     /// a relay-unavailable completion (see `on_track`) is left out. Health is
     /// unaffected: such a job still counts toward `unresolved_failures`. With the
@@ -618,7 +619,9 @@ impl JobLedger {
         let failing = {
             let mut query = self.db.prepare(
                 "SELECT id,state='retry_wait',attempt FROM jobs
-                 WHERE state='blocked' OR (state='retry_wait' AND attempt>=3) ORDER BY id",
+                 WHERE (state='blocked' OR (state='retry_wait' AND attempt>=3))
+                 AND relay NOT IN (SELECT relay FROM planner_relays WHERE enabled=0)
+                 ORDER BY id",
             )?;
             query
                 .query_map([], |r| {
