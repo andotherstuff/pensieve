@@ -28,6 +28,10 @@ worker=pensieve-negentropy-worker
 
 die() { echo "deploy-ingest: $*" >&2; exit 1; }
 say() { echo "deploy-ingest: $*"; }
+# True if the unit's journal since $2 contains $3. Not `journalctl | grep -q`:
+# under pipefail, grep -q exits at the first match, journalctl dies of SIGPIPE
+# and the pipeline fails (exit 141) whenever the journal is long.
+journal_has() { sudo journalctl -u "$1" --since "$2" --no-pager -q | grep -F -- "$3" >/dev/null; }
 
 # 1. The release is intact.
 [[ -f $dest/build-manifest.json ]] || die "no $dest/build-manifest.json"
@@ -66,7 +70,7 @@ sudo systemctl stop "$unit"
 result=$(systemctl show "$unit" -p Result --value)
 status=$(systemctl show "$unit" -p ExecMainStatus --value)
 if [[ $result != success || $status != 0 ]] ||
-    ! sudo journalctl -u "$unit" --since "$since" --no-pager -q | grep -q 'shutdown complete'; then
+    ! journal_has "$unit" "$since" 'shutdown complete'; then
     die "stop was not graceful (Result=$result ExecMainStatus=$status); nothing was started. Check the journal and the RUNBOOK's graceful-stop checks, then start $unit by hand"
 fi
 say "graceful stop confirmed"
@@ -92,7 +96,7 @@ for _ in $(seq 1 24); do
     exe=$(sudo readlink "/proc/$pid/exe" || true)
     code=$(curl -s -o /dev/null -w '%{http_code}' "$admission" || true)
     if [[ $exe == "$dest/pensieve-ingest" && $code == 200 ]] &&
-        sudo journalctl -u "$unit" --since "$started" --no-pager -q | grep -q 'ingest configuration' &&
+        journal_has "$unit" "$started" 'ingest configuration' &&
         systemctl is-active --quiet "$worker"; then
         ok=1
         break
