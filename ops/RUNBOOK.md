@@ -179,7 +179,9 @@ and preview had two each. The switch, done once:
 3. Install `ops/systemd/pensieve-ingest.service`, `sudo rm -r /etc/systemd/system/pensieve-ingest.service.d`,
    `daemon-reload`. Check `systemctl show pensieve-ingest -p DropInPaths -p ExecStart`: no
    drop-ins, `releases/current/pensieve-ingest`. The running process is untouched.
-4. Build and deploy the first tag, `v2026.11.23`, with the scripts above.
+4. Build and deploy the first tag, `v2026.11.23`, with the scripts above (built in 6 min;
+   deployed 10:15 UTC with a graceful stop. The first `deploy-ingest.sh` reported `NOT VERIFIED`
+   although every check held, a `grep -q` under `pipefail` false negative fixed right after).
 5. Remove the retired units: the API and preview units with their drop-ins, and the
    ClickHouse-index Kuma units, `/usr/local/libexec/pensieve-clickhouse-index-kuma.py` and
    `/etc/pensieve/clickhouse-index-kuma.url`; `daemon-reload`.
