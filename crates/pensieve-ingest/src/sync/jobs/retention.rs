@@ -70,6 +70,10 @@ pub struct RetentionProgress {
 
 impl JobLedger {
     /// Sample restart-stable progress on the owner, never from event timestamps.
+    ///
+    /// Jobs of a relay removed from the planner allowlist (`enabled=0`) are
+    /// retained but never leased, so they neither hold progress pending nor
+    /// count as persistent failures; re-adding the relay counts them again.
     pub fn progress_observation(
         &self,
         now: i64,
@@ -80,7 +84,8 @@ impl JobLedger {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
         let mut pending: Option<i64> = self.db.query_row(
-            "SELECT min(recorded_at) FROM jobs WHERE state!='complete' AND recorded_at>0",
+            "SELECT min(recorded_at) FROM jobs WHERE state!='complete' AND recorded_at>0
+             AND relay NOT IN (SELECT relay FROM planner_relays WHERE enabled=0)",
             [],
             |r| r.get(0),
         )?;
@@ -88,7 +93,8 @@ impl JobLedger {
         // epoch: use the persisted upgrade observation as a one-time grace
         // baseline. Reopening the ledger cannot refresh this deadline.
         let unknown_pending: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state!='complete' AND recorded_at=0)",
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state!='complete' AND recorded_at=0
+             AND relay NOT IN (SELECT relay FROM planner_relays WHERE enabled=0))",
             [],
             |r| r.get(0),
         )?;
@@ -103,8 +109,9 @@ impl JobLedger {
             pending = Some(last_success.unwrap_or(activated));
         }
         let persistent_failure = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='blocked'
-             OR (state='retry_wait' AND attempt>=3))",
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE (state='blocked'
+             OR (state='retry_wait' AND attempt>=3))
+             AND relay NOT IN (SELECT relay FROM planner_relays WHERE enabled=0))",
             [],
             |r| r.get(0),
         )?;
@@ -714,6 +721,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn removed_relay_jobs_leave_health_and_pause_until_re_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db =
+            JobLedger::open(&dir.path().join("jobs.sqlite"), LedgerLimits::default()).unwrap();
+        let (kept, removed) = ("wss://kept.example", "wss://removed.example");
+        db.configure_planner(&[kept, removed]).unwrap();
+        let kept_job = db.enqueue("s", kept, 0, 899).unwrap().id;
+        let removed_job = db.enqueue("s", removed, 0, 899).unwrap().id;
+        db.db
+            .execute(
+                "UPDATE jobs SET state='retry_wait',attempt=6,recorded_at=100",
+                [],
+            )
+            .unwrap();
+        db.db
+            .execute("UPDATE jobs SET recorded_at=200 WHERE id=?1", [kept_job])
+            .unwrap();
+        db.configure_planner(&[kept]).unwrap();
+        let o = db.progress_observation(4000).unwrap();
+        assert!(o.persistent_failure);
+        assert_eq!(o.pending_since, Some(200));
+        assert_eq!(db.pause_failures().unwrap(), [kept_job]);
+
+        db.db
+            .execute("UPDATE jobs SET state='complete' WHERE id=?1", [kept_job])
+            .unwrap();
+        let o = db.progress_observation(4000).unwrap();
+        assert!(!o.persistent_failure);
+        assert_ne!(o.pending_since, Some(100));
+        assert!(db.pause_failures().unwrap().is_empty());
+
+        db.configure_planner(&[kept, removed]).unwrap();
+        let o = db.progress_observation(4000).unwrap();
+        assert!(o.persistent_failure);
+        assert_eq!(o.pending_since, Some(100));
+        assert_eq!(db.pause_failures().unwrap(), [removed_job]);
     }
 
     #[test]

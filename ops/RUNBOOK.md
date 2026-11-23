@@ -2107,6 +2107,18 @@ Read the fixed reason first: `curl -s localhost:9091/health/negentropy`.
   counted job has failed continuously for the grace (`isolated reconciliation
   paused leasing` in the journal); stopping the worker is then optional.
 
+  **A relay removed from the relays file.** Removing a relay from
+  `--isolated-negentropy-relays-file` disables it in the ledger's planner
+  (`planner_relays.enabled=0`): its cursor and unfinished jobs are kept, but they
+  are no longer leased and, since `v2026.11.23.2`, no longer count toward
+  `unresolved_failures`, the progress deadline or the failure pause. Re-adding the
+  relay resumes them and counts them again. Older builds kept counting them, so
+  the jobs left by removing `wss://relay.nostr.net` (2026-11-06) and disabling
+  `wss://relay.ditto.pub` (2026-11-11) held monitor 46 red and paused leasing for
+  Premium Primal from 2026-11-16 14:35 UTC until the restarts of 2026-11-23. List
+  what a removed relay left behind (read-only):
+  `sudo -u pensieve sqlite3 -readonly "$LEDGER" "SELECT j.relay,j.state,count(*),max(j.attempt) FROM jobs j JOIN planner_relays p ON p.relay=j.relay WHERE p.enabled=0 AND j.state!='complete' GROUP BY 1,2"`.
+
   **A revisited excluded window.** A later rolling pass over history enqueues
   windows again. On 2026-10-13 the 15:15 UTC pass enqueued job 768's excluded
   window as job 1984, which withheld the same ID on every attempt and, before
