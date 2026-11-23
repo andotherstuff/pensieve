@@ -99,12 +99,12 @@ jobs:
       - run: cargo test --workspace --doc
 
   clickhouse:
-    name: ClickHouse integration (24.8)
+    name: ClickHouse integration (26.8 LTS)
     runs-on: ubuntu-latest
     services:
       clickhouse:
         # Same release line as production.
-        image: clickhouse/clickhouse-server:24.8
+        image: clickhouse/clickhouse-server:26.8@sha256:8b28eb09479c36c4533eec7a6268917d04ba3a6fd90e3f4205f70e761b6d7779
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports:

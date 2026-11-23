@@ -953,3 +953,13 @@ These migrations enable the following new endpoints:
 | `GET /api/v1/stats/publishers` | Top publishers | None |
 
 All endpoints include HTTP caching headers (`ETag` and a per-endpoint `Cache-Control`; see [Caching](../../crates/pensieve-serve/README.md#caching)).
+
+## 2026-11-03 — 023: cohort refresh ordering
+
+Applied `023_serialize_cohort_refreshes.sql` to production. Monthly refresh now
+`DEPENDS ON nostr.cohort_retention_weekly_mv`; daily 03:00/03:15 UTC schedules,
+SELECT queries, output tables and memory limits are unchanged. Dependency/startup
+behavior was verified with a network-isolated container running the exact
+production ClickHouse 26.8.36.3 image. Weekly failure deliberately delays monthly.
+This is scheduling protection, not a guarantee against unrelated memory pressure.
+Rollback only this change with `rollback/023_unserialize_cohort_refreshes.sql`.

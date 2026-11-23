@@ -29,7 +29,7 @@ services:
   # Caddy - Reverse Proxy with Auto-HTTPS
   # ═══════════════════════════════════════════════════════════════════════════
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     container_name: pensieve-caddy
     restart: unless-stopped
     ports:
@@ -63,7 +63,7 @@ services:
   # ClickHouse - Analytics Database
   # ═══════════════════════════════════════════════════════════════════════════
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.8.36.3@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
     container_name: pensieve-clickhouse
     restart: unless-stopped
     ports:
@@ -116,7 +116,7 @@ services:
   # Prometheus - Metrics Collection
   # ═══════════════════════════════════════════════════════════════════════════
   prometheus:
-    image: prom/prometheus:v2.48.0
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     container_name: pensieve-prometheus
     restart: unless-stopped
     # Localhost only, on 19090. Docker-published ports bypass UFW, so
@@ -156,7 +156,7 @@ services:
   # Grafana - Dashboards
   # ═══════════════════════════════════════════════════════════════════════════
   grafana:
-    image: grafana/grafana:10.2.2
+    image: grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
     container_name: pensieve-grafana
     restart: unless-stopped
     ports:
@@ -180,7 +180,7 @@ services:
       - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
       # Install plugins on startup (datasources are configured on the running instance)
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,frser-sqlite-datasource
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource 4.23.2,frser-sqlite-datasource 4.0.6
     depends_on:
       - prometheus
       - clickhouse

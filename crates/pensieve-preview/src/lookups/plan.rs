@@ -279,6 +279,11 @@ pub fn projection_client(client: &Client, require_projection: bool) -> Client {
             .clone()
             .with_option("optimize_use_projections", "1")
             .with_option("force_optimize_projection", "1")
+            // ClickHouse 26.8 can prune every part using statistics before
+            // selecting a projection, making the force guard reject even an
+            // empty read. Keep explicit projection-proof queries on the
+            // projection path; normal application queries retain pruning.
+            .with_option("use_statistics_for_part_pruning", "0")
     } else {
         client.clone()
     }
