@@ -4,10 +4,12 @@ This file provides context for AI coding agents working on the Pensieve codebase
 
 ## Project Overview
 
-Pensieve is an **archive-first Nostr indexer** written in Rust. It ingests events from Nostr relays, stores them in a canonical notepack archive (source of truth), and indexes them into ClickHouse for analytics. A Parquet lake (optional live shadow plus a historical campaign) is being built alongside ClickHouse, with DuckDB batch tools for research over it; see `docs/migration-plan.md`. The Postgres analytics serving store was abandoned on 2026-10-12 and its code removed; the API serves everything from ClickHouse.
+Pensieve is an **archive-first Nostr indexer** written in Rust. It ingests events from Nostr relays, deduplicates them in RocksDB, stores them in a canonical notepack archive (source of truth) and publishes every sealed segment as Parquet to object storage (the live Parquet shadow; a historical campaign covers older segments). DuckDB batch tools do research over the lake; see `docs/migration-plan.md`.
+
+> **ClickHouse analytics is retired in production (2026-11-23).** `/data` filled up, so the ingester runs without `--clickhouse-url`, ClickHouse is stopped (and behind the `clickhouse-retired` Compose profile), and `pensieve-api` and `pensieve-preview`, which only read ClickHouse, are stopped and disabled. The ClickHouse indexer, `pensieve-serve`, `pensieve-preview` and the migrations are still in the tree but run nowhere; do not add ClickHouse migrations or deploy those services. See `ops/RUNBOOK.md` → ClickHouse retirement. The Postgres analytics serving store was abandoned earlier, on 2026-10-12.
 
 **Key architecture decisions:**
-- Archive-first: notepack segments are the source of truth; ClickHouse is a derived index
+- Archive-first: notepack segments are the source of truth; Parquet (and, until 2026-11-23, ClickHouse) is derived from them
 - RocksDB for deduplication (billions of event IDs, SSD-backed)
 - Length-prefixed framing for segment files
 - Notepack binary format for ~128 bytes/event savings over JSON
@@ -184,13 +186,13 @@ Review [rust-code-style.mdc](./.cursor/rules/rust-code-style.mdc) for full code 
 1. **Source** (relay/JSONL/protobuf) → validated events
 2. **DedupeIndex** (RocksDB) → filter duplicates by event ID
 3. **SegmentWriter** → append to gzipped notepack segment
-4. **ClickHouseIndexer** → index sealed segments for analytics
-5. **Parquet shadow** (optional, enabled by `/etc/pensieve/parquet-shadow.env` in production) → convert sealed segments to Parquet and publish them to object storage
+4. **Parquet shadow** (optional, enabled by `/etc/pensieve/parquet-shadow.env` in production) → convert sealed segments to Parquet and publish them to object storage
+5. **ClickHouseIndexer** (only with `--clickhouse-url`; off in production since 2026-11-23) → index sealed segments into `events_local`
 
 ### Segment Lifecycle
 - Events written to current segment with length-prefix framing
 - Segment sealed at the size threshold (`--segment-size`, default 256 MB) or by the periodic seal timer (`--archive-seal-interval-secs`, default 300 s), whichever comes first
-- Sealed segments are indexed to ClickHouse, handed to the Parquet shadow when it is active, and synced hourly to the Storage Box by `ops/scripts/sync-archive.sh`
+- Sealed segments are handed to the Parquet shadow when it is active (and indexed to ClickHouse only when `--clickhouse-url` is set), and synced hourly to the Storage Box by `ops/scripts/sync-archive.sh`
 
 ## Testing
 
@@ -237,7 +239,7 @@ Every crate has unit tests; `pensieve-ingest`, `-preview`, `-serve`, `-lake`, `-
 Migrations live in `docs/migrations/` and are numbered sequentially (e.g., `001_active_user_views.sql`, `009_fix_zap_amounts.sql`).
 `docs/migrations/prepared/` holds operations that need an explicit preflight (016 and 018 drop projections; 017 creates the preview compact lookups; 019 creates the API rollups behind `/stats/publishers` and `/stats/longform`; 020 replaces the `daily_user_stats_mv` lookups and the `kinds_stats_mv` / `relay_distribution_mv` rescans in two phases, the second run by `api-rollups cutover`; 021 creates `kind_activity` behind `/kinds/{kind}`, `/kinds/{kind}/activity`, `/stats/events` and `/stats/throughput`; 022 creates `hourly_pubkeys` behind `/stats/activity/hourly`) and `docs/migrations/rollback/` holds their reversals. Neither directory is run by `just ch-migrate-all`.
 
-**Production state (2026-10-14):** 001–015 and prepared 016, 017, 018, 019, 020, 021 and 022 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13; 022 applied 14:11 UTC 2026-10-14, backfilled and validated, read by `api-0a14656` since 14:49 UTC). **Deploy gate (for any database without 022, e.g. a rebuild):** no `api-*` release cut from master at or after PR #101 may be deployed until 022 has been applied, backfilled (`api-rollups status`: 256/256) and validated (`validate --migration 022` exits 0); an early deploy answers `/stats/activity/hourly` with 503 before the apply and with undercounted `unique_pubkeys` while the backfill is incomplete (RUNBOOK → Hourly authors). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
+**Production state:** ClickHouse is retired (2026-11-23, see the overview); nothing below runs in production any more. As of the retirement,  001–015 and prepared 016, 017, 018, 019, 020, 021 and 022 are applied (019 and 020 backfilled and validated 2026-10-12; 020's cutover ran at 19:18 UTC, dropping `kinds_stats_mv`; 021 backfilled and validated 2026-10-13; 022 applied 14:11 UTC 2026-10-14, backfilled and validated, read by `api-0a14656` since 14:49 UTC). **Deploy gate (for any database without 022, e.g. a rebuild):** no `api-*` release cut from master at or after PR #101 may be deployed until 022 has been applied, backfilled (`api-rollups status`: 256/256) and validated (`validate --migration 022` exits 0); an early deploy answers `/stats/activity/hourly` with 503 before the apply and with undercounted `unique_pubkeys` while the backfill is incomplete (RUNBOOK → Hourly authors). `events_local` has no projections. There is no ledger table; the record is `docs/migrations/README.md` and the RUNBOOK.
 
 ### Writing Migrations
 
@@ -293,7 +295,7 @@ just ch-tables
 - **Truncate + backfill**: Some migrations truncate tables and repopulate from `events_local` (2.4 billion rows in production). These take a long time.
 - **Materialized views**: When fixing MV logic, you typically: drop the view, recreate with new logic, truncate the target table, and backfill.
 - **Prepared operations**: Files under `docs/migrations/prepared/` are excluded from `just ch-migrate-all` and require explicit operator preflight and invocation.
-- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017, 019, 020 with its cutover, 021 and 022, as in the block above) produces the same tables and views as production once production has 022 (prepared 020 replaced three derived views and is applied; 022 is not yet applied there), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
+- **Base schema vs production**: `docs/clickhouse_self_hosted.sql` is the fresh-install starting point; 013 later drops several objects it creates. A fresh install (base schema + 001–015 + prepared 017, 019, 020 with its cutover, 021 and 022, as in the block above) produces the tables and views production had (plus 023, applied 2026-11-03), but `events_local` keeps the `events_by_kind` and `events_by_author` projections, which production does not have (see the header of that file).
 - **Test locally first**: `just ch-test-up` starts a disposable ClickHouse 26.8 LTS (same line as production).
 
 ---
@@ -319,16 +321,18 @@ summary below is a quick reference.
 
 ### Architecture
 
-| Component | Runs as | What actually starts (2026-10-11) |
+| Component | Runs as | What actually starts (2026-11-23) |
 |-----------|---------|-----------------------------------|
-| ClickHouse, Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` |
-| `pensieve-serve` | `pensieve-api.service` | `~/pensieve/releases/api-89f526b/pensieve-serve` (master incl. #101 `/stats/events`, `/stats/throughput` and `/stats/activity/hourly` from rollups, #102 private per-endpoint cache headers and live relay DB reads, and #107 eMudhra-distrusting TLS roots; since 2026-10-21 08:42 UTC) via `pensieve-api.service.d/90-postgres-cutover.conf` |
-| `pensieve-preview` | `pensieve-preview.service` | `~/pensieve/releases/preview-89f526b/pensieve-preview` (master; preview code unchanged since `3ab1045`, plus #107 eMudhra-distrusting TLS roots; since 2026-10-21 08:42 UTC) via `pensieve-preview.service.d/10-release.conf` |
-| `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-89f526b/pensieve-ingest` (master incl. #88, #90, #92, #94, #95 carried exclusions, #98 16 GiB dedupe block cache, #103 carries ahead of a retry backlog, #105 indexer retries instead of stranding segments and #107 eMudhra-distrusting TLS roots, since 2026-10-21 08:43 UTC, with `--isolated-negentropy-pause-on-failure-secs 7200`) via `pensieve-ingest.service.d/zzzz-bounded-canary.conf` (sets `Restart=no`); `stop-timeout.conf` sets `TimeoutStopSec=15min` |
-| `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against Premium Primal since 2026-10-12) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-89f526b` worker, with #107 eMudhra-distrusting TLS roots, since 2026-10-21 08:43 UTC; the previous builds are kept beside it as `pensieve-negentropy-worker.26f2170` and `.ba0c4a1`) |
+| Grafana, Prometheus, Caddy | Docker Compose via `pensieve.service` | `~/pensieve/ops/production/compose.yml` (images pinned by digest) |
+| ClickHouse | **retired 2026-11-23**: stopped, behind the `clickhouse-retired` Compose profile | nothing; `/data/clickhouse` is to be deleted |
+| `pensieve-ingest` | `pensieve-ingest.service` | `~/pensieve/releases/ingest-security-20261022/pensieve-ingest` (built from `974d8fb`, the 2026-10-22 security maintenance) via `pensieve-ingest.service.d/zzzzzz-no-clickhouse-20261123.conf`: the flags of `zzzzz-security-20261022.conf` without `--clickhouse-url`. `zzzz-bounded-canary.conf` still sets `Restart=no`; `stop-timeout.conf` sets `TimeoutStopSec=15min` |
+| `pensieve-negentropy-worker` | `pensieve-negentropy-worker.service` (static; pulled in by the ingester's `negentropy-worker.conf`, continuous against the relays in `/etc/pensieve/negentropy-premium-canary-20261010T162833Z.txt`) | `/usr/local/libexec/pensieve-negentropy-worker` (the `ingest-security-20261022` worker) |
+| `pensieve-serve`, `pensieve-preview` | `pensieve-api.service`, `pensieve-preview.service` | **stopped and disabled 2026-11-23** (they only read ClickHouse) |
 | Archive sync | `archive-sync.timer` | scripts in the `~/pensieve/ops/scripts/` checkout |
-| Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer`, `pensieve-clickhouse-index-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` |
-| Prometheus `:9090` for the monitoring VM | `pensieve-prometheus-proxy.socket` (enabled), socket-activated `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`, gated by UFW. In the repo since PR #100; installed by its RUNBOOK rollout, not yet on the host |
+| Uptime Kuma push probes | `pensieve-archive-admission-kuma.timer`, `pensieve-negentropy-kuma.timer` | `/usr/local/libexec/pensieve-*-kuma.py` (the ClickHouse-index probe was disabled and removed 2026-11-23) |
+| Log shipping | `alloy.service` | `/usr/local/bin/alloy` with `/etc/alloy/config.alloy` (copy of `ops/production/alloy/config.alloy`) |
+| Maintenance agent | `openclaw-gateway.service` (Sven) | OpenClaw; performs host maintenance. Record what it changes in the repo |
+| Prometheus `:9090` for the monitoring VM | `pensieve-prometheus-proxy.socket` (enabled), socket-activated `.service` | `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19090`, gated by UFW |
 
 The `ExecStart` lines in `ops/systemd/*.service` still point at
 `~/pensieve/target/release/`; production overrides them. Copies of the
@@ -353,7 +357,7 @@ Per component, as done for `api-*` and `preview-3ab1045` (full steps in the RUNB
 
 Migrations are applied separately and explicitly (`just ch-migrate <file>`), never with `just ch-migrate-all`.
 
-> **API deploy gate (since PR #101):** an `api-*` release cut from master at or after #101 reads migration 022's `hourly_pubkeys`. Do not deploy one until 022 is applied, backfilled and validated (ops/RUNBOOK.md → Hourly authors (migration 022)): before the apply `/stats/activity/hourly` answers 503, and while the backfill is incomplete it answers 200 with undercounted `unique_pubkeys`.
+> **(Historical; the API is retired.) API deploy gate (since PR #101):** an `api-*` release cut from master at or after #101 reads migration 022's `hourly_pubkeys`. Do not deploy one until 022 is applied, backfilled and validated (ops/RUNBOOK.md → Hourly authors (migration 022)): before the apply `/stats/activity/hourly` answers 503, and while the backfill is incomplete it answers 200 with undercounted `unique_pubkeys`.
 
 ### Service Management
 
@@ -373,7 +377,6 @@ sudo systemctl restart pensieve-ingest
 sudo systemctl status pensieve pensieve-api pensieve-ingest pensieve-preview
 
 # Docker infrastructure
-docker logs -f pensieve-clickhouse
 docker logs -f pensieve-grafana
 # Compose commands need the production env file, e.g.
 # cd ~/pensieve/ops/production && docker compose --env-file /etc/pensieve/pensieve.env ps
@@ -444,7 +447,7 @@ the Storage Box by `archive-sync`.
 
 | Path | Purpose | Storage |
 |------|---------|---------|
-| `/data/clickhouse/` | ClickHouse data | NVMe (RAID0) |
+| `/data/clickhouse/` | Retired ClickHouse data (to be deleted) | NVMe (RAID0) |
 | `/data/rocksdb/` | Dedupe index | NVMe |
 | `/data/relay-stats.db` | Relay quality SQLite | NVMe |
 | `/data/sync-state/`, `/data/negentropy/` | Negentropy sync state and isolated-reconciliation ledgers | NVMe |

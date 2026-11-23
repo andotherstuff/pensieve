@@ -10,7 +10,8 @@ User=pensieve
 Group=pensieve
 WorkingDirectory=/home/pensieve/pensieve/ops/production
 
-# Start docker compose (ClickHouse, Grafana, Prometheus, Caddy).
+# Start docker compose (Grafana, Prometheus, Caddy; ClickHouse is retired and
+# behind a profile in compose.yml).
 # --env-file points at the production secrets, which live outside the repo tree.
 # --project-name pins the project to pensieve-deploy (also set via `name:` in
 # compose.yml) so the ops/ rename does not orphan the existing volumes/network.

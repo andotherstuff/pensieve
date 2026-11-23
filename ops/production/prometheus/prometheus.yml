@@ -2,7 +2,6 @@
 #
 # Scrapes metrics from:
 # - Prometheus itself
-# - ClickHouse (built-in metrics)
 # - Pensieve ingester (native binary on host, port 9091)
 # - node_exporter on the host (port 9100), if installed
 
@@ -29,14 +28,6 @@ scrape_configs:
     static_configs:
       # host.docker.internal reaches the host from inside Docker (Linux needs extra_hosts)
       - targets: ['host.docker.internal:9091']
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # ClickHouse built-in Prometheus metrics
-  # Metrics exposed on port 9363 inside the Docker network
-  # ═══════════════════════════════════════════════════════════════════════════
-  - job_name: 'clickhouse'
-    static_configs:
-      - targets: ['pensieve-clickhouse:9363']
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Node Exporter (host machine metrics)

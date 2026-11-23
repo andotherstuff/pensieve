@@ -91,7 +91,7 @@ discovery.relabel "pensieve_docker" {
 
 	rule {
 		source_labels = ["__meta_docker_container_name"]
-		regex         = "/pensieve-(caddy|clickhouse|prometheus)"
+		regex         = "/pensieve-(caddy|prometheus)"
 		action        = "keep"
 	}
 
